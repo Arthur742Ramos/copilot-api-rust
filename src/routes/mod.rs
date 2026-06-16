@@ -4,4 +4,5 @@ pub mod embeddings;
 pub mod models;
 pub mod provider;
 pub mod token;
+pub mod token_usage;
 pub mod usage;
