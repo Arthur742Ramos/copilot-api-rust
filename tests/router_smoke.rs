@@ -1,5 +1,5 @@
 //! Cheap route-table regression checks: landing page, 404 for unknown routes,
-//! the trace-id response header, and the usage-viewer placeholder. These hit
+//! the trace-id response header, and the usage-viewer dashboard. These hit
 //! unauthenticated / non-upstream paths, so no config seam is required, but the
 //! landing/usage routes read the (possibly shared) cached config indirectly via
 //! auth, so we keep them serial to avoid racing other config-mutating tests.
@@ -63,9 +63,9 @@ async fn incoming_trace_id_is_echoed() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn usage_viewer_returns_placeholder() {
+async fn usage_viewer_returns_dashboard() {
     let (status, body) = send(get("/usage-viewer")).await;
     assert_eq!(status, StatusCode::OK);
     let html = String::from_utf8_lossy(&body);
-    assert!(html.contains("Usage Viewer"));
+    assert!(html.contains("Token Usage Dashboard"));
 }
