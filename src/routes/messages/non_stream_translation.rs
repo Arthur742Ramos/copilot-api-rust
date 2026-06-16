@@ -63,6 +63,28 @@ impl Default for TranslationCapabilities {
     }
 }
 
+/// Mirrors `TranslateToOpenAIOptions`. Threaded from `modelConfig` at the
+/// provider call sites; the `Default` matches the hardcoded capabilities used
+/// by the main `/v1/messages` spine (support_pdf = false,
+/// tool_content_support_type = ["array", "image"]).
+#[derive(Debug, Clone)]
+pub struct TranslateToOpenAiOptions {
+    pub support_pdf: bool,
+    pub tool_content_support_type: Vec<String>,
+}
+
+impl Default for TranslateToOpenAiOptions {
+    fn default() -> Self {
+        Self {
+            support_pdf: false,
+            tool_content_support_type: COPILOT_TOOL_CONTENT_SUPPORT_TYPE
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
 /// Mirrors `ToolContentSupport`.
 struct ToolContentSupport {
     array: bool,
@@ -81,11 +103,24 @@ struct ToolResultMessages {
 // ---------------------------------------------------------------------------
 
 /// Mirrors `translateToOpenAI`. The api-flows caller passes no options, so the
-/// default capabilities apply.
+/// default capabilities apply. Thin wrapper over
+/// [`translate_to_openai_with_options`].
 pub fn translate_to_openai(payload: &AnthropicMessagesPayload) -> ChatCompletionsPayload {
+    translate_to_openai_with_options(payload, &TranslateToOpenAiOptions::default())
+}
+
+/// Mirrors `translateToOpenAI(payload, options)`: honours `supportPdf` /
+/// `toolContentSupportType` from the provider model config.
+pub fn translate_to_openai_with_options(
+    payload: &AnthropicMessagesPayload,
+    options: &TranslateToOpenAiOptions,
+) -> ChatCompletionsPayload {
     let model_id = payload.model.clone();
     let thinking_budget = get_thinking_budget(payload);
-    let capabilities = TranslationCapabilities::default();
+    let capabilities = TranslationCapabilities {
+        support_pdf: options.support_pdf,
+        tool_content_support_type: options.tool_content_support_type.clone(),
+    };
 
     let messages = translate_anthropic_messages_to_openai(payload, &model_id, &capabilities);
 
@@ -1178,5 +1213,44 @@ mod tests {
             translate_anthropic_tool_choice_to_openai(Some(&none)),
             Some(json!("none"))
         );
+    }
+
+    #[test]
+    fn translate_options_thread_support_pdf() {
+        // A user message carrying a document block: with support_pdf=false the
+        // document is replaced by a text placeholder; with support_pdf=true it
+        // becomes a `file` content part.
+        let payload = AnthropicMessagesPayload {
+            model: "gpt-4o".to_string(),
+            messages: vec![user_message(json!([
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "JVBER0=",
+                    },
+                },
+            ]))],
+            max_tokens: 100,
+            ..Default::default()
+        };
+
+        // Default options: PDF unsupported -> text placeholder.
+        let default_out =
+            translate_to_openai_with_options(&payload, &TranslateToOpenAiOptions::default());
+        let default_parts = default_out.messages[0].content.as_ref().unwrap();
+        assert_eq!(default_parts[0]["type"], "text");
+
+        // support_pdf=true -> file part.
+        let pdf_out = translate_to_openai_with_options(
+            &payload,
+            &TranslateToOpenAiOptions {
+                support_pdf: true,
+                tool_content_support_type: vec!["array".to_string(), "image".to_string()],
+            },
+        );
+        let pdf_parts = pdf_out.messages[0].content.as_ref().unwrap();
+        assert_eq!(pdf_parts[0]["type"], "file");
     }
 }
