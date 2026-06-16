@@ -65,12 +65,35 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     // 2. Web-search server-tool short-circuit. Mirrors `tryHandleWebSearch`.
     //
-    // TODO web_search: wire once `web_search::fulfill::try_handle_web_search`
-    // stabilizes its signature (it is being built this stage and currently
-    // exposes the building blocks but not the entry point, whose final shape
-    // takes a generic provider-forward callback). Expected behaviour: if it
-    // returns `Some(response)`, return it here; the call must run BEFORE the
-    // provider-alias step below since web-search may itself route to a provider.
+    // Runs BEFORE the provider-alias step because a web-search request may
+    // itself route to a configured provider (via the injected callback). A
+    // cheap `Value`-level check gates the typed round-trip so the common case
+    // (no web_search server tool) avoids an extra deserialize/serialize.
+    if has_web_search_server_tool_value(&payload) {
+        let mut typed = deserialize_payload(&payload)?;
+        let forward_headers = headers.clone();
+        let web_search_result =
+            crate::routes::messages::web_search::fulfill::try_handle_web_search(
+                &mut typed,
+                &headers,
+                |fwd_payload, provider| async move {
+                    crate::routes::provider::messages::handle_provider_messages_for_provider(
+                        fwd_payload,
+                        provider,
+                        forward_headers,
+                    )
+                    .await
+                },
+            )
+            .await;
+        if let Some(result) = web_search_result {
+            return result;
+        }
+        // The tool was stripped (not fulfilled); fold the mutations back into
+        // the working `Value` payload.
+        payload =
+            serde_json::to_value(&typed).map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    }
 
     // 3. `<provider>/model` alias -> delegate to the provider proxy.
     if let Some(alias) = parse_provider_model_alias(&model_of(&payload)) {
@@ -193,6 +216,27 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 fn deserialize_payload(payload: &Value) -> Result<AnthropicMessagesPayload, AppError> {
     serde_json::from_value(payload.clone())
         .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))
+}
+
+/// Cheap `Value`-level probe for an Anthropic `web_search` server tool: a
+/// `tools[]` entry whose `type` starts with `web_search` and that has no
+/// `input_schema`. Mirrors `is_web_search_server_tool` without deserializing.
+fn has_web_search_server_tool_value(payload: &Value) -> bool {
+    payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools.iter().any(|tool| {
+                let is_web_search = tool
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t.starts_with("web_search"))
+                    .unwrap_or(false);
+                let no_input_schema = tool.get("input_schema").map(Value::is_null).unwrap_or(true);
+                is_web_search && no_input_schema
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Mirrors `shouldUseResponsesApi`.
