@@ -14,8 +14,20 @@
 //!   shape is a union; typed structs are used where a known shape helps.
 //! - All optionals use `#[serde(skip_serializing_if = "Option::is_none")]`.
 
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::libs::api_config::{
+    copilot_base_url, copilot_headers, prepare_for_compact, prepare_interaction_headers, set_header,
+};
+use crate::libs::compact::COMPACT_REQUEST;
+use crate::libs::copilot_rate_limit::log_copilot_rate_limits;
+use crate::libs::error::{http_error_from_response, HttpError};
+use crate::libs::http::client;
+use crate::libs::state;
+use crate::libs::subagent::SubagentMarker;
+use crate::services::copilot::create_chat_completions::reqwest_headers_to_axum;
 
 // ---------------------------------------------------------------------------
 // Request payload
@@ -701,6 +713,126 @@ pub enum ResponsesOutcome {
     // TODO Phase 3: replace `Box<Value>` with the real pooled-stream handle once
     // the websocket/HTTP transport is implemented.
     Stream(Box<Value>),
+}
+
+/// Return type of [`create_responses`] / [`create_http_responses`], mirroring
+/// the TS `CreateResponsesReturn = ResponsesResult | ResponsesStream`.
+///
+/// Unlike [`ResponsesOutcome`] (a serde-friendly placeholder kept for any
+/// callers that need to (de)serialize an outcome), this enum carries the live
+/// `reqwest::Response` for the streaming arm so the route layer can forward its
+/// SSE body. It therefore cannot derive `Serialize`/`Deserialize`/`Clone`.
+pub enum CreateResponsesReturn {
+    /// Non-streaming: the fully-buffered, parsed result.
+    Result(Box<ResponsesResult>),
+    /// Streaming: the raw upstream response whose SSE body the route forwards.
+    Stream(reqwest::Response),
+}
+
+// ---------------------------------------------------------------------------
+// Transport (HTTP)
+// ---------------------------------------------------------------------------
+
+/// Options for [`create_responses`], mirroring the TS `ResponsesRequestOptions`.
+pub struct ResponsesRequestOptions<'a> {
+    pub vision: bool,
+    /// `"agent"` or `"user"`.
+    pub initiator: &'a str,
+    pub subagent_marker: Option<&'a SubagentMarker>,
+    pub request_id: &'a str,
+    pub session_id: Option<&'a str>,
+    pub compact_type: Option<i32>,
+    pub transport: ResponsesTransport,
+}
+
+/// Mirrors `createResponses` in services/copilot/create-responses.ts.
+///
+/// HTTP transport only. The websocket transport is Phase 5; where the TS code
+/// branches to a pooled websocket stream we fall back to HTTP (see below).
+pub async fn create_responses(
+    payload: &ResponsesPayload,
+    options: ResponsesRequestOptions<'_>,
+) -> Result<CreateResponsesReturn, HttpError> {
+    let st = state::snapshot();
+    if st.copilot_token.as_deref().unwrap_or("").is_empty() {
+        return Err(HttpError::internal("Copilot token not found"));
+    }
+
+    let mut headers: HeaderMap = copilot_headers(&st, Some(options.request_id), options.vision);
+    set_header(&mut headers, "x-initiator", options.initiator);
+
+    prepare_interaction_headers(
+        options.session_id,
+        options.subagent_marker.is_some(),
+        &mut headers,
+    );
+
+    prepare_for_compact(&mut headers, options.compact_type);
+
+    // service_tier is not supported by github copilot: strip it before sending.
+    let mut payload = payload.clone();
+    payload.service_tier = None;
+    payload.extra.remove("service_tier");
+
+    tracing::info!("<-- model: {}", payload.model);
+
+    let effective_transport = if options.compact_type == Some(COMPACT_REQUEST) {
+        ResponsesTransport::Http
+    } else {
+        options.transport
+    };
+
+    if payload.stream == Some(true) && effective_transport == ResponsesTransport::Websocket {
+        // TODO Phase 5: pooled websocket transport. For now fall back to HTTP so
+        // streaming still works over plain SSE.
+        tracing::debug!(
+            "websocket responses transport not yet implemented; falling back to HTTP transport"
+        );
+        return create_http_responses(&payload, &st, headers, true).await;
+    }
+
+    let stream = payload.stream.unwrap_or(false);
+    create_http_responses(&payload, &st, headers, stream).await
+}
+
+/// Mirrors `createHttpResponses`: POST `{copilotBaseUrl}/responses`, log rate
+/// limits, error on non-2xx, then either hand back the streaming response or
+/// parse the buffered JSON body.
+async fn create_http_responses(
+    payload: &ResponsesPayload,
+    st: &state::State,
+    headers: HeaderMap,
+    stream: bool,
+) -> Result<CreateResponsesReturn, HttpError> {
+    let base = copilot_base_url(st);
+    let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    let response = client()
+        .post(format!("{base}/responses"))
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| HttpError::internal(format!("Failed to create responses: {e}")))?;
+
+    {
+        let axum_headers = reqwest_headers_to_axum(response.headers());
+        log_copilot_rate_limits(&axum_headers);
+    }
+
+    if !response.status().is_success() {
+        tracing::error!("Failed to create responses");
+        return Err(http_error_from_response("Failed to create responses", response).await);
+    }
+
+    if stream {
+        Ok(CreateResponsesReturn::Stream(response))
+    } else {
+        let result = response
+            .json::<ResponsesResult>()
+            .await
+            .map_err(|e| HttpError::internal(format!("Failed to parse responses: {e}")))?;
+        Ok(CreateResponsesReturn::Result(Box::new(result)))
+    }
 }
 
 // ---------------------------------------------------------------------------

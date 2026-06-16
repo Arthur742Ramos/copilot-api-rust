@@ -13,6 +13,7 @@ pub mod oauth;
 pub mod opencode;
 pub mod paths;
 pub mod provider_model;
+pub mod provider_resolver;
 pub mod rate_limit;
 pub mod request_auth;
 pub mod request_context;
