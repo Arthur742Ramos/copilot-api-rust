@@ -108,7 +108,8 @@ pub fn translate_to_openai(payload: &AnthropicMessagesPayload) -> ChatCompletion
     if let Some(tools) = translate_anthropic_tools_to_openai(payload.tools.as_ref()) {
         extra.insert("tools".to_string(), Value::Array(tools));
     }
-    if let Some(tool_choice) = translate_anthropic_tool_choice_to_openai(payload.tool_choice.as_ref())
+    if let Some(tool_choice) =
+        translate_anthropic_tool_choice_to_openai(payload.tool_choice.as_ref())
     {
         extra.insert("tool_choice".to_string(), tool_choice);
     }
@@ -159,7 +160,10 @@ fn thinking_budget_from_model(
 
     if max_thinking_budget > 0 {
         let bt = std::cmp::min(budget_tokens, max_thinking_budget);
-        Some(std::cmp::max(bt, supports.min_thinking_budget.unwrap_or(1024)))
+        Some(std::cmp::max(
+            bt,
+            supports.min_thinking_budget.unwrap_or(1024),
+        ))
     } else {
         None
     }
@@ -177,7 +181,11 @@ fn translate_anthropic_messages_to_openai(
         if message.role == "user" {
             out.extend(handle_user_message(&message.content, capabilities));
         } else {
-            out.extend(handle_assistant_message(&message.content, model_id, capabilities));
+            out.extend(handle_assistant_message(
+                &message.content,
+                model_id,
+                capabilities,
+            ));
         }
     }
     out
@@ -287,10 +295,7 @@ fn handle_tool_result_block(
         _ => {
             return ToolResultMessages {
                 moved_user_message: None,
-                tool_message: create_tool_message(
-                    &tool_use_id,
-                    Some(Value::String(String::new())),
-                ),
+                tool_message: create_tool_message(&tool_use_id, Some(Value::String(String::new()))),
             };
         }
     };
@@ -298,10 +303,7 @@ fn handle_tool_result_block(
     let support = get_tool_content_support(capabilities);
     let has_image = blocks.iter().any(|b| block_type(b) == Some("image"));
     let has_document = blocks.iter().any(|b| block_type(b) == Some("document"));
-    let content_value = map_content(
-        &Value::Array(blocks.clone()),
-        capabilities.support_pdf,
-    );
+    let content_value = map_content(&Value::Array(blocks.clone()), capabilities.support_pdf);
 
     let has_pdf_file = has_document && capabilities.support_pdf;
     let should_move_image_to_user_message = has_image && !support.image;
@@ -938,7 +940,10 @@ mod tests {
         assert_eq!(out.messages.len(), 2);
         assert_eq!(out.messages[0].role, "tool");
         assert_eq!(
-            out.messages[0].extra.get("tool_call_id").and_then(|v| v.as_str()),
+            out.messages[0]
+                .extra
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
             Some("call_1")
         );
         assert_eq!(
@@ -1056,7 +1061,10 @@ mod tests {
             budget_tokens: Some(500),
             display: None,
         };
-        assert_eq!(thinking_budget_from_model(Some(&thinking), Some(&model)), None);
+        assert_eq!(
+            thinking_budget_from_model(Some(&thinking), Some(&model)),
+            None
+        );
         // No thinking config -> None.
         assert_eq!(thinking_budget_from_model(None, Some(&model)), None);
     }
@@ -1092,7 +1100,10 @@ mod tests {
         assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
         // text block then tool_use block.
         assert_eq!(out.content.len(), 2);
-        assert_eq!(out.content[0].get("type").and_then(|t| t.as_str()), Some("text"));
+        assert_eq!(
+            out.content[0].get("type").and_then(|t| t.as_str()),
+            Some("text")
+        );
         assert_eq!(
             out.content[0].get("text").and_then(|t| t.as_str()),
             Some("let me check")
@@ -1126,18 +1137,27 @@ mod tests {
         }];
         let out = translate_anthropic_tools_to_openai(Some(&tools)).unwrap();
         assert_eq!(out.len(), 1);
-        let params = out[0].get("function").and_then(|f| f.get("parameters")).unwrap();
+        let params = out[0]
+            .get("function")
+            .and_then(|f| f.get("parameters"))
+            .unwrap();
         assert!(params.get("properties").is_some());
     }
 
     #[test]
     fn tool_choice_maps_variants() {
-        let auto = AnthropicToolChoice { kind: "auto".to_string(), name: None };
+        let auto = AnthropicToolChoice {
+            kind: "auto".to_string(),
+            name: None,
+        };
         assert_eq!(
             translate_anthropic_tool_choice_to_openai(Some(&auto)),
             Some(json!("auto"))
         );
-        let any = AnthropicToolChoice { kind: "any".to_string(), name: None };
+        let any = AnthropicToolChoice {
+            kind: "any".to_string(),
+            name: None,
+        };
         assert_eq!(
             translate_anthropic_tool_choice_to_openai(Some(&any)),
             Some(json!("required"))
@@ -1150,7 +1170,10 @@ mod tests {
             translate_anthropic_tool_choice_to_openai(Some(&tool)),
             Some(json!({ "type": "function", "function": { "name": "t" } }))
         );
-        let none = AnthropicToolChoice { kind: "none".to_string(), name: None };
+        let none = AnthropicToolChoice {
+            kind: "none".to_string(),
+            name: None,
+        };
         assert_eq!(
             translate_anthropic_tool_choice_to_openai(Some(&none)),
             Some(json!("none"))

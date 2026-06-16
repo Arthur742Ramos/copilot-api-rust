@@ -111,10 +111,7 @@ impl<'de> Deserialize<'de> for ResponseInputItem {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        let tag = value
-            .get("type")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let tag = value.get("type").and_then(Value::as_str).map(str::to_owned);
         let from = |v: Value| -> Result<Self, D::Error> {
             // input messages may omit `type`; everything else carries it.
             Ok(match tag.as_deref() {
@@ -369,10 +366,7 @@ impl<'de> Deserialize<'de> for ResponseOutputItem {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        let tag = value
-            .get("type")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let tag = value.get("type").and_then(Value::as_str).map(str::to_owned);
         Ok(match tag.as_deref() {
             Some("message") => ResponseOutputItem::Message(
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?,

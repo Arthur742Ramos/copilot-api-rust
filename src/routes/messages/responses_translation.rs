@@ -371,7 +371,9 @@ fn translate_assistant_message(
                         "assistant",
                         assistant_phase.clone(),
                     );
-                    items.push(ResponseInputItem::Reasoning(create_reasoning_content(block)));
+                    items.push(ResponseInputItem::Reasoning(create_reasoning_content(
+                        block,
+                    )));
                     continue;
                 }
             }
@@ -556,9 +558,15 @@ fn create_compaction_content(signature: &str) -> Option<ResponseInputCompaction>
 // Tool-call input items
 // ---------------------------------------------------------------------------
 
-fn create_function_tool_call(block: &Value, state: &TranslationState) -> ResponseFunctionToolCallItem {
+fn create_function_tool_call(
+    block: &Value,
+    state: &TranslationState,
+) -> ResponseFunctionToolCallItem {
     let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-    let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let arguments = serde_json::to_string(block.get("input").unwrap_or(&Value::Null))
         .unwrap_or_else(|_| "null".to_string());
     let namespace = if state.tool_search_enabled && is_deferred_tool_name(name) {
@@ -589,7 +597,10 @@ fn create_tool_search_call(block: &Value) -> ResponseToolSearchCallItem {
 }
 
 fn create_tool_call(block: &Value, state: &TranslationState) -> ResponseInputItem {
-    let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if state.tool_search_enabled && is_bridge_tool_search_name(name) {
         ResponseInputItem::ToolSearchCall(create_tool_search_call(block))
     } else {
@@ -689,7 +700,11 @@ fn extract_tool_reference_names(content: Option<&Value>) -> Vec<String> {
     };
     arr.iter()
         .filter(|b| block_type(b) == Some("tool_reference"))
-        .filter_map(|b| b.get("tool_name").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|b| {
+            b.get("tool_name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -766,7 +781,10 @@ fn translate_system_prompt(system: Option<&Value>, model: &str) -> Option<String
         .iter()
         .enumerate()
         .map(|(index, block)| {
-            let text = block.get("text").and_then(Value::as_str).unwrap_or_default();
+            let text = block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if index == 0 {
                 format!("{text}\n\n{extra_prompt}\n\n")
             } else {
@@ -800,7 +818,9 @@ fn convert_anthropic_tools(tools: &[Value], tool_search_enabled: bool) -> Option
 
         if is_bridge_tool_search_name(name) {
             if tool_search_enabled && !added_tool_search {
-                converted.push(create_responses_tool_search_definition(&searchable_tool_names));
+                converted.push(create_responses_tool_search_definition(
+                    &searchable_tool_names,
+                ));
                 added_tool_search = true;
             }
             continue;
@@ -881,11 +901,17 @@ fn convert_deferred_tool_to_namespace(tool: &Value) -> Value {
     if let Some(description) = description {
         obj.insert("description".to_string(), json!(description));
     }
-    obj.insert("tools".to_string(), Value::Array(vec![Value::Object(inner)]));
+    obj.insert(
+        "tools".to_string(),
+        Value::Array(vec![Value::Object(inner)]),
+    );
     Value::Object(obj)
 }
 
-fn convert_anthropic_tool_choice(payload: &AnthropicMessagesPayload, tool_search_enabled: bool) -> Value {
+fn convert_anthropic_tool_choice(
+    payload: &AnthropicMessagesPayload,
+    tool_search_enabled: bool,
+) -> Value {
     let Some(choice) = payload.tool_choice.as_ref() else {
         return json!("auto");
     };
@@ -1139,7 +1165,12 @@ fn parse_function_call_arguments(raw_arguments: &str) -> Value {
         Ok(parsed) if parsed.is_object() => parsed,
         Ok(_) => json!({ "raw_arguments": raw_arguments }),
         Err(_) => {
-            tracing::warn!("Failed to parse function call arguments: {raw_arguments}");
+            // Avoid logging the raw arguments — they may contain user data or
+            // secrets. Log only the length as a diagnostic.
+            tracing::warn!(
+                "Failed to parse function call arguments ({} bytes)",
+                raw_arguments.len()
+            );
             json!({ "raw_arguments": raw_arguments })
         }
     }
@@ -1161,7 +1192,14 @@ fn map_responses_stop_reason(response: &ResponsesResult, has_tool_call: bool) ->
 
     if status == "completed" {
         if response.output.is_empty() {
-            return Some(if has_tool_call { "tool_use" } else { "end_turn" }.to_string());
+            return Some(
+                if has_tool_call {
+                    "tool_use"
+                } else {
+                    "end_turn"
+                }
+                .to_string(),
+            );
         }
 
         let has_call = response.output.iter().any(|item| {
@@ -1197,7 +1235,7 @@ fn map_responses_usage(response: &ResponsesResult) -> AnthropicUsage {
         .map(|d| d.cached_tokens);
 
     AnthropicUsage {
-        input_tokens: input_tokens - cached_tokens.unwrap_or(0),
+        input_tokens: (input_tokens - cached_tokens.unwrap_or(0)).max(0),
         output_tokens,
         cache_creation_input_tokens: None,
         cache_read_input_tokens: cached_tokens,
@@ -1434,7 +1472,9 @@ mod tests {
             Some("thinking")
         );
         assert_eq!(
-            anthropic.content[0].get("signature").and_then(Value::as_str),
+            anthropic.content[0]
+                .get("signature")
+                .and_then(Value::as_str),
             Some("ENC@rs_1")
         );
         assert_eq!(
@@ -1469,7 +1509,9 @@ mod tests {
             Some(THINKING_TEXT)
         );
         assert_eq!(
-            anthropic.content[0].get("signature").and_then(Value::as_str),
+            anthropic.content[0]
+                .get("signature")
+                .and_then(Value::as_str),
             Some("E@rs")
         );
     }

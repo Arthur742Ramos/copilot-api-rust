@@ -173,9 +173,7 @@ fn resolve_tool_use_name(item: &Value) -> String {
 
 /// Mirrors the TS `encodeCompactionCarrierSignature`.
 fn encode_compaction_carrier_signature(id: &str, encrypted_content: &str) -> String {
-    format!(
-        "{COMPACTION_SIGNATURE_PREFIX}{encrypted_content}{COMPACTION_SIGNATURE_SEPARATOR}{id}"
-    )
+    format!("{COMPACTION_SIGNATURE_PREFIX}{encrypted_content}{COMPACTION_SIGNATURE_SEPARATOR}{id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +312,9 @@ fn open_function_call_block(
         let resolved_tool_call_id = tool_call_id
             .map(str::to_string)
             .unwrap_or_else(|| format!("tool_call_{block_index}"));
-        let resolved_name = name.map(str::to_string).unwrap_or_else(|| "function".to_string());
+        let resolved_name = name
+            .map(str::to_string)
+            .unwrap_or_else(|| "function".to_string());
 
         state.function_call_state_by_output_index.insert(
             output_index,
@@ -381,7 +381,7 @@ fn message_start(
         .and_then(|u| u.get("input_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let input_tokens = input_tokens_raw - input_cached_tokens.unwrap_or(0);
+    let input_tokens = (input_tokens_raw - input_cached_tokens.unwrap_or(0)).max(0);
 
     let id = get_str(response, "id").unwrap_or("").to_string();
     let model = get_str(response, "model").unwrap_or("").to_string();
@@ -399,7 +399,7 @@ fn message_start(
                 input_tokens,
                 output_tokens: 0,
                 cache_creation_input_tokens: None,
-                cache_read_input_tokens: Some(input_cached_tokens.unwrap_or(0)),
+                cache_read_input_tokens: input_cached_tokens,
                 service_tier: None,
             },
         },
@@ -497,9 +497,8 @@ fn handle_output_item_done(
             &mut events,
         );
 
-        let final_arguments = stringify_tool_search_arguments(
-            item.get("arguments").unwrap_or(&Value::Null),
-        );
+        let final_arguments =
+            stringify_tool_search_arguments(item.get("arguments").unwrap_or(&Value::Null));
 
         if !state.block_has_delta.contains(&block_index) {
             if let Some(args) = final_arguments {
@@ -513,7 +512,9 @@ fn handle_output_item_done(
             }
         }
 
-        state.function_call_state_by_output_index.remove(&output_index);
+        state
+            .function_call_state_by_output_index
+            .remove(&output_index);
         return events;
     }
 
@@ -615,7 +616,10 @@ fn handle_function_call_arguments_delta(
         );
     }
 
-    if let Some(fc) = state.function_call_state_by_output_index.get_mut(&output_index) {
+    if let Some(fc) = state
+        .function_call_state_by_output_index
+        .get_mut(&output_index)
+    {
         fc.consecutive_whitespace_count = next_count;
     }
 
@@ -652,7 +656,9 @@ fn handle_function_call_arguments_done(
         }
     }
 
-    state.function_call_state_by_output_index.remove(&output_index);
+    state
+        .function_call_state_by_output_index
+        .remove(&output_index);
     events
 }
 
@@ -669,8 +675,7 @@ fn handle_output_text_delta(
         return events;
     }
 
-    let block_index =
-        open_text_block_if_needed(state, output_index, content_index, &mut events);
+    let block_index = open_text_block_if_needed(state, output_index, content_index, &mut events);
 
     events.push(AnthropicStreamEventData::ContentBlockDelta {
         index: block_index,
@@ -733,8 +738,7 @@ fn handle_output_text_done(
     let content_index = get_i64(event, "content_index");
     let text = get_str(event, "text").unwrap_or("");
 
-    let block_index =
-        open_text_block_if_needed(state, output_index, content_index, &mut events);
+    let block_index = open_text_block_if_needed(state, output_index, content_index, &mut events);
 
     if !text.is_empty() && !state.block_has_delta.contains(&block_index) {
         events.push(AnthropicStreamEventData::ContentBlockDelta {
@@ -831,10 +835,24 @@ fn map_responses_stop_reason(response: &Value, has_tool_call: bool) -> Option<St
         let output = response.get("output").and_then(Value::as_array);
         match output {
             None => {
-                return Some(if has_tool_call { "tool_use" } else { "end_turn" }.to_string());
+                return Some(
+                    if has_tool_call {
+                        "tool_use"
+                    } else {
+                        "end_turn"
+                    }
+                    .to_string(),
+                );
             }
             Some(items) if items.is_empty() => {
-                return Some(if has_tool_call { "tool_use" } else { "end_turn" }.to_string());
+                return Some(
+                    if has_tool_call {
+                        "tool_use"
+                    } else {
+                        "end_turn"
+                    }
+                    .to_string(),
+                );
             }
             Some(items) => {
                 let has_call = items.iter().any(|item| {
@@ -881,7 +899,7 @@ fn map_responses_usage_delta(response: &Value) -> AnthropicMessageDeltaUsage {
         .and_then(Value::as_i64);
 
     AnthropicMessageDeltaUsage {
-        input_tokens: Some(input_tokens - cached.unwrap_or(0)),
+        input_tokens: Some((input_tokens - cached.unwrap_or(0)).max(0)),
         output_tokens,
         cache_creation_input_tokens: None,
         cache_read_input_tokens: cached,

@@ -238,7 +238,11 @@ fn get_openai_chunk_usage_tokens(chunk: &Value) -> (i64, i64, i64) {
     let cached_tokens = usage_num(chunk, &["usage", "prompt_tokens_details", "cached_tokens"]);
     let cache_creation_tokens = usage_num(
         chunk,
-        &["usage", "prompt_tokens_details", "cache_creation_input_tokens"],
+        &[
+            "usage",
+            "prompt_tokens_details",
+            "cache_creation_input_tokens",
+        ],
     );
 
     (
@@ -263,10 +267,7 @@ fn handle_tool_calls(
     handle_reasoning_opaque_in_tool_calls(state, events, delta);
 
     for tool_call in &delta.tool_calls {
-        let index = tool_call
-            .get("index")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let index = tool_call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
         let id = tool_call
             .get("id")
             .and_then(|v| v.as_str())
@@ -845,7 +846,10 @@ mod tests {
             "choices": [{ "index": 0, "delta": { "content": "trailing" }, "finish_reason": null }],
         });
         let ev = translate_chunk_to_anthropic_events(&c2, &mut state);
-        assert!(ev.is_empty(), "content must be deferred while a tool block is open");
+        assert!(
+            ev.is_empty(),
+            "content must be deferred while a tool block is open"
+        );
         assert_eq!(state.deferred_content.as_deref(), Some("trailing"));
 
         // Finish: tool block closes, deferred text flushed as its own block.
