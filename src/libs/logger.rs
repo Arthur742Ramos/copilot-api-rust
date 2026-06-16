@@ -35,7 +35,10 @@ where
 /// (`debugJson(logger, "msg:", val)`); we collapse it to a simple string tag.
 pub fn debug_json(tag: &str, label: &str, value: &Value) {
     debug_lazy(tag, || {
-        format!("{label} {}", serde_json::to_string(value).unwrap_or_default())
+        format!(
+            "{label} {}",
+            serde_json::to_string(value).unwrap_or_default()
+        )
     });
 }
 

@@ -39,10 +39,24 @@ fn open_usage_db() -> rusqlite::Result<Connection> {
 
 /// Lazily-opened, process-global SQLite connection guarding the token-usage
 /// store. Mirrors `tokenUsageDbStore.getDb()` in store.ts.
+///
+/// If the on-disk database cannot be opened or initialized (permissions, a
+/// read-only filesystem, an invalid path, ...) we fall back to an in-memory
+/// database rather than panicking the whole process, so the server keeps
+/// serving requests and the token-usage reads degrade to empty results.
 pub fn usage_db() -> &'static Mutex<Connection> {
     USAGE_DB.get_or_init(|| {
-        let conn =
-            open_usage_db().expect("failed to open token usage SQLite database");
+        let conn = open_usage_db().unwrap_or_else(|error| {
+            tracing::warn!(
+                "Failed to open token usage SQLite database ({error}); \
+                 falling back to an in-memory database"
+            );
+            let conn = Connection::open_in_memory()
+                .expect("failed to open in-memory token usage database");
+            let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+            let _ = crate::libs::token_usage::initialize_schema(&conn);
+            conn
+        });
         Mutex::new(conn)
     })
 }

@@ -184,8 +184,23 @@ impl TokenUsageRecorder {
             Some(event) => event,
             None => return,
         };
-        if let Err(error) = write_token_usage_event(&event) {
-            warn!("Failed to record token usage: {error}");
+        // The write is a blocking SQLite insert behind a global mutex, and
+        // `record` is called from async contexts (e.g. SSE stream finalizers).
+        // Offload to a blocking thread when a Tokio runtime is available; fall
+        // back to a direct write otherwise (e.g. unit tests, CLI paths).
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    if let Err(error) = write_token_usage_event(&event) {
+                        warn!("Failed to record token usage: {error}");
+                    }
+                });
+            }
+            Err(_) => {
+                if let Err(error) = write_token_usage_event(&event) {
+                    warn!("Failed to record token usage: {error}");
+                }
+            }
         }
     }
 }
@@ -619,7 +634,11 @@ fn range_payload(start_ms: i64, end_ms: i64) -> TokenUsageRange {
 
 // --- Aggregation queries ---
 
-fn get_totals_row(conn: &Connection, start_ms: i64, end_ms: i64) -> rusqlite::Result<TokenUsageTotals> {
+fn get_totals_row(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+) -> rusqlite::Result<TokenUsageTotals> {
     conn.query_row(
         r#"
         SELECT
@@ -701,7 +720,7 @@ fn sum_model_totals(models: &[TokenUsageModelSummary]) -> TokenUsageTotals {
 
 // --- Empty (well-formed) shapes for the DB-error / disabled paths ---
 
-fn create_empty_summary(period: &str) -> TokenUsageSummary {
+pub(crate) fn create_empty_summary(period: &str) -> TokenUsageSummary {
     let (start_ms, end_ms) = get_period_range(period, Utc::now().timestamp_millis());
     TokenUsageSummary {
         by_model: Vec::new(),
@@ -711,7 +730,7 @@ fn create_empty_summary(period: &str) -> TokenUsageSummary {
     }
 }
 
-fn create_empty_daily_summary(period: &str) -> TokenUsageDailySummary {
+pub(crate) fn create_empty_daily_summary(period: &str) -> TokenUsageDailySummary {
     let (start_ms, end_ms) = get_period_range(period, Utc::now().timestamp_millis());
     let days = create_daily_intervals(start_ms, end_ms)
         .into_iter()
@@ -732,7 +751,11 @@ fn create_empty_daily_summary(period: &str) -> TokenUsageDailySummary {
     }
 }
 
-fn create_empty_events_page(page: i64, page_size: i64, period: &str) -> TokenUsageEventsPage {
+pub(crate) fn create_empty_events_page(
+    page: i64,
+    page_size: i64,
+    period: &str,
+) -> TokenUsageEventsPage {
     let (start_ms, end_ms) = get_period_range(period, Utc::now().timestamp_millis());
     TokenUsageEventsPage {
         items: Vec::new(),
@@ -816,7 +839,11 @@ fn daily_summary_inner(
     })
 }
 
-pub fn get_token_usage_events_page(page: i64, page_size: i64, period: &str) -> TokenUsageEventsPage {
+pub fn get_token_usage_events_page(
+    page: i64,
+    page_size: i64,
+    period: &str,
+) -> TokenUsageEventsPage {
     let page = page.max(1);
     let page_size = page_size.clamp(1, 100);
     if !is_token_usage_storage_enabled() {
@@ -887,7 +914,9 @@ fn events_page_inner(
                 endpoint: row.get("endpoint")?,
                 id: row.get("id")?,
                 input_tokens: row.get("input_tokens")?,
-                model: model.filter(|m| !m.is_empty()).unwrap_or_else(|| "unknown".to_string()),
+                model: model
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| "unknown".to_string()),
                 output_tokens: row.get("output_tokens")?,
                 provider_name: row.get("provider_name")?,
                 session_id: row.get("session_id")?,
@@ -994,7 +1023,9 @@ mod tests {
         // global connection at our temp path.
         let path_matches = {
             let conn = usage_db().lock().unwrap();
-            conn.path().map(|p| std::path::Path::new(p) == db_path).unwrap_or(false)
+            conn.path()
+                .map(|p| std::path::Path::new(p) == db_path)
+                .unwrap_or(false)
         };
         if !path_matches {
             return;

@@ -154,8 +154,7 @@ pub fn has_deferred_namespace_tool(tools: Option<&[Value]>) -> bool {
                 .and_then(Value::as_array)
                 .is_some_and(|namespace_tools| {
                     namespace_tools.iter().any(|entry| {
-                        entry.is_object()
-                            && entry.get("defer_loading") == Some(&Value::Bool(true))
+                        entry.is_object() && entry.get("defer_loading") == Some(&Value::Bool(true))
                     })
                 })
         })

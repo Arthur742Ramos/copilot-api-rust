@@ -44,6 +44,8 @@ chrono = "0.4"
 ruzstd = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 indexmap = { version = "2", features = ["serde"] }
+# Used by the pooled websocket responses transport (later in this stacked
+# series); declared here so the dependency set is stable across the stack.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 [profile.release]

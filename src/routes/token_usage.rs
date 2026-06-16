@@ -5,6 +5,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::libs::token_usage::{
+    create_empty_daily_summary, create_empty_events_page, create_empty_summary,
     get_token_usage_daily_summary, get_token_usage_events_page, get_token_usage_summary,
 };
 
@@ -50,17 +51,37 @@ fn parse_positive_int(value: Option<&str>, fallback: i64) -> i64 {
 
 async fn get_summary(Query(query): Query<PeriodQuery>) -> Response {
     let period = parse_period(query.period.as_deref());
-    Json(get_token_usage_summary(&period)).into_response()
+    // rusqlite is blocking and the connection is behind a global mutex; offload
+    // the query so it does not stall Tokio worker threads.
+    let summary = tokio::task::spawn_blocking({
+        let period = period.clone();
+        move || get_token_usage_summary(&period)
+    })
+    .await
+    .unwrap_or_else(|_| create_empty_summary(&period));
+    Json(summary).into_response()
 }
 
 async fn get_daily(Query(query): Query<PeriodQuery>) -> Response {
     let period = parse_period(query.period.as_deref());
-    Json(get_token_usage_daily_summary(&period)).into_response()
+    let summary = tokio::task::spawn_blocking({
+        let period = period.clone();
+        move || get_token_usage_daily_summary(&period)
+    })
+    .await
+    .unwrap_or_else(|_| create_empty_daily_summary(&period));
+    Json(summary).into_response()
 }
 
 async fn get_events(Query(query): Query<EventsQuery>) -> Response {
     let period = parse_period(query.period.as_deref());
     let page = parse_positive_int(query.page.as_deref(), 1);
     let page_size = parse_positive_int(query.page_size.as_deref(), DEFAULT_EVENTS_PAGE_SIZE);
-    Json(get_token_usage_events_page(page, page_size, &period)).into_response()
+    let page_result = tokio::task::spawn_blocking({
+        let period = period.clone();
+        move || get_token_usage_events_page(page, page_size, &period)
+    })
+    .await
+    .unwrap_or_else(|_| create_empty_events_page(page, page_size, &period));
+    Json(page_result).into_response()
 }
