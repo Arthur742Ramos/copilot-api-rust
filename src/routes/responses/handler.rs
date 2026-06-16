@@ -108,7 +108,8 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
         .as_ref()
         .and_then(|m| m.capabilities.limits.vision.as_ref())
         .and_then(|v| v.max_prompt_image_size);
-    let sanitized_image_count = sanitize_oversized_input_images(&mut payload, max_prompt_image_size);
+    let sanitized_image_count =
+        sanitize_oversized_input_images(&mut payload, max_prompt_image_size);
     if sanitized_image_count > 0 {
         tracing::warn!(
             "Omitted {sanitized_image_count} oversized input image(s) before forwarding to Copilot Responses"
@@ -311,7 +312,8 @@ fn remove_web_search_tool(payload: &mut ResponsesPayload) {
 }
 
 fn get_incoming_responses_session_id(headers: &HeaderMap) -> Option<String> {
-    get_trimmed_header(headers, "session-id").or_else(|| get_trimmed_header(headers, "x-session-id"))
+    get_trimmed_header(headers, "session-id")
+        .or_else(|| get_trimmed_header(headers, "x-session-id"))
 }
 
 const CODEX_SUBAGENT_HEADER_VALUES: &[&str] =

@@ -194,7 +194,8 @@ mod tests {
     #[test]
     fn added_keeps_existing_id() {
         let mut tracker = StreamIdTracker::new();
-        let data = r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"existing"}}"#;
+        let data =
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"existing"}}"#;
         let out = fix_stream_ids(data, Some("response.output_item.added"), &mut tracker);
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["item"]["id"].as_str().unwrap(), "existing");

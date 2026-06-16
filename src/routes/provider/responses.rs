@@ -20,7 +20,8 @@ use crate::libs::error::{http_error_from_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::request_context::request_context_store;
 use crate::libs::token_usage::{
-    create_provider_token_usage_recorder, normalize_responses_usage, TokenUsageRecorder, UsageTokens,
+    create_provider_token_usage_recorder, normalize_responses_usage, TokenUsageRecorder,
+    UsageTokens,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
@@ -85,11 +86,14 @@ pub async fn handle_provider_responses_for_provider(
         }
 
         let response_body = read_responses_result(upstream_response).await?;
-        recorder.record(normalize_responses_usage(usage_value(&response_body).as_ref()));
+        recorder.record(normalize_responses_usage(
+            usage_value(&response_body).as_ref(),
+        ));
         return Ok(Json(response_body).into_response());
     }
 
-    let upstream_response = forward_provider_responses(&provider_config, &payload, &headers).await?;
+    let upstream_response =
+        forward_provider_responses(&provider_config, &payload, &headers).await?;
 
     if !upstream_response.status().is_success() {
         return Err(http_error_from_response(
@@ -107,16 +111,21 @@ pub async fn handle_provider_responses_for_provider(
     // Non-streaming: buffer, record usage, forward unchanged.
     let status = upstream_response.status();
     let resp_headers = upstream_response.headers().clone();
-    let bytes = upstream_response
-        .bytes()
-        .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Failed to read provider response body: {e}")))?;
+    let bytes = upstream_response.bytes().await.map_err(|e| {
+        AppError::Other(anyhow::anyhow!(
+            "Failed to read provider response body: {e}"
+        ))
+    })?;
 
     if let Ok(body_value) = serde_json::from_slice::<Value>(&bytes) {
         recorder.record(normalize_responses_usage(body_value.get("usage")));
     }
 
-    Ok(build_proxy_response_from_parts(status, &resp_headers, bytes))
+    Ok(build_proxy_response_from_parts(
+        status,
+        &resp_headers,
+        bytes,
+    ))
 }
 
 /// Mirrors `createProviderResponsesUsageRecorder`: session id derived from the

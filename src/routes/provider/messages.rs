@@ -29,7 +29,9 @@ use crate::libs::utils::parse_user_id_metadata;
 use crate::routes::messages::anthropic_types::{
     AnthropicMessagesPayload, AnthropicStreamEventData, AnthropicStreamState,
 };
-use crate::routes::messages::non_stream_translation::{translate_to_anthropic, translate_to_openai};
+use crate::routes::messages::non_stream_translation::{
+    translate_to_anthropic, translate_to_openai,
+};
 use crate::routes::messages::preprocess::normalize_system_messages;
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, translate_chunk_to_anthropic_events,
@@ -120,8 +122,14 @@ pub async fn handle_provider_messages_for_provider(
         "openai-compatible" => {
             // stripWebSearchServerTool — no-op pass-through here (web-search
             // server tools are not represented in the typed payload yet).
-            handle_openai_compatible_provider_messages(payload, &provider, &provider_config, model_config.as_ref(), &headers)
-                .await
+            handle_openai_compatible_provider_messages(
+                payload,
+                &provider,
+                &provider_config,
+                model_config.as_ref(),
+                &headers,
+            )
+            .await
         }
         _ => {
             // anthropic passthrough
@@ -152,8 +160,13 @@ pub async fn handle_provider_messages_for_provider(
                     &provider_config,
                 ))
             } else {
-                respond_provider_messages_json(upstream_response, &payload, &provider, &provider_config)
-                    .await
+                respond_provider_messages_json(
+                    upstream_response,
+                    &payload,
+                    &provider,
+                    &provider_config,
+                )
+                .await
             }
         }
     }
@@ -165,7 +178,10 @@ pub async fn handle_provider_messages_for_provider(
 
 /// Mirrors `applyModelDefaults` for the Anthropic payload (typed top_k is i64;
 /// config top_k is f64 — round to match the JS number).
-fn apply_model_defaults(payload: &mut AnthropicMessagesPayload, model_config: Option<&ModelConfig>) {
+fn apply_model_defaults(
+    payload: &mut AnthropicMessagesPayload,
+    model_config: Option<&ModelConfig>,
+) {
     if payload.temperature.is_none() {
         payload.temperature = model_config.and_then(|m| m.temperature);
     }
@@ -254,7 +270,8 @@ async fn handle_openai_compatible_provider_messages(
             provider,
         ))
     } else {
-        respond_openai_compatible_provider_messages_json(upstream_response, &payload, provider).await
+        respond_openai_compatible_provider_messages_json(upstream_response, &payload, provider)
+            .await
     }
 }
 
@@ -268,7 +285,9 @@ fn create_openai_compatible_payload(
     apply_openai_compatible_thinking_budget(&mut openai_payload, payload);
 
     if let Some(top_k) = payload.top_k {
-        openai_payload.extra.insert("top_k".to_string(), json!(top_k));
+        openai_payload
+            .extra
+            .insert("top_k".to_string(), json!(top_k));
     }
 
     if openai_payload.stream.unwrap_or(false) {
@@ -734,8 +753,12 @@ fn create_provider_messages_usage_recorder(
         .metadata
         .as_ref()
         .and_then(|m| parse_user_id_metadata(m.user_id.as_deref()).session_id);
-    let mut recorder =
-        create_provider_token_usage_recorder("provider_messages", payload.model.clone(), provider, None);
+    let mut recorder = create_provider_token_usage_recorder(
+        "provider_messages",
+        payload.model.clone(),
+        provider,
+        None,
+    );
     recorder.session_id = session_id;
     recorder
 }
@@ -772,12 +795,16 @@ fn response_content_type(response: &reqwest::Response) -> String {
 }
 
 async fn read_json(response: reqwest::Response) -> Result<Value, AppError> {
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Failed to read provider response body: {e}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Failed to parse provider response body: {e}")))
+    let bytes = response.bytes().await.map_err(|e| {
+        AppError::Other(anyhow::anyhow!(
+            "Failed to read provider response body: {e}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        AppError::Other(anyhow::anyhow!(
+            "Failed to parse provider response body: {e}"
+        ))
+    })
 }
 
 /// Render one translated Anthropic event as an SSE frame (`event: {type}\ndata:

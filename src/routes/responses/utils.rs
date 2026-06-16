@@ -15,13 +15,15 @@ use crate::libs::config::{
     is_responses_api_web_socket_enabled as configured_responses_api_web_socket_enabled,
 };
 use crate::services::copilot::create_responses::{
-    FunctionCallOutputContent, InputField, MessageContent, ResponseInputContent, ResponseInputImage,
-    ResponseInputItem, ResponsesPayload, ResponsesTransport,
+    FunctionCallOutputContent, InputField, MessageContent, ResponseInputContent,
+    ResponseInputImage, ResponseInputItem, ResponsesPayload, ResponsesTransport,
 };
 use crate::services::copilot::get_models::Model;
 
 pub const RESPONSES_ENDPOINT: &str = "/responses";
 pub const RESPONSES_WS_ENDPOINT: &str = "ws:/responses";
+/// Some models (e.g. the Codex catalog) advertise the `/v1`-prefixed form.
+pub const RESPONSES_ENDPOINT_V1: &str = "/v1/responses";
 pub const DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO: f64 = 0.9;
 
 const DATA_URL_PREFIX: &str = "data:";
@@ -85,7 +87,10 @@ pub fn get_responses_transport_for_model(
         return Some(ResponsesTransport::Websocket);
     }
 
-    if supported_endpoints.iter().any(|e| e == RESPONSES_ENDPOINT) {
+    if supported_endpoints
+        .iter()
+        .any(|e| e == RESPONSES_ENDPOINT || e == RESPONSES_ENDPOINT_V1)
+    {
         return Some(ResponsesTransport::Http);
     }
 
@@ -463,8 +468,14 @@ mod tests {
 
     #[test]
     fn compact_threshold_math() {
-        assert_eq!(resolve_responses_compact_threshold(Some(100_000), 0.9), 90_000);
-        assert_eq!(resolve_responses_compact_threshold(Some(272_000), 0.9), 244_800);
+        assert_eq!(
+            resolve_responses_compact_threshold(Some(100_000), 0.9),
+            90_000
+        );
+        assert_eq!(
+            resolve_responses_compact_threshold(Some(272_000), 0.9),
+            244_800
+        );
         // Non-positive / missing falls back to 200_000 * ratio.
         assert_eq!(resolve_responses_compact_threshold(None, 0.9), 180_000);
         assert_eq!(resolve_responses_compact_threshold(Some(0), 0.9), 180_000);
@@ -490,7 +501,10 @@ mod tests {
             Some(InputField::Items(items)) => {
                 // Kept from the latest compaction (index 3) onward: 2 items.
                 assert_eq!(items.len(), 2);
-                assert_eq!(input_item_type_tag(&items[0]).as_deref(), Some("compaction"));
+                assert_eq!(
+                    input_item_type_tag(&items[0]).as_deref(),
+                    Some("compaction")
+                );
                 assert_eq!(input_item_type_tag(&items[1]).as_deref(), Some("message"));
             }
             other => panic!("expected items, got {other:?}"),
@@ -540,7 +554,10 @@ mod tests {
             }
         ]));
         // Limit far above the small image: no replacement.
-        assert_eq!(sanitize_oversized_input_images(&mut payload, Some(1_000_000)), 0);
+        assert_eq!(
+            sanitize_oversized_input_images(&mut payload, Some(1_000_000)),
+            0
+        );
         // Limit of zero is treated as "no limit set" -> no replacement.
         assert_eq!(sanitize_oversized_input_images(&mut payload, Some(0)), 0);
         // Tiny limit: replaced.

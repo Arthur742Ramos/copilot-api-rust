@@ -34,8 +34,12 @@ use crate::libs::token_usage::{
 };
 use crate::libs::tool_search::resolve_bridge_tool_search_name;
 use crate::libs::utils::parse_user_id_metadata;
-use crate::routes::messages::anthropic_types::{AnthropicMessagesPayload, AnthropicStreamEventData, AnthropicStreamState};
-use crate::routes::messages::non_stream_translation::{translate_to_anthropic, translate_to_openai};
+use crate::routes::messages::anthropic_types::{
+    AnthropicMessagesPayload, AnthropicStreamEventData, AnthropicStreamState,
+};
+use crate::routes::messages::non_stream_translation::{
+    translate_to_anthropic, translate_to_openai,
+};
 use crate::routes::messages::preprocess::prepare_messages_api_payload;
 use crate::routes::messages::responses_stream_translation::{
     build_error_event, translate_responses_stream_event, ResponsesStreamState,
@@ -274,8 +278,9 @@ pub async fn handle_with_responses_api(
     compact_input_by_latest_compaction(&mut responses_payload);
 
     let (vision, initiator) = get_responses_request_options(&responses_payload);
-    let transport = get_responses_transport_for_model(opts.selected_model.as_ref(), opts.compact_type)
-        .unwrap_or(ResponsesTransport::Http);
+    let transport =
+        get_responses_transport_for_model(opts.selected_model.as_ref(), opts.compact_type)
+            .unwrap_or(ResponsesTransport::Http);
 
     // resolveBridgeToolSearchName(anthropicPayload.tools)
     let tool_values: Vec<Value> = payload
@@ -498,9 +503,10 @@ fn apply_copilot_context_cache(payload: &mut ChatCompletionsPayload) {
     let indexes = select_copilot_context_cache_message_indexes(&payload.messages);
     for index in indexes {
         if let Some(message) = payload.messages.get_mut(index) {
-            message
-                .extra
-                .insert("copilot_cache_control".to_string(), copilot_context_cache_control());
+            message.extra.insert(
+                "copilot_cache_control".to_string(),
+                copilot_context_cache_control(),
+            );
         }
     }
 }
@@ -612,10 +618,10 @@ mod tests {
     #[test]
     fn skips_ineligible_messages() {
         let messages = vec![
-            msg("system", json!("")),     // ineligible
-            msg("system", json!("s1")),   // eligible (1st system)
-            msg("user", json!([])),       // ineligible
-            msg("user", json!("u3")),     // eligible (last non-system)
+            msg("system", json!("")),   // ineligible
+            msg("system", json!("s1")), // eligible (1st system)
+            msg("user", json!([])),     // ineligible
+            msg("user", json!("u3")),   // eligible (last non-system)
         ];
         let indexes = select_copilot_context_cache_message_indexes(&messages);
         assert_eq!(indexes, vec![1, 3]);
@@ -640,6 +646,9 @@ mod tests {
     #[test]
     fn emit_event_frame_format() {
         let frame = emit_event(&AnthropicStreamEventData::MessageStop).unwrap();
-        assert_eq!(frame, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert_eq!(
+            frame,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
     }
 }

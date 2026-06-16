@@ -74,8 +74,12 @@ pub async fn handle_provider_chat_completions(
         .into());
     }
 
-    let recorder =
-        create_provider_token_usage_recorder("chat_completions", payload.model.clone(), provider, None);
+    let recorder = create_provider_token_usage_recorder(
+        "chat_completions",
+        payload.model.clone(),
+        provider,
+        None,
+    );
 
     let content_type = upstream_response
         .headers()
@@ -87,23 +91,31 @@ pub async fn handle_provider_chat_completions(
         payload.stream.unwrap_or(false) && content_type.contains("text/event-stream");
 
     if is_streaming_response {
-        return Ok(stream_provider_chat_completions(upstream_response, recorder));
+        return Ok(stream_provider_chat_completions(
+            upstream_response,
+            recorder,
+        ));
     }
 
     // Non-streaming: clone-equivalent — buffer the JSON, record usage, then
     // forward it back to the client with the proxy header policy.
     let status = upstream_response.status();
     let resp_headers = upstream_response.headers().clone();
-    let bytes = upstream_response
-        .bytes()
-        .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Failed to read provider response body: {e}")))?;
+    let bytes = upstream_response.bytes().await.map_err(|e| {
+        AppError::Other(anyhow::anyhow!(
+            "Failed to read provider response body: {e}"
+        ))
+    })?;
 
     if let Ok(body_value) = serde_json::from_slice::<Value>(&bytes) {
         recorder.record(normalize_openai_usage(body_value.get("usage")));
     }
 
-    Ok(build_proxy_response_from_parts(status, &resp_headers, bytes))
+    Ok(build_proxy_response_from_parts(
+        status,
+        &resp_headers,
+        bytes,
+    ))
 }
 
 /// Mirrors `applyProviderModelDefaults`.
@@ -111,9 +123,21 @@ fn apply_provider_model_defaults(
     payload: &mut ChatCompletionsPayload,
     model_config: Option<&ModelConfig>,
 ) {
-    set_default_number(&mut payload.extra, "temperature", model_config.and_then(|m| m.temperature));
-    set_default_number(&mut payload.extra, "top_p", model_config.and_then(|m| m.top_p));
-    set_default_number(&mut payload.extra, "top_k", model_config.and_then(|m| m.top_k));
+    set_default_number(
+        &mut payload.extra,
+        "temperature",
+        model_config.and_then(|m| m.temperature),
+    );
+    set_default_number(
+        &mut payload.extra,
+        "top_p",
+        model_config.and_then(|m| m.top_p),
+    );
+    set_default_number(
+        &mut payload.extra,
+        "top_k",
+        model_config.and_then(|m| m.top_k),
+    );
 }
 
 /// `payload[key] ??= value` for an `f64` config default.
@@ -128,7 +152,10 @@ fn set_default_number(extra: &mut serde_json::Map<String, Value>, key: &str, val
 
 /// Mirrors `applyMissingExtraBody`: copy each `extraBody` key not already
 /// present on the payload.
-fn apply_missing_extra_body(payload: &mut ChatCompletionsPayload, model_config: Option<&ModelConfig>) {
+fn apply_missing_extra_body(
+    payload: &mut ChatCompletionsPayload,
+    model_config: Option<&ModelConfig>,
+) {
     let Some(extra_body) = model_config.and_then(|m| m.extra_body.as_ref()) else {
         return;
     };

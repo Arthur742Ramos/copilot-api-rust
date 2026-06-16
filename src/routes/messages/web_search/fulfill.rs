@@ -31,9 +31,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 
-use crate::libs::config::{
-    get_message_api_web_search_model, is_responses_api_web_search_enabled,
-};
+use crate::libs::config::{get_message_api_web_search_model, is_responses_api_web_search_enabled};
 use crate::libs::error::AppError;
 use crate::libs::models::find_endpoint_model;
 use crate::libs::provider_model::{parse_provider_model_alias, ProviderModelAlias};
@@ -49,7 +47,8 @@ use crate::routes::messages::anthropic_types::{AnthropicMessagesPayload, Anthrop
 use crate::routes::messages::preprocess::{get_compact_type, normalize_system_messages};
 use crate::routes::messages::responses_translation::translate_anthropic_messages_to_responses_payload;
 use crate::routes::messages::web_search::backend::{
-    build_responses_web_search_tool, extract_web_search_result, WebSearchExtract, WebSearchToolConfig,
+    build_responses_web_search_tool, extract_web_search_result, WebSearchExtract,
+    WebSearchToolConfig,
 };
 use crate::routes::responses::utils::{
     get_responses_request_options, get_responses_transport_for_model,
@@ -731,8 +730,7 @@ where
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let request_id =
-                generate_request_id_from_payload(&messages, session_id.as_deref());
+            let request_id = generate_request_id_from_payload(&messages, session_id.as_deref());
             if session_id.is_none() {
                 session_id = Some(get_uuid(&request_id));
             }
@@ -850,7 +848,11 @@ pub async fn handle_web_search_via_responses(
         session_id: session_from_metadata,
     };
     recorder.record(normalize_responses_usage(
-        result.usage.as_ref().and_then(|u| serde_json::to_value(u).ok()).as_ref(),
+        result
+            .usage
+            .as_ref()
+            .and_then(|u| serde_json::to_value(u).ok())
+            .as_ref(),
     ));
 
     if !wants_stream {
@@ -894,7 +896,10 @@ pub fn block_to_stream_events(block: &Value, index: i64) -> Vec<Value> {
 
     match block.get("type").and_then(Value::as_str) {
         Some("text") => {
-            let text = block.get("text").cloned().unwrap_or(Value::String(String::new()));
+            let text = block
+                .get("text")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
             vec![
                 start(json!({ "type": "text", "text": "" })),
                 json!({
@@ -1285,10 +1290,7 @@ mod tests {
 
         // web_search_tool_result block: full block delivered in start, then stop.
         assert_eq!(events[4]["type"], "content_block_start");
-        assert_eq!(
-            events[4]["content_block"]["type"],
-            "web_search_tool_result"
-        );
+        assert_eq!(events[4]["content_block"]["type"], "web_search_tool_result");
         assert_eq!(events[5]["type"], "content_block_stop");
 
         // text block: start empty, delta carries text.
