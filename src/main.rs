@@ -1,0 +1,343 @@
+mod libs;
+mod routes;
+mod server;
+mod services;
+
+use clap::{Args, Parser, Subcommand};
+
+use crate::libs::config::merge_config_with_defaults;
+use crate::libs::opencode::init_opencode_version;
+use crate::libs::paths::{ensure_paths, PATHS};
+use crate::libs::state;
+use crate::libs::token::{log_user, setup_copilot_token, setup_github_token};
+use crate::libs::utils::{
+    cache_mac_machine_id, cache_models, cache_vscode_device_id, cache_vscode_session_id,
+    cache_vscode_version,
+};
+
+/// A wrapper around GitHub Copilot API to make it OpenAI compatible.
+#[derive(Parser, Debug)]
+#[command(name = "copilot-api", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+
+    /// Path to the API home directory.
+    #[arg(long = "api-home", global = true)]
+    api_home: Option<String>,
+    /// OAuth app identifier.
+    #[arg(long = "oauth-app", global = true)]
+    oauth_app: Option<String>,
+    /// Enterprise URL for GitHub.
+    #[arg(long = "enterprise-url", global = true)]
+    enterprise_url: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Start the Copilot API server
+    Start(StartArgs),
+    /// Run authentication flows without running the server
+    Auth(AuthArgs),
+    /// Show current GitHub Copilot usage/quota information
+    CheckUsage,
+}
+
+#[derive(Args, Debug)]
+struct StartArgs {
+    /// Port to listen on
+    #[arg(short = 'p', long, default_value = "4141")]
+    port: u16,
+    /// Enable verbose logging
+    #[arg(short = 'v', long, default_value_t = false)]
+    verbose: bool,
+    /// Account type to use (individual, business, enterprise)
+    #[arg(short = 'a', long = "account-type", default_value = "individual")]
+    account_type: String,
+    /// Enable manual request approval
+    #[arg(long, default_value_t = false)]
+    manual: bool,
+    /// Rate limit in seconds between requests
+    #[arg(short = 'r', long = "rate-limit")]
+    rate_limit: Option<u64>,
+    /// Wait instead of error when rate limit is hit
+    #[arg(short = 'w', long = "wait", default_value_t = false)]
+    wait: bool,
+    /// Provide GitHub token directly (generated via the `auth` subcommand)
+    #[arg(short = 'g', long = "github-token")]
+    github_token: Option<String>,
+    /// Generate a command to launch Claude Code with Copilot API config
+    #[arg(short = 'c', long = "claude-code", default_value_t = false)]
+    claude_code: bool,
+    /// Show GitHub and Copilot tokens on fetch and refresh
+    #[arg(long = "show-token", default_value_t = false)]
+    show_token: bool,
+    /// Initialize proxy from environment variables
+    #[arg(long = "proxy-env", default_value_t = false)]
+    proxy_env: bool,
+}
+
+#[derive(Args, Debug)]
+struct AuthArgs {
+    /// Provider to log in with (copilot or codex)
+    #[arg(long)]
+    provider: Option<String>,
+    /// Enable verbose logging
+    #[arg(short = 'v', long, default_value_t = false)]
+    verbose: bool,
+    /// Show provider access token on auth
+    #[arg(long = "show-token", default_value_t = false)]
+    show_token: bool,
+}
+
+fn apply_global_env(cli: &Cli) {
+    if let Some(v) = &cli.api_home {
+        std::env::set_var("COPILOT_API_HOME", v);
+    }
+    if let Some(v) = &cli.oauth_app {
+        std::env::set_var("COPILOT_API_OAUTH_APP", v);
+    }
+    if let Some(v) = &cli.enterprise_url {
+        std::env::set_var("COPILOT_API_ENTERPRISE_URL", v);
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    apply_global_env(&cli);
+
+    let verbose = matches!(&cli.command, Command::Start(a) if a.verbose)
+        || matches!(&cli.command, Command::Auth(a) if a.verbose);
+    init_tracing(verbose);
+
+    let result = match cli.command {
+        Command::Start(args) => run_server(args).await,
+        Command::Auth(args) => run_auth(args).await,
+        Command::CheckUsage => run_check_usage().await,
+    };
+
+    if let Err(e) = result {
+        tracing::error!("{e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn init_tracing(verbose: bool) {
+    let default = if verbose { "debug" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
+        )
+        .init();
+}
+
+async fn run_server(options: StartArgs) -> anyhow::Result<()> {
+    crate::libs::http::set_proxy_from_env(options.proxy_env);
+    if options.proxy_env {
+        tracing::debug!("HTTP proxy configured from environment (per-URL)");
+    }
+    merge_config_with_defaults()?;
+    init_opencode_version().await;
+
+    state::with_state_mut(|s| {
+        s.verbose = options.verbose;
+        s.account_type = options.account_type.clone();
+        s.manual_approve = options.manual;
+        s.rate_limit_seconds = options.rate_limit;
+        s.rate_limit_wait = options.wait;
+        s.show_token = options.show_token;
+    });
+
+    if options.verbose {
+        tracing::info!("Verbose logging enabled");
+    }
+    if options.account_type != "individual" {
+        tracing::info!("Using {} plan GitHub account", options.account_type);
+    }
+
+    ensure_paths().await?;
+    cache_vscode_version().await;
+    cache_mac_machine_id();
+    cache_vscode_session_id();
+    cache_vscode_device_id().await;
+
+    if let Some(token) = options.github_token {
+        state::with_state_mut(|s| s.github_token = Some(token));
+        tracing::info!("Using provided GitHub token");
+        log_user().await?;
+    } else {
+        setup_github_token(false).await?;
+    }
+
+    setup_copilot_token().await?;
+    cache_models().await?;
+
+    let model_list = state::with_state(|s| {
+        s.models
+            .as_ref()
+            .map(|m| {
+                m.data
+                    .iter()
+                    .map(|model| format!("- {}", model.id))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    });
+    tracing::info!("Available models: \n{model_list}");
+
+    let server_url = format!("http://localhost:{}", options.port);
+    if options.claude_code {
+        tracing::info!(
+            "The --claude-code flag generates a clipboard command for launching Claude Code. \
+             All models remain accessible without it; configure the model ID in settings.json."
+        );
+    }
+    tracing::info!(
+        "Usage Viewer: {server_url}/usage-viewer?endpoint={server_url}/usage"
+    );
+
+    let app = server::build_router();
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], options.port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("Listening on {server_url}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn run_auth(options: AuthArgs) -> anyhow::Result<()> {
+    state::with_state_mut(|s| s.show_token = options.show_token);
+    ensure_paths().await?;
+
+    let provider = options.provider.unwrap_or_else(|| "copilot".to_string());
+    let provider = provider.trim();
+    match provider {
+        "copilot" => {
+            setup_github_token(true).await?;
+            tracing::info!("GitHub token written to {}", PATHS.github_token_path.display());
+        }
+        "codex" => {
+            run_codex_login().await?;
+        }
+        other => {
+            anyhow::bail!("Unknown provider '{other}'. Expected one of: copilot, codex");
+        }
+    }
+    Ok(())
+}
+
+async fn run_codex_login() -> anyhow::Result<()> {
+    use crate::libs::oauth::codex::{login_codex, CodexAuthInfo};
+    use crate::libs::token::persist_codex_credentials;
+
+    let credentials = login_codex(
+        |info: CodexAuthInfo| {
+            tracing::info!("Open the following URL to authenticate with Codex:");
+            tracing::info!("{}", info.url);
+            if let Some(instructions) = &info.instructions {
+                tracing::info!("{instructions}");
+            }
+        },
+        |message: String| async move {
+            print_prompt(&message);
+            read_line().await
+        },
+    )
+    .await?;
+
+    persist_codex_credentials(&credentials, true).await?;
+    tracing::info!(
+        "Codex provider config written to {} and credentials written to {}",
+        PATHS.config_path.display(),
+        PATHS.codex_credential_path.display()
+    );
+    Ok(())
+}
+
+fn print_prompt(message: &str) {
+    use std::io::Write;
+    print!("{message}: ");
+    let _ = std::io::stdout().flush();
+}
+
+async fn read_line() -> String {
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        line.trim().to_string()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn run_check_usage() -> anyhow::Result<()> {
+    use crate::services::github::get_copilot_usage::QuotaDetail;
+
+    ensure_paths().await?;
+    setup_github_token(false).await?;
+
+    let snapshot = state::snapshot();
+    let usage = crate::services::github::get_copilot_usage::get_copilot_usage(&snapshot, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch Copilot usage: {}", e.message))?;
+
+    let snapshots = usage.quota_snapshots.unwrap_or_else(|| {
+        crate::services::github::get_copilot_usage::QuotaSnapshots {
+            chat: None,
+            completions: None,
+            premium_interactions: None,
+            extra: Default::default(),
+        }
+    });
+
+    let premium = snapshots.premium_interactions.unwrap_or_else(default_quota_detail);
+    let premium_total = premium.entitlement;
+    let premium_used = premium_total - premium.remaining;
+    let premium_percent_used = if premium_total > 0.0 {
+        premium_used / premium_total * 100.0
+    } else {
+        0.0
+    };
+
+    let summarize = |name: &str, snap: Option<&QuotaDetail>| match snap {
+        None => format!("{name}: N/A"),
+        Some(snap) => {
+            let total = snap.entitlement;
+            let used = total - snap.remaining;
+            let percent_used = if total > 0.0 { used / total * 100.0 } else { 0.0 };
+            format!(
+                "{name}: {}/{} used ({:.1}% used, {:.1}% remaining)",
+                used, total, percent_used, snap.percent_remaining
+            )
+        }
+    };
+
+    let plan = usage.copilot_plan.clone().unwrap_or_default();
+    tracing::info!(
+        "Copilot Usage (plan: {plan})\nQuota resets: {}\n\nQuotas:\n  Premium: {}/{} used ({:.1}% used, {:.1}% remaining)\n  {}\n  {}",
+        usage.quota_reset_date.clone().unwrap_or_default(),
+        premium_used,
+        premium_total,
+        premium_percent_used,
+        premium.percent_remaining,
+        summarize("Chat", snapshots.chat.as_ref()),
+        summarize("Completions", snapshots.completions.as_ref()),
+    );
+    Ok(())
+}
+
+fn default_quota_detail() -> crate::services::github::get_copilot_usage::QuotaDetail {
+    crate::services::github::get_copilot_usage::QuotaDetail {
+        entitlement: 0.0,
+        overage_count: 0.0,
+        overage_permitted: false,
+        percent_remaining: 0.0,
+        quota_id: String::new(),
+        quota_remaining: 0.0,
+        remaining: 0.0,
+        unlimited: false,
+        extra: Default::default(),
+    }
+}
