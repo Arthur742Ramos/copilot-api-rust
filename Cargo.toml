@@ -4,6 +4,12 @@ version = "1.12.5"
 edition = "2021"
 description = "OpenAI and Anthropic-compatible gateway for GitHub Copilot or Codex or third-party providers (Rust port)."
 license = "MIT"
+repository = "https://github.com/Arthur742Ramos/copilot-api-rust"
+homepage = "https://github.com/Arthur742Ramos/copilot-api-rust"
+readme = "README.md"
+keywords = ["github-copilot", "openai", "anthropic", "gateway", "proxy"]
+categories = ["command-line-utilities", "web-programming"]
+rust-version = "1.82"
 default-run = "copilot-api"
 
 [[bin]]

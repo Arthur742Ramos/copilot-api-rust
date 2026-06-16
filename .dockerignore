@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+
+# VCS and CI
+.git/
+.github/
+.gitignore
+
+# Agent / editor / tooling
+.claude/
+.vscode/
+.idea/
+
+# Docs and misc non-build files
+*.md
+LICENSE
+deny.toml
+Dockerfile
+.dockerignore
+
+# Keep: src/, Cargo.toml, Cargo.lock (not listed = included)
