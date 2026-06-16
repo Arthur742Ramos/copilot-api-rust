@@ -1,15 +1,20 @@
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 
 use crate::libs::request_auth::{check_auth, AuthOptions};
 use crate::libs::request_context::{resolve_trace_id, run_with_context, RequestContext};
+
+/// Maximum accepted request-body size (32 MiB). Generous enough for large
+/// multimodal / Anthropic payloads while bounding memory per request.
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Build the axum application, mirroring src/server.ts route table and
 /// middleware stack (trace -> cors -> general auth -> admin auth).
@@ -82,7 +87,27 @@ pub fn build_router() -> Router {
         .layer(from_fn(admin_auth_middleware))
         .layer(from_fn(general_auth_middleware))
         .layer(CorsLayer::permissive())
+        // Cap request-body size before any handler buffers it.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Convert a panic in any handler into a 500 JSON response instead of an
+        // abruptly reset connection.
+        .layer(CatchPanicLayer::custom(handle_panic))
         .layer(from_fn(trace_middleware))
+}
+
+/// Render a handler panic as a 500 JSON error (instead of dropping the
+/// connection). The panic is still logged by the default panic hook.
+fn handle_panic(_err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": {
+                "message": "Internal server error.",
+                "type": "internal_error",
+            }
+        })),
+    )
+        .into_response()
 }
 
 async fn trace_middleware(req: Request, next: Next) -> Response {

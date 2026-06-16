@@ -137,7 +137,9 @@ fn stream_sse(
     let mapped = byte_stream.map(move |chunk| {
         if let Ok(bytes) = &chunk {
             if let Some(usage) = sniff_usage(bytes) {
-                *usage_for_stream.lock().unwrap() = usage;
+                *usage_for_stream
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = usage;
             }
         }
         chunk.map_err(std::io::Error::other)
@@ -148,7 +150,11 @@ fn stream_sse(
     let recorder_final = recorder.clone();
     let usage_final = usage_acc.clone();
     let finalizing = mapped.chain(futures_util::stream::once(async move {
-        let usage = std::mem::take(&mut *usage_final.lock().unwrap());
+        let usage = std::mem::take(
+            &mut *usage_final
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
         recorder_final.record(usage);
         Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::new())
     }));
