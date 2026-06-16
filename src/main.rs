@@ -145,14 +145,29 @@ async fn main() {
 
 fn init_tracing(verbose: bool, to_stderr: bool) {
     let default = if verbose { "debug" } else { "info" };
-    let builder = tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
-    );
-    if to_stderr {
-        builder.with_writer(std::io::stderr).init();
-    } else {
-        builder.init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    // Opt into structured JSON logs via COPILOT_API_LOG_FORMAT=json; default to
+    // the existing human-readable format otherwise.
+    let json = std::env::var("COPILOT_API_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    match (json, to_stderr) {
+        (true, true) => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .with_writer(std::io::stderr)
+            .init(),
+        (true, false) => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .init(),
+        (false, true) => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init(),
+        (false, false) => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
     }
 }
 

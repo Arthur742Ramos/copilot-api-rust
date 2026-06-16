@@ -8,6 +8,7 @@ use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use metrics::{counter, histogram};
 use serde_json::json;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
@@ -25,6 +26,8 @@ const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 pub fn build_router() -> Router {
     Router::new()
         .route("/", get(|| async { "Server running" }))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_handler))
         .route("/usage-viewer", get(usage_viewer))
         .route("/usage-viewer/", get(usage_viewer_redirect))
         // Implemented spine routes
@@ -100,6 +103,8 @@ pub fn build_router() -> Router {
         // abruptly reset connection.
         .layer(CatchPanicLayer::custom(handle_panic))
         .layer(from_fn(trace_middleware))
+        // Record request count + latency metrics for every request.
+        .layer(from_fn(metrics_middleware))
         // Per-request access logging (method/path/status/latency) for all
         // requests, including those rejected by auth.
         .layer(TraceLayer::new_for_http())
@@ -174,6 +179,44 @@ async fn trace_middleware(req: Request, next: Next) -> Response {
         response.headers_mut().insert("x-trace-id", value);
     }
     response
+}
+
+/// Times each request and records a total-requests counter plus a
+/// latency histogram, labelled by method and response status.
+async fn metrics_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().as_str().to_owned();
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+    counter!("http_requests_total", "method" => method, "status" => status).increment(1);
+    histogram!("http_request_duration_seconds").record(elapsed);
+    response
+}
+
+/// Prometheus text-exposition endpoint. Mounted outside auth via the general
+/// layer's `allow_unauthenticated_paths` so scrapers need no API key.
+async fn metrics_handler() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4")
+        .body(Body::from(crate::libs::metrics::render()))
+        .unwrap()
+}
+
+/// Readiness probe: ready only once a copilot token is held and the model list
+/// has been cached. Distinct from `/` (liveness), which is always 200.
+async fn readyz() -> Response {
+    let ready = crate::libs::state::with_state(|s| s.copilot_token.is_some() && s.models.is_some());
+    if ready {
+        (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready"})),
+        )
+            .into_response()
+    }
 }
 
 fn header_string(req: &Request, name: &str) -> Option<String> {

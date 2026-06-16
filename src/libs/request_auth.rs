@@ -122,7 +122,13 @@ impl AuthOptions {
     pub fn general() -> Self {
         AuthOptions {
             get_api_keys: get_configured_api_keys,
-            allow_unauthenticated_paths: &["/", "/usage-viewer", "/usage-viewer/"],
+            allow_unauthenticated_paths: &[
+                "/",
+                "/usage-viewer",
+                "/usage-viewer/",
+                "/metrics",
+                "/readyz",
+            ],
             allow_options_bypass: true,
             allow_when_no_api_keys: true,
             skip_admin_prefix: true,
