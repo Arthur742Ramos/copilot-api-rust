@@ -5,9 +5,7 @@ use crate::libs::token::setup_codex_token;
 /// Mirrors the TS `isMissingCodexCredentialsError`: only the specific
 /// "Codex credentials not found ..." error is swallowed into `None`.
 fn is_missing_codex_credentials_error(error: &anyhow::Error) -> bool {
-    error
-        .to_string()
-        .contains("Codex credentials not found")
+    error.to_string().contains("Codex credentials not found")
 }
 
 /// Port of `resolveProviderConfig` from `lib/provider-resolver.ts`.

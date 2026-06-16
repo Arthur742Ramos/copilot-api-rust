@@ -92,7 +92,10 @@ fn normalize_codex_model(model: &CodexModelDefinition) -> Model {
         name: model.name.to_string(),
         object: "model".to_string(),
         preview: false,
-        supported_endpoints: Some(vec!["/v1/messages".to_string(), "/v1/responses".to_string()]),
+        supported_endpoints: Some(vec![
+            "/v1/messages".to_string(),
+            "/v1/responses".to_string(),
+        ]),
         vendor: "openai".to_string(),
         version: "chatgpt-codex".to_string(),
         policy: None,
@@ -127,7 +130,10 @@ mod tests {
         assert_eq!(spark.capabilities.family, "gpt");
         assert_eq!(spark.capabilities.tokenizer, "o200k_base");
         assert_eq!(spark.capabilities.model_type, "chat");
-        assert_eq!(spark.capabilities.limits.max_context_window_tokens, Some(100_000));
+        assert_eq!(
+            spark.capabilities.limits.max_context_window_tokens,
+            Some(100_000)
+        );
         assert_eq!(spark.capabilities.limits.max_output_tokens, Some(32_000));
         assert_eq!(spark.capabilities.limits.max_prompt_tokens, Some(100_000));
         // spark is text-only -> vision false.
@@ -142,7 +148,12 @@ mod tests {
         assert_eq!(gpt54.id, "gpt-5.4");
         assert_eq!(gpt54.capabilities.supports.vision, Some(true));
         assert_eq!(
-            gpt54.capabilities.supports.reasoning_effort.as_ref().unwrap(),
+            gpt54
+                .capabilities
+                .supports
+                .reasoning_effort
+                .as_ref()
+                .unwrap(),
             &vec![
                 "minimal".to_string(),
                 "low".to_string(),

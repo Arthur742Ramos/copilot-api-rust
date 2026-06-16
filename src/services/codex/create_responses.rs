@@ -30,6 +30,9 @@ const STRIPPED_CODEX_REQUEST_HEADERS: &[&str] = &[
     "cdn-loop",
     "connection",
     "content-length",
+    // `cookie` is not in the TS strip-set, but forwarding browser cookies to a
+    // third-party upstream is an unnecessary data-leak risk, so we drop it.
+    "cookie",
     "host",
     "keep-alive",
     "proxy-authenticate",
@@ -132,7 +135,11 @@ pub fn build_codex_responses_headers(
         );
     }
 
-    set_req_header(&mut headers, "authorization", &format!("Bearer {access_token}"));
+    set_req_header(
+        &mut headers,
+        "authorization",
+        &format!("Bearer {access_token}"),
+    );
     set_req_header(&mut headers, "chatgpt-account-id", &account_id);
     if !headers.contains_key("content-type") {
         set_req_header(&mut headers, "content-type", "application/json");
@@ -241,14 +248,16 @@ pub fn normalize_codex_responses_payload(payload: &mut ResponsesPayload) {
     }
 }
 
-/// Mirrors the TS `getTextContent`. Returns `None` for the TS `undefined`
-/// (signals "leave this message in place"); `Some` for extracted text.
+/// Extracts the text content of a message for system-prompt folding. Returns
+/// `None` (the TS `undefined`) to signal "leave this message in place" — this
+/// includes a missing `content` field, so a content-less system message is kept
+/// untouched rather than folded-and-dropped with an empty prompt.
 fn get_text_content(content: Option<&MessageContent>) -> Option<String> {
     match content {
         // `typeof content === "string"`.
         Some(MessageContent::Text(s)) => Some(s.clone()),
-        // `content === undefined` -> "".
-        None => Some(String::new()),
+        // No `content` field: keep the message untouched rather than deleting it.
+        None => None,
         Some(MessageContent::Blocks(blocks)) => {
             let mut text_blocks: Vec<String> = Vec::new();
             for block in blocks {

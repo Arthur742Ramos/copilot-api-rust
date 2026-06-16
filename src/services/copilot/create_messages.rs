@@ -130,12 +130,13 @@ pub async fn create_messages(
         return Err(HttpError::internal("Copilot token not found"));
     }
 
-    let enable_vision = payload.messages.iter().any(|message| {
-        match &message.content {
+    let enable_vision = payload
+        .messages
+        .iter()
+        .any(|message| match &message.content {
             Value::Array(blocks) => blocks.iter().any(block_has_image),
             _ => false,
-        }
-    });
+        });
 
     let is_initiate = is_initiate_request(payload);
 
@@ -154,10 +155,7 @@ pub async fn create_messages(
 
     prepare_for_compact(&mut headers, options.compact_type);
 
-    let user_id = payload
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_deref());
+    let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
     let parsed = parse_user_id_metadata(user_id);
 
     // claude-opus-4.8 is excluded: Copilot's upstream WAF returns a generic
@@ -306,10 +304,7 @@ mod tests {
 
     #[test]
     fn initiate_array_with_text_block_is_true() {
-        let p = payload_with(vec![msg(
-            "user",
-            json!([{ "type": "text", "text": "hi" }]),
-        )]);
+        let p = payload_with(vec![msg("user", json!([{ "type": "text", "text": "hi" }]))]);
         assert!(is_initiate_request(&p));
     }
 

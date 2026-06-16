@@ -86,8 +86,8 @@ pub fn build_provider_upstream_headers(
 pub fn create_provider_proxy_response(upstream: reqwest::Response) -> Response {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
 
-    let status =
-        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     let mut headers = HeaderMap::new();
     for (name, value) in upstream.headers().iter() {
@@ -98,7 +98,9 @@ pub fn create_provider_proxy_response(upstream: reqwest::Response) -> Response {
             HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            headers.insert(n, v);
+            // `append` (not `insert`) so multi-value headers such as
+            // `set-cookie` are forwarded in full rather than collapsed to one.
+            headers.append(n, v);
         }
     }
 
@@ -198,7 +200,10 @@ mod tests {
 
     #[test]
     fn x_api_key_auth() {
-        let headers = build_provider_upstream_headers(&cfg("anthropic", "x-api-key", "secret"), &HeaderMap::new());
+        let headers = build_provider_upstream_headers(
+            &cfg("anthropic", "x-api-key", "secret"),
+            &HeaderMap::new(),
+        );
         assert_eq!(headers.get("x-api-key").unwrap(), "secret");
         assert!(headers.get("authorization").is_none());
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
@@ -232,8 +237,7 @@ mod tests {
         req.insert("anthropic-version", "2023-06-01".parse().unwrap());
         req.insert("anthropic-beta", "beta-feature".parse().unwrap());
 
-        let anthropic =
-            build_provider_upstream_headers(&cfg("anthropic", "x-api-key", "k"), &req);
+        let anthropic = build_provider_upstream_headers(&cfg("anthropic", "x-api-key", "k"), &req);
         assert_eq!(anthropic.get("anthropic-version").unwrap(), "2023-06-01");
         assert_eq!(anthropic.get("anthropic-beta").unwrap(), "beta-feature");
 
