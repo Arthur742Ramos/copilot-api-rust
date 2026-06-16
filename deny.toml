@@ -30,6 +30,8 @@ allow = [
     "CC0-1.0",
     "OpenSSL",
     "BSL-1.0",
+    # tiktoken-rs bundles BPE token-merge data under the Community Data License.
+    "CDLA-Permissive-2.0",
 ]
 # Allow crates with no license metadata to be flagged rather than hard-fail.
 confidence-threshold = 0.8
