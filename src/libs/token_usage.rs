@@ -5,7 +5,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::libs::request_context::{generate_trace_id, request_context_store};
-use crate::libs::sqlite::usage_db;
+use crate::libs::sqlite::with_usage_conn;
 use crate::libs::state;
 
 /// Mirrors `UsageTokens` in src/lib/token-usage/store.ts.
@@ -511,11 +511,9 @@ fn ensure_column(conn: &Connection, name: &str, definition: &str) -> rusqlite::R
 /// Mirrors `writeTokenUsageEvent` but synchronous, under the usage_db() mutex
 /// (the async write-queue from TS is dropped).
 pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Result<()> {
-    let conn = usage_db()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    conn.execute(
-        r#"
+    with_usage_conn(|conn| {
+        conn.execute(
+            r#"
         INSERT INTO token_usage_events (
           created_at_ms,
           created_at_utc,
@@ -533,24 +531,25 @@ pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Re
           total_tokens
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
-        params![
-            event.created_at_ms,
-            event.created_at_utc,
-            event.trace_id,
-            event.session_id,
-            event.user_id,
-            event.source,
-            event.endpoint,
-            event.provider_name,
-            event.model,
-            event.input_tokens,
-            event.output_tokens,
-            event.cache_read_input_tokens,
-            event.cache_creation_input_tokens,
-            event.total_tokens,
-        ],
-    )?;
-    Ok(())
+            params![
+                event.created_at_ms,
+                event.created_at_utc,
+                event.trace_id,
+                event.session_id,
+                event.user_id,
+                event.source,
+                event.endpoint,
+                event.provider_name,
+                event.model,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_input_tokens,
+                event.cache_creation_input_tokens,
+                event.total_tokens,
+            ],
+        )?;
+        Ok(())
+    })
 }
 
 // --- Range math (local time, mirroring the Date-based logic in store.ts) ---
@@ -787,16 +786,15 @@ pub fn get_token_usage_summary(period: &str) -> TokenUsageSummary {
 }
 
 fn summary_inner(period: &str, start_ms: i64, end_ms: i64) -> rusqlite::Result<TokenUsageSummary> {
-    let conn = usage_db()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let totals = get_totals_row(&conn, start_ms, end_ms)?;
-    let by_model = get_model_rows(&conn, start_ms, end_ms)?;
-    Ok(TokenUsageSummary {
-        by_model,
-        period: period.to_string(),
-        range: range_payload(start_ms, end_ms),
-        totals,
+    with_usage_conn(|conn| {
+        let totals = get_totals_row(conn, start_ms, end_ms)?;
+        let by_model = get_model_rows(conn, start_ms, end_ms)?;
+        Ok(TokenUsageSummary {
+            by_model,
+            period: period.to_string(),
+            range: range_payload(start_ms, end_ms),
+            totals,
+        })
     })
 }
 
@@ -819,29 +817,28 @@ fn daily_summary_inner(
     start_ms: i64,
     end_ms: i64,
 ) -> rusqlite::Result<TokenUsageDailySummary> {
-    let conn = usage_db()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let totals = get_totals_row(&conn, start_ms, end_ms)?;
-    let by_model = get_model_rows(&conn, start_ms, end_ms)?;
-    let mut days = Vec::new();
-    for interval in create_daily_intervals(start_ms, end_ms) {
-        let models = get_model_rows(&conn, interval.start_ms, interval.end_ms)?;
-        let bucket_totals = sum_model_totals(&models);
-        days.push(TokenUsageDailyBucket {
-            by_model: models,
-            date: interval.date,
-            end_ms: interval.end_ms,
-            start_ms: interval.start_ms,
-            totals: bucket_totals,
-        });
-    }
-    Ok(TokenUsageDailySummary {
-        by_model,
-        days,
-        period: period.to_string(),
-        range: range_payload(start_ms, end_ms),
-        totals,
+    with_usage_conn(|conn| {
+        let totals = get_totals_row(conn, start_ms, end_ms)?;
+        let by_model = get_model_rows(conn, start_ms, end_ms)?;
+        let mut days = Vec::new();
+        for interval in create_daily_intervals(start_ms, end_ms) {
+            let models = get_model_rows(conn, interval.start_ms, interval.end_ms)?;
+            let bucket_totals = sum_model_totals(&models);
+            days.push(TokenUsageDailyBucket {
+                by_model: models,
+                date: interval.date,
+                end_ms: interval.end_ms,
+                start_ms: interval.start_ms,
+                totals: bucket_totals,
+            });
+        }
+        Ok(TokenUsageDailySummary {
+            by_model,
+            days,
+            period: period.to_string(),
+            range: range_payload(start_ms, end_ms),
+            totals,
+        })
     })
 }
 
@@ -873,22 +870,19 @@ fn events_page_inner(
     end_ms: i64,
 ) -> rusqlite::Result<TokenUsageEventsPage> {
     let offset = (page - 1) * page_size;
-    let conn = usage_db()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let total: i64 = conn.query_row(
-        r#"
+    with_usage_conn(|conn| {
+        let total: i64 = conn.query_row(
+            r#"
         SELECT COUNT(*) AS total
         FROM token_usage_events
         WHERE created_at_ms >= ? AND created_at_ms < ?
         "#,
-        params![start_ms, end_ms],
-        |row| row.get(0),
-    )?;
+            params![start_ms, end_ms],
+            |row| row.get(0),
+        )?;
 
-    let mut stmt = conn.prepare(
-        r#"
+        let mut stmt = conn.prepare(
+            r#"
         SELECT
           id,
           created_at_ms,
@@ -910,46 +904,47 @@ fn events_page_inner(
         ORDER BY created_at_ms DESC, id DESC
         LIMIT ? OFFSET ?
         "#,
-    )?;
-    let items = stmt
-        .query_map(params![start_ms, end_ms, page_size, offset], |row| {
-            let model: Option<String> = row.get("model")?;
-            Ok(TokenUsageEventRecord {
-                cache_creation_input_tokens: row.get("cache_creation_input_tokens")?,
-                cache_read_input_tokens: row.get("cache_read_input_tokens")?,
-                created_at_ms: row.get("created_at_ms")?,
-                created_at_utc: row.get("created_at_utc")?,
-                endpoint: row.get("endpoint")?,
-                id: row.get("id")?,
-                input_tokens: row.get("input_tokens")?,
-                model: model
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                output_tokens: row.get("output_tokens")?,
-                provider_name: row.get("provider_name")?,
-                session_id: row.get("session_id")?,
-                source: row.get("source")?,
-                total_tokens: row.get("total_tokens")?,
-                trace_id: row.get("trace_id")?,
-                user_id: row.get("user_id")?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        )?;
+        let items = stmt
+            .query_map(params![start_ms, end_ms, page_size, offset], |row| {
+                let model: Option<String> = row.get("model")?;
+                Ok(TokenUsageEventRecord {
+                    cache_creation_input_tokens: row.get("cache_creation_input_tokens")?,
+                    cache_read_input_tokens: row.get("cache_read_input_tokens")?,
+                    created_at_ms: row.get("created_at_ms")?,
+                    created_at_utc: row.get("created_at_utc")?,
+                    endpoint: row.get("endpoint")?,
+                    id: row.get("id")?,
+                    input_tokens: row.get("input_tokens")?,
+                    model: model
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    output_tokens: row.get("output_tokens")?,
+                    provider_name: row.get("provider_name")?,
+                    session_id: row.get("session_id")?,
+                    source: row.get("source")?,
+                    total_tokens: row.get("total_tokens")?,
+                    trace_id: row.get("trace_id")?,
+                    user_id: row.get("user_id")?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let total_pages = if page_size > 0 {
-        ((total + page_size - 1) / page_size).max(1)
-    } else {
-        1
-    };
+        let total_pages = if page_size > 0 {
+            ((total + page_size - 1) / page_size).max(1)
+        } else {
+            1
+        };
 
-    Ok(TokenUsageEventsPage {
-        items,
-        page,
-        page_size,
-        period: period.to_string(),
-        range: range_payload(start_ms, end_ms),
-        total,
-        total_pages,
+        Ok(TokenUsageEventsPage {
+            items,
+            page,
+            page_size,
+            period: period.to_string(),
+            range: range_payload(start_ms, end_ms),
+            total,
+            total_pages,
+        })
     })
 }
 
@@ -1028,15 +1023,12 @@ mod tests {
         .expect("event present");
 
         // Only run the DB roundtrip if this test is the one that initialized the
-        // global connection at our temp path.
-        let path_matches = {
-            let conn = usage_db()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // global pool at our temp path.
+        let path_matches = with_usage_conn(|conn| {
             conn.path()
                 .map(|p| std::path::Path::new(p) == db_path)
                 .unwrap_or(false)
-        };
+        });
         if !path_matches {
             return;
         }

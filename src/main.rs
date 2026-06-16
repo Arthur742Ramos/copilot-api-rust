@@ -227,9 +227,9 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
 
     // Flush the token-usage WAL on a clean shutdown.
     if crate::libs::token_usage::is_token_usage_storage_enabled() {
-        if let Ok(conn) = crate::libs::sqlite::usage_db().lock() {
+        crate::libs::sqlite::with_usage_conn(|conn| {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        }
+        });
     }
 
     Ok(())
