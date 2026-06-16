@@ -178,7 +178,7 @@ pub async fn handle_count_tokens(body: Value, headers: HeaderMap) -> Result<Resp
             (final_token_count as f64 * get_claude_token_multiplier()).round() as i64;
     }
 
-    tracing::info!("Token count: {final_token_count}");
+    tracing::info!("Token count (estimated): {final_token_count}");
 
     Ok(Json(json!({ "input_tokens": final_token_count })).into_response())
 }
