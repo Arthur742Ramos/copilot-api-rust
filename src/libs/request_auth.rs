@@ -176,7 +176,23 @@ pub fn check_auth(
 
     let request_api_key = extract_request_api_key(headers);
     match request_api_key {
-        Some(key) if api_keys.contains(&key) => None,
+        Some(key) if api_keys.iter().any(|valid| constant_time_eq(valid, &key)) => None,
         _ => Some(unauthorized_response()),
     }
+}
+
+/// Compare two strings without short-circuiting on the first differing byte, to
+/// avoid leaking key contents through response timing. Not branch-perfect, but
+/// removes the obvious early-exit timing signal of `==` / `Vec::contains`.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }

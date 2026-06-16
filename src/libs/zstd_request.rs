@@ -14,6 +14,23 @@ use serde_json::json;
 
 const ZSTD_CONTENT_ENCODING: &str = "zstd";
 
+/// Maximum size of the *compressed* request body we will read (16 MiB).
+const MAX_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum size of the *decompressed* output (64 MiB). Bounds a zstd
+/// decompression bomb: a small frame can otherwise expand to many GiB and
+/// OOM-kill the worker.
+const MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Failure modes of [`decompress_zstd`].
+#[derive(Debug)]
+enum DecompressError {
+    /// The frame was malformed or could not be decoded.
+    Invalid,
+    /// The decompressed output exceeded [`MAX_DECOMPRESSED_BYTES`].
+    TooLarge,
+}
+
 pub async fn zstd_decompression_middleware(req: Request, next: Next) -> Response {
     let is_zstd = req
         .headers()
@@ -27,14 +44,16 @@ pub async fn zstd_decompression_middleware(req: Request, next: Next) -> Response
 
     let (mut parts, body) = req.into_parts();
 
-    let compressed = match to_bytes(body, usize::MAX).await {
+    let compressed = match to_bytes(body, MAX_COMPRESSED_BYTES).await {
         Ok(bytes) => bytes,
-        Err(_) => return invalid_body(),
+        // `to_bytes` errors when the body exceeds the cap (or on a read error).
+        Err(_) => return payload_too_large(),
     };
 
     let decompressed = match tokio::task::spawn_blocking(move || decompress_zstd(&compressed)).await
     {
         Ok(Ok(bytes)) => bytes,
+        Ok(Err(DecompressError::TooLarge)) => return payload_too_large(),
         _ => return invalid_body(),
     };
 
@@ -45,11 +64,26 @@ pub async fn zstd_decompression_middleware(req: Request, next: Next) -> Response
     next.run(rebuilt).await
 }
 
-fn decompress_zstd(input: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(input)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+fn decompress_zstd(input: &[u8]) -> Result<Vec<u8>, DecompressError> {
+    let mut decoder =
+        ruzstd::decoding::StreamingDecoder::new(input).map_err(|_| DecompressError::Invalid)?;
+
+    // Read in bounded chunks so a decompression bomb can't expand past the
+    // ceiling. `read_to_end` would happily grow the Vec to many GiB.
     let mut output = Vec::new();
-    decoder.read_to_end(&mut output)?;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = decoder
+            .read(&mut chunk)
+            .map_err(|_| DecompressError::Invalid)?;
+        if n == 0 {
+            break;
+        }
+        if output.len() + n > MAX_DECOMPRESSED_BYTES {
+            return Err(DecompressError::TooLarge);
+        }
+        output.extend_from_slice(&chunk[..n]);
+    }
     Ok(output)
 }
 
@@ -59,6 +93,19 @@ fn invalid_body() -> Response {
         Json(json!({
             "error": {
                 "message": "Failed to decompress zstd request body.",
+                "type": "invalid_request_error",
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn payload_too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": {
+                "message": "Request body is too large.",
                 "type": "invalid_request_error",
             }
         })),

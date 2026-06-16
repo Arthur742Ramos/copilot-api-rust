@@ -511,7 +511,9 @@ fn ensure_column(conn: &Connection, name: &str, definition: &str) -> rusqlite::R
 /// Mirrors `writeTokenUsageEvent` but synchronous, under the usage_db() mutex
 /// (the async write-queue from TS is dropped).
 pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Result<()> {
-    let conn = usage_db().lock().expect("usage db mutex poisoned");
+    let conn = usage_db()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     conn.execute(
         r#"
         INSERT INTO token_usage_events (
@@ -785,7 +787,9 @@ pub fn get_token_usage_summary(period: &str) -> TokenUsageSummary {
 }
 
 fn summary_inner(period: &str, start_ms: i64, end_ms: i64) -> rusqlite::Result<TokenUsageSummary> {
-    let conn = usage_db().lock().expect("usage db mutex poisoned");
+    let conn = usage_db()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let totals = get_totals_row(&conn, start_ms, end_ms)?;
     let by_model = get_model_rows(&conn, start_ms, end_ms)?;
     Ok(TokenUsageSummary {
@@ -815,7 +819,9 @@ fn daily_summary_inner(
     start_ms: i64,
     end_ms: i64,
 ) -> rusqlite::Result<TokenUsageDailySummary> {
-    let conn = usage_db().lock().expect("usage db mutex poisoned");
+    let conn = usage_db()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let totals = get_totals_row(&conn, start_ms, end_ms)?;
     let by_model = get_model_rows(&conn, start_ms, end_ms)?;
     let mut days = Vec::new();
@@ -867,7 +873,9 @@ fn events_page_inner(
     end_ms: i64,
 ) -> rusqlite::Result<TokenUsageEventsPage> {
     let offset = (page - 1) * page_size;
-    let conn = usage_db().lock().expect("usage db mutex poisoned");
+    let conn = usage_db()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let total: i64 = conn.query_row(
         r#"
@@ -1022,7 +1030,9 @@ mod tests {
         // Only run the DB roundtrip if this test is the one that initialized the
         // global connection at our temp path.
         let path_matches = {
-            let conn = usage_db().lock().unwrap();
+            let conn = usage_db()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             conn.path()
                 .map(|p| std::path::Path::new(p) == db_path)
                 .unwrap_or(false)
