@@ -42,22 +42,39 @@ pub fn build_router() -> Router {
         // Token-usage subsystem (implemented).
         .nest("/token-usage", crate::routes::token_usage::router())
         .nest("/token-usage/", crate::routes::token_usage::router())
-        // Deferred subsystems — clearly-marked stubs (see translation notes).
-        .route("/responses", post(deferred_responses))
-        .route("/v1/responses", post(deferred_responses))
-        .route("/v1/messages", post(deferred_messages))
-        .route("/v1/messages/count_tokens", post(deferred_messages))
+        .route(
+            "/responses",
+            post(crate::routes::responses::route::post_responses),
+        )
+        .route(
+            "/v1/responses",
+            post(crate::routes::responses::route::post_responses),
+        )
+        .route(
+            "/v1/messages",
+            post(crate::routes::messages::route::post_messages),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::routes::messages::route::post_count_tokens),
+        )
         .route(
             "/admin/config/model-mappings",
             get(crate::routes::admin_config::get_model_mappings_route)
                 .post(crate::routes::admin_config::post_model_mappings_route),
         )
-        .route("/:provider/v1/messages", post(deferred_provider_messages))
+        .route(
+            "/:provider/v1/messages",
+            post(crate::routes::provider::messages::post_provider_messages),
+        )
         .route(
             "/:provider/v1/messages/count_tokens",
             post(deferred_provider_messages),
         )
-        .route("/:provider/v1/models", get(deferred_provider_models))
+        .route(
+            "/:provider/v1/models",
+            get(crate::routes::provider::models::get_provider_models),
+        )
         // Middleware stack (innermost first; trace ends up outermost).
         .layer(from_fn(
             crate::libs::zstd_request::zstd_decompression_middleware,
@@ -164,15 +181,6 @@ fn deferred(name: &str) -> Response {
         .into_response()
 }
 
-async fn deferred_responses() -> Response {
-    deferred("responses")
-}
-async fn deferred_messages() -> Response {
-    deferred("messages")
-}
 async fn deferred_provider_messages() -> Response {
-    deferred("provider messages")
-}
-async fn deferred_provider_models() -> Response {
-    deferred("provider models")
+    deferred("provider messages count_tokens")
 }
