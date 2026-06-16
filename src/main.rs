@@ -8,6 +8,8 @@ mod routes;
 mod server;
 mod services;
 
+mod debug;
+
 use clap::{Args, Parser, Subcommand};
 
 use crate::libs::config::merge_config_with_defaults;
@@ -46,6 +48,12 @@ enum Command {
     Auth(AuthArgs),
     /// Show current GitHub Copilot usage/quota information
     CheckUsage,
+    /// Print environment, provider, and path diagnostics
+    Debug {
+        /// Emit diagnostics as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -120,6 +128,10 @@ async fn main() {
         Command::Start(args) => run_server(args).await,
         Command::Auth(args) => run_auth(args).await,
         Command::CheckUsage => run_check_usage().await,
+        Command::Debug { json } => {
+            debug::run_debug(json).await;
+            Ok(())
+        }
     };
 
     if let Err(e) = result {

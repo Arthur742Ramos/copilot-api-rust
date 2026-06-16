@@ -40,7 +40,8 @@ pub fn build_router() -> Router {
         .route("/usage", get(crate::routes::usage::get_usage))
         .route("/token", get(crate::routes::token::get_token))
         // Deferred subsystems — clearly-marked stubs (see translation notes).
-        .route("/token-usage", get(deferred_token_usage))
+        .nest("/token-usage", crate::routes::token_usage::router())
+        .nest("/token-usage/", crate::routes::token_usage::router())
         .route("/responses", post(deferred_responses))
         .route("/v1/responses", post(deferred_responses))
         .route("/v1/messages", post(deferred_messages))
@@ -162,9 +163,6 @@ fn deferred(name: &str) -> Response {
         .into_response()
 }
 
-async fn deferred_token_usage() -> Response {
-    deferred("token-usage")
-}
 async fn deferred_responses() -> Response {
     deferred("responses")
 }
