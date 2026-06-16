@@ -701,21 +701,6 @@ pub enum ResponsesTransport {
     Websocket,
 }
 
-/// Mirrors the TS `CreateResponsesReturn` union (`ResponsesResult | stream`).
-/// The streaming arm is a Phase 3 placeholder.
-///
-/// `#[serde(untagged)]` so the `Result` arm (de)serializes as the bare
-/// `ResponsesResult` wire shape rather than an externally-tagged
-/// `{ "Result": ... }` object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ResponsesOutcome {
-    Result(Box<ResponsesResult>),
-    // TODO Phase 3: replace `Box<Value>` with the real pooled-stream handle once
-    // the websocket/HTTP transport is implemented.
-    Stream(Box<Value>),
-}
-
 /// A boxed stream of decoded SSE events, produced by either the HTTP transport
 /// (parsing the upstream response body) or the pooled websocket transport.
 pub type ResponsesEventStream = std::pin::Pin<

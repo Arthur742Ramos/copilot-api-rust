@@ -1,3 +1,6 @@
+//! Shared `reqwest` HTTP client used for all upstream calls, plus the
+//! `--proxy-env` opt-in gate for honoring proxy environment variables.
+
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

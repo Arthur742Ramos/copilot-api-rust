@@ -1,3 +1,6 @@
+//! Process-global mutable application state (tokens, account info, cached
+//! models) behind an `RwLock`, mirroring the TS singleton `state` object.
+
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
 

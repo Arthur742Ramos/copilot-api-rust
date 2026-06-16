@@ -1,3 +1,6 @@
+//! HTTP route handlers for the proxy's public API surface (chat completions,
+//! messages, responses, embeddings, models, token, and usage endpoints).
+
 pub mod admin_config;
 pub mod chat_completions;
 pub mod embeddings;

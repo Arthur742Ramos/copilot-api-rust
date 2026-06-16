@@ -1,3 +1,5 @@
+//! `/v1/embeddings` endpoint: forwards embedding requests to the Copilot API.
+
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::Value;
