@@ -304,7 +304,11 @@ pub fn copilot_headers(state: &State, request_id: Option<&str>, vision: bool) ->
         if let Some(store) = request_context_store() {
             let ua = store.user_agent.trim().to_string();
             if ua.starts_with("opencode/") {
-                set_header(&mut headers, "User-Agent", &normalize_opencode_user_agent(&ua));
+                set_header(
+                    &mut headers,
+                    "User-Agent",
+                    &normalize_opencode_user_agent(&ua),
+                );
             }
             if let Some(sa) = &store.session_affinity {
                 set_header(&mut headers, "x-session-affinity", sa);
@@ -336,7 +340,10 @@ fn github_copilot_headers(state: &State, request_id: Option<&str>, vision: bool)
         ("editor-device-id", state.vscode_device_id.clone()),
         (
             "editor-version",
-            format!("vscode/{}", state.vscode_version.clone().unwrap_or_default()),
+            format!(
+                "vscode/{}",
+                state.vscode_version.clone().unwrap_or_default()
+            ),
         ),
         ("editor-plugin-version", editor_plugin_version()),
         ("user-agent", user_agent()),

@@ -44,9 +44,12 @@ pub async fn handle_completion(body: Value) -> Result<Response, AppError> {
 
     // Find the selected model from the cache.
     let selected_model = state::with_state(|s| {
-        s.models
-            .as_ref()
-            .and_then(|m| m.data.iter().find(|model| model.id == payload.model).cloned())
+        s.models.as_ref().and_then(|m| {
+            m.data
+                .iter()
+                .find(|model| model.id == payload.model)
+                .cloned()
+        })
     });
 
     if selected_model.as_ref().map(|m| m.id.as_str()) == Some("gpt-5.4") {
@@ -72,8 +75,7 @@ pub async fn handle_completion(body: Value) -> Result<Response, AppError> {
             .and_then(|m| m.capabilities.limits.max_output_tokens);
     }
 
-    let request_id =
-        generate_request_id_from_payload(&messages_as_values(&payload), None);
+    let request_id = generate_request_id_from_payload(&messages_as_values(&payload), None);
     tracing::debug!("Generated request ID: {request_id}");
 
     let session_id = get_uuid(&request_id);

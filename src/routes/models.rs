@@ -17,12 +17,15 @@ pub async fn get_models_route() -> Response {
 
 async fn build_models() -> Result<Value, AppError> {
     if state::with_state(|s| s.models.is_none()) {
-        cache_models()
-            .await
-            .map_err(AppError::Other)?;
+        cache_models().await.map_err(AppError::Other)?;
     }
 
-    let models = state::with_state(|s| s.models.as_ref().map(|m| m.data.clone()).unwrap_or_default());
+    let models = state::with_state(|s| {
+        s.models
+            .as_ref()
+            .map(|m| m.data.clone())
+            .unwrap_or_default()
+    });
 
     let data: Vec<Value> = models
         .into_iter()
@@ -48,10 +51,7 @@ async fn build_models() -> Result<Value, AppError> {
                 map.insert("object".to_string(), json!("model"));
                 map.insert("type".to_string(), json!("model"));
                 map.insert("created".to_string(), json!(0));
-                map.insert(
-                    "created_at".to_string(),
-                    json!("1970-01-01T00:00:00.000Z"),
-                );
+                map.insert("created_at".to_string(), json!("1970-01-01T00:00:00.000Z"));
                 map.insert("owned_by".to_string(), json!(model.vendor));
                 map.insert("display_name".to_string(), json!(model.name));
             }

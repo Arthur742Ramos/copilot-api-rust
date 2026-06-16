@@ -16,12 +16,14 @@ pub async fn get_models() -> Result<ModelsResponse, HttpError> {
         .headers(headers)
         .send()
         .await
-        .map_err(|e| HttpError::new(
-            format!("Failed to get models: {e}"),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Default::default(),
-            String::new(),
-        ))?;
+        .map_err(|e| {
+            HttpError::new(
+                format!("Failed to get models: {e}"),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Default::default(),
+                String::new(),
+            )
+        })?;
 
     if !response.status().is_success() {
         let err = http_error_from_response("Failed to get models", response).await;
@@ -29,15 +31,14 @@ pub async fn get_models() -> Result<ModelsResponse, HttpError> {
         return Err(err);
     }
 
-    response
-        .json::<ModelsResponse>()
-        .await
-        .map_err(|e| HttpError::new(
+    response.json::<ModelsResponse>().await.map_err(|e| {
+        HttpError::new(
             format!("Failed to parse models: {e}"),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Default::default(),
             String::new(),
-        ))
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -23,9 +23,7 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     if !PROXY_FROM_ENV.load(Ordering::SeqCst) {
         builder = builder.no_proxy();
     }
-    builder
-        .build()
-        .expect("failed to build reqwest client")
+    builder.build().expect("failed to build reqwest client")
 });
 
 pub fn client() -> &'static reqwest::Client {

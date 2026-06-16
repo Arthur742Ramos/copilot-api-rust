@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Mirrors src/lib/oauth/codex.ts. OpenAI Codex OAuth (PKCE) login + refresh.
+// Mirrors src/lib/oauth/codex.ts. OpenAI Codex OAuth (PKCE) login + refresh.
 
 pub const CODEX_API_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
@@ -109,7 +109,11 @@ async fn post_token_form(params: &[(&str, &str)]) -> Result<TokenSuccessResult, 
     }
 
     let payload: TokenResponsePayload = response.json().await?;
-    match (payload.access_token, payload.refresh_token, payload.expires_in) {
+    match (
+        payload.access_token,
+        payload.refresh_token,
+        payload.expires_in,
+    ) {
         (Some(access_token), Some(refresh_token), Some(expires_in)) => Ok(TokenSuccessResult {
             access_token,
             refresh_token,
@@ -162,8 +166,7 @@ fn create_authorization_flow() -> (String, String, String) {
     (verifier, state, url.to_string())
 }
 
-const SUCCESS_BODY: &str =
-    "OpenAI Codex authentication completed. You can close this window.";
+const SUCCESS_BODY: &str = "OpenAI Codex authentication completed. You can close this window.";
 
 fn http_response(status_line: &str, body_message: &str) -> String {
     let body = render_oauth_page(body_message);
@@ -174,7 +177,10 @@ fn http_response(status_line: &str, body_message: &str) -> String {
 }
 
 fn render_oauth_page(message: &str) -> String {
-    format!("<!doctype html><html><body><p>{}</p></body></html>", escape_html(message))
+    format!(
+        "<!doctype html><html><body><p>{}</p></body></html>",
+        escape_html(message)
+    )
 }
 
 fn escape_html(value: &str) -> String {
@@ -223,10 +229,18 @@ async fn wait_for_authorization_code(state: &str) -> Option<String> {
                     } else if let Some(code) = q_code {
                         ("200 OK", SUCCESS_BODY.to_string(), Some(code))
                     } else {
-                        ("400 Bad Request", "Missing authorization code.".to_string(), None)
+                        (
+                            "400 Bad Request",
+                            "Missing authorization code.".to_string(),
+                            None,
+                        )
                     }
                 }
-                _ => ("404 Not Found", "Callback route not found.".to_string(), None),
+                _ => (
+                    "404 Not Found",
+                    "Callback route not found.".to_string(),
+                    None,
+                ),
             };
 
             let _ = socket
@@ -240,10 +254,9 @@ async fn wait_for_authorization_code(state: &str) -> Option<String> {
         }
     };
 
-    match tokio::time::timeout(Duration::from_millis(CALLBACK_TIMEOUT_MS), accept_loop).await {
-        Ok(result) => result,
-        Err(_) => None,
-    }
+    tokio::time::timeout(Duration::from_millis(CALLBACK_TIMEOUT_MS), accept_loop)
+        .await
+        .unwrap_or_default()
 }
 
 fn parse_authorization_input(input: &str) -> (Option<String>, Option<String>) {
@@ -252,8 +265,14 @@ fn parse_authorization_input(input: &str) -> (Option<String>, Option<String>) {
         return (None, None);
     }
     if let Ok(u) = url::Url::parse(value) {
-        let code = u.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string());
-        let state = u.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
+        let code = u
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.to_string());
+        let state = u
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.to_string());
         return (code, state);
     }
     if value.contains('#') {

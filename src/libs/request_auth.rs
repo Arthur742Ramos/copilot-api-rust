@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 
 use crate::libs::config::get_config;
 
-/// Mirrors src/lib/request-auth.ts. Provides API-key extraction and the auth
-/// decision used by the server middleware layers.
+// Mirrors src/lib/request-auth.ts. Provides API-key extraction and the auth
+// decision used by the server middleware layers.
 
 pub fn normalize_api_keys(api_keys: Option<&Vec<Value>>) -> Vec<String> {
     let api_keys = match api_keys {
@@ -77,7 +77,7 @@ pub fn extract_request_api_key(headers: &HeaderMap) -> Option<String> {
     }
 
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok())?;
-    let mut parts = authorization.trim().split_whitespace();
+    let mut parts = authorization.split_whitespace();
     let scheme = parts.next().unwrap_or("");
     if scheme.to_lowercase() != "bearer" {
         return None;

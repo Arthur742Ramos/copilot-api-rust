@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-/// Mirrors src/lib/deviceid.ts. Reads (or lazily creates + persists) the stable
-/// VSCode "device id" GUID used in the `editor-device-id` Copilot header,
-/// matching VSCode's own storage location per-platform.
+// Mirrors src/lib/deviceid.ts. Reads (or lazily creates + persists) the stable
+// VSCode "device id" GUID used in the `editor-device-id` Copilot header,
+// matching VSCode's own storage location per-platform.
 
 fn get_posix_home_dir() -> Result<PathBuf, anyhow::Error> {
     match std::env::var("HOME") {
@@ -16,7 +16,10 @@ fn get_device_id_file_path() -> Result<PathBuf, anyhow::Error> {
     let folder = get_posix_home_dir()?
         .join("Library")
         .join("Application Support");
-    Ok(folder.join("Microsoft").join("DeveloperTools").join("deviceid"))
+    Ok(folder
+        .join("Microsoft")
+        .join("DeveloperTools")
+        .join("deviceid"))
 }
 
 #[cfg(target_os = "linux")]
@@ -25,7 +28,10 @@ fn get_device_id_file_path() -> Result<PathBuf, anyhow::Error> {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => get_posix_home_dir()?.join(".cache"),
     };
-    Ok(folder.join("Microsoft").join("DeveloperTools").join("deviceid"))
+    Ok(folder
+        .join("Microsoft")
+        .join("DeveloperTools")
+        .join("deviceid"))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -34,7 +40,9 @@ fn get_device_id_file_path() -> Result<PathBuf, anyhow::Error> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn read_stored_device_id_file(path: &std::path::Path) -> Result<Option<String>, anyhow::Error> {
+async fn read_stored_device_id_file(
+    path: &std::path::Path,
+) -> Result<Option<String>, anyhow::Error> {
     match tokio::fs::read_to_string(path).await {
         Ok(contents) => Ok(Some(contents)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -43,7 +51,10 @@ async fn read_stored_device_id_file(path: &std::path::Path) -> Result<Option<Str
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn write_stored_device_id_file(path: &std::path::Path, device_id: &str) -> Result<(), anyhow::Error> {
+async fn write_stored_device_id_file(
+    path: &std::path::Path,
+    device_id: &str,
+) -> Result<(), anyhow::Error> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

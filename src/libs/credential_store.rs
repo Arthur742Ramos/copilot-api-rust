@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::libs::oauth::codex::CodexCredentials;
 use crate::libs::paths::{set_permissions_600, PATHS};
 
-/// Mirrors src/lib/credential-store.ts. Reads/writes the GitHub token and Codex
-/// credential files, with 0600 permissions on write.
+// Mirrors src/lib/credential-store.ts. Reads/writes the GitHub token and Codex
+// credential files, with 0600 permissions on write.
 
 async fn read_optional_file(path: &std::path::Path) -> Result<Option<String>, anyhow::Error> {
     match tokio::fs::read_to_string(path).await {

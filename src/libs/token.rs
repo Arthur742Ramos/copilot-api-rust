@@ -118,7 +118,8 @@ pub async fn persist_codex_credentials(
 pub async fn setup_copilot_token() -> Result<(), anyhow::Error> {
     if is_opencode_oauth_app() {
         let github_token = state::with_state(|s| s.github_token.clone());
-        let github_token = github_token.ok_or_else(|| anyhow::anyhow!("opencode token not found"))?;
+        let github_token =
+            github_token.ok_or_else(|| anyhow::anyhow!("opencode token not found"))?;
         state::with_state_mut(|s| s.copilot_token = Some(github_token.clone()));
         tracing::debug!("GitHub Copilot token set from opencode auth token");
         if state::with_state(|s| s.show_token) {
@@ -202,11 +203,15 @@ const RETRY_REFRESH_JITTER_MS: i64 = 15_000;
 const MIN_REFRESH_DELAY_MS: i64 = 1_000;
 
 pub fn get_refresh_deadline_ms(refresh_in: i64, now_ms: i64) -> i64 {
-    now_ms + std::cmp::max(refresh_in * 1000 - EARLY_REFRESH_BUFFER_MS, MIN_REFRESH_DELAY_MS)
+    now_ms
+        + std::cmp::max(
+            refresh_in * 1000 - EARLY_REFRESH_BUFFER_MS,
+            MIN_REFRESH_DELAY_MS,
+        )
 }
 
 pub fn get_refresh_poll_delay_ms(refresh_at_ms: i64, now_ms: i64) -> i64 {
-    std::cmp::min(std::cmp::max(refresh_at_ms - now_ms, 0), REFRESH_POLL_INTERVAL_MS)
+    (refresh_at_ms - now_ms).clamp(0, REFRESH_POLL_INTERVAL_MS)
 }
 
 async fn run_copilot_refresh_loop(refresh_in: i64, aborted: Arc<AtomicBool>) {
@@ -246,7 +251,8 @@ async fn run_copilot_refresh_loop(refresh_in: i64, aborted: Arc<AtomicBool>) {
 
 async fn run_codex_refresh_loop(aborted: Arc<AtomicBool>) {
     let mut refresh_at_ms = std::cmp::max(
-        state::with_state(|s| s.codex_expires_at.unwrap_or_else(now_millis)) - EARLY_REFRESH_BUFFER_MS,
+        state::with_state(|s| s.codex_expires_at.unwrap_or_else(now_millis))
+            - EARLY_REFRESH_BUFFER_MS,
         now_millis(),
     );
 
@@ -277,8 +283,10 @@ async fn run_codex_refresh_loop(aborted: Arc<AtomicBool>) {
                 if let Err(e) = persist_codex_credentials(&credentials, false).await {
                     tracing::error!("Failed to persist refreshed Codex credentials: {e}");
                 }
-                refresh_at_ms =
-                    std::cmp::max(credentials.expires_at - EARLY_REFRESH_BUFFER_MS, now_millis());
+                refresh_at_ms = std::cmp::max(
+                    credentials.expires_at - EARLY_REFRESH_BUFFER_MS,
+                    now_millis(),
+                );
                 tracing::debug!("Codex credentials refreshed");
             }
             Err(e) => {

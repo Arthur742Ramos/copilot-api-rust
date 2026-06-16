@@ -41,7 +41,10 @@ pub async fn get_copilot_usage(
     auth_state.github_token = Some(resolved);
 
     let response = client()
-        .get(format!("{}/copilot_internal/user", get_github_api_base_url()))
+        .get(format!(
+            "{}/copilot_internal/user",
+            get_github_api_base_url()
+        ))
         .headers(github_headers(&auth_state))
         .send()
         .await

@@ -106,9 +106,7 @@ async fn refresh_models() -> Result<(), anyhow::Error> {
     let filtered: Vec<_> = models
         .data
         .into_iter()
-        .filter(|model| {
-            model.model_picker_enabled || model.capabilities.model_type == "embeddings"
-        })
+        .filter(|model| model.model_picker_enabled || model.capabilities.model_type == "embeddings")
         .collect();
     let next_ids: Vec<String> = filtered.iter().map(|m| m.id.clone()).collect();
 
@@ -125,7 +123,11 @@ async fn refresh_models() -> Result<(), anyhow::Error> {
         .cloned()
         .collect();
     if !added.is_empty() {
-        tracing::info!("Models refresh: {} new -- {}", added.len(), added.join(", "));
+        tracing::info!(
+            "Models refresh: {} new -- {}",
+            added.len(),
+            added.join(", ")
+        );
     } else {
         tracing::debug!("Models refresh: no changes ({} total)", next_ids.len());
     }
@@ -236,7 +238,10 @@ pub fn cache_vscode_session_id() {
         loop {
             let random_delay = rand::random::<u64>() % SESSION_REFRESH_JITTER_MS;
             let delay = SESSION_REFRESH_BASE_MS + random_delay;
-            tracing::debug!("Scheduling next VSCode session ID refresh in {} seconds", delay / 1000);
+            tracing::debug!(
+                "Scheduling next VSCode session ID refresh in {} seconds",
+                delay / 1000
+            );
             tokio::time::sleep(Duration::from_millis(delay)).await;
             if aborted_clone.load(Ordering::SeqCst) {
                 return;
@@ -307,11 +312,15 @@ pub fn parse_user_id_metadata(user_id: Option<&str>) -> UserIdMetadata {
 
     let safety_identifier = legacy_safety.or_else(|| {
         parsed.as_ref().and_then(|p| {
-            get_user_id_json_field(p, "device_id").or_else(|| get_user_id_json_field(p, "account_uuid"))
+            get_user_id_json_field(p, "device_id")
+                .or_else(|| get_user_id_json_field(p, "account_uuid"))
         })
     });
-    let session_id = legacy_session
-        .or_else(|| parsed.as_ref().and_then(|p| get_user_id_json_field(p, "session_id")));
+    let session_id = legacy_session.or_else(|| {
+        parsed
+            .as_ref()
+            .and_then(|p| get_user_id_json_field(p, "session_id"))
+    });
 
     UserIdMetadata {
         safety_identifier,

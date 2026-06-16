@@ -19,12 +19,24 @@ pub fn build_router() -> Router {
         .route("/usage-viewer", get(usage_viewer))
         .route("/usage-viewer/", get(usage_viewer_redirect))
         // Implemented spine routes
-        .route("/chat/completions", post(crate::routes::chat_completions::route::post_chat_completions))
-        .route("/v1/chat/completions", post(crate::routes::chat_completions::route::post_chat_completions))
+        .route(
+            "/chat/completions",
+            post(crate::routes::chat_completions::route::post_chat_completions),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(crate::routes::chat_completions::route::post_chat_completions),
+        )
         .route("/models", get(crate::routes::models::get_models_route))
         .route("/v1/models", get(crate::routes::models::get_models_route))
-        .route("/embeddings", post(crate::routes::embeddings::post_embeddings))
-        .route("/v1/embeddings", post(crate::routes::embeddings::post_embeddings))
+        .route(
+            "/embeddings",
+            post(crate::routes::embeddings::post_embeddings),
+        )
+        .route(
+            "/v1/embeddings",
+            post(crate::routes::embeddings::post_embeddings),
+        )
         .route("/usage", get(crate::routes::usage::get_usage))
         .route("/token", get(crate::routes::token::get_token))
         // Deferred subsystems — clearly-marked stubs (see translation notes).
@@ -33,9 +45,15 @@ pub fn build_router() -> Router {
         .route("/v1/responses", post(deferred_responses))
         .route("/v1/messages", post(deferred_messages))
         .route("/v1/messages/count_tokens", post(deferred_messages))
-        .route("/admin/config", get(deferred_admin_config).post(deferred_admin_config))
+        .route(
+            "/admin/config",
+            get(deferred_admin_config).post(deferred_admin_config),
+        )
         .route("/:provider/v1/messages", post(deferred_provider_messages))
-        .route("/:provider/v1/messages/count_tokens", post(deferred_provider_messages))
+        .route(
+            "/:provider/v1/messages/count_tokens",
+            post(deferred_provider_messages),
+        )
         .route("/:provider/v1/models", get(deferred_provider_models))
         // Middleware stack (innermost first; trace ends up outermost).
         .layer(from_fn(admin_auth_middleware))
