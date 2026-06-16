@@ -195,10 +195,7 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
 
     let server_url = format!("http://localhost:{}", options.port);
     if options.claude_code {
-        tracing::info!(
-            "The --claude-code flag generates a clipboard command for launching Claude Code. \
-             All models remain accessible without it; configure the model ID in settings.json."
-        );
+        run_claude_code_setup(&server_url).await;
     }
     tracing::info!("Usage Viewer: {server_url}/usage-viewer?endpoint={server_url}/usage");
 
@@ -276,6 +273,76 @@ async fn read_line() -> String {
     })
     .await
     .unwrap_or_default()
+}
+
+/// Mirrors the `--claude-code` branch of start.ts: prints the tip, prompts for
+/// a primary + small model, builds the env-setup command, and copies it to the
+/// clipboard (falling back to printing it on clipboard failure).
+async fn run_claude_code_setup(server_url: &str) {
+    use crate::libs::shell::generate_env_script;
+
+    tracing::info!(
+        "\n💡 Tip: The --claude-code flag simply generates a clipboard command for launching Claude Code. \n\
+         All models remain fully accessible without this flag, just configure the model ID directly in your settings.json file."
+    );
+
+    let model_ids: Vec<String> = state::with_state(|s| {
+        s.models
+            .as_ref()
+            .map(|m| m.data.iter().map(|model| model.id.clone()).collect())
+            .unwrap_or_default()
+    });
+
+    if model_ids.is_empty() {
+        tracing::warn!("No models are loaded; skipping Claude Code command generation.");
+        return;
+    }
+
+    let selected_model = select_model("Select a model to use with Claude Code", &model_ids).await;
+    let selected_small_model =
+        select_model("Select a small model to use with Claude Code", &model_ids).await;
+
+    let env_vars: [(&str, &str); 12] = [
+        ("ANTHROPIC_BASE_URL", server_url),
+        ("ANTHROPIC_AUTH_TOKEN", "dummy"),
+        ("ANTHROPIC_MODEL", &selected_model),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", &selected_model),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &selected_small_model),
+        ("DISABLE_NON_ESSENTIAL_MODEL_CALLS", "1"),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0"),
+        ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false"),
+        ("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "true"),
+        ("CLAUDE_CODE_ENABLE_AWAY_SUMMARY", "0"),
+        ("CLAUDE_PLUGIN_ENABLE_QUESTION_RULES", "true"),
+    ];
+
+    let command = generate_env_script(&env_vars, "claude");
+
+    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(command.clone())) {
+        Ok(()) => tracing::info!("Copied Claude Code command to clipboard!"),
+        Err(_) => {
+            tracing::warn!("Failed to copy to clipboard. Here is the Claude Code command:");
+            tracing::info!("{command}");
+        }
+    }
+}
+
+/// Numbered-list replacement for consola's arrow-key `select` prompt. Defaults
+/// to the first option on blank or out-of-range input.
+async fn select_model(label: &str, options: &[String]) -> String {
+    for (index, id) in options.iter().enumerate() {
+        tracing::info!("  {}) {id}", index + 1);
+    }
+    print_prompt(&format!("{label} [1-{}]", options.len()));
+    let answer = read_line().await;
+    let selected = answer
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= 1 && *n <= options.len())
+        .map(|n| n - 1)
+        .unwrap_or(0);
+    options[selected].clone()
 }
 
 async fn run_check_usage() -> anyhow::Result<()> {

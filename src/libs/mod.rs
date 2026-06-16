@@ -15,6 +15,7 @@ pub mod provider_model;
 pub mod rate_limit;
 pub mod request_auth;
 pub mod request_context;
+pub mod shell;
 pub mod state;
 pub mod subagent;
 pub mod token;
