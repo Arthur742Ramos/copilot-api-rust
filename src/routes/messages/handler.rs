@@ -65,12 +65,33 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     // 2. Web-search server-tool short-circuit. Mirrors `tryHandleWebSearch`.
     //
-    // TODO web_search: wire once `web_search::fulfill::try_handle_web_search`
-    // stabilizes its signature (it is being built this stage and currently
-    // exposes the building blocks but not the entry point, whose final shape
-    // takes a generic provider-forward callback). Expected behaviour: if it
-    // returns `Some(response)`, return it here; the call must run BEFORE the
-    // provider-alias step below since web-search may itself route to a provider.
+    // Runs BEFORE the provider-alias step because a web-search request may
+    // itself route to a configured provider (via the injected callback).
+    {
+        let mut typed = deserialize_payload(&payload)?;
+        let forward_headers = headers.clone();
+        let web_search_result =
+            crate::routes::messages::web_search::fulfill::try_handle_web_search(
+                &mut typed,
+                &headers,
+                |fwd_payload, provider| async move {
+                    crate::routes::provider::messages::handle_provider_messages_for_provider(
+                        fwd_payload,
+                        provider,
+                        forward_headers,
+                    )
+                    .await
+                },
+            )
+            .await;
+        if let Some(result) = web_search_result {
+            return result;
+        }
+        // No web-search tool present: fold any in-place mutations back into the
+        // working `Value` payload.
+        payload =
+            serde_json::to_value(&typed).map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
+    }
 
     // 3. `<provider>/model` alias -> delegate to the provider proxy.
     if let Some(alias) = parse_provider_model_alias(&model_of(&payload)) {
