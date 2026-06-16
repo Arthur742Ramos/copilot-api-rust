@@ -181,6 +181,20 @@ fn default_config() -> AppConfig {
 
 static CACHED_CONFIG: Lazy<RwLock<Option<AppConfig>>> = Lazy::new(|| RwLock::new(None));
 
+/// Test seam: overwrite the process-global cached config so router/auth tests can
+/// install a known `auth.apiKeys` / `auth.adminApiKey` without touching disk.
+/// Tests that use this MUST run serially (the cache is a process-global).
+#[doc(hidden)]
+pub fn set_cached_config_for_test(config: AppConfig) {
+    *CACHED_CONFIG.write().unwrap() = Some(config);
+}
+
+/// Test seam: clear the cached config so the next `get_config()` re-reads.
+#[doc(hidden)]
+pub fn reset_cached_config_for_test() {
+    *CACHED_CONFIG.write().unwrap() = None;
+}
+
 fn serialize_pretty(config: &AppConfig) -> String {
     let mut s = serde_json::to_string_pretty(config).unwrap_or_else(|_| "{}".to_string());
     s.push('\n');
