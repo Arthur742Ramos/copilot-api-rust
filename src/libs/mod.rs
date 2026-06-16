@@ -12,6 +12,7 @@ pub mod deviceid;
 pub mod error;
 pub mod http;
 pub mod logger;
+pub mod metrics;
 pub mod models;
 pub mod oauth;
 pub mod opencode;
