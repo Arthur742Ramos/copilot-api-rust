@@ -188,7 +188,13 @@ pub struct AnthropicMessagesPayload {
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<AnthropicToolChoice>,
-    pub max_tokens: i64,
+    // Required by the Anthropic Messages API, but `/v1/messages/count_tokens`
+    // legitimately omits it (you're counting input, not generating). The TS
+    // original types it as `number` but does no runtime validation, so a
+    // count_tokens payload without it deserializes fine there; model it as
+    // optional here to match that behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -405,6 +411,16 @@ mod tests {
         let payload: AnthropicMessagesPayload = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&payload).unwrap();
         assert_eq!(input, output);
+    }
+
+    #[test]
+    fn payload_deserializes_without_max_tokens() {
+        // `/v1/messages/count_tokens` omits `max_tokens` (you're counting input,
+        // not generating). The TS original does no runtime validation, so the
+        // field must be optional here too — otherwise count_tokens 400s.
+        let input = r#"{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}"#;
+        let payload: AnthropicMessagesPayload = serde_json::from_str(input).unwrap();
+        assert_eq!(payload.max_tokens, None);
     }
 
     #[test]

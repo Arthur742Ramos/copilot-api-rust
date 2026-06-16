@@ -155,7 +155,7 @@ pub fn translate_to_openai_with_options(
     ChatCompletionsPayload {
         messages,
         model: model_id,
-        max_tokens: Some(payload.max_tokens),
+        max_tokens: payload.max_tokens,
         stream: payload.stream,
         extra,
     }
@@ -967,7 +967,7 @@ mod tests {
                 { "type": "tool_result", "tool_use_id": "call_1", "content": "result text" },
                 { "type": "text", "text": "follow up" },
             ]))],
-            max_tokens: 100,
+            max_tokens: Some(100),
             ..Default::default()
         };
 
@@ -1232,7 +1232,7 @@ mod tests {
                     },
                 },
             ]))],
-            max_tokens: 100,
+            max_tokens: Some(100),
             ..Default::default()
         };
 

@@ -283,7 +283,7 @@ mod tests {
         AnthropicMessagesPayload {
             model: "m".to_string(),
             messages,
-            max_tokens: 100,
+            max_tokens: Some(100),
             ..Default::default()
         }
     }
