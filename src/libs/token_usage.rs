@@ -303,6 +303,27 @@ pub struct TokenUsageModelSummary {
     pub model: String,
 }
 
+/// Per-session aggregated usage row. Like `TokenUsageModelSummary`, the totals
+/// are flattened into the object, with the session id and first/last timestamps
+/// alongside.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenUsageSessionSummary {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub totals: TokenUsageTotals,
+    pub first_request_ms: i64,
+    pub last_request_ms: i64,
+}
+
+/// Response shape for `/token-usage/sessions`: the per-session rows plus the
+/// period label and the resolved range (mirrors the summary response style).
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenUsageSessionsResponse {
+    pub period: TokenUsagePeriod,
+    pub range: TokenUsageRange,
+    pub sessions: Vec<TokenUsageSessionSummary>,
+}
+
 /// Mirrors the inline `range` object on the summary shapes.
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenUsageRange {
@@ -548,8 +569,18 @@ pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Re
                 event.total_tokens,
             ],
         )?;
-        Ok(())
-    })
+        Ok::<(), rusqlite::Error>(())
+    })?;
+    // Bounded Prometheus counter: per-session detail lives in the SQLite
+    // `/token-usage/sessions` endpoint to avoid unbounded label cardinality.
+    // `source` and `endpoint` are fixed enums, so labeling by them is safe.
+    metrics::counter!(
+        "token_usage_events_total",
+        "source" => event.source,
+        "endpoint" => event.endpoint,
+    )
+    .increment(1);
+    Ok(())
 }
 
 // --- Range math (local time, mirroring the Date-based logic in store.ts) ---
@@ -706,6 +737,49 @@ fn get_model_rows(
     Ok(rows)
 }
 
+fn get_session_rows(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+) -> rusqlite::Result<Vec<TokenUsageSessionSummary>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+          session_id,
+          COUNT(*) AS request_count,
+          COALESCE(SUM(input_tokens), 0) AS input_tokens,
+          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+          COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+          COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+          COALESCE(SUM(total_tokens), 0) AS total_tokens,
+          MIN(created_at_ms) AS first_request_ms,
+          MAX(created_at_ms) AS last_request_ms
+        FROM token_usage_events
+        WHERE created_at_ms >= ? AND created_at_ms < ? AND session_id != ''
+        GROUP BY session_id
+        ORDER BY total_tokens DESC, session_id ASC
+        "#,
+    )?;
+    let rows = stmt
+        .query_map(params![start_ms, end_ms], |row| {
+            Ok(TokenUsageSessionSummary {
+                session_id: row.get("session_id")?,
+                totals: TokenUsageTotals {
+                    cache_creation_input_tokens: row.get("cache_creation_input_tokens")?,
+                    cache_read_input_tokens: row.get("cache_read_input_tokens")?,
+                    input_tokens: row.get("input_tokens")?,
+                    output_tokens: row.get("output_tokens")?,
+                    request_count: row.get("request_count")?,
+                    total_tokens: row.get("total_tokens")?,
+                },
+                first_request_ms: row.get("first_request_ms")?,
+                last_request_ms: row.get("last_request_ms")?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 fn sum_model_totals(models: &[TokenUsageModelSummary]) -> TokenUsageTotals {
     let mut totals = TokenUsageTotals::default();
     for model in models {
@@ -769,6 +843,14 @@ pub(crate) fn create_empty_events_page(
     }
 }
 
+pub(crate) fn create_empty_sessions(period: &str) -> TokenUsageSessionsResponse {
+    let (start_ms, end_ms) = get_period_range(period, Utc::now().timestamp_millis());
+    TokenUsageSessionsResponse {
+        period: period.to_string(),
+        range: range_payload(start_ms, end_ms),
+        sessions: Vec::new(),
+    }
+}
 // --- Public read API (mirrors the getTokenUsage* functions) ---
 
 pub fn get_token_usage_summary(period: &str) -> TokenUsageSummary {
@@ -794,6 +876,35 @@ fn summary_inner(period: &str, start_ms: i64, end_ms: i64) -> rusqlite::Result<T
             period: period.to_string(),
             range: range_payload(start_ms, end_ms),
             totals,
+        })
+    })
+}
+
+pub fn get_token_usage_sessions(period: &str) -> TokenUsageSessionsResponse {
+    if !is_token_usage_storage_enabled() {
+        return create_empty_sessions(period);
+    }
+    let (start_ms, end_ms) = get_period_range(period, Utc::now().timestamp_millis());
+    match sessions_inner(period, start_ms, end_ms) {
+        Ok(response) => response,
+        Err(error) => {
+            warn!("Failed to read token usage sessions: {error}");
+            create_empty_sessions(period)
+        }
+    }
+}
+
+fn sessions_inner(
+    period: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> rusqlite::Result<TokenUsageSessionsResponse> {
+    with_usage_conn(|conn| {
+        let sessions = get_session_rows(conn, start_ms, end_ms)?;
+        Ok(TokenUsageSessionsResponse {
+            period: period.to_string(),
+            range: range_payload(start_ms, end_ms),
+            sessions,
         })
     })
 }
@@ -1045,5 +1156,84 @@ mod tests {
         let events = get_token_usage_events_page(1, 20, "day");
         assert!(events.total >= 1);
         assert!(events.items.iter().any(|e| e.model == "roundtrip-model"));
+    }
+
+    #[test]
+    fn sessions_group_by_session_id() {
+        // Same guard pattern as `insert_then_summary_roundtrip`: point at a fresh
+        // temp DB and only assert if this test won the process-global pool.
+        let dir = std::env::temp_dir().join(format!("copilot-api-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("usage.sqlite");
+        std::env::set_var("COPILOT_API_SQLITE_DB_PATH", &db_path);
+
+        let path_matches = with_usage_conn(|conn| {
+            conn.path()
+                .map(|p| std::path::Path::new(p) == db_path)
+                .unwrap_or(false)
+        });
+        if !path_matches {
+            return;
+        }
+
+        // Two events under "session-a" and one under "session-b". The session_id
+        // arg is honored because no request context is active in unit tests.
+        let make = |session: &str, input: i64, output: i64| {
+            let usage = UsageTokens {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                ..Default::default()
+            };
+            to_persisted_event(
+                "chat_completions",
+                "copilot",
+                "session-model",
+                None,
+                Some(session),
+                None,
+                Some("trace-session"),
+                &usage,
+            )
+            .expect("event present")
+        };
+
+        write_token_usage_event(&make("session-a", 100, 40)).expect("write a1");
+        write_token_usage_event(&make("session-a", 10, 5)).expect("write a2");
+        write_token_usage_event(&make("session-b", 7, 3)).expect("write b1");
+
+        let response = get_token_usage_sessions("day");
+        let a = response
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "session-a")
+            .expect("session-a present");
+        assert_eq!(a.totals.request_count, 2);
+        assert_eq!(a.totals.input_tokens, 110);
+        assert_eq!(a.totals.output_tokens, 45);
+        assert_eq!(a.totals.total_tokens, 155);
+        assert!(a.first_request_ms <= a.last_request_ms);
+
+        let b = response
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "session-b")
+            .expect("session-b present");
+        assert_eq!(b.totals.request_count, 1);
+        assert_eq!(b.totals.total_tokens, 10);
+
+        // Empty session ids are excluded from the grouping.
+        assert!(response.sessions.iter().all(|s| !s.session_id.is_empty()));
+        // Ordered by total_tokens DESC, so session-a precedes session-b.
+        let pos_a = response
+            .sessions
+            .iter()
+            .position(|s| s.session_id == "session-a")
+            .unwrap();
+        let pos_b = response
+            .sessions
+            .iter()
+            .position(|s| s.session_id == "session-b")
+            .unwrap();
+        assert!(pos_a < pos_b);
     }
 }
