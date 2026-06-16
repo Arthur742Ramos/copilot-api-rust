@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Local Claude Code tooling (not part of the deliverable)
+/.claude
+
+# Editor / OS noise
+*.swp
+.DS_Store
