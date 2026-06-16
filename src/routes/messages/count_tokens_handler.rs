@@ -95,8 +95,23 @@ async fn count_tokens_via_anthropic(payload: &AnthropicMessagesPayload) -> Optio
 /// Mirrors `handleCountTokens`.
 #[allow(clippy::result_large_err)]
 pub async fn handle_count_tokens(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
-    let mut anthropic_payload: AnthropicMessagesPayload = serde_json::from_value(body)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))?;
+    let mut anthropic_payload: AnthropicMessagesPayload = match serde_json::from_value(body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            // An invalid client payload is a 400, not a 500 (AppError::Other
+            // renders as INTERNAL_SERVER_ERROR). Matches the provider handler.
+            return Ok((
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": format!("Invalid request payload: {e}"),
+                        "type": "invalid_request_error",
+                    }
+                })),
+            )
+                .into_response());
+        }
+    };
 
     anthropic_payload.model = resolve_mapped_model(&anthropic_payload.model);
 

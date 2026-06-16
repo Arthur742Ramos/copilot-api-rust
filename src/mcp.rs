@@ -39,7 +39,11 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
         let request: Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
             Err(err) => {
-                tracing::warn!("Ignoring malformed JSON-RPC line: {err}");
+                // JSON-RPC 2.0: reply to a parse error with code -32700 and a
+                // null id so clients waiting on a response don't block.
+                tracing::warn!("Malformed JSON-RPC line: {err}");
+                let response = error(Value::Null, -32700, "Parse error".to_string());
+                write_response(&mut stdout, &response).await?;
                 continue;
             }
         };

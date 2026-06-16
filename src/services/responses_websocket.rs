@@ -262,6 +262,10 @@ async fn acquire(
     let decision = {
         // Both maps under their own locks; held only for this sync section.
         if active_request_count(&request.pool_key) > 0 {
+            // Increment before the connect await so concurrent acquirers in-flight
+            // reliably observe active_request_count > 0 and avoid racing on the
+            // pooled path. Decremented below if the connect fails.
+            increment_active_request_count(&request.pool_key);
             Decision::NewUnpooled
         } else {
             let mut pool = WEBSOCKET_POOL.lock().unwrap();
@@ -276,7 +280,15 @@ async fn acquire(
                     increment_active_request_count(&request.pool_key);
                     Decision::Reuse(conn, id)
                 }
-                _ => Decision::NewPooled,
+                _ => {
+                    // Increment before awaiting the connect so a concurrent
+                    // acquire sees active_request_count > 0 and takes the
+                    // unpooled path instead of starting a redundant pooled
+                    // connection. Decremented below on connect failure.
+                    drop(pool);
+                    increment_active_request_count(&request.pool_key);
+                    Decision::NewPooled
+                }
             }
         }
     };
@@ -291,8 +303,17 @@ async fn acquire(
             released: false,
         }),
         Decision::NewPooled => {
-            let ws = open_web_socket(&request.url, &request.headers, &options.open_error_message)
-                .await?;
+            // active count already incremented before this await.
+            let ws =
+                match open_web_socket(&request.url, &request.headers, &options.open_error_message)
+                    .await
+                {
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        decrement_active_request_count(&request.pool_key);
+                        return Err(e);
+                    }
+                };
             let conn = Arc::new(Conn {
                 ws: tokio::sync::Mutex::new(ws),
             });
@@ -310,7 +331,6 @@ async fn acquire(
                     },
                 );
             }
-            increment_active_request_count(&request.pool_key);
             Ok(RequestHandle {
                 conn,
                 pool_key: request.pool_key.clone(),
@@ -321,12 +341,20 @@ async fn acquire(
             })
         }
         Decision::NewUnpooled => {
-            let ws = open_web_socket(&request.url, &request.headers, &options.open_error_message)
-                .await?;
+            // active count already incremented before this await.
+            let ws =
+                match open_web_socket(&request.url, &request.headers, &options.open_error_message)
+                    .await
+                {
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        decrement_active_request_count(&request.pool_key);
+                        return Err(e);
+                    }
+                };
             let conn = Arc::new(Conn {
                 ws: tokio::sync::Mutex::new(ws),
             });
-            increment_active_request_count(&request.pool_key);
             Ok(RequestHandle {
                 conn,
                 pool_key: request.pool_key.clone(),
