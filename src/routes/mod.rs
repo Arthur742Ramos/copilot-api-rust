@@ -1,3 +1,4 @@
+pub mod admin_config;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod models;
