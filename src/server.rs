@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use serde_json::json;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 
 use crate::libs::request_auth::{check_auth, AuthOptions};
 use crate::libs::request_context::{resolve_trace_id, run_with_context, RequestContext};
@@ -93,6 +94,9 @@ pub fn build_router() -> Router {
         // abruptly reset connection.
         .layer(CatchPanicLayer::custom(handle_panic))
         .layer(from_fn(trace_middleware))
+        // Per-request access logging (method/path/status/latency) for all
+        // requests, including those rejected by auth.
+        .layer(TraceLayer::new_for_http())
 }
 
 /// Render a handler panic as a 500 JSON error (instead of dropping the

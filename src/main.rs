@@ -225,8 +225,46 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], options.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Listening on {server_url}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Flush the token-usage WAL on a clean shutdown.
+    if crate::libs::token_usage::is_token_usage_storage_enabled() {
+        if let Ok(conn) = crate::libs::sqlite::usage_db().lock() {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+    }
+
     Ok(())
+}
+
+/// Resolves when the process receives a Ctrl-C, or (on unix) a SIGTERM, so the
+/// server can drain in-flight requests before exiting.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("Shutdown signal received, stopping server");
 }
 
 async fn run_auth(options: AuthArgs) -> anyhow::Result<()> {
