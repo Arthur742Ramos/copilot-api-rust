@@ -24,6 +24,7 @@ pub mod state;
 pub mod subagent;
 pub mod token;
 pub mod token_usage;
+pub mod tokenizer;
 pub mod tool_search;
 pub mod utils;
 pub mod zstd_request;
