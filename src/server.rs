@@ -46,8 +46,9 @@ pub fn build_router() -> Router {
         .route("/v1/messages", post(deferred_messages))
         .route("/v1/messages/count_tokens", post(deferred_messages))
         .route(
-            "/admin/config",
-            get(deferred_admin_config).post(deferred_admin_config),
+            "/admin/config/model-mappings",
+            get(crate::routes::admin_config::get_model_mappings_route)
+                .post(crate::routes::admin_config::post_model_mappings_route),
         )
         .route("/:provider/v1/messages", post(deferred_provider_messages))
         .route(
@@ -166,9 +167,6 @@ async fn deferred_responses() -> Response {
 }
 async fn deferred_messages() -> Response {
     deferred("messages")
-}
-async fn deferred_admin_config() -> Response {
-    deferred("admin/config")
 }
 async fn deferred_provider_messages() -> Response {
     deferred("provider messages")
