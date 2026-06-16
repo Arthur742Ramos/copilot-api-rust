@@ -18,6 +18,7 @@ pub mod request_auth;
 pub mod request_context;
 pub mod shell;
 pub mod sqlite;
+pub mod sse;
 pub mod state;
 pub mod subagent;
 pub mod token;

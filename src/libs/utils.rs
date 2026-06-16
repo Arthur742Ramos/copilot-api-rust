@@ -328,6 +328,31 @@ pub fn parse_user_id_metadata(user_id: Option<&str>) -> UserIdMetadata {
     }
 }
 
+/// Mirrors `getRootSessionId`. Resolves the session id from
+/// `metadata.user_id` (via `parse_user_id_metadata`) or, when absent, the
+/// `x-session-id` request header, then maps it through `get_uuid`.
+pub fn get_root_session_id(
+    payload: &serde_json::Value,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    let user_id = payload
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|v| v.as_str());
+
+    let session_id = match user_id {
+        Some(uid) => parse_user_id_metadata(Some(uid))
+            .session_id
+            .filter(|s| !s.is_empty()),
+        None => headers
+            .get("x-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+    };
+
+    session_id.map(|s| get_uuid(&s))
+}
+
 fn regex_capture(haystack: &str, pattern: &str) -> Option<String> {
     let re = regex::Regex::new(pattern).ok()?;
     re.captures(haystack)
