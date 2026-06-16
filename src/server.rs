@@ -1,3 +1,6 @@
+//! Axum router assembly: wires every route, the auth/trace middleware stack,
+//! CORS, body limits, and panic handling into the application `Router`.
+
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderValue, StatusCode};
@@ -206,17 +209,4 @@ async fn token_usage_redirect() -> Response {
         .header("location", "/token-usage")
         .body(Body::empty())
         .unwrap()
-}
-
-fn deferred(name: &str) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": {
-                "message": format!("The {name} endpoint is not yet implemented in this build"),
-                "type": "not_implemented",
-            }
-        })),
-    )
-        .into_response()
 }

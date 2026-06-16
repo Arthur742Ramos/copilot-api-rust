@@ -1,3 +1,6 @@
+//! Error types and Axum responses: `AppError` for internal failures and
+//! `HttpError` for forwarding an upstream response's status/headers/body.
+
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;

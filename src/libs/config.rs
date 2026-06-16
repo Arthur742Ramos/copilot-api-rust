@@ -1,3 +1,7 @@
+//! Persisted configuration model (`config.json`): auth keys, per-model
+//! overrides, and provider definitions. Mirrors the TS `src/lib/config.ts`
+//! and round-trips unknown keys via `serde(flatten)`.
+
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

@@ -1,3 +1,6 @@
+//! Shared infrastructure: configuration, global state, HTTP client, auth and
+//! token handling, error types, and other cross-cutting utilities.
+
 pub mod api_config;
 pub mod approval;
 pub mod codex_rate_limit;

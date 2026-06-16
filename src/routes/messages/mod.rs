@@ -1,3 +1,6 @@
+//! Anthropic `/v1/messages` endpoint: request preprocessing and bidirectional
+//! translation between the Anthropic Messages API and the Copilot backend.
+
 pub mod anthropic_types;
 pub mod api_flows;
 pub mod count_tokens_handler;

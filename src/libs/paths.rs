@@ -1,3 +1,6 @@
+//! Filesystem paths for app data (tokens, credentials, config) resolved once
+//! from the environment at startup. Mirrors the TS `src/lib/paths.ts`.
+
 use once_cell::sync::Lazy;
 use std::path::PathBuf;
 

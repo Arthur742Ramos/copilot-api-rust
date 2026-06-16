@@ -1,3 +1,6 @@
+//! Builds the GitHub Copilot API request headers (User-Agent, version, editor
+//! and integration identifiers). Mirrors the TS `src/lib/api-config.ts`.
+
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::libs::opencode::get_cached_opencode_version;

@@ -1,3 +1,5 @@
+//! `/v1/models` endpoint: serves the list of available Copilot models.
+
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
