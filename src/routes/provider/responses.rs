@@ -248,7 +248,12 @@ fn render_responses_chunk(
 
     if !chunk.data.is_empty() && chunk.data != "[DONE]" {
         if let Ok(parsed) = serde_json::from_str::<Value>(&chunk.data) {
-            // TODO: logCodexRateLimitsEvent has no Rust port yet.
+            // The codex branch logs `codex.rate_limits` events (TS
+            // `parseResponsesProviderStreamChunk` does this when the provider is
+            // codex, which is exactly when `normalize_codex` is set).
+            if normalize_codex {
+                crate::libs::codex_rate_limit::log_codex_rate_limits_event(&parsed);
+            }
             if let Some(next) = responses_stream_event_usage(&parsed) {
                 *usage = next;
             }

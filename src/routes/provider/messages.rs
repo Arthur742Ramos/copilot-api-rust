@@ -7,8 +7,8 @@
 //! - `anthropic` — forward the Anthropic payload unchanged, optionally adjusting
 //!   reported input tokens, raw-forwarding the stream / JSON.
 //! - `openai-compatible` — translate Anthropic <-> OpenAI chat-completions.
-//! - `openai-responses` — translate Anthropic <-> Responses API (NOT YET PORTED;
-//!   returns 501).
+//! - `openai-responses` — translate Anthropic <-> Responses API (codex transport
+//!   or generic `/v1/responses`), including the web-search-only sub-flow.
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -23,22 +23,41 @@ use crate::libs::error::{http_error_from_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{
     create_provider_token_usage_recorder, merge_anthropic_usage, normalize_anthropic_usage,
-    normalize_openai_usage, TokenUsageRecorder, UsageTokens,
+    normalize_openai_usage, normalize_responses_usage, TokenUsageRecorder, UsageTokens,
 };
+use crate::libs::tool_search::resolve_bridge_tool_search_name;
 use crate::libs::utils::parse_user_id_metadata;
 use crate::routes::messages::anthropic_types::{
     AnthropicMessagesPayload, AnthropicStreamEventData, AnthropicStreamState,
 };
 use crate::routes::messages::non_stream_translation::{
-    translate_to_anthropic, translate_to_openai,
+    translate_to_anthropic, translate_to_openai_with_options, TranslateToOpenAiOptions,
 };
 use crate::routes::messages::preprocess::normalize_system_messages;
+use crate::routes::messages::responses_stream_translation::{
+    build_error_event, translate_responses_stream_event, ResponsesStreamState,
+};
+use crate::routes::messages::responses_translation::{
+    translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
+};
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, translate_chunk_to_anthropic_events,
 };
+use crate::routes::messages::web_search::fulfill::{
+    build_synthetic_stream_events, collect_web_search_responses_stream_result,
+    has_web_search_server_tool, is_web_search_only_request, prepare_web_search_responses_payload,
+    reconstruct_web_search_response, strip_web_search_server_tool,
+};
+use crate::routes::responses::utils::{
+    apply_responses_api_context_management, compact_input_by_latest_compaction,
+    DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO,
+};
+use crate::services::codex::create_responses::forward_codex_responses;
+use crate::services::codex::get_models::get_codex_models;
 use crate::services::copilot::create_chat_completions::ChatCompletionsPayload;
+use crate::services::copilot::create_responses::ResponsesResult;
 use crate::services::providers::provider_proxy::{
-    forward_provider_chat_completions, forward_provider_messages,
+    forward_provider_chat_completions, forward_provider_messages, forward_provider_responses,
 };
 
 const OPENAI_COMPATIBLE_CONTEXT_CACHE_MARKER_LIMIT: usize = 4;
@@ -103,21 +122,26 @@ pub async fn handle_provider_messages_for_provider(
 
     match provider_config.provider_type.as_str() {
         "openai-responses" => {
-            // TODO: port the openai-responses provider messages branch
-            // (web-search + Responses translation). Needs the web-search fulfill
-            // collect helpers and responses stream translation wiring.
-            Ok((
-                StatusCode::NOT_IMPLEMENTED,
-                Json(json!({
-                    "error": {
-                        "message": format!(
-                            "Provider '{provider}' openai-responses /v1/messages routing is not yet implemented in this build"
-                        ),
-                        "type": "invalid_request_error",
-                    }
-                })),
+            if has_web_search_server_tool(&payload) {
+                if is_web_search_only_request(&payload) {
+                    return handle_openai_responses_provider_web_search_messages(
+                        payload,
+                        &provider,
+                        &provider_config,
+                        &headers,
+                    )
+                    .await;
+                }
+                strip_web_search_server_tool(&mut payload);
+            }
+
+            handle_openai_responses_provider_messages(
+                payload,
+                &provider,
+                &provider_config,
+                &headers,
             )
-                .into_response())
+            .await
         }
         "openai-compatible" => {
             // stripWebSearchServerTool — no-op pass-through here (web-search
@@ -173,8 +197,322 @@ pub async fn handle_provider_messages_for_provider(
 }
 
 // ---------------------------------------------------------------------------
-// Model defaults / extra body
+// openai-responses branch
 // ---------------------------------------------------------------------------
+
+/// Mirrors `handleOpenAIResponsesProviderMessages`: translate the Anthropic
+/// payload to a Responses payload, run it through the codex transport (codex
+/// provider) or the generic `/v1/responses` endpoint, then translate the result
+/// back to Anthropic (streaming or JSON).
+async fn handle_openai_responses_provider_messages(
+    payload: AnthropicMessagesPayload,
+    provider: &str,
+    provider_config: &ResolvedProviderConfig,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let max_prompt_tokens = codex_max_prompt_tokens(provider_config, &payload.model);
+
+    let mut responses_payload = translate_anthropic_messages_to_responses_payload(&payload, None);
+
+    apply_responses_api_context_management(
+        &mut responses_payload,
+        max_prompt_tokens,
+        DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO,
+    );
+    compact_input_by_latest_compaction(&mut responses_payload);
+
+    let is_stream = responses_payload.stream.unwrap_or(false);
+    let is_codex = provider_config.name == "codex";
+
+    if is_codex {
+        let upstream_response =
+            forward_codex_responses(responses_payload, headers, &provider_config.base_url).await?;
+
+        if is_stream {
+            return Ok(stream_responses_provider_messages(
+                upstream_response,
+                &payload,
+                provider,
+                is_codex,
+            ));
+        }
+
+        let body = read_responses_result(upstream_response).await?;
+        return respond_responses_provider_messages_json(&body, &payload, provider);
+    }
+
+    let upstream_response =
+        forward_provider_responses(provider_config, &responses_payload, headers).await?;
+
+    if !upstream_response.status().is_success() {
+        tracing::error!("Failed to create provider responses: {provider}");
+        return Err(http_error_from_response(
+            "Failed to create provider responses",
+            upstream_response,
+        )
+        .await
+        .into());
+    }
+
+    if is_stream {
+        return Ok(stream_responses_provider_messages(
+            upstream_response,
+            &payload,
+            provider,
+            is_codex,
+        ));
+    }
+
+    let body = read_responses_result(upstream_response).await?;
+    respond_responses_provider_messages_json(&body, &payload, provider)
+}
+
+/// Mirrors `handleOpenAIResponsesProviderWebSearchMessages`: the web-search-only
+/// sub-flow. Switches the request to the Responses `web_search` tool, collects
+/// the streamed result into a single [`ResponsesResult`], reconstructs the
+/// native Anthropic `server_tool_use` + `web_search_tool_result` blocks, and
+/// replays them (streaming) or returns them as JSON.
+async fn handle_openai_responses_provider_web_search_messages(
+    payload: AnthropicMessagesPayload,
+    provider: &str,
+    provider_config: &ResolvedProviderConfig,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let max_prompt_tokens = codex_max_prompt_tokens(provider_config, &payload.model);
+
+    // `prepare_web_search_responses_payload` keeps the original model (model =
+    // None), drops the Anthropic server tool, and sets stream = true.
+    let mut responses_payload = prepare_web_search_responses_payload(&payload, None, None);
+    responses_payload.stream = Some(true);
+
+    apply_responses_api_context_management(
+        &mut responses_payload,
+        max_prompt_tokens,
+        DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO,
+    );
+    compact_input_by_latest_compaction(&mut responses_payload);
+
+    let is_codex = provider_config.name == "codex";
+    let error_prefix = format!("{provider} web search responses stream");
+
+    let body: ResponsesResult = if is_codex {
+        let upstream_response =
+            forward_codex_responses(responses_payload, headers, &provider_config.base_url).await?;
+        let stream = Box::pin(crate::libs::sse::events(upstream_response));
+        collect_web_search_responses_stream_result(stream, &error_prefix).await?
+    } else {
+        let upstream_response =
+            forward_provider_responses(provider_config, &responses_payload, headers).await?;
+
+        if !upstream_response.status().is_success() {
+            tracing::error!("Failed to create provider web search responses: {provider}");
+            return Err(http_error_from_response(
+                "Failed to create provider web search responses",
+                upstream_response,
+            )
+            .await
+            .into());
+        }
+
+        let content_type = response_content_type(&upstream_response);
+        if content_type.contains("text/event-stream") {
+            let stream = Box::pin(crate::libs::sse::events(upstream_response));
+            collect_web_search_responses_stream_result(stream, &error_prefix).await?
+        } else {
+            read_responses_result(upstream_response).await?
+        }
+    };
+
+    respond_web_search_provider_messages_json(&body, &payload, provider)
+}
+
+/// `codex` provider only: the configured model's `max_prompt_tokens` (used as the
+/// context-management limit). Mirrors the TS `selectedModel?.capabilities.limits.max_prompt_tokens`.
+fn codex_max_prompt_tokens(provider_config: &ResolvedProviderConfig, model: &str) -> Option<i64> {
+    if provider_config.name != "codex" {
+        return None;
+    }
+    get_codex_models()
+        .data
+        .iter()
+        .find(|m| m.id == model)
+        .and_then(|m| m.capabilities.limits.max_prompt_tokens)
+}
+
+/// Mirrors `streamResponsesProviderMessages`: drive the upstream Responses SSE
+/// stream through the Anthropic stream translator. Emits a synthetic error event
+/// if the stream ends without a completion event.
+fn stream_responses_provider_messages(
+    upstream: reqwest::Response,
+    payload: &AnthropicMessagesPayload,
+    provider: &str,
+    is_codex: bool,
+) -> Response {
+    let recorder = create_provider_messages_usage_recorder(payload, provider);
+    let tool_search_name =
+        resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
+    let provider_label = provider.to_string();
+    let event_stream = crate::libs::sse::events(upstream);
+
+    let body = Body::from_stream(async_stream::stream! {
+        let mut usage = UsageTokens::default();
+        let mut state = ResponsesStreamState::new(Some(tool_search_name));
+        futures_util::pin_mut!(event_stream);
+
+        while let Some(item) = event_stream.next().await {
+            let chunk = match item {
+                Ok(ev) => ev,
+                Err(err) => {
+                    yield Err(err);
+                    return;
+                }
+            };
+
+            if chunk.event.as_deref() == Some("ping") {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                ));
+                continue;
+            }
+
+            if chunk.data.is_empty() || chunk.data == "[DONE]" {
+                if chunk.data == "[DONE]" {
+                    break;
+                }
+                continue;
+            }
+
+            let parsed: Value = match serde_json::from_str(&chunk.data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Codex: log `codex.rate_limits` events (mirrors
+            // parseResponsesProviderStreamChunk).
+            if is_codex {
+                crate::libs::codex_rate_limit::log_codex_rate_limits_event(&parsed);
+            }
+
+            match parsed.get("type").and_then(Value::as_str) {
+                Some("response.completed") | Some("response.failed")
+                | Some("response.incomplete") => {
+                    usage = normalize_responses_usage(
+                        parsed.get("response").and_then(|r| r.get("usage")),
+                    );
+                }
+                _ => {}
+            }
+
+            for event in translate_responses_stream_event(&parsed, &mut state) {
+                if let Some(frame) = emit_event(&event) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
+            }
+        }
+
+        if !state.message_completed {
+            let error_event =
+                build_error_event(&format!("{provider_label} stream ended without a completion event"));
+            if let Some(frame) = emit_event(&error_event) {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            }
+        }
+
+        recorder.record(usage);
+    });
+
+    sse_response(body)
+}
+
+/// Mirrors `respondResponsesProviderMessagesJson`.
+#[allow(clippy::result_large_err)]
+fn respond_responses_provider_messages_json(
+    body: &ResponsesResult,
+    payload: &AnthropicMessagesPayload,
+    provider: &str,
+) -> Result<Response, AppError> {
+    let recorder = create_provider_messages_usage_recorder(payload, provider);
+    recorder.record(normalize_responses_usage(
+        responses_usage_value(body).as_ref(),
+    ));
+
+    let tool_search_name =
+        resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
+    let anthropic_response = translate_responses_result_to_anthropic(body, Some(&tool_search_name));
+    Ok(Json(anthropic_response).into_response())
+}
+
+/// Mirrors `respondWebSearchProviderMessagesJson`: record usage, reconstruct the
+/// native Anthropic web-search response, then JSON or synthetic-SSE replay it.
+#[allow(clippy::result_large_err)]
+fn respond_web_search_provider_messages_json(
+    body: &ResponsesResult,
+    payload: &AnthropicMessagesPayload,
+    provider: &str,
+) -> Result<Response, AppError> {
+    let recorder = create_provider_messages_usage_recorder(payload, provider);
+    recorder.record(normalize_responses_usage(
+        responses_usage_value(body).as_ref(),
+    ));
+
+    let request_id = if body.id.is_empty() {
+        format!("{provider}:{}", payload.model)
+    } else {
+        body.id.clone()
+    };
+    let (_extract, response) = reconstruct_web_search_response(payload, body, &request_id);
+
+    if !payload.stream.unwrap_or(false) {
+        return Ok(Json(response.to_json()).into_response());
+    }
+
+    let events = build_synthetic_stream_events(&response);
+    let body_stream = async_stream::stream! {
+        for event in events {
+            let event_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+                .to_string();
+            let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+            let frame = format!("event: {event_type}\ndata: {data}\n\n");
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+        }
+    };
+    Ok(sse_response(Body::from_stream(body_stream)))
+}
+
+/// Anthropic typed tools serialized to `Value`s for `resolve_bridge_tool_search_name`.
+fn anthropic_tools_as_slice(payload: &AnthropicMessagesPayload) -> Option<Vec<Value>> {
+    payload.tools.as_ref().map(|tools| {
+        tools
+            .iter()
+            .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+            .collect()
+    })
+}
+
+/// Read a Responses-API body into a typed [`ResponsesResult`].
+#[allow(clippy::result_large_err)]
+async fn read_responses_result(response: reqwest::Response) -> Result<ResponsesResult, AppError> {
+    let bytes = response.bytes().await.map_err(|e| {
+        AppError::Other(anyhow::anyhow!(
+            "Failed to read provider responses body: {e}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        AppError::Other(anyhow::anyhow!(
+            "Failed to parse provider responses body: {e}"
+        ))
+    })
+}
+
+/// The `usage` from a [`ResponsesResult`] as a `Value`, for `normalize_responses_usage`.
+fn responses_usage_value(body: &ResponsesResult) -> Option<Value> {
+    body.usage
+        .as_ref()
+        .and_then(|u| serde_json::to_value(u).ok())
+}
 
 /// Mirrors `applyModelDefaults` for the Anthropic payload (typed top_k is i64;
 /// config top_k is f64 — round to match the JS number).
@@ -280,7 +618,15 @@ fn create_openai_compatible_payload(
     payload: &AnthropicMessagesPayload,
     model_config: Option<&ModelConfig>,
 ) -> ChatCompletionsPayload {
-    let mut openai_payload = translate_to_openai(payload);
+    // Thread the PDF / tool-content support flags from the provider model config
+    // (TS passes `{ supportPdf, toolContentSupportType }` here).
+    let translation_options = TranslateToOpenAiOptions {
+        support_pdf: model_config.and_then(|m| m.support_pdf).unwrap_or(false),
+        tool_content_support_type: model_config
+            .and_then(|m| m.tool_content_support_type.clone())
+            .unwrap_or_default(),
+    };
+    let mut openai_payload = translate_to_openai_with_options(payload, &translation_options);
 
     apply_openai_compatible_thinking_budget(&mut openai_payload, payload);
 

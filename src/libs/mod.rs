@@ -1,5 +1,6 @@
 pub mod api_config;
 pub mod approval;
+pub mod codex_rate_limit;
 pub mod compact;
 pub mod config;
 pub mod copilot_rate_limit;
