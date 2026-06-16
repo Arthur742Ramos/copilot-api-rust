@@ -7,6 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 
 use crate::libs::request_auth::{check_auth, AuthOptions};
 use crate::libs::request_context::{resolve_trace_id, run_with_context, RequestContext};
@@ -83,6 +84,9 @@ pub fn build_router() -> Router {
         .layer(from_fn(general_auth_middleware))
         .layer(CorsLayer::permissive())
         .layer(from_fn(trace_middleware))
+        // Per-request access logging (method/path/status/latency) for all
+        // requests, including those rejected by auth.
+        .layer(TraceLayer::new_for_http())
 }
 
 async fn trace_middleware(req: Request, next: Next) -> Response {
