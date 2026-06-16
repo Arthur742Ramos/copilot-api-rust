@@ -66,8 +66,10 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     // 2. Web-search server-tool short-circuit. Mirrors `tryHandleWebSearch`.
     //
     // Runs BEFORE the provider-alias step because a web-search request may
-    // itself route to a configured provider (via the injected callback).
-    {
+    // itself route to a configured provider (via the injected callback). A
+    // cheap `Value`-level check gates the typed round-trip so the common case
+    // (no web_search server tool) avoids an extra deserialize/serialize.
+    if has_web_search_server_tool_value(&payload) {
         let mut typed = deserialize_payload(&payload)?;
         let forward_headers = headers.clone();
         let web_search_result =
@@ -87,8 +89,8 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         if let Some(result) = web_search_result {
             return result;
         }
-        // No web-search tool present: fold any in-place mutations back into the
-        // working `Value` payload.
+        // The tool was stripped (not fulfilled); fold the mutations back into
+        // the working `Value` payload.
         payload =
             serde_json::to_value(&typed).map_err(|e| AppError::Other(anyhow::anyhow!("{e}")))?;
     }
@@ -214,6 +216,27 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 fn deserialize_payload(payload: &Value) -> Result<AnthropicMessagesPayload, AppError> {
     serde_json::from_value(payload.clone())
         .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))
+}
+
+/// Cheap `Value`-level probe for an Anthropic `web_search` server tool: a
+/// `tools[]` entry whose `type` starts with `web_search` and that has no
+/// `input_schema`. Mirrors `is_web_search_server_tool` without deserializing.
+fn has_web_search_server_tool_value(payload: &Value) -> bool {
+    payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools.iter().any(|tool| {
+                let is_web_search = tool
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t.starts_with("web_search"))
+                    .unwrap_or(false);
+                let no_input_schema = tool.get("input_schema").map(Value::is_null).unwrap_or(true);
+                is_web_search && no_input_schema
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Mirrors `shouldUseResponsesApi`.
