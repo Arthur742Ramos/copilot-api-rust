@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Usage Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --panel-2: #1f232c;
+    --border: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #9aa3b2;
+    --accent: #5b9dff;
+    --accent-2: #7c5cff;
+    --good: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  select, input, button {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  input::placeholder { color: var(--muted); }
+  .section { margin-bottom: 28px; }
+  .section > h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin: 0 0 12px;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  th, td { padding: 9px 12px; text-align: right; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+    background: var(--panel-2);
+  }
+  thead th:hover { color: var(--text); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--panel-2); }
+  .sort-active { color: var(--accent); }
+  .chart {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    align-items: flex-end;
+    gap: 6px;
+    height: 200px;
+    overflow-x: auto;
+  }
+  .bar-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-end;
+    flex: 1 0 28px;
+    height: 100%;
+    gap: 6px;
+  }
+  .bar {
+    width: 70%;
+    min-height: 2px;
+    background: linear-gradient(180deg, var(--accent), var(--accent-2));
+    border-radius: 4px 4px 0 0;
+    transition: height 0.2s;
+  }
+  .bar-label { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  .pager { display: flex; gap: 10px; align-items: center; margin-top: 12px; justify-content: flex-end; }
+  .muted { color: var(--muted); }
+  .empty {
+    padding: 28px;
+    text-align: center;
+    color: var(--muted);
+    background: var(--panel);
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+  }
+  .range-note { color: var(--muted); font-size: 12px; margin-top: -6px; margin-bottom: 12px; }
+  .err { color: #ff6b6b; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Token Usage Dashboard</h1>
+  <div class="controls">
+    <select id="period" title="Period">
+      <option value="day">Day</option>
+      <option value="week">Week</option>
+      <option value="month">Month</option>
+    </select>
+    <input id="apiKey" type="password" placeholder="API key (optional)" style="width:180px" autocomplete="off">
+    <button id="refresh">Refresh</button>
+  </div>
+</header>
+<main>
+  <div id="error" class="err" style="display:none"></div>
+
+  <section class="section">
+    <h2>Totals</h2>
+    <div class="range-note" id="rangeNote"></div>
+    <div class="cards" id="totals"></div>
+  </section>
+
+  <section class="section">
+    <h2>By Model</h2>
+    <div id="modelWrap"></div>
+  </section>
+
+  <section class="section">
+    <h2>Daily Usage (total tokens)</h2>
+    <div id="chartWrap"></div>
+  </section>
+
+  <section class="section">
+    <h2>Recent Events</h2>
+    <div id="eventsWrap"></div>
+    <div class="pager" id="pager" style="display:none">
+      <span class="muted" id="pageInfo"></span>
+      <button id="prevPage">Prev</button>
+      <button id="nextPage">Next</button>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const EVENTS_PAGE_SIZE = 20;
+const state = {
+  period: "day",
+  eventsPage: 1,
+  totalPages: 1,
+  modelSort: { key: "total_tokens", dir: -1 },
+};
+
+function getKey() {
+  return (sessionStorage.getItem("tokenUsageApiKey") || "").trim();
+}
+function setKey(value) {
+  if (value) sessionStorage.setItem("tokenUsageApiKey", value);
+  else sessionStorage.removeItem("tokenUsageApiKey");
+}
+
+async function api(path) {
+  const headers = {};
+  const key = getKey();
+  if (key) headers["Authorization"] = "Bearer " + key;
+  const res = await fetch(path, { headers });
+  if (!res.ok) {
+    throw new Error("HTTP " + res.status + " for " + path);
+  }
+  return res.json();
+}
+
+function fmt(n) {
+  return (typeof n === "number" ? n : 0).toLocaleString();
+}
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+function showError(msg) {
+  const el = document.getElementById("error");
+  if (!msg) { el.style.display = "none"; el.textContent = ""; return; }
+  el.style.display = "block";
+  el.textContent = msg;
+}
+
+function renderTotals(summary) {
+  const t = summary.totals || {};
+  const cards = [
+    ["Total tokens", t.total_tokens],
+    ["Requests", t.request_count],
+    ["Input tokens", t.input_tokens],
+    ["Output tokens", t.output_tokens],
+    ["Cache read", t.cache_read_input_tokens],
+    ["Cache creation", t.cache_creation_input_tokens],
+  ];
+  document.getElementById("totals").innerHTML = cards.map(function (c) {
+    return '<div class="card"><div class="label">' + esc(c[0]) +
+      '</div><div class="value">' + fmt(c[1]) + "</div></div>";
+  }).join("");
+
+  const r = summary.range || {};
+  const note = r.start_utc && r.end_utc
+    ? "Range: " + esc(r.start_utc) + "  ->  " + esc(r.end_utc) + "  (period: " + esc(summary.period) + ")"
+    : "";
+  document.getElementById("rangeNote").textContent = note;
+}
+
+function renderModels(summary) {
+  const wrap = document.getElementById("modelWrap");
+  const rows = (summary.byModel || []).slice();
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">No usage recorded yet.</div>';
+    return;
+  }
+  const cols = [
+    ["model", "Model"],
+    ["request_count", "Requests"],
+    ["input_tokens", "Input"],
+    ["output_tokens", "Output"],
+    ["cache_read_input_tokens", "Cache read"],
+    ["cache_creation_input_tokens", "Cache create"],
+    ["total_tokens", "Total"],
+  ];
+  const s = state.modelSort;
+  rows.sort(function (a, b) {
+    let av = a[s.key], bv = b[s.key];
+    if (typeof av === "string" || typeof bv === "string") {
+      av = String(av); bv = String(bv);
+      return av < bv ? s.dir : av > bv ? -s.dir : 0;
+    }
+    return ((av || 0) - (bv || 0)) * -s.dir;
+  });
+  const head = cols.map(function (c) {
+    const active = c[0] === s.key ? " sort-active" : "";
+    const arrow = c[0] === s.key ? (s.dir < 0 ? " ▼" : " ▲") : "";
+    return '<th class="' + active.trim() + '" data-key="' + c[0] + '">' + esc(c[1]) + arrow + "</th>";
+  }).join("");
+  const body = rows.map(function (m) {
+    return "<tr><td>" + esc(m.model) + "</td>" +
+      "<td>" + fmt(m.request_count) + "</td>" +
+      "<td>" + fmt(m.input_tokens) + "</td>" +
+      "<td>" + fmt(m.output_tokens) + "</td>" +
+      "<td>" + fmt(m.cache_read_input_tokens) + "</td>" +
+      "<td>" + fmt(m.cache_creation_input_tokens) + "</td>" +
+      "<td>" + fmt(m.total_tokens) + "</td></tr>";
+  }).join("");
+  wrap.innerHTML = "<table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table>";
+  wrap.querySelectorAll("th[data-key]").forEach(function (th) {
+    th.addEventListener("click", function () {
+      const key = th.getAttribute("data-key");
+      if (state.modelSort.key === key) state.modelSort.dir *= -1;
+      else state.modelSort = { key: key, dir: key === "model" ? 1 : -1 };
+      renderModels(summary);
+    });
+  });
+}
+
+function renderChart(daily) {
+  const wrap = document.getElementById("chartWrap");
+  const days = daily.days || [];
+  const hasData = days.some(function (d) { return ((d.totals && d.totals.total_tokens) || 0) > 0; });
+  if (!days.length || !hasData) {
+    wrap.innerHTML = '<div class="empty">No usage recorded yet.</div>';
+    return;
+  }
+  const max = days.reduce(function (m, d) {
+    return Math.max(m, (d.totals && d.totals.total_tokens) || 0);
+  }, 0) || 1;
+  const bars = days.map(function (d) {
+    const v = (d.totals && d.totals.total_tokens) || 0;
+    const pct = Math.round((v / max) * 100);
+    const label = String(d.date || "").slice(5);
+    return '<div class="bar-wrap" title="' + esc(d.date) + ": " + fmt(v) + ' tokens">' +
+      '<div class="bar" style="height:' + pct + '%"></div>' +
+      '<div class="bar-label">' + esc(label) + "</div></div>";
+  }).join("");
+  wrap.innerHTML = '<div class="chart">' + bars + "</div>";
+}
+
+function renderEvents(page) {
+  const wrap = document.getElementById("eventsWrap");
+  const pager = document.getElementById("pager");
+  const items = page.items || [];
+  if (!items.length) {
+    wrap.innerHTML = '<div class="empty">No usage recorded yet.</div>';
+    pager.style.display = "none";
+    return;
+  }
+  const head = ["Time", "Model", "Endpoint", "Source", "Input", "Output", "Cache R", "Cache C", "Total"]
+    .map(function (h) { return "<th>" + esc(h) + "</th>"; }).join("");
+  const body = items.map(function (e) {
+    let when = e.created_at_utc || "";
+    const ms = e.created_at_ms;
+    if (typeof ms === "number") { try { when = new Date(ms).toLocaleString(); } catch (x) {} }
+    return "<tr><td>" + esc(when) + "</td>" +
+      "<td>" + esc(e.model) + "</td>" +
+      "<td>" + esc(e.endpoint) + "</td>" +
+      "<td>" + esc(e.source) + "</td>" +
+      "<td>" + fmt(e.input_tokens) + "</td>" +
+      "<td>" + fmt(e.output_tokens) + "</td>" +
+      "<td>" + fmt(e.cache_read_input_tokens) + "</td>" +
+      "<td>" + fmt(e.cache_creation_input_tokens) + "</td>" +
+      "<td>" + fmt(e.total_tokens) + "</td></tr>";
+  }).join("");
+  wrap.innerHTML = "<table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table>";
+
+  pager.style.display = "flex";
+  document.getElementById("pageInfo").textContent =
+    "Page " + page.page + " of " + page.total_pages + "  (" + fmt(page.total) + " events)";
+  document.getElementById("prevPage").disabled = page.page <= 1;
+  document.getElementById("nextPage").disabled = page.page >= page.total_pages;
+  state.eventsPage = page.page;
+  state.totalPages = page.total_pages;
+}
+
+async function loadEvents() {
+  const p = encodeURIComponent(state.period);
+  const page = await api("/token-usage/events?period=" + p +
+    "&page=" + state.eventsPage + "&page_size=" + EVENTS_PAGE_SIZE);
+  renderEvents(page);
+}
+
+async function loadAll() {
+  showError("");
+  const p = encodeURIComponent(state.period);
+  try {
+    const summary = await api("/token-usage?period=" + p);
+    renderTotals(summary);
+    renderModels(summary);
+    const daily = await api("/token-usage/daily?period=" + p);
+    renderChart(daily);
+    await loadEvents();
+  } catch (err) {
+    showError("Failed to load usage data: " + err.message +
+      (getKey() ? "" : " (if auth is enabled, enter an API key)"));
+  }
+}
+
+document.getElementById("period").addEventListener("change", function (e) {
+  state.period = e.target.value;
+  state.eventsPage = 1;
+  loadAll();
+});
+document.getElementById("apiKey").addEventListener("change", function (e) {
+  setKey(e.target.value);
+  state.eventsPage = 1;
+  loadAll();
+});
+document.getElementById("refresh").addEventListener("click", function () {
+  state.eventsPage = 1;
+  loadAll();
+});
+document.getElementById("prevPage").addEventListener("click", function () {
+  if (state.eventsPage > 1) { state.eventsPage--; loadEvents().catch(function (e) { showError(e.message); }); }
+});
+document.getElementById("nextPage").addEventListener("click", function () {
+  if (state.eventsPage < (state.totalPages || 1)) { state.eventsPage++; loadEvents().catch(function (e) { showError(e.message); }); }
+});
+
+(function init() {
+  const saved = getKey();
+  if (saved) document.getElementById("apiKey").value = saved;
+  document.getElementById("period").value = state.period;
+  loadAll();
+})();
+</script>
+</body>
+</html>
