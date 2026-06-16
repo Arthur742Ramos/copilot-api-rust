@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::StreamExt;
@@ -18,7 +18,7 @@ use crate::services::copilot::create_chat_completions::{
 };
 
 /// Mirrors routes/chat-completions/handler.ts `handleCompletion`.
-pub async fn handle_completion(body: Value) -> Result<Response, AppError> {
+pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
     let mut payload: ChatCompletionsPayload = serde_json::from_value(body)
         .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))?;
 
@@ -36,6 +36,7 @@ pub async fn handle_completion(body: Value) -> Result<Response, AppError> {
         return crate::routes::provider::chat_completions::handle_provider_chat_completions(
             payload,
             alias.provider,
+            headers,
         )
         .await;
     }
