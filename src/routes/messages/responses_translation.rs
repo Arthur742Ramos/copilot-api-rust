@@ -216,7 +216,9 @@ pub fn translate_anthropic_messages_to_responses_payload(
         .as_ref()
         .map(|m| serde_json::to_value(m).unwrap_or(Value::Null));
 
-    let max_output_tokens = payload.max_tokens.max(12800);
+    // `max_tokens` is required on a real /v1/messages request; default a
+    // missing value to 0 so the 12800 floor applies.
+    let max_output_tokens = payload.max_tokens.unwrap_or(0).max(12800);
 
     let reasoning = json!({
         "effort": get_reasoning_effort_for_model(&payload.model),
