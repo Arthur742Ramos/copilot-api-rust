@@ -12,8 +12,12 @@ env:
 
 jobs:
   ci:
-    name: build / test / lint
-    runs-on: ubuntu-latest
+    name: build / test / lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
 
@@ -33,7 +37,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Run fmt --check only on Linux to avoid CRLF/line-ending noise on Windows.
       - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
       - name: Clippy
@@ -44,3 +50,26 @@ jobs:
 
       - name: Test
         run: cargo test --verbose
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    # Non-blocking: advisory database churn shouldn't break CI; surfaced as a
+    # warning/annotation instead.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
