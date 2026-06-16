@@ -57,6 +57,9 @@ pub fn build_router() -> Router {
         )
         .route("/:provider/v1/models", get(deferred_provider_models))
         // Middleware stack (innermost first; trace ends up outermost).
+        .layer(from_fn(
+            crate::libs::zstd_request::zstd_decompression_middleware,
+        ))
         .layer(from_fn(admin_auth_middleware))
         .layer(from_fn(general_auth_middleware))
         .layer(CorsLayer::permissive())

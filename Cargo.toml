@@ -41,6 +41,7 @@ mac_address = "1"
 arboard = "3"
 tiktoken-rs = "0.6"
 chrono = "0.4"
+ruzstd = "0.8"
 
 [profile.release]
 opt-level = 3
