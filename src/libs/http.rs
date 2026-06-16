@@ -13,6 +13,13 @@ pub fn set_proxy_from_env(enabled: bool) {
     PROXY_FROM_ENV.store(enabled, Ordering::SeqCst);
 }
 
+/// Whether proxy-from-env is enabled. Exposed so the provider forwarding client
+/// (which is built separately, with redirects disabled) can mirror the same
+/// proxy gating as the shared `client()`.
+pub fn proxy_from_env_enabled() -> bool {
+    PROXY_FROM_ENV.load(Ordering::SeqCst)
+}
+
 /// Shared reqwest client. The TS code uses a global monkey-patched `fetch`
 /// (electron-fetch / undici with system CA). Here we use a single reqwest
 /// client configured with native roots and no global timeout (streaming).

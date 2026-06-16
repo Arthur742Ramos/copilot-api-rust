@@ -324,6 +324,13 @@ pub async fn forward_codex_responses(
 
     let headers = build_codex_responses_headers(request_headers, payload.stream)?;
     let url = resolve_codex_responses_url(base_url);
+    // SSRF: when the operator has configured a custom Codex base URL it is
+    // runtime-settable and therefore untrusted; validate it before forwarding.
+    // An empty `base_url` falls back to the fixed CODEX_API_BASE_URL (ChatGPT's
+    // own endpoint), which we trust and skip.
+    if !base_url.trim().is_empty() {
+        crate::services::providers::provider_proxy::validate_upstream_url(&url)?;
+    }
     let body = serde_json::to_vec(&payload).map_err(|e| {
         HttpError::internal(format!("Failed to serialize codex responses payload: {e}"))
     })?;
