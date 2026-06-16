@@ -86,7 +86,12 @@ pub enum InputField {
 /// Mirrors the TS `ResponseInputItem` union. Untagged: serde tries each variant
 /// structurally in order, falling back to `Other` for unknown shapes. Each
 /// known struct keeps its discriminating fields required so the match is stable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deserialization dispatches on the `type` discriminant (see the manual impl
+/// below) rather than relying on untagged structural matching: `Compaction`'s
+/// fields are a structural subset of `Reasoning`'s, so untagged matching would
+/// mis-route reasoning items. `Serialize` stays untagged (emits the inner shape).
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ResponseInputItem {
     Message(ResponseInputMessage),
@@ -98,6 +103,47 @@ pub enum ResponseInputItem {
     Compaction(ResponseInputCompaction),
     CompactionTrigger(ResponseInputCompactionTrigger),
     Other(Value),
+}
+
+impl<'de> Deserialize<'de> for ResponseInputItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let tag = value.get("type").and_then(Value::as_str).map(str::to_owned);
+        let from = |v: Value| -> Result<Self, D::Error> {
+            // input messages may omit `type`; everything else carries it.
+            Ok(match tag.as_deref() {
+                Some("function_call") => ResponseInputItem::FunctionToolCall(
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                ),
+                Some("function_call_output") => ResponseInputItem::FunctionCallOutput(
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                ),
+                Some("tool_search_call") => ResponseInputItem::ToolSearchCall(
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                ),
+                Some("tool_search_output") => ResponseInputItem::ToolSearchOutput(
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                ),
+                Some("reasoning") => ResponseInputItem::Reasoning(
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                ),
+                Some("compaction") => ResponseInputItem::Compaction(
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                ),
+                Some("compaction_trigger") => ResponseInputItem::CompactionTrigger(
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                ),
+                Some("message") | None => ResponseInputItem::Message(
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                ),
+                Some(_) => ResponseInputItem::Other(v),
+            })
+        };
+        from(value)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,9 +345,10 @@ pub struct ResponsesResult {
 // Output items
 // ---------------------------------------------------------------------------
 
-/// Mirrors the TS `ResponseOutputItem` union. Untagged, most-constrained
-/// variants first, `Other` last.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Mirrors the TS `ResponseOutputItem` union. `Serialize` is untagged;
+/// `Deserialize` dispatches on the `type` discriminant (manual impl below)
+/// because `Compaction`'s fields are a structural subset of `Reasoning`'s.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ResponseOutputItem {
     Message(ResponseOutputMessage),
@@ -311,6 +358,37 @@ pub enum ResponseOutputItem {
     Compaction(ResponseOutputCompaction),
     Reasoning(ResponseOutputReasoning),
     Other(Value),
+}
+
+impl<'de> Deserialize<'de> for ResponseOutputItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let tag = value.get("type").and_then(Value::as_str).map(str::to_owned);
+        Ok(match tag.as_deref() {
+            Some("message") => ResponseOutputItem::Message(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            ),
+            Some("function_call") => ResponseOutputItem::FunctionCall(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            ),
+            Some("tool_search_output") => ResponseOutputItem::ToolSearchOutput(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            ),
+            Some("tool_search_call") => ResponseOutputItem::ToolSearchCall(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            ),
+            Some("compaction") => ResponseOutputItem::Compaction(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            ),
+            Some("reasoning") => ResponseOutputItem::Reasoning(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            ),
+            _ => ResponseOutputItem::Other(value),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
