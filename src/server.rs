@@ -255,14 +255,12 @@ async fn admin_auth_middleware(req: Request, next: Next) -> Response {
 }
 
 async fn usage_viewer() -> Response {
-    // The usage dashboard HTML (pages/index.html) ships with the SQLite usage
-    // subsystem, which is deferred. Serve a placeholder so the route exists.
+    // Self-contained dashboard (inline CSS/JS, no external deps) that renders the
+    // /token-usage JSON API. Embedded at compile time so it ships in the binary.
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
-        .body(Body::from(
-            "<!doctype html><title>Usage Viewer</title><p>Usage viewer is not available in this build.</p>",
-        ))
+        .body(Body::from(include_str!("usage_viewer.html")))
         .unwrap()
 }
 
