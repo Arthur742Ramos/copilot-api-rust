@@ -1,5 +1,6 @@
 pub mod anthropic_types;
 pub mod api_flows;
+pub mod count_tokens_handler;
 pub mod handler;
 pub mod non_stream_translation;
 pub mod preprocess;

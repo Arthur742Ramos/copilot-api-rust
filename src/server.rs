@@ -69,7 +69,7 @@ pub fn build_router() -> Router {
         )
         .route(
             "/:provider/v1/messages/count_tokens",
-            post(deferred_provider_messages),
+            post(crate::routes::provider::count_tokens::post_provider_count_tokens),
         )
         .route(
             "/:provider/v1/models",
@@ -179,8 +179,4 @@ fn deferred(name: &str) -> Response {
         })),
     )
         .into_response()
-}
-
-async fn deferred_provider_messages() -> Response {
-    deferred("provider messages count_tokens")
 }

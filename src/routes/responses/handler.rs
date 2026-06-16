@@ -171,12 +171,12 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
 /// running `fixStreamIds` over its data, while sniffing usage from the terminal
 /// events, then record usage when the stream completes.
 fn stream_responses_sse(
-    upstream: reqwest::Response,
+    upstream: crate::services::copilot::create_responses::ResponsesEventStream,
     recorder: crate::libs::token_usage::TokenUsageRecorder,
 ) -> Response {
     use crate::libs::token_usage::UsageTokens;
 
-    let event_stream = crate::libs::sse::events(upstream);
+    let event_stream = upstream;
 
     let body = Body::from_stream(async_stream::stream! {
         let mut tracker = StreamIdTracker::new();

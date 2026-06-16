@@ -9,6 +9,7 @@ mod server;
 mod services;
 
 mod debug;
+mod mcp;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -54,6 +55,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Start the MCP tool_search bridge server over stdio
+    Mcp,
 }
 
 #[derive(Args, Debug)]
@@ -122,7 +125,10 @@ async fn main() {
 
     let verbose = matches!(&cli.command, Command::Start(a) if a.verbose)
         || matches!(&cli.command, Command::Auth(a) if a.verbose);
-    init_tracing(verbose);
+    // In MCP mode stdout is the JSON-RPC transport, so all logs must go to
+    // stderr to avoid corrupting the protocol stream.
+    let mcp_mode = matches!(&cli.command, Command::Mcp);
+    init_tracing(verbose, mcp_mode);
 
     let result = match cli.command {
         Command::Start(args) => run_server(args).await,
@@ -132,6 +138,7 @@ async fn main() {
             debug::run_debug(json).await;
             Ok(())
         }
+        Command::Mcp => mcp::run_mcp_server().await,
     };
 
     if let Err(e) = result {
@@ -140,14 +147,17 @@ async fn main() {
     }
 }
 
-fn init_tracing(verbose: bool) {
+fn init_tracing(verbose: bool, to_stderr: bool) {
     let default = if verbose { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
-        )
-        .init();
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
+    );
+    if to_stderr {
+        builder.with_writer(std::io::stderr).init();
+    } else {
+        builder.init();
+    }
 }
 
 async fn run_server(options: StartArgs) -> anyhow::Result<()> {

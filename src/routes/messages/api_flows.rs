@@ -319,7 +319,7 @@ pub async fn handle_with_responses_api(
                 let mut state = ResponsesStreamState::new(Some(tool_search_name));
                 let mut usage = UsageTokens::default();
 
-                let sse = crate::libs::sse::events(upstream);
+                let sse = upstream;
                 futures_util::pin_mut!(sse);
                 while let Some(item) = sse.next().await {
                     let chunk = match item {

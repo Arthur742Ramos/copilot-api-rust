@@ -17,6 +17,7 @@
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::libs::api_config::{
     copilot_base_url, copilot_headers, prepare_for_compact, prepare_interaction_headers, set_header,
@@ -715,18 +716,23 @@ pub enum ResponsesOutcome {
     Stream(Box<Value>),
 }
 
+/// A boxed stream of decoded SSE events, produced by either the HTTP transport
+/// (parsing the upstream response body) or the pooled websocket transport.
+pub type ResponsesEventStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<crate::libs::sse::SseEvent, std::io::Error>> + Send>,
+>;
+
 /// Return type of [`create_responses`] / [`create_http_responses`], mirroring
 /// the TS `CreateResponsesReturn = ResponsesResult | ResponsesStream`.
 ///
-/// Unlike [`ResponsesOutcome`] (a serde-friendly placeholder kept for any
-/// callers that need to (de)serialize an outcome), this enum carries the live
-/// `reqwest::Response` for the streaming arm so the route layer can forward its
-/// SSE body. It therefore cannot derive `Serialize`/`Deserialize`/`Clone`.
+/// The streaming arm carries a decoded `SseEvent` stream so the same route code
+/// drives both the HTTP (SSE-over-body) and websocket transports. It therefore
+/// cannot derive `Serialize`/`Deserialize`/`Clone`.
 pub enum CreateResponsesReturn {
     /// Non-streaming: the fully-buffered, parsed result.
     Result(Box<ResponsesResult>),
-    /// Streaming: the raw upstream response whose SSE body the route forwards.
-    Stream(reqwest::Response),
+    /// Streaming: decoded SSE events from the chosen transport.
+    Stream(ResponsesEventStream),
 }
 
 // ---------------------------------------------------------------------------
@@ -783,16 +789,130 @@ pub async fn create_responses(
     };
 
     if payload.stream == Some(true) && effective_transport == ResponsesTransport::Websocket {
-        // TODO Phase 5: pooled websocket transport. For now fall back to HTTP so
-        // streaming still works over plain SSE.
-        tracing::debug!(
-            "websocket responses transport not yet implemented; falling back to HTTP transport"
-        );
-        return create_http_responses(&payload, &st, headers, true).await;
+        return create_web_socket_responses(&payload, &st, &headers, &options);
     }
 
     let stream = payload.stream.unwrap_or(false);
     create_http_responses(&payload, &st, headers, stream).await
+}
+
+/// Build and drive the pooled websocket `/responses` transport, returning a
+/// decoded SSE event stream identical in shape to the HTTP path. Mirrors
+/// `prepareResponsesWebSocketRequest` + `createPooledResponsesWebSocketStream`.
+#[allow(clippy::result_large_err)]
+fn create_web_socket_responses(
+    payload: &ResponsesPayload,
+    st: &state::State,
+    headers: &HeaderMap,
+    options: &ResponsesRequestOptions<'_>,
+) -> Result<CreateResponsesReturn, HttpError> {
+    use crate::services::responses_websocket::{
+        create_pooled_web_socket_stream, create_web_socket_url, PooledWebSocketRequest,
+        PooledWebSocketStreamOptions,
+    };
+
+    // Headers: the websocket handshake reuses the prepared HTTP headers minus
+    // `x-initiator` (the initiator is carried in the payload instead).
+    let ws_headers: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| name.as_str() != "x-initiator")
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect();
+
+    // Pool key: token fingerprint | model | request id | subagent key.
+    let token_fingerprint = match st.copilot_token.as_deref() {
+        Some(token) if !token.is_empty() => {
+            let digest = Sha256::digest(token.as_bytes());
+            hex::encode(digest)[..16].to_string()
+        }
+        _ => "missing-token".to_string(),
+    };
+    let subagent_key = options
+        .subagent_marker
+        .map(|m| format!("{}:{}:{}", m.session_id, m.agent_id, m.agent_type))
+        .unwrap_or_else(|| "main".to_string());
+    let pool_key = [
+        token_fingerprint,
+        payload.model.clone(),
+        options.request_id.to_string(),
+        subagent_key,
+    ]
+    .join("|");
+
+    // Payload: response.create envelope with the initiator, minus stream/
+    // background/service_tier.
+    let mut ws_payload =
+        serde_json::to_value(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    if let Some(obj) = ws_payload.as_object_mut() {
+        obj.insert("type".to_string(), Value::String("response.create".into()));
+        obj.insert(
+            "initiator".to_string(),
+            Value::String(options.initiator.to_string()),
+        );
+        obj.remove("stream");
+        obj.remove("background");
+        obj.remove("service_tier");
+    }
+
+    let base = copilot_base_url(st);
+    let url = create_web_socket_url(&format!("{}/responses", base.trim_end_matches('/')));
+
+    let request = PooledWebSocketRequest {
+        headers: ws_headers,
+        payload: ws_payload,
+        pool_key,
+        url,
+    };
+
+    let stream = create_pooled_web_socket_stream(
+        request,
+        PooledWebSocketStreamOptions {
+            create_chunk: ws_chunk_from_data,
+            idle_timeout_ms: None,
+            is_terminal_chunk: is_terminal_ws_chunk,
+            open_error_message: "Failed to create responses websocket".to_string(),
+            stream_error_message: "Responses websocket stream error".to_string(),
+            terminal_chunk_missing_message: "Responses websocket ended without a terminal response"
+                .to_string(),
+            unavailable_error_message: None,
+        },
+    );
+
+    Ok(CreateResponsesReturn::Stream(Box::pin(stream)))
+}
+
+/// Turn one websocket message payload into an `SseEvent`, lifting the event type
+/// out of the JSON `type` field so downstream translation sees the same shape as
+/// the HTTP SSE transport.
+fn ws_chunk_from_data(data: String) -> crate::libs::sse::SseEvent {
+    let (event, id) = serde_json::from_str::<Value>(&data)
+        .ok()
+        .map(|parsed| {
+            let event = parsed
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let id = parsed.get("id").and_then(Value::as_str).map(str::to_owned);
+            (event, id)
+        })
+        .unwrap_or((None, None));
+    crate::libs::sse::SseEvent { id, event, data }
+}
+
+/// Terminal websocket chunk detector: completed / failed / incomplete / error.
+fn is_terminal_ws_chunk(chunk: &crate::libs::sse::SseEvent) -> bool {
+    matches!(
+        chunk.event.as_deref(),
+        Some("response.completed")
+            | Some("response.failed")
+            | Some("response.incomplete")
+            | Some("error")
+    )
 }
 
 /// Mirrors `createHttpResponses`: POST `{copilotBaseUrl}/responses`, log rate
@@ -825,7 +945,9 @@ async fn create_http_responses(
     }
 
     if stream {
-        Ok(CreateResponsesReturn::Stream(response))
+        Ok(CreateResponsesReturn::Stream(Box::pin(
+            crate::libs::sse::events(response),
+        )))
     } else {
         let result = response
             .json::<ResponsesResult>()

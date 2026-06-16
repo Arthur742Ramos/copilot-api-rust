@@ -35,7 +35,6 @@ use crate::libs::config::{get_message_api_web_search_model, is_responses_api_web
 use crate::libs::error::AppError;
 use crate::libs::models::find_endpoint_model;
 use crate::libs::provider_model::{parse_provider_model_alias, ProviderModelAlias};
-use crate::libs::sse::events;
 use crate::libs::subagent::{parse_subagent_marker_from_first_user, SubagentMarker};
 use crate::libs::token_usage::{
     create_copilot_token_usage_recorder, normalize_responses_usage, UsageTokens,
@@ -619,11 +618,11 @@ fn build_web_search_responses_stream_result(
 /// `collectWebSearchResponsesStreamResult`: drive the upstream SSE stream to a
 /// single buffered `ResponsesResult`.
 pub async fn collect_web_search_responses_stream_result(
-    upstream: reqwest::Response,
+    upstream: crate::services::copilot::create_responses::ResponsesEventStream,
     error_message_prefix: &str,
 ) -> Result<ResponsesResult, AppError> {
     let mut state = WebSearchResponsesStreamCollection::default();
-    let stream = events(upstream);
+    let stream = upstream;
     futures_util::pin_mut!(stream);
 
     while let Some(item) = stream.next().await {
