@@ -1,7 +1,7 @@
 use crate::libs::state;
 use crate::services::copilot::get_models::Model;
 
-/// Mirrors src/lib/models.ts.
+// Mirrors src/lib/models.ts.
 
 pub struct NormalizedSdkModelId {
     pub family: String,
@@ -21,7 +21,12 @@ pub fn to_client_model_id(model_id: &str) -> String {
 }
 
 pub fn find_endpoint_model(sdk_model_id: &str) -> Option<Model> {
-    let models = state::with_state(|s| s.models.as_ref().map(|m| m.data.clone()).unwrap_or_default());
+    let models = state::with_state(|s| {
+        s.models
+            .as_ref()
+            .map(|m| m.data.clone())
+            .unwrap_or_default()
+    });
 
     if let Some(exact) = models.iter().find(|m| m.id == sdk_model_id) {
         return Some(exact.clone());

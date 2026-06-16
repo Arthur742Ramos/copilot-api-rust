@@ -2,7 +2,7 @@ use serde_json::json;
 
 use crate::services::copilot::get_models::Model;
 
-/// Mirrors src/lib/provider-model.ts.
+// Mirrors src/lib/provider-model.ts.
 
 pub struct ProviderModelAlias {
     pub model: String,

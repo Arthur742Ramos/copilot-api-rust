@@ -93,7 +93,10 @@ pub fn normalize_anthropic_usage(usage: Option<&Value>) -> UsageTokens {
             usage,
             "cache_creation_input_tokens",
         )),
-        cache_read_input_tokens: normalize_optional_token(top_f64(usage, "cache_read_input_tokens")),
+        cache_read_input_tokens: normalize_optional_token(top_f64(
+            usage,
+            "cache_read_input_tokens",
+        )),
         input_tokens: normalize_optional_token(top_f64(usage, "input_tokens")),
         output_tokens: normalize_optional_token(top_f64(usage, "output_tokens")),
         total_tokens: normalize_optional_token(top_f64(usage, "total_tokens")),
@@ -106,7 +109,9 @@ pub fn merge_anthropic_usage(current: UsageTokens, next: UsageTokens) -> UsageTo
         cache_creation_input_tokens: next
             .cache_creation_input_tokens
             .or(current.cache_creation_input_tokens),
-        cache_read_input_tokens: next.cache_read_input_tokens.or(current.cache_read_input_tokens),
+        cache_read_input_tokens: next
+            .cache_read_input_tokens
+            .or(current.cache_read_input_tokens),
         input_tokens: next.input_tokens.or(current.input_tokens),
         output_tokens: next.output_tokens.or(current.output_tokens),
         total_tokens: next.total_tokens.or(current.total_tokens),

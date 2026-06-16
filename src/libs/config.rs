@@ -32,7 +32,10 @@ pub struct ModelConfig {
     pub context_cache: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "supportPdf")]
     pub support_pdf: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "toolContentSupportType")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "toolContentSupportType"
+    )]
     pub tool_content_support_type: Option<Vec<String>>,
 }
 
@@ -90,19 +93,34 @@ pub struct AppConfig {
         rename = "modelResponsesApiCompactThresholds"
     )]
     pub model_responses_api_compact_thresholds: Option<BTreeMap<String, f64>>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "modelReasoningEfforts")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "modelReasoningEfforts"
+    )]
     pub model_reasoning_efforts: Option<BTreeMap<String, ReasoningEffort>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "useMessagesApi")]
     pub use_messages_api: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "useResponsesApiWebSocket")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "useResponsesApiWebSocket"
+    )]
     pub use_responses_api_web_socket: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "anthropicApiKey")]
     pub anthropic_api_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "useResponsesApiWebSearch")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "useResponsesApiWebSearch"
+    )]
     pub use_responses_api_web_search: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "messageApiWebSearchModel")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "messageApiWebSearchModel"
+    )]
     pub message_api_web_search_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "claudeTokenMultiplier")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "claudeTokenMultiplier"
+    )]
     pub claude_token_multiplier: Option<f64>,
     /// Preserve unknown top-level keys (e.g. desktop-only fields).
     #[serde(flatten)]
@@ -115,9 +133,18 @@ const GPT5_COMMENTARY_PROMPT: &str = "# Working with the user\n\nYou interact wi
 
 fn default_config() -> AppConfig {
     let mut extra_prompts = BTreeMap::new();
-    extra_prompts.insert("gpt-5-mini".to_string(), GPT5_EXPLORATION_PROMPT.to_string());
-    extra_prompts.insert("gpt-5.3-codex".to_string(), GPT5_COMMENTARY_PROMPT.to_string());
-    extra_prompts.insert("gpt-5.4-mini".to_string(), GPT5_COMMENTARY_PROMPT.to_string());
+    extra_prompts.insert(
+        "gpt-5-mini".to_string(),
+        GPT5_EXPLORATION_PROMPT.to_string(),
+    );
+    extra_prompts.insert(
+        "gpt-5.3-codex".to_string(),
+        GPT5_COMMENTARY_PROMPT.to_string(),
+    );
+    extra_prompts.insert(
+        "gpt-5.4-mini".to_string(),
+        GPT5_COMMENTARY_PROMPT.to_string(),
+    );
     extra_prompts.insert("gpt-5.4".to_string(), GPT5_COMMENTARY_PROMPT.to_string());
     extra_prompts.insert("gpt-5.5".to_string(), GPT5_COMMENTARY_PROMPT.to_string());
 
@@ -202,8 +229,12 @@ fn read_editable_config_from_disk() -> Result<AppConfig, anyhow::Error> {
             if raw.trim().is_empty() {
                 return Ok(AppConfig::default());
             }
-            serde_json::from_str::<AppConfig>(&raw)
-                .map_err(|_| anyhow::anyhow!("Config file is not valid JSON: {}", PATHS.config_path.display()))
+            serde_json::from_str::<AppConfig>(&raw).map_err(|_| {
+                anyhow::anyhow!(
+                    "Config file is not valid JSON: {}",
+                    PATHS.config_path.display()
+                )
+            })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AppConfig::default()),
         Err(e) => Err(anyhow::Error::new(e)),
@@ -221,7 +252,10 @@ fn merge_default_config(mut config: AppConfig) -> (AppConfig, bool) {
     let def = default_config();
     let def_prompts = def.extra_prompts.clone().unwrap_or_default();
     let def_efforts = def.model_reasoning_efforts.clone().unwrap_or_default();
-    let def_thresholds = def.model_responses_api_compact_thresholds.clone().unwrap_or_default();
+    let def_thresholds = def
+        .model_responses_api_compact_thresholds
+        .clone()
+        .unwrap_or_default();
 
     let prompts = config.extra_prompts.get_or_insert_with(BTreeMap::new);
     let mut changed = false;
@@ -231,7 +265,9 @@ fn merge_default_config(mut config: AppConfig) -> (AppConfig, bool) {
             changed = true;
         }
     }
-    let efforts = config.model_reasoning_efforts.get_or_insert_with(BTreeMap::new);
+    let efforts = config
+        .model_reasoning_efforts
+        .get_or_insert_with(BTreeMap::new);
     for (k, v) in &def_efforts {
         if !efforts.contains_key(k) {
             efforts.insert(k.clone(), v.clone());
@@ -399,7 +435,9 @@ pub fn get_small_model() -> String {
 }
 
 pub fn is_responses_api_context_management_enabled() -> bool {
-    get_config().use_responses_api_context_management.unwrap_or(true)
+    get_config()
+        .use_responses_api_context_management
+        .unwrap_or(true)
 }
 
 pub fn get_model_responses_api_compact_threshold(model: &str) -> Option<f64> {
@@ -526,12 +564,14 @@ pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
         return None;
     }
     let base_url = normalize_provider_base_url(provider.base_url.as_deref().unwrap_or(""));
-    let auth_type = resolve_provider_auth_type(
-        provider_name,
-        provider.auth_type.as_deref(),
-        &provider_type,
-    );
-    let api_key = provider.api_key.clone().unwrap_or_default().trim().to_string();
+    let auth_type =
+        resolve_provider_auth_type(provider_name, provider.auth_type.as_deref(), &provider_type);
+    let api_key = provider
+        .api_key
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let mut missing = Vec::new();
     if base_url.is_empty() {
         missing.push("baseUrl");

@@ -9,7 +9,10 @@ use crate::libs::state::State;
 /// token for a short-lived Copilot API token. Uses the global state directly.
 pub async fn get_copilot_token(state: &State) -> Result<GetCopilotTokenResponse, HttpError> {
     let response = client()
-        .get(format!("{}/copilot_internal/v2/token", get_github_api_base_url()))
+        .get(format!(
+            "{}/copilot_internal/v2/token",
+            get_github_api_base_url()
+        ))
         .headers(github_headers(state))
         .send()
         .await

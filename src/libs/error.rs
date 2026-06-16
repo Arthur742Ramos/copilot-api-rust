@@ -15,7 +15,12 @@ pub struct HttpError {
 }
 
 impl HttpError {
-    pub fn new(message: impl Into<String>, status: StatusCode, headers: HeaderMap, body: String) -> Self {
+    pub fn new(
+        message: impl Into<String>,
+        status: StatusCode,
+        headers: HeaderMap,
+        body: String,
+    ) -> Self {
         HttpError {
             message: message.into(),
             status,
@@ -45,8 +50,12 @@ impl std::fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 /// Build an HttpError from a non-OK reqwest response, consuming its body.
-pub async fn http_error_from_response(message: impl Into<String>, response: reqwest::Response) -> HttpError {
-    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+pub async fn http_error_from_response(
+    message: impl Into<String>,
+    response: reqwest::Response,
+) -> HttpError {
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut headers = HeaderMap::new();
     for (name, value) in response.headers().iter() {
         if let (Ok(n), Ok(v)) = (
@@ -121,7 +130,11 @@ impl IntoResponse for AppError {
                 // body text, and a synthetic Error from its `.message`. Our
                 // synthetic errors (HttpError::internal) carry an empty body, so
                 // fall back to the message text in that case.
-                let message = if e.body.is_empty() { e.message.clone() } else { e.body.clone() };
+                let message = if e.body.is_empty() {
+                    e.message.clone()
+                } else {
+                    e.body.clone()
+                };
                 let body = Json(json!({
                     "error": {
                         "message": message,

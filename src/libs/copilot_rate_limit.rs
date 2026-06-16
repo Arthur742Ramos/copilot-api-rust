@@ -46,7 +46,11 @@ fn decode_component(value: &str) -> String {
     value.replace('+', " ")
 }
 
-fn get_rate_limit_usage(headers: &HeaderMap, type_name: &'static str, header_name: &str) -> Option<RateLimitUsage> {
+fn get_rate_limit_usage(
+    headers: &HeaderMap,
+    type_name: &'static str,
+    header_name: &str,
+) -> Option<RateLimitUsage> {
     let header_value = get_header_value(headers, header_name)?;
     let (remaining, reset_at) = parse_rate_limit_header(&header_value)?;
     Some(RateLimitUsage {

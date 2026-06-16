@@ -1,3 +1,8 @@
+// Deferred subsystems (provider routing, Codex OAuth, MCP, usage store) are
+// translated and wired but not yet reachable from the core proxy spine, so
+// their items read as dead code until those features are turned on.
+#![allow(dead_code)]
+
 mod libs;
 mod routes;
 mod server;
@@ -195,9 +200,7 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
              All models remain accessible without it; configure the model ID in settings.json."
         );
     }
-    tracing::info!(
-        "Usage Viewer: {server_url}/usage-viewer?endpoint={server_url}/usage"
-    );
+    tracing::info!("Usage Viewer: {server_url}/usage-viewer?endpoint={server_url}/usage");
 
     let app = server::build_router();
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], options.port));
@@ -216,7 +219,10 @@ async fn run_auth(options: AuthArgs) -> anyhow::Result<()> {
     match provider {
         "copilot" => {
             setup_github_token(true).await?;
-            tracing::info!("GitHub token written to {}", PATHS.github_token_path.display());
+            tracing::info!(
+                "GitHub token written to {}",
+                PATHS.github_token_path.display()
+            );
         }
         "codex" => {
             run_codex_login().await?;
@@ -292,7 +298,9 @@ async fn run_check_usage() -> anyhow::Result<()> {
         }
     });
 
-    let premium = snapshots.premium_interactions.unwrap_or_else(default_quota_detail);
+    let premium = snapshots
+        .premium_interactions
+        .unwrap_or_else(default_quota_detail);
     let premium_total = premium.entitlement;
     let premium_used = premium_total - premium.remaining;
     let premium_percent_used = if premium_total > 0.0 {
@@ -306,7 +314,11 @@ async fn run_check_usage() -> anyhow::Result<()> {
         Some(snap) => {
             let total = snap.entitlement;
             let used = total - snap.remaining;
-            let percent_used = if total > 0.0 { used / total * 100.0 } else { 0.0 };
+            let percent_used = if total > 0.0 {
+                used / total * 100.0
+            } else {
+                0.0
+            };
             format!(
                 "{name}: {}/{} used ({:.1}% used, {:.1}% remaining)",
                 used, total, percent_used, snap.percent_remaining

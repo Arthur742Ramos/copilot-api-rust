@@ -15,7 +15,10 @@ pub async fn poll_access_token(device_code: &DeviceCodeResponse) -> String {
 
     // Interval is seconds; +1 second of safety margin, then to milliseconds.
     let sleep_duration = Duration::from_millis((device_code.interval + 1) * 1000);
-    tracing::debug!("Polling access token with interval of {}ms", sleep_duration.as_millis());
+    tracing::debug!(
+        "Polling access token with interval of {}ms",
+        sleep_duration.as_millis()
+    );
 
     let body = serde_json::json!({
         "client_id": app_config.client_id,
