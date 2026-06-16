@@ -3,13 +3,9 @@
 // their items read as dead code until those features are turned on.
 #![allow(dead_code)]
 
-mod libs;
-mod routes;
-mod server;
-mod services;
-
-mod debug;
-mod mcp;
+// The crate's modules live in the `copilot_api` library (src/lib.rs) so that
+// integration tests can link against them. The binary just drives the CLI.
+use copilot_api::{debug, libs, mcp, server, services};
 
 use clap::{Args, Parser, Subcommand};
 

@@ -45,9 +45,12 @@ pub fn build_router() -> Router {
         )
         .route("/usage", get(crate::routes::usage::get_usage))
         .route("/token", get(crate::routes::token::get_token))
-        // Token-usage subsystem (implemented).
+        // Token-usage subsystem (implemented). A single `nest` already serves
+        // `/token-usage` and `/token-usage/...`; the bare trailing-slash form is
+        // redirected like `/usage-viewer/` (nesting it twice panics axum with an
+        // overlapping-route error at router construction).
         .nest("/token-usage", crate::routes::token_usage::router())
-        .nest("/token-usage/", crate::routes::token_usage::router())
+        .route("/token-usage/", get(token_usage_redirect))
         .route(
             "/responses",
             post(crate::routes::responses::route::post_responses),
@@ -193,6 +196,14 @@ async fn usage_viewer_redirect() -> Response {
     Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header("location", "/usage-viewer")
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn token_usage_redirect() -> Response {
+    Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header("location", "/token-usage")
         .body(Body::empty())
         .unwrap()
 }

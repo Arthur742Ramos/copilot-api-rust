@@ -12,6 +12,10 @@ categories = ["command-line-utilities", "web-programming"]
 rust-version = "1.82"
 default-run = "copilot-api"
 
+[lib]
+name = "copilot_api"
+path = "src/lib.rs"
+
 [[bin]]
 name = "copilot-api"
 path = "src/main.rs"
@@ -53,6 +57,11 @@ indexmap = { version = "2", features = ["serde"] }
 # Used by the pooled websocket responses transport (later in this stacked
 # series); declared here so the dependency set is stable across the stack.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+
+[dev-dependencies]
+serial_test = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.release]
 opt-level = 3
