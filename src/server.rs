@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::libs::request_auth::{check_auth, AuthOptions};
@@ -90,7 +90,7 @@ pub fn build_router() -> Router {
         ))
         .layer(from_fn(admin_auth_middleware))
         .layer(from_fn(general_auth_middleware))
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         // Cap request-body size before any handler buffers it.
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         // Convert a panic in any handler into a 500 JSON response instead of an
@@ -100,6 +100,34 @@ pub fn build_router() -> Router {
         // Per-request access logging (method/path/status/latency) for all
         // requests, including those rejected by auth.
         .layer(TraceLayer::new_for_http())
+}
+
+/// CORS policy for the API.
+///
+/// We intentionally allow any origin: the OpenAI / Anthropic browser SDKs call
+/// this gateway directly from arbitrary web origins, so origin-restricting would
+/// break client compatibility. Methods and headers are restricted to the set the
+/// SDKs actually use rather than `Any`, making the policy explicit.
+///
+/// SECURITY: credentials are NOT allowed (`allow_credentials` is never set), so
+/// browsers will not send cookies / HTTP-auth on cross-origin requests and the
+/// wildcard origin cannot be combined with credentials. This gateway relies on
+/// bearer/x-api-key tokens in request headers for auth, not ambient credentials.
+/// Operators SHOULD still front this service with their own authentication.
+fn cors_layer() -> CorsLayer {
+    use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+    use axum::http::{HeaderName, Method};
+
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            CONTENT_TYPE,
+            AUTHORIZATION,
+            HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("anthropic-version"),
+            HeaderName::from_static("anthropic-beta"),
+        ])
 }
 
 /// Render a handler panic as a 500 JSON error (instead of dropping the
