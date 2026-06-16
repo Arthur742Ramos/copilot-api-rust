@@ -6,7 +6,10 @@
 //!
 //! Conventions match the rest of the crate:
 //! - serde_json has `preserve_order`, so unknown keys captured via
-//!   `#[serde(flatten)] extra` round-trip in their original insertion order.
+//!   `#[serde(flatten)] extra` preserve their order *relative to each other*.
+//!   Note that serde emits all declared struct fields first and the flattened
+//!   `extra` map afterwards, so key order is not preserved relative to known
+//!   fields — only within `extra`.
 //! - Anthropic/Responses payloads are walked as loosely-typed `Value` where the
 //!   shape is a union; typed structs are used where a known shape helps.
 //! - All optionals use `#[serde(skip_serializing_if = "Option::is_none")]`.
@@ -609,7 +612,12 @@ pub enum ResponsesTransport {
 
 /// Mirrors the TS `CreateResponsesReturn` union (`ResponsesResult | stream`).
 /// The streaming arm is a Phase 3 placeholder.
+///
+/// `#[serde(untagged)]` so the `Result` arm (de)serializes as the bare
+/// `ResponsesResult` wire shape rather than an externally-tagged
+/// `{ "Result": ... }` object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum ResponsesOutcome {
     Result(Box<ResponsesResult>),
     // TODO Phase 3: replace `Box<Value>` with the real pooled-stream handle once

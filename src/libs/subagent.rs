@@ -35,8 +35,8 @@ fn parse_subagent_marker_from_system_reminder(text: &str) -> Option<SubagentMark
                 continue;
             }
             Some(marker_index) => {
-                let marker_json = reminder_content[marker_index + SUBAGENT_MARKER_PREFIX.len()..]
-                    .trim();
+                let marker_json =
+                    reminder_content[marker_index + SUBAGENT_MARKER_PREFIX.len()..].trim();
                 match serde_json::from_str::<SubagentMarker>(marker_json) {
                     Ok(parsed)
                         if !parsed.session_id.is_empty()

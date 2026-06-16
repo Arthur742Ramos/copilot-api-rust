@@ -86,7 +86,7 @@ fn parse_record(record: &str) -> Option<SseEvent> {
     let mut id: Option<String> = None;
     let mut event: Option<String> = None;
     let mut data_lines: Vec<String> = Vec::new();
-    let mut saw_field = false;
+    let mut saw_data = false;
 
     for raw_line in record.split('\n') {
         // Normalize a trailing `\r` (handles `\r\n` line endings within a record).
@@ -113,25 +113,24 @@ fn parse_record(record: &str) -> Option<SseEvent> {
         match field {
             "data" => {
                 data_lines.push(value.to_string());
-                saw_field = true;
+                saw_data = true;
             }
             "event" => {
                 event = Some(value.to_string());
-                saw_field = true;
             }
-            "id" => {
-                // The spec ignores an id containing a NUL; otherwise set it.
-                if !value.contains('\u{0}') {
-                    id = Some(value.to_string());
-                }
-                saw_field = true;
+            // The spec ignores an id containing a NUL; otherwise set it.
+            "id" if !value.contains('\u{0}') => {
+                id = Some(value.to_string());
             }
             // "retry" and unknown fields are ignored.
             _ => {}
         }
     }
 
-    if !saw_field {
+    // Per the SSE spec, a record only dispatches an event when it carried at
+    // least one `data:` field; records with only `event:`/`id:` (e.g. bare
+    // keep-alives) do not emit.
+    if !saw_data {
         return None;
     }
 

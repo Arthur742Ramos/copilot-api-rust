@@ -26,9 +26,18 @@ mod tests {
 
     #[test]
     fn maps_all_known_finish_reasons() {
-        assert_eq!(map_openai_stop_reason_to_anthropic(Some("stop")), Some("end_turn"));
-        assert_eq!(map_openai_stop_reason_to_anthropic(Some("length")), Some("max_tokens"));
-        assert_eq!(map_openai_stop_reason_to_anthropic(Some("tool_calls")), Some("tool_use"));
+        assert_eq!(
+            map_openai_stop_reason_to_anthropic(Some("stop")),
+            Some("end_turn")
+        );
+        assert_eq!(
+            map_openai_stop_reason_to_anthropic(Some("length")),
+            Some("max_tokens")
+        );
+        assert_eq!(
+            map_openai_stop_reason_to_anthropic(Some("tool_calls")),
+            Some("tool_use")
+        );
         assert_eq!(
             map_openai_stop_reason_to_anthropic(Some("content_filter")),
             Some("end_turn")

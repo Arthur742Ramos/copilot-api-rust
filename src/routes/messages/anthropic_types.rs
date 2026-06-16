@@ -409,7 +409,8 @@ mod tests {
 
     #[test]
     fn stream_event_round_trips() {
-        let input = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        let input =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
         let ev: AnthropicStreamEventData = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&ev).unwrap();
         assert_eq!(input, output);

@@ -121,7 +121,10 @@ fn normalize_system_content_for_merge(content: &Value) -> Value {
                 } else {
                     let mut c = block.clone();
                     if let Some(obj) = c.as_object_mut() {
-                        obj.insert("text".into(), Value::String(ensure_system_reminder_text(text)));
+                        obj.insert(
+                            "text".into(),
+                            Value::String(ensure_system_reminder_text(text)),
+                        );
                     }
                     c
                 }
@@ -264,10 +267,7 @@ pub fn normalize_system_messages(payload: &mut Value) {
 
     let mut normalized: Vec<Value> = Vec::new();
     // `undefined` system is `None`; preserve an empty-string system as `Some`.
-    let mut system: Option<Value> = payload
-        .get("system")
-        .filter(|v| !v.is_null())
-        .cloned();
+    let mut system: Option<Value> = payload.get("system").filter(|v| !v.is_null()).cloned();
 
     for message in messages {
         if message.get("role").and_then(|r| r.as_str()) == Some("system") {
@@ -448,7 +448,10 @@ fn is_compact_auto_continue_message(last_message: &Value) -> bool {
 
 /// `getCompactType`: `1` COMPACT_REQUEST / `2` COMPACT_AUTO_CONTINUE / `0`.
 pub fn get_compact_type(payload: &Value) -> i32 {
-    let last_message = payload.get("messages").and_then(|m| m.as_array()).and_then(|a| a.last());
+    let last_message = payload
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.last());
 
     if let Some(lm) = last_message {
         if is_compact_message(lm) {
@@ -527,7 +530,10 @@ fn tool_result_with_content(tr: &Value, new_content: Value) -> Value {
 
 fn merge_content_with_text(tr: &Value, text_block: &Value) -> Value {
     if let Some(s) = tr.get("content").and_then(|c| c.as_str()) {
-        let text = text_block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        let text = text_block
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
         return tool_result_with_content(tr, Value::String(format!("{s}\n\n{text}")));
     }
     if has_tool_ref(tr) {
@@ -614,8 +620,10 @@ fn merge_attachments_into_tool_results(
             };
             let mut ordered = matched.clone();
             ordered.sort_by_key(|(order, _)| *order);
-            let ordered_attachments: Vec<Value> =
-                ordered.into_iter().map(|(_, attachment)| attachment).collect();
+            let ordered_attachments: Vec<Value> = ordered
+                .into_iter()
+                .map(|(_, attachment)| attachment)
+                .collect();
             merge_content_with_attachments(block, &ordered_attachments)
         })
         .collect()
@@ -627,8 +635,7 @@ fn assign_attachments_to_tool_results(
     tool_result_indices: &[usize],
     fallback_tool_result_indices: Option<&[usize]>,
 ) {
-    let fallback_tool_result_indices =
-        fallback_tool_result_indices.unwrap_or(tool_result_indices);
+    let fallback_tool_result_indices = fallback_tool_result_indices.unwrap_or(tool_result_indices);
 
     if attachments.is_empty() {
         return;
@@ -767,8 +774,9 @@ fn merge_attachments_for_tool_results(
 
     // Match PDF read tool results and documents in order first.
     if !document_blocks.is_empty() && !pdf_read_tool_result_indices.is_empty() {
-        let matched_document_count =
-            pdf_read_tool_result_indices.len().min(document_blocks.len());
+        let matched_document_count = pdf_read_tool_result_indices
+            .len()
+            .min(document_blocks.len());
         let matched_documents = &document_blocks[..matched_document_count];
         let matched_document_orders: std::collections::HashSet<usize> =
             matched_documents.iter().map(|(order, _)| *order).collect();
@@ -1129,7 +1137,12 @@ pub fn prepare_messages_api_payload(payload: &mut Value, selected_model: Option<
     }
 
     let mut effort_undefined = false;
-    if let Some(reasoning_effort) = selected_model.capabilities.supports.reasoning_effort.as_ref() {
+    if let Some(reasoning_effort) = selected_model
+        .capabilities
+        .supports
+        .reasoning_effort
+        .as_ref()
+    {
         if !reasoning_effort.contains(&effort) {
             match reasoning_effort.last() {
                 Some(last) => effort = last.clone(),
