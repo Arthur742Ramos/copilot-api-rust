@@ -10,7 +10,7 @@
 #   docker compose up
 #
 # Alternatively, skip the interactive step by exporting a pre-generated token on
-# the host (COPILOT_API_GITHUB_TOKEN is passed through below) and just `up`.
+# the host before `up` — see the COPILOT_API_GITHUB_TOKEN note below.
 services:
   copilot-api:
     build: .
@@ -19,10 +19,14 @@ services:
       - "4141:4141"
     volumes:
       - copilot-api-data:/data
+    # The image already sets COPILOT_API_HOST=0.0.0.0 so the published port
+    # works. COPILOT_API_GITHUB_TOKEN is passed through from the host using the
+    # list form (no `=value`): when the host variable is unset it is left
+    # UNDEFINED in the container rather than set to an empty string. An
+    # empty-but-present value would be treated as a provided token by clap's env
+    # binding and would defeat the interactive auth flow.
     environment:
-      # The image already sets COPILOT_API_HOST=0.0.0.0 so the published port
-      # works; pass a token through from the host to skip interactive auth.
-      COPILOT_API_GITHUB_TOKEN: ${COPILOT_API_GITHUB_TOKEN:-}
+      - COPILOT_API_GITHUB_TOKEN
     restart: unless-stopped
 
 volumes:

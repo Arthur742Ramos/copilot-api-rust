@@ -315,13 +315,22 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
 
 /// Compact, copy-pasteable startup banner so a new user immediately knows the
 /// server is up and how to point a client at it. Emitted once after the listener
-/// binds. Reuses the configured-API-keys check to flag the unauthenticated case.
+/// binds. Reuses the configured-API-keys check to describe the auth requirement.
 fn print_ready_banner(server_url: &str) {
     let unauthenticated = crate::libs::request_auth::get_configured_api_keys().is_empty();
-    let auth_line = if unauthenticated {
-        "  Auth:    UNAUTHENTICATED (any key works). Set auth.apiKeys in config.json to require one."
+    // The token shown in the Anthropic example must actually be accepted: any
+    // value (even none) works when no keys are configured, but a configured
+    // deployment rejects "dummy", so show a placeholder there instead.
+    let (auth_line, anthropic_token) = if unauthenticated {
+        (
+            "  Auth:    OPEN — no API key required. Set auth.apiKeys in config.json to require one.",
+            "dummy",
+        )
     } else {
-        "  Auth:    API key required (auth.apiKeys is set)."
+        (
+            "  Auth:    API key required — send one of your auth.apiKeys as x-api-key / Bearer.",
+            "<your-api-key>",
+        )
     };
     tracing::info!(
         "\n\
@@ -331,7 +340,7 @@ fn print_ready_banner(server_url: &str) {
          OpenAI clients:    base_url = {server_url}/v1\n\
          Anthropic / Claude Code:\n\
            ANTHROPIC_BASE_URL={server_url}\n\
-           ANTHROPIC_AUTH_TOKEN=dummy\n\
+           ANTHROPIC_AUTH_TOKEN={anthropic_token}\n\
          {auth_line}\n\
          ============================================================"
     );
@@ -339,7 +348,8 @@ fn print_ready_banner(server_url: &str) {
 
 /// Resolves when the process receives a Ctrl-C, or (on unix) a SIGTERM, so the
 /// server can drain in-flight requests before exiting.
-async fn shutdown_signal() {    let ctrl_c = async {
+async fn shutdown_signal() {
+    let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
 

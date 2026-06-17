@@ -37,11 +37,18 @@ pub async fn poll_access_token(device_code: &DeviceCodeResponse) -> Result<Strin
 
     loop {
         if Instant::now() >= deadline {
-            return Err(HttpError::internal(format!(
-                "Device code expired after {}s without authorization. \
-                 Re-run the command and complete the GitHub login prompt.",
-                device_code.expires_in
-            )));
+            // A user-visible timeout, not an internal failure — use 408 so the
+            // CLI error line doesn't read as a server bug ("status 500").
+            return Err(HttpError::new(
+                format!(
+                    "Device code expired after {}s without authorization. \
+                     Re-run the command and complete the GitHub login prompt.",
+                    device_code.expires_in
+                ),
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                axum::http::HeaderMap::new(),
+                String::new(),
+            ));
         }
 
         let response = client()
