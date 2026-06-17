@@ -104,8 +104,7 @@ pub async fn create_chat_completions(
     if payload.stream.unwrap_or(false) {
         Ok(ChatCompletionsResult::Streaming(response))
     } else {
-        let json = response
-            .json::<Value>()
+        let json = crate::libs::http::read_json_capped::<Value>(response)
             .await
             .map_err(|e| HttpError::internal(format!("Failed to parse chat completions: {e}")))?;
         Ok(ChatCompletionsResult::NonStreaming(json))

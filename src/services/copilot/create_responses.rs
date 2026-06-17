@@ -947,8 +947,7 @@ async fn create_http_responses(
             crate::libs::sse::events(response),
         )))
     } else {
-        let result = response
-            .json::<ResponsesResult>()
+        let result = crate::libs::http::read_json_capped::<ResponsesResult>(response)
             .await
             .map_err(|e| HttpError::internal(format!("Failed to parse responses: {e}")))?;
         Ok(CreateResponsesReturn::Result(Box::new(result)))

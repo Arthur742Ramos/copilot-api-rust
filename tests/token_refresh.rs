@@ -19,6 +19,16 @@ fn clamps_refresh_deadline_to_avoid_hot_loop() {
 }
 
 #[test]
+fn zero_or_missing_refresh_in_uses_default_not_hot_loop() {
+    let now_ms = 1_000_000;
+    // refresh_in 0 (omitted/malformed upstream) must NOT yield a ~1s deadline.
+    // It substitutes the 1500s default: 1_500_000 - 60_000 = 1_440_000ms.
+    assert_eq!(get_refresh_deadline_ms(0, now_ms), now_ms + 1_440_000);
+    // A negative value is treated the same way.
+    assert_eq!(get_refresh_deadline_ms(-5, now_ms), now_ms + 1_440_000);
+}
+
+#[test]
 fn caps_poll_delay_at_15_seconds() {
     let now_ms = 1_000_000;
     assert_eq!(get_refresh_poll_delay_ms(now_ms + 120_000, now_ms), 15_000);

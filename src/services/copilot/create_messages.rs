@@ -233,8 +233,7 @@ pub async fn create_messages(
     if payload.stream.unwrap_or(false) {
         Ok(CreateMessagesResult::Streaming(response))
     } else {
-        let json = response
-            .json::<AnthropicResponse>()
+        let json = crate::libs::http::read_json_capped::<AnthropicResponse>(response)
             .await
             .map_err(|e| HttpError::internal(format!("Failed to parse messages: {e}")))?;
         Ok(CreateMessagesResult::NonStreaming(json))
