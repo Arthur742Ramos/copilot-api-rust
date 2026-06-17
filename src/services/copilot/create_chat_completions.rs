@@ -74,16 +74,19 @@ pub async fn create_chat_completions(
         .post(format!("{base}/chat/completions"))
         .headers(headers)
         .body(body);
-    let response = crate::libs::http::send_with_connect_retry(request, "chat")
-        .await
-        .map_err(|e| {
-            crate::libs::metrics::record_upstream_request(
-                "chat",
-                crate::libs::metrics::UpstreamStatus::TransportError,
-                upstream_start.elapsed().as_secs_f64(),
-            );
-            HttpError::internal(format!("Failed to create chat completions: {e}"))
-        })?;
+    let response = crate::libs::http::send_with_connect_retry(
+        request,
+        crate::libs::http::retry_endpoint::CHAT,
+    )
+    .await
+    .map_err(|e| {
+        crate::libs::metrics::record_upstream_request(
+            "chat",
+            crate::libs::metrics::UpstreamStatus::TransportError,
+            upstream_start.elapsed().as_secs_f64(),
+        );
+        HttpError::internal(format!("Failed to create chat completions: {e}"))
+    })?;
     crate::libs::metrics::record_upstream_request(
         "chat",
         crate::libs::metrics::UpstreamStatus::from_code(response.status().as_u16()),
