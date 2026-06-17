@@ -44,7 +44,7 @@ pub fn get_configured_api_keys() -> Vec<String> {
     normalize_api_keys(config.auth.as_ref().and_then(|a| a.api_keys.as_ref()))
 }
 
-fn normalize_api_key(value: &Option<Value>) -> Option<String> {
+fn normalize_api_key(value: Option<&Value>) -> Option<String> {
     match value {
         Some(Value::String(s)) => {
             let t = s.trim();
@@ -60,8 +60,7 @@ fn normalize_api_key(value: &Option<Value>) -> Option<String> {
 
 pub fn get_configured_admin_api_keys() -> Vec<String> {
     let config = get_config();
-    let admin_api_key = config.auth.as_ref().and_then(|a| a.admin_api_key.clone());
-    match normalize_api_key(&admin_api_key) {
+    match normalize_api_key(config.auth.as_ref().and_then(|a| a.admin_api_key.as_ref())) {
         Some(k) => vec![k],
         None => Vec::new(),
     }

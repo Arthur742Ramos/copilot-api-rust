@@ -481,12 +481,34 @@ mod tests {
 
     #[test]
     fn event_name_matches_serde_tag() {
-        // event_name() must stay in lockstep with the serialized `type` field;
-        // the SSE encoder relies on this to skip an intermediate Value.
+        // event_name() must stay in lockstep with the serialized `type` field
+        // for EVERY variant; the SSE encoder relies on this to skip an
+        // intermediate Value. Covering all variants catches drift if a new one
+        // is added.
         let cases = [
+            AnthropicStreamEventData::MessageStart {
+                message: AnthropicMessageStart::default(),
+            },
+            AnthropicStreamEventData::ContentBlockStart {
+                index: 0,
+                content_block: serde_json::json!({"type": "text", "text": ""}),
+            },
+            AnthropicStreamEventData::ContentBlockDelta {
+                index: 0,
+                delta: AnthropicContentBlockDelta::TextDelta {
+                    text: String::new(),
+                },
+            },
+            AnthropicStreamEventData::ContentBlockStop { index: 0 },
+            AnthropicStreamEventData::MessageDelta {
+                delta: AnthropicMessageDeltaBody::default(),
+                usage: None,
+            },
             AnthropicStreamEventData::MessageStop,
             AnthropicStreamEventData::Ping,
-            AnthropicStreamEventData::ContentBlockStop { index: 0 },
+            AnthropicStreamEventData::Error {
+                error: AnthropicErrorBody::default(),
+            },
         ];
         for ev in cases {
             let value = serde_json::to_value(&ev).unwrap();
