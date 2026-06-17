@@ -206,17 +206,16 @@ async fn wait_for_authorization_code(state: &str) -> Option<String> {
     let v4 = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
         .await
         .ok();
-    let v6 = tokio::net::TcpListener::bind(("::1", CALLBACK_PORT)).await.ok();
+    let v6 = tokio::net::TcpListener::bind(("::1", CALLBACK_PORT))
+        .await
+        .ok();
     if v4.is_none() && v6.is_none() {
         return None;
     }
 
     // Handle one accepted connection: parse the callback, write the response,
     // and return Some(code) once the matching-state code arrives.
-    async fn handle_conn(
-        socket: &mut tokio::net::TcpStream,
-        state: &str,
-    ) -> Option<String> {
+    async fn handle_conn(socket: &mut tokio::net::TcpStream, state: &str) -> Option<String> {
         let mut buf = vec![0u8; 8192];
         let n = socket.read(&mut buf).await.ok()?;
         let request = String::from_utf8_lossy(&buf[..n]);
