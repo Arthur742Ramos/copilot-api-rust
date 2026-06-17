@@ -120,8 +120,10 @@ async fn oversize_body_returns_json_shaped_413() {
     // A body over the 32 MiB limit must return a 413 with the Anthropic JSON
     // error shape, not axum's plain-text "length limit exceeded" rejection.
     set_config(&[], None);
-    // 33 MiB of filler — just over MAX_REQUEST_BODY_BYTES.
-    let big = "x".repeat(33 * 1024 * 1024);
+    // Just over the configured request-body limit; derive from the constant so
+    // this stays correct if the limit changes.
+    let over_limit = copilot_api::libs::http::MAX_REQUEST_BODY_BYTES + 1024;
+    let big = "x".repeat(over_limit);
     let request = Request::builder()
         .method(Method::POST)
         .uri("/v1/messages")

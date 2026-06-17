@@ -235,10 +235,9 @@ async fn normalize_oversize_response(req: Request, next: Next) -> Response {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
         Json(json!({
-            "type": "error",
             "error": {
-                "type": "invalid_request_error",
                 "message": "Request body is too large.",
+                "type": "invalid_request_error",
             }
         })),
     )
