@@ -88,10 +88,11 @@ pub async fn set_permissions_600(path: &std::path::Path) {
 #[cfg(not(unix))]
 pub async fn set_permissions_600(_path: &std::path::Path) {}
 
-/// Emit a one-line startup warning on platforms where [`set_permissions_600`]
-/// cannot restrict file permissions (non-unix, i.e. win32). No-op on unix.
+/// Emit a one-line startup warning on Windows, where [`set_permissions_600`]
+/// cannot restrict file permissions via unix mode bits. No-op on unix and on
+/// other non-unix targets (the message is Windows/NTFS-specific).
 pub fn warn_if_file_perms_unrestricted() {
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         tracing::warn!(
             "File permissions are not restricted on this platform (win32): the GitHub token and \

@@ -231,7 +231,29 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     });
     tracing::info!("Available models: \n{model_list}");
 
-    let server_url = format!("http://localhost:{}", options.port);
+    // Resolve the bind host once into an IpAddr (single source of truth for both
+    // the advertised URL and the listen SocketAddr below). Accepts an IP literal
+    // (e.g. 127.0.0.1, ::1, 0.0.0.0) and defaults to loopback to limit exposure.
+    // We parse to an IpAddr rather than DNS-resolving so the listen interface is
+    // unambiguous.
+    let ip: std::net::IpAddr = options.host.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid --host '{}': expected an IP address such as 127.0.0.1 or 0.0.0.0",
+            options.host
+        )
+    })?;
+
+    // Derive the advertised URL from the actual bind IP. Unspecified binds
+    // (0.0.0.0 / ::) aren't directly reachable, so fall back to "localhost" for
+    // display; otherwise advertise the concrete IP (bracketing IPv6 literals).
+    let server_host = if ip.is_unspecified() {
+        "localhost".to_string()
+    } else if ip.is_ipv6() {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    };
+    let server_url = format!("http://{server_host}:{}", options.port);
     if options.claude_code {
         run_claude_code_setup(&server_url).await;
     }
@@ -248,15 +270,6 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
 
     let app = server::build_router();
-    // Resolve the bind host. Accepts an IP literal (e.g. 127.0.0.1, ::1,
-    // 0.0.0.0) and defaults to loopback to limit exposure. We parse to an
-    // IpAddr rather than DNS-resolving so the listen interface is unambiguous.
-    let ip: std::net::IpAddr = options.host.trim().parse().map_err(|_| {
-        anyhow::anyhow!(
-            "Invalid --host '{}': expected an IP address such as 127.0.0.1 or 0.0.0.0",
-            options.host
-        )
-    })?;
     let addr = std::net::SocketAddr::new(ip, options.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     if !ip.is_loopback() {
