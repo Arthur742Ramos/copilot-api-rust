@@ -47,6 +47,36 @@ pub fn client() -> &'static reqwest::Client {
     &CLIENT
 }
 
+/// Send a request, retrying ONCE on a genuine connection failure.
+///
+/// A `reqwest` error where `is_connect()` is true means the TCP/TLS connection
+/// to the upstream never established — the request did not reach the model, so
+/// retrying cannot duplicate or double-bill a generation. We deliberately do
+/// NOT on read/body errors (the connection was live, a stream may have
+/// started) or on HTTP 5xx status (those reached the model, so the caller
+/// handles them). One short fixed backoff smooths the sporadic stale-keepalive /
+/// transient-connect failures seen under concurrency.
+///
+/// `endpoint` is a bounded label (messages | chat | responses) used only for the
+/// retry counter metric. The builder must be cloneable (our bodies are owned
+/// `Vec<u8>`, so `try_clone` always succeeds); if it somehow isn't, we send once.
+pub async fn send_with_connect_retry(
+    builder: reqwest::RequestBuilder,
+    endpoint: &'static str,
+) -> reqwest::Result<reqwest::Response> {
+    let retry = builder.try_clone();
+    let first = builder.send().await;
+    match first {
+        Err(e) if e.is_connect() && retry.is_some() => {
+            tracing::warn!("upstream connect error ({endpoint}); retrying once: {e}");
+            metrics::counter!("copilot_upstream_retry_total", "endpoint" => endpoint).increment(1);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            retry.unwrap().send().await
+        }
+        other => other,
+    }
+}
+
 /// Max bytes buffered from a non-streaming upstream JSON response (16 MiB).
 /// Generous for any real Copilot completion (output is bounded by `max_tokens`)
 /// while preventing a misbehaving/compromised upstream from driving unbounded
@@ -85,4 +115,30 @@ pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
     }
 
     serde_json::from_slice(&buf).map_err(|e| format!("failed to parse upstream response: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_body_requests_are_cloneable_for_retry() {
+        // send_with_connect_retry depends on try_clone() succeeding so it can
+        // replay the request after a connect failure. A request built with an
+        // owned byte body (as all our upstream calls are) must be cloneable;
+        // streaming bodies would not be, which is why we only use owned Vec<u8>.
+        let req = client()
+            .post("http://127.0.0.1:0/v1/messages")
+            .body(vec![1u8, 2, 3])
+            .build()
+            .unwrap();
+        let rebuilt = client()
+            .post("http://127.0.0.1:0/v1/messages")
+            .body(vec![1u8, 2, 3]);
+        assert!(
+            rebuilt.try_clone().is_some(),
+            "owned-body requests must be cloneable so the retry can replay them"
+        );
+        drop(req);
+    }
 }
