@@ -68,7 +68,7 @@ pub async fn http_error_from_response(
             headers.insert(n, v);
         }
     }
-    let body = response.text().await.unwrap_or_default();
+    let body = crate::libs::http::read_text_capped(response).await;
     HttpError::new(message, status, headers, body)
 }
 
