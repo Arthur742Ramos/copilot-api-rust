@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::libs::config::{
-    get_model_mappings, get_raw_provider_config, is_reserved_provider_name, list_enabled_providers,
+    get_model_mappings, get_provider_config, get_raw_provider_config, is_reserved_provider_name,
     reload_config, set_model_mappings, set_provider_config, ProviderConfig,
 };
 use crate::libs::paths::PATHS;
@@ -75,7 +75,10 @@ pub async fn post_reload_route() -> Response {
 
 /// A single provider's state with the `apiKey` secret redacted to a boolean.
 fn provider_summary(name: &str) -> Value {
-    let enabled = list_enabled_providers().iter().any(|n| n == name);
+    // `get_provider_config` resolves+validates this one provider, so it is the
+    // O(1) per-provider enabled check (list_enabled_providers would re-scan all
+    // providers on every call, making the listing O(n^2)).
+    let enabled = get_provider_config(name).is_some();
     match get_raw_provider_config(name) {
         Some(p) => json!({
             "name": name,
@@ -131,21 +134,23 @@ pub async fn post_providers_route(body: Bytes) -> Response {
         Err(_) => return invalid_request("Invalid request body."),
     };
 
-    if parsed.name.trim().is_empty() {
+    let name = parsed.name.trim();
+    if name.is_empty() {
         return invalid_request("Provider name must be a non-empty string.");
     }
-    // Reserved-name rejection is a client error, not a server fault.
-    if is_reserved_provider_name(&parsed.name) {
+    // Reserved-name rejection is a client error, not a server fault. Checked on
+    // the trimmed name so a value like "copilot " is rejected as 400 here rather
+    // than slipping through to set_provider_config and surfacing as a 500.
+    if is_reserved_provider_name(name) {
         return invalid_request(&format!(
-            "Provider {} is reserved and cannot be configured.",
-            parsed.name.trim()
+            "Provider {name} is reserved and cannot be configured."
         ));
     }
 
-    match set_provider_config(&parsed.name, parsed.config) {
+    match set_provider_config(name, parsed.config) {
         Ok(_) => Json(json!({
             "configPath": config_path_string(),
-            "provider": provider_summary(parsed.name.trim()),
+            "provider": provider_summary(name),
         }))
         .into_response(),
         Err(error) => forwarded_error(&error.to_string()),
