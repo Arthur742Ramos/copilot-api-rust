@@ -43,8 +43,9 @@ const MESSAGE_TYPE: &str = "message";
 const COMPACTION_SIGNATURE_PREFIX: &str = "cm1#";
 const COMPACTION_SIGNATURE_SEPARATOR: &str = "@";
 
-/// `export const THINKING_TEXT = "Thinking..."`.
-pub const THINKING_TEXT: &str = "Thinking...";
+/// Re-exported from [`super::utils`] so all translation modules share one
+/// source of truth for the "Thinking..." placeholder.
+pub use super::utils::THINKING_TEXT;
 
 // ---------------------------------------------------------------------------
 // normalizeToolSchema — defined locally (non_stream_translation may not exist

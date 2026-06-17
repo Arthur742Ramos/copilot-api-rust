@@ -2,6 +2,11 @@
 //!
 //! Mirrors `src/routes/messages/utils.ts`.
 
+/// Placeholder text for an empty thinking block. Mirrors the TS
+/// `THINKING_TEXT = "Thinking..."`. Defined once here and reused by all four
+/// translation modules so the user-visible string has a single source of truth.
+pub const THINKING_TEXT: &str = "Thinking...";
+
 /// Maps an OpenAI `finish_reason` to the Anthropic `stop_reason`.
 ///
 /// Mirrors `mapOpenAIStopReasonToAnthropic`:
