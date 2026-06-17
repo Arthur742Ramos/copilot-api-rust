@@ -203,16 +203,19 @@ pub async fn create_messages(
         .post(format!("{base}/v1/messages"))
         .headers(headers)
         .body(body);
-    let response = crate::libs::http::send_with_connect_retry(request, "messages")
-        .await
-        .map_err(|e| {
-            crate::libs::metrics::record_upstream_request(
-                "messages",
-                crate::libs::metrics::UpstreamStatus::TransportError,
-                upstream_start.elapsed().as_secs_f64(),
-            );
-            HttpError::internal(format!("Failed to create messages: {e}"))
-        })?;
+    let response = crate::libs::http::send_with_connect_retry(
+        request,
+        crate::libs::http::retry_endpoint::MESSAGES,
+    )
+    .await
+    .map_err(|e| {
+        crate::libs::metrics::record_upstream_request(
+            "messages",
+            crate::libs::metrics::UpstreamStatus::TransportError,
+            upstream_start.elapsed().as_secs_f64(),
+        );
+        HttpError::internal(format!("Failed to create messages: {e}"))
+    })?;
     crate::libs::metrics::record_upstream_request(
         "messages",
         crate::libs::metrics::UpstreamStatus::from_code(response.status().as_u16()),

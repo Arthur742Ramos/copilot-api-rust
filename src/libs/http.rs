@@ -47,10 +47,25 @@ pub fn client() -> &'static reqwest::Client {
     &CLIENT
 }
 
-/// The upstream endpoints that route through [`send_with_connect_retry`]. Used
-/// both as the `endpoint` label values and to pre-register the retry counter, so
-/// the label set can't drift between the call sites and the pre-registration.
-pub const RETRY_ENDPOINTS: [&str; 3] = ["messages", "chat", "responses"];
+/// The `endpoint` label values for upstream calls that route through
+/// [`send_with_connect_retry`]. Defined as named constants and used at BOTH the
+/// call sites and the pre-registration below, so a new/renamed endpoint can't
+/// silently reintroduce the "counter series only appears after the first retry"
+/// gap. `RETRY_ENDPOINTS` is built from the same constants.
+pub mod retry_endpoint {
+    pub const MESSAGES: &str = "messages";
+    pub const CHAT: &str = "chat";
+    pub const RESPONSES: &str = "responses";
+}
+
+/// Every endpoint label that routes through [`send_with_connect_retry`], used to
+/// pre-register the retry counter. Built from [`retry_endpoint`] so it stays in
+/// lockstep with the call sites.
+pub const RETRY_ENDPOINTS: [&str; 3] = [
+    retry_endpoint::MESSAGES,
+    retry_endpoint::CHAT,
+    retry_endpoint::RESPONSES,
+];
 
 /// Register `copilot_upstream_retry_total{endpoint=...}` at 0 for every known
 /// endpoint so the series exists from startup. Without this the counter only
