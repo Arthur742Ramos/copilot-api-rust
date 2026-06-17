@@ -19,7 +19,9 @@ use crate::libs::config::{get_image_chat_model, get_image_model};
 use crate::libs::error::{AppError, HttpError};
 use crate::libs::sse::Decoder;
 use crate::services::codex::create_responses::forward_codex_responses;
-use crate::services::copilot::create_responses::ResponsesPayload;
+use crate::services::copilot::create_responses::{
+    InputField, MessageContent, ResponseInputItem, ResponseInputMessage, ResponsesPayload,
+};
 
 /// A parsed `/v1/images/generations` request. Only `prompt` is required; every
 /// other field defaults server-side so a minimal `images.generate(model, prompt)`
@@ -101,16 +103,18 @@ fn build_image_payload(req: &ImageGenerationRequest) -> ResponsesPayload {
         }
     }
 
-    let input = json!([{
-        "type": "message",
-        "role": "user",
-        "content": [{ "type": "input_text", "text": req.prompt }],
-    }]);
+    let input = InputField::Items(vec![ResponseInputItem::Message(ResponseInputMessage {
+        item_type: Some("message".to_string()),
+        role: "user".to_string(),
+        content: Some(MessageContent::Text(req.prompt.clone())),
+        status: None,
+        phase: None,
+    })]);
 
     ResponsesPayload {
         model: get_image_chat_model(),
         instructions: Some(String::new()),
-        input: serde_json::from_value(input).ok(),
+        input: Some(input),
         tools: Some(vec![tool]),
         tool_choice: Some(json!({ "type": "image_generation" })),
         parallel_tool_calls: Some(false),
@@ -149,13 +153,17 @@ fn default_responses_payload() -> ResponsesPayload {
 
 /// Generate one or more images, returning the base64-encoded bytes in order.
 /// `request_headers` is forwarded to the Codex transport (it strips and re-auths
-/// them); pass the inbound request's headers.
+/// them); pass the inbound request's headers. `base_url` is the resolved Codex
+/// provider base URL (empty string for the default ChatGPT backend), threaded
+/// so an operator-configured custom Codex `baseUrl` (and its SSRF validation) is
+/// honored exactly as on the other Codex routes.
 pub async fn create_codex_image(
     req: &ImageGenerationRequest,
     request_headers: &axum::http::HeaderMap,
+    base_url: &str,
 ) -> Result<Vec<String>, AppError> {
     let payload = build_image_payload(req);
-    let response = forward_codex_responses(payload, request_headers, "").await?;
+    let response = forward_codex_responses(payload, request_headers, base_url).await?;
 
     if !response.status().is_success() {
         return Err(AppError::Http(

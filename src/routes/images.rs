@@ -34,15 +34,18 @@ async fn handle(body: Value, headers: axum::http::HeaderMap) -> Result<Value, Ap
     // Ensure the Codex OAuth token is loaded/refreshed into global state before
     // forwarding (no-op if the refresh loop already populated it). A missing
     // Codex login resolves to `None` -> a clear 400 rather than an opaque 401.
-    if resolve_provider_config("codex").await.is_none() {
-        return Err(AppError::BadRequest(
-            "Image generation requires Codex (Sign in with ChatGPT) credentials. \
-             Run `copilot-api auth --provider codex` first."
-                .to_string(),
-        ));
-    }
+    let provider_config = match resolve_provider_config("codex").await {
+        Some(cfg) => cfg,
+        None => {
+            return Err(AppError::BadRequest(
+                "Image generation requires Codex (Sign in with ChatGPT) credentials. \
+                 Run `copilot-api auth --provider codex` first."
+                    .to_string(),
+            ));
+        }
+    };
 
-    let images = create_codex_image(&req, &headers).await?;
+    let images = create_codex_image(&req, &headers, &provider_config.base_url).await?;
 
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
