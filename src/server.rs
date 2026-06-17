@@ -18,9 +18,7 @@ use tracing::{info_span, Instrument, Level};
 use crate::libs::request_auth::{check_auth, AuthOptions};
 use crate::libs::request_context::{resolve_trace_id, run_with_context, RequestContext};
 
-/// Maximum accepted request-body size (32 MiB). Generous enough for large
-/// multimodal / Anthropic payloads while bounding memory per request.
-const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+use crate::libs::http::MAX_REQUEST_BODY_BYTES;
 
 /// Build the axum application, mirroring src/server.ts route table and
 /// middleware stack (trace -> cors -> general auth -> admin auth).
@@ -101,6 +99,11 @@ pub fn build_router() -> Router {
         .layer(cors_layer())
         // Cap request-body size before any handler buffers it.
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Rewrite the plain-text 413 that the body-limit layer / Bytes extractor
+        // produces into the Anthropic JSON error envelope, so an oversize request
+        // gets the same error shape as every other client error. Listed AFTER
+        // (outside) DefaultBodyLimit so it sees that layer's response.
+        .layer(from_fn(normalize_oversize_response))
         // Convert a panic in any handler into a 500 JSON response instead of an
         // abruptly reset connection.
         .layer(CatchPanicLayer::custom(handle_panic))
@@ -206,6 +209,35 @@ fn handle_panic(_err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body>
             "error": {
                 "message": "Internal server error.",
                 "type": "internal_error",
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Rewrite a `413 Payload Too Large` whose body is not already JSON (the
+/// plain-text rejection axum's body-limit layer / `Bytes` extractor emits) into
+/// the Anthropic `invalid_request_error` envelope, so clients that parse error
+/// JSON get a consistent shape. Other responses pass through untouched.
+async fn normalize_oversize_response(req: Request, next: Next) -> Response {
+    let response = next.run(req).await;
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("application/json"));
+    if is_json {
+        return response;
+    }
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": {
+                "message": "Request body is too large.",
+                "type": "invalid_request_error",
             }
         })),
     )

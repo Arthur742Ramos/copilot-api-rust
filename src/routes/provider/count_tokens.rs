@@ -75,7 +75,12 @@ pub async fn handle_provider_count_tokens_for_provider(
 
     let selected_model = create_fallback_model(&model_id);
 
-    let (input, output) = get_token_count(&openai_payload, &selected_model);
+    // tiktoken BPE is CPU-bound; offload it so it does not stall the Tokio worker
+    // thread (and any in-flight streams sharing it). Mirrors count_tokens_handler.
+    let (input, output) =
+        tokio::task::spawn_blocking(move || get_token_count(&openai_payload, &selected_model))
+            .await
+            .map_err(|e| AppError::Other(anyhow::anyhow!("count_tokens task failed: {e}")))?;
     let final_token_count = input + output;
 
     tracing::debug!(

@@ -56,7 +56,13 @@ fn open_usage_connection(path: &PathBuf) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     // `pragma_update` rejects pragmas that return rows (journal_mode echoes the
     // new mode), so issue them via execute_batch which discards results.
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
+    // synchronous=NORMAL (the recommended setting under WAL) avoids an fsync on
+    // every INSERT on the per-request usage-record write path; it stays durable
+    // against app crashes and only risks the last txn(s) on OS/power loss, which
+    // is acceptable for telemetry-class usage data.
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
+    )?;
     crate::libs::token_usage::initialize_schema(&conn)?;
     Ok(conn)
 }

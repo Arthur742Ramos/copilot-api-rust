@@ -208,14 +208,21 @@ const MIN_REFRESH_DELAY_MS: i64 = 1_000;
 /// disables every proxied request). Positive-but-small values are left alone —
 /// they signal a genuinely imminent expiry and are clamped by MIN below.
 const DEFAULT_REFRESH_IN_SECS: i64 = 1_500;
+/// Upper bound on an accepted `refresh_in` (24h). `refresh_in` is taken directly
+/// from upstream JSON; a pathological value would overflow `refresh_in * 1000`
+/// (panicking the spawned refresh task in debug, or wrapping to a ~1s hot loop in
+/// release — the very thing the floor below guards against). Clamping before the
+/// multiply keeps the arithmetic in range. No real GitHub token lives this long.
+const MAX_REFRESH_IN_SECS: i64 = 24 * 60 * 60;
 
 pub fn get_refresh_deadline_ms(refresh_in: i64, now_ms: i64) -> i64 {
     // A non-positive refresh_in is missing/invalid, not "refresh now": substitute
     // a sane default so an upstream that omits the field can't drive a hot loop.
+    // A pathologically large value is clamped so `refresh_in * 1000` can't overflow.
     let refresh_in = if refresh_in <= 0 {
         DEFAULT_REFRESH_IN_SECS
     } else {
-        refresh_in
+        refresh_in.min(MAX_REFRESH_IN_SECS)
     };
     now_ms
         + std::cmp::max(

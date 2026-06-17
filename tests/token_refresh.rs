@@ -29,6 +29,18 @@ fn zero_or_missing_refresh_in_uses_default_not_hot_loop() {
 }
 
 #[test]
+fn pathological_refresh_in_is_clamped_not_overflowed() {
+    let now_ms = 1_000_000;
+    // A huge refresh_in must not overflow `refresh_in * 1000` (which would panic
+    // in debug or wrap to a ~1s hot loop in release). It is clamped to 24h:
+    // 86_400 * 1000 - 60_000 = 86_340_000ms in the future.
+    let deadline = get_refresh_deadline_ms(i64::MAX, now_ms);
+    assert_eq!(deadline, now_ms + 86_340_000);
+    // Far future, definitely not the ~1s hot-loop floor.
+    assert!(deadline > now_ms + 60_000_000);
+}
+
+#[test]
 fn caps_poll_delay_at_15_seconds() {
     let now_ms = 1_000_000;
     assert_eq!(get_refresh_poll_delay_ms(now_ms + 120_000, now_ms), 15_000);
