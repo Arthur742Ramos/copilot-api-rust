@@ -93,11 +93,7 @@ pub async fn create_chat_completions(
         upstream_start.elapsed().as_secs_f64(),
     );
 
-    {
-        // Convert reqwest headers to axum HeaderMap for the rate-limit logger.
-        let axum_headers = reqwest_headers_to_axum(response.headers());
-        log_copilot_rate_limits(&axum_headers);
-    }
+    log_copilot_rate_limits(response.headers());
 
     if !response.status().is_success() {
         tracing::error!("Failed to create chat completions");
@@ -112,19 +108,6 @@ pub async fn create_chat_completions(
             .map_err(|e| HttpError::internal(format!("Failed to parse chat completions: {e}")))?;
         Ok(ChatCompletionsResult::NonStreaming(json))
     }
-}
-
-pub fn reqwest_headers_to_axum(headers: &reqwest::header::HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (name, value) in headers.iter() {
-        if let (Ok(n), Ok(v)) = (
-            axum::http::HeaderName::from_bytes(name.as_str().as_bytes()),
-            axum::http::HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            out.insert(n, v);
-        }
-    }
-    out
 }
 
 // --- Payload types ---------------------------------------------------------

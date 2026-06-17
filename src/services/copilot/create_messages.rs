@@ -17,8 +17,6 @@ use crate::routes::messages::anthropic_types::{
     AnthropicMessagesPayload, AnthropicResponse, AnthropicThinkingConfig,
 };
 
-use super::create_chat_completions::reqwest_headers_to_axum;
-
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
@@ -222,11 +220,7 @@ pub async fn create_messages(
         upstream_start.elapsed().as_secs_f64(),
     );
 
-    {
-        // Convert reqwest headers to axum HeaderMap for the rate-limit logger.
-        let axum_headers = reqwest_headers_to_axum(response.headers());
-        log_copilot_rate_limits(&axum_headers);
-    }
+    log_copilot_rate_limits(response.headers());
 
     if !response.status().is_success() {
         tracing::error!("Failed to create messages");

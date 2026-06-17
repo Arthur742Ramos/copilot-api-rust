@@ -28,7 +28,6 @@ use crate::libs::error::{http_error_from_response, HttpError};
 use crate::libs::http::client;
 use crate::libs::state;
 use crate::libs::subagent::SubagentMarker;
-use crate::services::copilot::create_chat_completions::reqwest_headers_to_axum;
 
 // ---------------------------------------------------------------------------
 // Request payload
@@ -935,10 +934,7 @@ async fn create_http_responses(
         upstream_start.elapsed().as_secs_f64(),
     );
 
-    {
-        let axum_headers = reqwest_headers_to_axum(response.headers());
-        log_copilot_rate_limits(&axum_headers);
-    }
+    log_copilot_rate_limits(response.headers());
 
     if !response.status().is_success() {
         tracing::error!("Failed to create responses");
