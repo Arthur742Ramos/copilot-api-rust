@@ -361,8 +361,14 @@ async fn setup_github_token_inner(force: bool) -> Result<(), anyhow::Error> {
         response.user_code,
         response.verification_uri
     );
+    // Best-effort: open the verification page so the user doesn't have to copy
+    // the URL by hand. Failures (no browser, headless/Docker, SSH) are non-fatal
+    // — the code + URL were already logged above.
+    if webbrowser::open(&response.verification_uri).is_err() {
+        tracing::debug!("Could not open a browser automatically; open the URL above manually.");
+    }
 
-    let token = poll_access_token(&response).await;
+    let token = poll_access_token(&response).await?;
     write_github_token(&token).await?;
     state::with_state_mut(|s| s.github_token = Some(token.clone()));
 

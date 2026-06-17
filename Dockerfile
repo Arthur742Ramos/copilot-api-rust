@@ -38,6 +38,10 @@ VOLUME ["/data"]
 # The default listen port; COPILOT_API_PORT overrides it for both the server
 # (via the clap env binding) and the healthcheck below.
 ENV COPILOT_API_PORT=4141
+# The server defaults to binding 127.0.0.1 (loopback). Inside a container that
+# is unreachable through Docker's published-port forwarding, so bind all
+# interfaces here; COPILOT_API_HOST maps to --host via the clap env binding.
+ENV COPILOT_API_HOST=0.0.0.0
 EXPOSE 4141
 
 # Probe /readyz (ready only once a Copilot token and the model list are loaded)
