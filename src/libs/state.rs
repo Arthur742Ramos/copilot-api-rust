@@ -2,6 +2,7 @@
 //! models) behind an `RwLock`, mirroring the TS singleton `state` object.
 
 use once_cell::sync::Lazy;
+use std::sync::Arc;
 use std::sync::RwLock;
 
 use crate::services::copilot::get_models::ModelsResponse;
@@ -19,7 +20,11 @@ pub struct State {
     pub codex_account_id: Option<String>,
 
     pub account_type: String,
-    pub models: Option<ModelsResponse>,
+    /// Cached model catalogue. Behind an `Arc` so [`snapshot`] (taken on every
+    /// upstream request to build headers) is a refcount bump rather than a deep
+    /// clone of the ~20-model `Vec` — the hot request path never reads `models`,
+    /// but `snapshot()` used to copy the whole catalogue regardless.
+    pub models: Option<Arc<ModelsResponse>>,
     pub vscode_version: Option<String>,
 
     pub mac_machine_id: Option<String>,

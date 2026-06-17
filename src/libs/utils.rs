@@ -111,10 +111,10 @@ async fn refresh_models() -> Result<(), anyhow::Error> {
     let next_ids: Vec<String> = filtered.iter().map(|m| m.id.clone()).collect();
 
     state::with_state_mut(|s| {
-        s.models = Some(ModelsResponse {
+        s.models = Some(std::sync::Arc::new(ModelsResponse {
             data: filtered,
             object: models.object,
-        });
+        }));
     });
 
     let added: Vec<String> = next_ids
