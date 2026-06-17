@@ -16,9 +16,40 @@ fn main() {
     println!("cargo:rustc-env=GIT_SHA={git_sha}");
     println!("cargo:rustc-env=BUILD_TIMESTAMP={build_timestamp}");
 
-    // Re-run the build script when HEAD moves so the embedded SHA stays fresh.
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    emit_rerun_triggers();
+}
+
+/// Emits `cargo:rerun-if-changed` triggers so the embedded SHA stays fresh.
+///
+/// Watching `.git/HEAD` alone is not enough: on an ordinary commit to the
+/// current branch, `.git/HEAD` keeps its `ref: refs/heads/<branch>` content
+/// while the *ref file* under `.git/refs/heads/` (or an entry in
+/// `.git/packed-refs`) is what actually changes. So we also watch the
+/// `refs/heads` directory and `packed-refs`. Each path is guarded by an
+/// existence check — in a checkout where `.git` is absent (e.g. a Docker
+/// build from a source tarball) no triggers are emitted and the SHA simply
+/// falls back to "unknown".
+///
+/// Tradeoff: once a build script emits *any* `rerun-if-*` trigger, Cargo stops
+/// using its default "rerun on any source change" heuristic for this script.
+/// That is fine here because the script's outputs (`GIT_SHA`,
+/// `BUILD_TIMESTAMP`) do not depend on crate sources — only on git state, the
+/// build script itself, and `SOURCE_DATE_EPOCH`. `BUILD_TIMESTAMP` therefore
+/// reflects the last time the script actually re-ran (a git move, an env
+/// change, or a clean build), not every incremental rebuild; that is an
+/// acceptable approximation for build metadata.
+fn emit_rerun_triggers() {
+    // Always re-run if the build script itself changes.
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+
+    let git_dir = std::path::Path::new(".git");
+    for rel in ["HEAD", "refs/heads", "packed-refs"] {
+        let path = git_dir.join(rel);
+        if path.exists() {
+            println!("cargo:rerun-if-changed=.git/{rel}");
+        }
+    }
 }
 
 /// Returns the short git commit SHA, or `None` if git is unavailable or this is
