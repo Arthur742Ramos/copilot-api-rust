@@ -912,11 +912,11 @@ async fn create_http_responses(
     let base = copilot_base_url(st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    let response = client()
+    let request = client()
         .post(format!("{base}/responses"))
         .headers(headers)
-        .body(body)
-        .send()
+        .body(body);
+    let response = crate::libs::http::send_with_connect_retry(request, "responses")
         .await
         .map_err(|e| {
             crate::libs::metrics::record_upstream_request(
