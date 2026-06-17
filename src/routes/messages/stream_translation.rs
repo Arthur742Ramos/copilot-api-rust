@@ -21,12 +21,11 @@ use super::anthropic_types::{
 };
 use super::utils::map_openai_stop_reason_to_anthropic;
 
-/// `non-stream-translation.ts`: `export const THINKING_TEXT = "Thinking..."`.
-///
-/// Defined locally (a sibling Phase-2 module may not exist yet) so this file
-/// compiles standalone. Compatible with opencode, which filters out thinking
-/// blocks whose text is empty, so a non-empty default is emitted.
-const THINKING_TEXT: &str = "Thinking...";
+/// Re-exported from [`super::utils`] so all translation modules share one
+/// source of truth for the user-visible "Thinking..." placeholder. Compatible
+/// with opencode, which filters out thinking blocks whose text is empty, so a
+/// non-empty default is emitted.
+use super::utils::THINKING_TEXT;
 
 // ---------------------------------------------------------------------------
 // Delta projection

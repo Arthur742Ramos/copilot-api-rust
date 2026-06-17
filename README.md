@@ -153,6 +153,8 @@ containers (the `start` flags below have matching `COPILOT_API_*` variables):
 | `COPILOT_API_HOME` | `--api-home` | App data / token directory. |
 | `COPILOT_API_OAUTH_APP` | `--oauth-app` | OAuth app identifier. |
 | `COPILOT_API_ENTERPRISE_URL` | `--enterprise-url` | Enterprise URL for GitHub. |
+| `COPILOT_API_LOG_FORMAT` | _(env only)_ | Set to `json` for structured JSON logs; defaults to the human-readable format. |
+| `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS` | _(env only)_ | Days of `token_usage_events` to retain before pruning (default `45`; `<= 0` disables pruning). |
 
 Example:
 

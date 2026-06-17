@@ -192,17 +192,32 @@ impl TokenUsageRecorder {
             Ok(handle) => {
                 handle.spawn_blocking(move || {
                     if let Err(error) = write_token_usage_event(&event) {
+                        record_write_error(&event);
                         warn!("Failed to record token usage: {error}");
                     }
                 });
             }
             Err(_) => {
                 if let Err(error) = write_token_usage_event(&event) {
+                    record_write_error(&event);
                     warn!("Failed to record token usage: {error}");
                 }
             }
         }
     }
+}
+
+/// Increment the dropped-write counter (bounded `source`/`endpoint` labels) so a
+/// node that has silently stopped persisting usage is visible on dashboards
+/// rather than looking identical to a healthy one. The write is fire-and-forget,
+/// so without this metric the failure leaves no trace beyond a log line.
+fn record_write_error(event: &PersistedTokenUsageEvent) {
+    metrics::counter!(
+        "token_usage_write_errors_total",
+        "source" => event.source,
+        "endpoint" => event.endpoint,
+    )
+    .increment(1);
 }
 
 pub fn create_copilot_token_usage_recorder(

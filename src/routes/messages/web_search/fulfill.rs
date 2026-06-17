@@ -727,9 +727,9 @@ where
             let messages = payload_value
                 .get("messages")
                 .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let request_id = generate_request_id_from_payload(&messages, session_id.as_deref());
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let request_id = generate_request_id_from_payload(messages, session_id.as_deref());
             if session_id.is_none() {
                 session_id = Some(get_uuid(&request_id));
             }
