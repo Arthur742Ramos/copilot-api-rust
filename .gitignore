@@ -1,8 +1,9 @@
 # Rust build artifacts
 /target
 
-# Local Claude Code tooling (not part of the deliverable)
-/.claude
+# Local Claude Code tooling (not part of the deliverable), except shared skills
+/.claude/*
+!/.claude/skills/
 
 # Editor / OS noise
 *.swp
