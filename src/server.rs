@@ -2,7 +2,7 @@
 //! CORS, body limits, and panic handling into the application `Router`.
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
@@ -12,7 +12,8 @@ use metrics::{counter, histogram};
 use serde_json::json;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tracing::{info_span, Instrument, Level};
 
 use crate::libs::request_auth::{check_auth, AuthOptions};
 use crate::libs::request_context::{resolve_trace_id, run_with_context, RequestContext};
@@ -102,12 +103,31 @@ pub fn build_router() -> Router {
         // Convert a panic in any handler into a 500 JSON response instead of an
         // abruptly reset connection.
         .layer(CatchPanicLayer::custom(handle_panic))
-        .layer(from_fn(trace_middleware))
-        // Record request count + latency metrics for every request.
-        .layer(from_fn(metrics_middleware))
         // Per-request access logging (method/path/status/latency) for all
-        // requests, including those rejected by auth.
-        .layer(TraceLayer::new_for_http())
+        // requests, including those rejected by auth. The default `on_response`
+        // emits at DEBUG, which is below the prod `info` filter — bump the
+        // success line to INFO and failures to WARN so per-request logs appear.
+        //
+        // ORDERING: tower applies layers bottom-up, so the LAST `.layer()` call is
+        // the OUTERMOST middleware. `trace_middleware` (below) creates the
+        // `info_span!("request", trace_id, ...)`, so it MUST be listed AFTER
+        // (outermost of) this `TraceLayer`. That way the TraceLayer's
+        // `on_response`/`on_failure` access logs are emitted INSIDE the trace_id
+        // span and inherit `trace_id` — otherwise they would fire outside the span
+        // and the per-request access log lines would lack the trace id.
+        .layer(
+            TraceLayer::new_for_http()
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_failure(DefaultOnFailure::new().level(Level::WARN)),
+        )
+        // Record request count + latency metrics for every request. Inside the
+        // trace span (listed before trace_middleware), outside the access log.
+        .layer(from_fn(metrics_middleware))
+        // Outermost application middleware: establishes the trace_id span +
+        // task-local RequestContext so EVERY inner layer (metrics + TraceLayer
+        // access logs) and handler runs within the span. Must remain the last
+        // `.layer()` call.
+        .layer(from_fn(trace_middleware))
 }
 
 /// CORS policy for the API.
@@ -174,7 +194,14 @@ async fn trace_middleware(req: Request, next: Next) -> Response {
         parent_session_id,
     };
 
-    let mut response = run_with_context(context, next.run(req)).await;
+    // Correlation span: every log line emitted while handling the request carries
+    // the trace id (also returned as `x-trace-id`), plus method/path. The
+    // task-local `RequestContext` is kept intact for token_usage to consume.
+    let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
+    let span = info_span!("request", trace_id = %trace_id, method = %method, path = %path);
+
+    let mut response = run_with_context(context, next.run(req).instrument(span)).await;
     if let Ok(value) = HeaderValue::from_str(&trace_id) {
         response.headers_mut().insert("x-trace-id", value);
     }
@@ -182,15 +209,29 @@ async fn trace_middleware(req: Request, next: Next) -> Response {
 }
 
 /// Times each request and records a total-requests counter plus a
-/// latency histogram, labelled by method and response status.
+/// latency histogram, labelled by method, matched route and response status.
 async fn metrics_middleware(req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_owned();
+    // Capture the matched route template (e.g. `/:provider/v1/messages`) BEFORE
+    // `next.run` consumes `req`. Using the template rather than the raw URI keeps
+    // the histogram label set bounded (no per-id explosion). Unmatched requests
+    // (404s) fall back to a fixed `unmatched` bucket.
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
     let start = std::time::Instant::now();
     let response = next.run(req).await;
     let elapsed = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
-    counter!("http_requests_total", "method" => method, "status" => status).increment(1);
-    histogram!("http_request_duration_seconds").record(elapsed);
+    counter!("http_requests_total", "method" => method, "status" => status.clone()).increment(1);
+    histogram!(
+        "http_request_duration_seconds",
+        "route" => route,
+        "status" => status,
+    )
+    .record(elapsed);
     response
 }
 

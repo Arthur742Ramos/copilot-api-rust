@@ -580,7 +580,52 @@ pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Re
         "endpoint" => event.endpoint,
     )
     .increment(1);
+    // Per-token counters reusing the same bounded {source, endpoint} labels.
+    // Summing these makes cache hit rate a PromQL one-liner, e.g.
+    //   sum(rate(cache_read_input_tokens_total[5m]))
+    //     / sum(rate(input_tokens_total[5m])).
+    // Counters take u64; `normalize_token` already clamps every component to
+    // >= 0, so the cast is lossless for any realistic count.
+    record_token_counter(
+        "input_tokens_total",
+        event.source,
+        event.endpoint,
+        event.input_tokens,
+    );
+    record_token_counter(
+        "output_tokens_total",
+        event.source,
+        event.endpoint,
+        event.output_tokens,
+    );
+    record_token_counter(
+        "cache_read_input_tokens_total",
+        event.source,
+        event.endpoint,
+        event.cache_read_input_tokens,
+    );
+    record_token_counter(
+        "cache_creation_input_tokens_total",
+        event.source,
+        event.endpoint,
+        event.cache_creation_input_tokens,
+    );
     Ok(())
+}
+
+/// Increment a per-token counter labelled by the bounded {source, endpoint}
+/// pair. Non-positive values are skipped so a monotonic counter never moves
+/// backwards (`normalize_token` already precludes negatives).
+fn record_token_counter(
+    name: &'static str,
+    source: TokenUsageSource,
+    endpoint: TokenUsageEndpoint,
+    tokens: i64,
+) {
+    if tokens <= 0 {
+        return;
+    }
+    metrics::counter!(name, "source" => source, "endpoint" => endpoint).increment(tokens as u64);
 }
 
 // --- Range math (local time, mirroring the Date-based logic in store.ts) ---
