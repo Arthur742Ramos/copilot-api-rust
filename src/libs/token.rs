@@ -214,6 +214,21 @@ pub fn get_refresh_poll_delay_ms(refresh_at_ms: i64, now_ms: i64) -> i64 {
     (refresh_at_ms - now_ms).clamp(0, REFRESH_POLL_INTERVAL_MS)
 }
 
+/// Bounded refresh-outcome counter. `token` is a fixed enum (`copilot`/`codex`)
+/// and `result` is `success`/`failure`, so the label set stays small.
+fn record_refresh_result(token: &'static str, success: bool) {
+    let result = if success { "success" } else { "failure" };
+    metrics::counter!("copilot_token_refresh_total", "token" => token, "result" => result)
+        .increment(1);
+}
+
+/// Gauge of the next scheduled refresh deadline (unix millis) per token kind.
+/// Lets alerting catch a refresh loop that has stalled or fallen far behind.
+fn record_refresh_deadline(token: &'static str, refresh_at_ms: i64) {
+    metrics::gauge!("copilot_token_refresh_deadline_ms", "token" => token)
+        .set(refresh_at_ms as f64);
+}
+
 async fn run_copilot_refresh_loop(refresh_in: i64, aborted: Arc<AtomicBool>) {
     let mut refresh_at_ms = get_refresh_deadline_ms(refresh_in, now_millis());
     let mut retry_delay_ms = RETRY_REFRESH_DELAY_MS;
@@ -232,6 +247,8 @@ async fn run_copilot_refresh_loop(refresh_in: i64, aborted: Arc<AtomicBool>) {
                 state::with_state_mut(|s| s.copilot_token = Some(resp.token.clone()));
                 refresh_at_ms = get_refresh_deadline_ms(resp.refresh_in, now_millis());
                 retry_delay_ms = RETRY_REFRESH_DELAY_MS;
+                record_refresh_result("copilot", true);
+                record_refresh_deadline("copilot", refresh_at_ms);
                 tracing::debug!("Copilot token refreshed");
                 if state::with_state(|s| s.show_token) {
                     tracing::info!("Refreshed Copilot token: {}", resp.token);
@@ -243,6 +260,8 @@ async fn run_copilot_refresh_loop(refresh_in: i64, aborted: Arc<AtomicBool>) {
                 let delay_ms = std::cmp::min(retry_delay_ms + jitter, MAX_RETRY_REFRESH_DELAY_MS);
                 refresh_at_ms = now_millis() + delay_ms;
                 retry_delay_ms = std::cmp::min(retry_delay_ms * 2, MAX_RETRY_REFRESH_DELAY_MS);
+                record_refresh_result("copilot", false);
+                record_refresh_deadline("copilot", refresh_at_ms);
                 tracing::warn!("Retrying Copilot token refresh in {}s", delay_ms / 1000);
             }
         }
@@ -287,11 +306,15 @@ async fn run_codex_refresh_loop(aborted: Arc<AtomicBool>) {
                     credentials.expires_at - EARLY_REFRESH_BUFFER_MS,
                     now_millis(),
                 );
+                record_refresh_result("codex", true);
+                record_refresh_deadline("codex", refresh_at_ms);
                 tracing::debug!("Codex credentials refreshed");
             }
             Err(e) => {
                 tracing::error!("Failed to refresh Codex credentials: {e}");
                 refresh_at_ms = now_millis() + RETRY_REFRESH_DELAY_MS;
+                record_refresh_result("codex", false);
+                record_refresh_deadline("codex", refresh_at_ms);
                 tracing::warn!(
                     "Retrying Codex token refresh in {}s",
                     RETRY_REFRESH_DELAY_MS / 1000
