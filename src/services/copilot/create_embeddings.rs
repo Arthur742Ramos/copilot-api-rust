@@ -3,7 +3,8 @@ use serde_json::Value;
 
 use crate::libs::api_config::{copilot_base_url, copilot_headers};
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::client;
+use crate::libs::http::{client, read_json_capped, retry_endpoint, send_with_connect_retry};
+use crate::libs::metrics::{record_upstream_request, UpstreamStatus};
 use crate::libs::state;
 
 /// Mirrors services/copilot/create-embeddings.ts. The upstream response is
@@ -16,20 +17,33 @@ pub async fn create_embeddings(payload: &EmbeddingRequest) -> Result<Value, Http
     }
 
     let base = copilot_base_url(&st);
-    let response = client()
+    let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    let upstream_start = std::time::Instant::now();
+    let request = client()
         .post(format!("{base}/embeddings"))
         .headers(copilot_headers(&st, None, false))
-        .json(payload)
-        .send()
+        .body(body);
+    let response = send_with_connect_retry(request, retry_endpoint::EMBEDDINGS)
         .await
-        .map_err(|e| HttpError::internal(format!("Failed to create embeddings: {e}")))?;
+        .map_err(|e| {
+            record_upstream_request(
+                retry_endpoint::EMBEDDINGS,
+                UpstreamStatus::TransportError,
+                upstream_start.elapsed().as_secs_f64(),
+            );
+            HttpError::internal(format!("Failed to create embeddings: {e}"))
+        })?;
+    record_upstream_request(
+        retry_endpoint::EMBEDDINGS,
+        UpstreamStatus::from_code(response.status().as_u16()),
+        upstream_start.elapsed().as_secs_f64(),
+    );
 
     if !response.status().is_success() {
         return Err(http_error_from_response("Failed to create embeddings", response).await);
     }
 
-    response
-        .json::<Value>()
+    read_json_capped::<Value>(response)
         .await
         .map_err(|e| HttpError::internal(format!("Failed to parse embeddings: {e}")))
 }

@@ -295,6 +295,7 @@ async fn run_codex_refresh_loop(aborted: Arc<AtomicBool>) {
             - EARLY_REFRESH_BUFFER_MS,
         now_millis(),
     );
+    let mut retry_delay_ms = RETRY_REFRESH_DELAY_MS;
 
     while !aborted.load(Ordering::SeqCst) {
         let (expires_at, refresh_token) =
@@ -327,19 +328,20 @@ async fn run_codex_refresh_loop(aborted: Arc<AtomicBool>) {
                     credentials.expires_at - EARLY_REFRESH_BUFFER_MS,
                     now_millis(),
                 );
+                retry_delay_ms = RETRY_REFRESH_DELAY_MS;
                 record_refresh_result("codex", true);
                 record_refresh_deadline("codex", refresh_at_ms);
                 tracing::debug!("Codex credentials refreshed");
             }
             Err(e) => {
                 tracing::error!("Failed to refresh Codex credentials: {e}");
-                refresh_at_ms = now_millis() + RETRY_REFRESH_DELAY_MS;
+                let jitter = (rand::random::<u64>() % RETRY_REFRESH_JITTER_MS as u64) as i64;
+                let delay_ms = std::cmp::min(retry_delay_ms + jitter, MAX_RETRY_REFRESH_DELAY_MS);
+                refresh_at_ms = now_millis() + delay_ms;
+                retry_delay_ms = std::cmp::min(retry_delay_ms * 2, MAX_RETRY_REFRESH_DELAY_MS);
                 record_refresh_result("codex", false);
                 record_refresh_deadline("codex", refresh_at_ms);
-                tracing::warn!(
-                    "Retrying Codex token refresh in {}s",
-                    RETRY_REFRESH_DELAY_MS / 1000
-                );
+                tracing::warn!("Retrying Codex token refresh in {}s", delay_ms / 1000);
             }
         }
     }
