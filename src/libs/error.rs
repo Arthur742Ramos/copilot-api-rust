@@ -112,16 +112,26 @@ impl std::fmt::Display for AppError {
     }
 }
 
-/// Mirrors `forwardError` in src/lib/error.ts: 429s forward retry-after / x-*
-/// headers; HTTP errors return `{ error: { message, type } }` with the upstream
+/// Mirrors `forwardError` in src/lib/error.ts: 429/529s forward retry-after /
+/// x-* headers and are reshaped into the Anthropic-recognized rate-limit shape
+/// (`{ type: "error", error: { type: "rate_limit_error"|"overloaded_error",
+/// message } }`) so the Claude Code SDK's retry/backoff engages; other HTTP
+/// errors return the TS-parity `{ error: { message, type } }` with the upstream
 /// status; everything else is a 500 with the error message.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             AppError::Http(e) => {
                 tracing::error!("Error occurred: {}", e.message);
+                let is_rate_limit = e.status == StatusCode::TOO_MANY_REQUESTS;
+                // 529 (overloaded) is not a named StatusCode constant.
+                let is_overloaded = e.status.as_u16() == 529;
                 let mut out_headers = HeaderMap::new();
-                if e.status == StatusCode::TOO_MANY_REQUESTS {
+                if is_rate_limit || is_overloaded {
+                    // Forward Copilot's retry-after (so the SDK backs off the
+                    // right amount) plus any x-ratelimit-* headers. We do NOT
+                    // synthesize a retry-after if absent — Anthropic clients
+                    // apply their own default backoff in that case.
                     for (name, value) in e.headers.iter() {
                         let lower = name.as_str().to_lowercase();
                         if lower == "retry-after" || lower.starts_with("x-") {
@@ -138,12 +148,32 @@ impl IntoResponse for AppError {
                 } else {
                     e.body.clone()
                 };
-                let body = Json(json!({
-                    "error": {
-                        "message": message,
+                let body = if is_rate_limit || is_overloaded {
+                    // Reshape rate-limit/overload errors into the Anthropic shape
+                    // the Claude Code SDK recognizes as retryable: top-level
+                    // `type: "error"` with a nested `error.type` of
+                    // `rate_limit_error` (429) or `overloaded_error` (529).
+                    let error_type = if is_overloaded {
+                        "overloaded_error"
+                    } else {
+                        "rate_limit_error"
+                    };
+                    Json(json!({
                         "type": "error",
-                    }
-                }));
+                        "error": {
+                            "type": error_type,
+                            "message": message,
+                        }
+                    }))
+                } else {
+                    // Non-rate-limit HTTP errors keep the existing TS-parity shape.
+                    Json(json!({
+                        "error": {
+                            "message": message,
+                            "type": "error",
+                        }
+                    }))
+                };
                 (e.status, out_headers, body).into_response()
             }
             AppError::Other(e) => {
@@ -161,3 +191,120 @@ impl IntoResponse for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    async fn render(err: AppError) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let resp = err.into_response();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+        (status, headers, json)
+    }
+
+    fn status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rate_limit_429_renders_anthropic_shape() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "30".parse().unwrap());
+        headers.insert(
+            "x-usage-ratelimit-session",
+            "rem=0&rst=123".parse().unwrap(),
+        );
+        let err = AppError::Http(HttpError::new(
+            "Failed to create messages",
+            status(429),
+            headers,
+            r#"{"message":"rate limited by copilot"}"#.to_string(),
+        ));
+        let (status, out_headers, body) = render(err).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            body["error"]["message"],
+            r#"{"message":"rate limited by copilot"}"#
+        );
+        // retry-after and x-* headers are forwarded so the SDK backs off.
+        assert_eq!(out_headers.get("retry-after").unwrap(), "30");
+        assert_eq!(
+            out_headers.get("x-usage-ratelimit-session").unwrap(),
+            "rem=0&rst=123"
+        );
+    }
+
+    #[tokio::test]
+    async fn overloaded_529_renders_overloaded_error() {
+        let err = AppError::Http(HttpError::new(
+            "Overloaded",
+            status(529),
+            HeaderMap::new(),
+            "upstream overloaded".to_string(),
+        ));
+        let (status, _headers, body) = render(err).await;
+
+        assert_eq!(status.as_u16(), 529);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["message"], "upstream overloaded");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_empty_body_uses_message() {
+        let err = AppError::Http(HttpError::new(
+            "quota exhausted",
+            status(429),
+            HeaderMap::new(),
+            String::new(),
+        ));
+        let (_status, _headers, body) = render(err).await;
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "quota exhausted");
+    }
+
+    #[tokio::test]
+    async fn non_rate_limit_500_renders_generic_shape() {
+        let err = AppError::Http(HttpError::new(
+            "boom",
+            status(500),
+            HeaderMap::new(),
+            "internal upstream error".to_string(),
+        ));
+        let (status, _headers, body) = render(err).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // Unchanged TS-parity shape: outer `error` object, type "error".
+        assert_eq!(body["error"]["type"], "error");
+        assert_eq!(body["error"]["message"], "internal upstream error");
+        assert!(body.get("type").is_none());
+    }
+
+    #[tokio::test]
+    async fn non_rate_limit_does_not_forward_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "30".parse().unwrap());
+        let err = AppError::Http(HttpError::new(
+            "forbidden",
+            status(403),
+            headers,
+            "nope".to_string(),
+        ));
+        let (status, out_headers, _body) = render(err).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Only 429/529 forward retry-after; other errors keep TS parity.
+        assert!(out_headers.get("retry-after").is_none());
+    }
+}
