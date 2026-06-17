@@ -39,11 +39,14 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 60_000;
 
-/// Maximum gap between received WebSocket frames (including control frames)
-/// before an in-flight request is considered wedged and torn down. Mirrors the
-/// 120s reqwest `read_timeout` on the shared HTTP path: the pooled idle-close
-/// only fires once `request_count` hits 0, which never happens while a request
-/// is in-flight, so a silent upstream would otherwise hang the request forever.
+/// Per-operation deadline for the pooled WebSocket transport: it bounds the
+/// initial request-frame send and each subsequent awaited frame independently
+/// (the timer resets on every frame received, including control frames). Mirrors
+/// the 120s reqwest `read_timeout` on the shared HTTP path — it caps the gap
+/// between successive operations, not the total stream duration. Without it a
+/// silent upstream would hang the request forever: the pooled idle-close only
+/// fires once `request_count` hits 0, which never happens while a request is
+/// in-flight.
 const DEFAULT_WEBSOCKET_READ_TIMEOUT_MS: u64 = 120_000;
 
 /// A single pooled request description. Mirrors `PooledWebSocketRequest<TPayload>`.
@@ -67,9 +70,10 @@ pub struct PooledWebSocketStreamOptions {
     pub create_chunk: fn(String) -> SseChunk,
     /// Idle window before a pooled socket is closed. Defaults to 60s when `None`.
     pub idle_timeout_ms: Option<u64>,
-    /// Maximum gap between received frames before an in-flight request is torn
-    /// down as wedged. Defaults to 120s when `None`, matching the HTTP path's
-    /// read timeout.
+    /// Per-operation deadline (in ms) bounding the initial request-frame send
+    /// and each subsequently awaited frame independently; resets on every frame
+    /// received. Defaults to 120s when `None`, matching the HTTP path's
+    /// read timeout. It caps the gap between operations, not total duration.
     pub read_timeout_ms: Option<u64>,
     /// Returns true once a chunk signals the end of the response.
     pub is_terminal_chunk: fn(&SseChunk) -> bool,
@@ -486,8 +490,9 @@ pub fn create_pooled_web_socket_stream(
                     remove_pooled_entry(&pool_key, id);
                 }
                 yield Err(std::io::Error::other(format!(
-                    "{}: timed out sending request frame",
-                    options.stream_error_message
+                    "{}: timed out sending request frame after {}ms",
+                    options.stream_error_message,
+                    read_timeout.as_millis()
                 )));
                 return;
             }

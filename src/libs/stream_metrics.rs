@@ -27,11 +27,13 @@ pub mod transport {
 /// messages) and `transport` (translated | native) label.
 ///
 /// While alive, the timer also holds the `proxy_streams_active` gauge up by one
-/// (same `flow`/`transport` labels). Because the decrement runs in `Drop`, the
-/// gauge falls back to zero on every exit path — including a stream wedged on a
-/// silent upstream that never produces a terminal frame, which the
-/// drop-recorded completion histogram cannot surface (it only records once the
-/// stream actually ends).
+/// (same `flow`/`transport` labels), decrementing in `Drop`. The gauge is the
+/// count of streams currently held open: a stream wedged on a silent upstream
+/// keeps its timer alive, so it stays counted here even though its completion
+/// histogram has not yet recorded (that only fires once the stream actually
+/// ends). A gauge that rises without falling is therefore the signal that
+/// streams are stuck or leaking — which the drop-recorded completion histogram
+/// cannot surface on its own.
 pub struct StreamTimer {
     flow: &'static str,
     transport: &'static str,
