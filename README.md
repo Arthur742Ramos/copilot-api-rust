@@ -212,6 +212,18 @@ Notes:
 - `adminApiKey` is generated automatically on startup if not set; it is required
   to call the `/admin/*` routes.
 
+### Exact token counts for Claude models
+
+Set the top-level `anthropicApiKey` field (or the `ANTHROPIC_API_KEY`
+environment variable) to your Anthropic API key to get **exact** token counts
+for Claude models on `POST /v1/messages/count_tokens`. With it set, the gateway
+forwards count requests to Anthropic's free `count_tokens` endpoint, so Claude
+Code's context-window bar and auto-compact thresholds are accurate.
+
+Without it, counts are **estimated** with a tokenizer approximation, which is
+slightly off. The key is used **only** for the `count_tokens` endpoint and is
+never used for generation — generation always goes through GitHub Copilot.
+
 ### `provider/model` alias routing
 
 Any model ID containing a `/` is parsed as `provider/model`. For example,

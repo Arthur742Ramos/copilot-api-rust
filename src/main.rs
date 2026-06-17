@@ -232,6 +232,16 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
     tracing::info!("Usage Viewer: {server_url}/usage-viewer?endpoint={server_url}/usage");
 
+    if crate::libs::config::get_anthropic_api_key().is_some() {
+        tracing::info!(
+            "Token counting: using the Anthropic count_tokens API for exact counts on Claude models."
+        );
+    } else {
+        tracing::info!(
+            "Token counting: estimating with a tokenizer approximation. Set anthropicApiKey in config for exact Claude token counts."
+        );
+    }
+
     let app = server::build_router();
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], options.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
