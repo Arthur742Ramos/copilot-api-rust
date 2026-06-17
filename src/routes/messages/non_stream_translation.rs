@@ -28,7 +28,7 @@ use crate::services::copilot::get_models::Model;
 
 /// Compatible with opencode, it filters out blocks where the thinking text is
 /// empty, so we add a default thinking text.
-pub const THINKING_TEXT: &str = "Thinking...";
+pub use super::utils::THINKING_TEXT;
 
 /// Inserted into the tool message when rich content had to be relocated to a
 /// user message because the upstream does not support it in tool messages.

@@ -34,14 +34,15 @@ use super::anthropic_types::{
 /// `const MAX_CONSECUTIVE_FUNCTION_CALL_WHITESPACE = 20`
 const MAX_CONSECUTIVE_FUNCTION_CALL_WHITESPACE: i64 = 20;
 
-/// `responses-translation.ts`: `export const THINKING_TEXT = "Thinking..."`
-const THINKING_TEXT: &str = "Thinking...";
+/// Imported from [`super::utils`] so all translation modules share one source of
+/// truth for the "Thinking..." placeholder.
+use super::utils::THINKING_TEXT;
 
-/// `responses-translation.ts`: `const COMPACTION_SIGNATURE_PREFIX = "cm1#"`
-const COMPACTION_SIGNATURE_PREFIX: &str = "cm1#";
-
-/// `responses-translation.ts`: `const COMPACTION_SIGNATURE_SEPARATOR = "@"`
-const COMPACTION_SIGNATURE_SEPARATOR: &str = "@";
+/// Shared with [`super::responses_translation`] so the byte-exact compaction
+/// carrier signature (`cm1#{enc}@{id}`) has a single source of truth — the
+/// signature must match exactly for Copilot cache hits, so a divergent second
+/// copy would silently corrupt them.
+use super::responses_translation::encode_compaction_carrier_signature;
 
 // ---------------------------------------------------------------------------
 // State
@@ -169,11 +170,6 @@ fn resolve_tool_use_name(item: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
-}
-
-/// Mirrors the TS `encodeCompactionCarrierSignature`.
-fn encode_compaction_carrier_signature(id: &str, encrypted_content: &str) -> String {
-    format!("{COMPACTION_SIGNATURE_PREFIX}{encrypted_content}{COMPACTION_SIGNATURE_SEPARATOR}{id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +536,7 @@ fn handle_output_item_done(
         events.push(AnthropicStreamEventData::ContentBlockDelta {
             index: block_index,
             delta: AnthropicContentBlockDelta::SignatureDelta {
-                signature: encode_compaction_carrier_signature(id, encrypted_content),
+                signature: encode_compaction_carrier_signature(encrypted_content, id),
             },
         });
         state.block_has_delta.insert(block_index);

@@ -77,6 +77,9 @@ fn build_pool() -> UsagePool {
 
     match open_usage_connection(&path) {
         Ok(first) => {
+            // Healthy on-disk store: render the degraded gauge at 0 so the series
+            // always exists and an alert on it reads "0", not "no data".
+            metrics::gauge!("token_usage_store_degraded").set(0.0);
             let mut connections = Vec::with_capacity(POOL_SIZE);
             connections.push(Mutex::new(first));
             // The schema is already initialized; the remaining connections share
@@ -100,6 +103,9 @@ fn build_pool() -> UsagePool {
             }
         }
         Err(error) => {
+            // Degraded: persistence is in-memory only and will not survive a
+            // restart. Flag it so a node running degraded is alertable.
+            metrics::gauge!("token_usage_store_degraded").set(1.0);
             tracing::warn!(
                 "Failed to open token usage SQLite database ({error}); \
                  falling back to a single in-memory database"

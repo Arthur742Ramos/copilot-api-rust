@@ -41,6 +41,11 @@ pub fn build_router() -> Router {
         )
         .route("/models", get(crate::routes::models::get_models_route))
         .route("/v1/models", get(crate::routes::models::get_models_route))
+        .route("/models/:id", get(crate::routes::models::get_model_route))
+        .route(
+            "/v1/models/:id",
+            get(crate::routes::models::get_model_route),
+        )
         .route(
             "/embeddings",
             post(crate::routes::embeddings::post_embeddings),
@@ -77,6 +82,15 @@ pub fn build_router() -> Router {
             "/admin/config/model-mappings",
             get(crate::routes::admin_config::get_model_mappings_route)
                 .post(crate::routes::admin_config::post_model_mappings_route),
+        )
+        .route(
+            "/admin/config/reload",
+            post(crate::routes::admin_config::post_reload_route),
+        )
+        .route(
+            "/admin/config/providers",
+            get(crate::routes::admin_config::get_providers_route)
+                .post(crate::routes::admin_config::post_providers_route),
         )
         .route(
             "/:provider/v1/messages",
