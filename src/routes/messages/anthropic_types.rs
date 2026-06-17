@@ -384,6 +384,24 @@ pub enum AnthropicStreamEventData {
     Error { error: AnthropicErrorBody },
 }
 
+impl AnthropicStreamEventData {
+    /// The wire `type` discriminant for this event, matching each variant's
+    /// `#[serde(rename = ...)]`. Lets the SSE encoder set the `event:` line
+    /// without serializing the event to an intermediate `Value` first.
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            Self::MessageStart { .. } => "message_start",
+            Self::ContentBlockStart { .. } => "content_block_start",
+            Self::ContentBlockDelta { .. } => "content_block_delta",
+            Self::ContentBlockStop { .. } => "content_block_stop",
+            Self::MessageDelta { .. } => "message_delta",
+            Self::MessageStop => "message_stop",
+            Self::Ping => "ping",
+            Self::Error { .. } => "error",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Streaming translation state
 // ---------------------------------------------------------------------------
@@ -459,5 +477,21 @@ mod tests {
         let ev: AnthropicStreamEventData = serde_json::from_str(input).unwrap();
         let output = serde_json::to_string(&ev).unwrap();
         assert_eq!(input, output);
+    }
+
+    #[test]
+    fn event_name_matches_serde_tag() {
+        // event_name() must stay in lockstep with the serialized `type` field;
+        // the SSE encoder relies on this to skip an intermediate Value.
+        let cases = [
+            AnthropicStreamEventData::MessageStop,
+            AnthropicStreamEventData::Ping,
+            AnthropicStreamEventData::ContentBlockStop { index: 0 },
+        ];
+        for ev in cases {
+            let value = serde_json::to_value(&ev).unwrap();
+            let tag = value.get("type").and_then(Value::as_str).unwrap();
+            assert_eq!(tag, ev.event_name());
+        }
     }
 }

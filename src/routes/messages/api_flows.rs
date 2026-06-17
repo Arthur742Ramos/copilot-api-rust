@@ -114,10 +114,8 @@ pub struct FlowOptions {
 /// (`event: {type}\ndata: {json}\n\n`). Returns `None` if the event cannot be
 /// serialized (never happens for the wire types here).
 fn emit_event(event: &AnthropicStreamEventData) -> Option<String> {
-    let value = serde_json::to_value(event).ok()?;
-    let event_name = value.get("type").and_then(Value::as_str)?.to_string();
-    let data = serde_json::to_string(&value).ok()?;
-    Some(format!("event: {event_name}\ndata: {data}\n\n"))
+    let data = serde_json::to_string(event).ok()?;
+    Some(format!("event: {}\ndata: {data}\n\n", event.event_name()))
 }
 
 /// Build a `text/event-stream` response over a byte stream, with the same header

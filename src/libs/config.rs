@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::RwLock;
 
 use super::paths::PATHS;
@@ -183,14 +184,14 @@ fn default_config() -> AppConfig {
     }
 }
 
-static CACHED_CONFIG: Lazy<RwLock<Option<AppConfig>>> = Lazy::new(|| RwLock::new(None));
+static CACHED_CONFIG: Lazy<RwLock<Option<Arc<AppConfig>>>> = Lazy::new(|| RwLock::new(None));
 
 /// Test seam: overwrite the process-global cached config so router/auth tests can
 /// install a known `auth.apiKeys` / `auth.adminApiKey` without touching disk.
 /// Tests that use this MUST run serially (the cache is a process-global).
 #[doc(hidden)]
 pub fn set_cached_config_for_test(config: AppConfig) {
-    *CACHED_CONFIG.write().unwrap() = Some(config);
+    *CACHED_CONFIG.write().unwrap() = Some(Arc::new(config));
 }
 
 /// Test seam: clear the cached config so the next `get_config()` re-reads.
@@ -368,20 +369,21 @@ pub fn merge_config_with_defaults() -> Result<AppConfig, anyhow::Error> {
         }
     }
 
-    *CACHED_CONFIG.write().unwrap() = Some(merged.clone());
+    *CACHED_CONFIG.write().unwrap() = Some(Arc::new(merged.clone()));
     Ok(merged)
 }
 
-pub fn get_config() -> AppConfig {
+pub fn get_config() -> Arc<AppConfig> {
     {
         let guard = CACHED_CONFIG.read().unwrap();
         if let Some(cfg) = guard.as_ref() {
-            return cfg.clone();
+            return Arc::clone(cfg);
         }
     }
     let (merged, _) = merge_default_config(read_config_from_disk());
-    *CACHED_CONFIG.write().unwrap() = Some(merged.clone());
-    merged
+    let arc = Arc::new(merged);
+    *CACHED_CONFIG.write().unwrap() = Some(Arc::clone(&arc));
+    arc
 }
 
 pub fn reload_config() -> Result<AppConfig, anyhow::Error> {
@@ -391,6 +393,7 @@ pub fn reload_config() -> Result<AppConfig, anyhow::Error> {
 pub fn get_extra_prompt_for_model(model: &str) -> String {
     get_config()
         .extra_prompts
+        .as_ref()
         .and_then(|m| m.get(model).cloned())
         .unwrap_or_default()
 }
@@ -398,14 +401,14 @@ pub fn get_extra_prompt_for_model(model: &str) -> String {
 pub fn get_model_mappings() -> BTreeMap<String, String> {
     let config = get_config();
     let mut valid = BTreeMap::new();
-    if let Some(mappings) = config.model_mappings {
+    if let Some(mappings) = config.model_mappings.as_ref() {
         for (source, target) in mappings {
             if source.is_empty() {
                 continue;
             }
             if let Value::String(t) = target {
                 if !t.is_empty() {
-                    valid.insert(source, t);
+                    valid.insert(source.clone(), t.clone());
                 }
             }
         }
@@ -440,15 +443,20 @@ pub fn set_model_mappings(
 }
 
 pub fn resolve_mapped_model(model: &str) -> String {
-    get_model_mappings()
-        .get(model)
-        .cloned()
+    get_config()
+        .model_mappings
+        .as_ref()
+        .and_then(|m| match m.get(model) {
+            Some(Value::String(t)) if !t.is_empty() => Some(t.clone()),
+            _ => None,
+        })
         .unwrap_or_else(|| model.to_string())
 }
 
 pub fn get_small_model() -> String {
     get_config()
         .small_model
+        .clone()
         .unwrap_or_else(|| "gpt-5-mini".to_string())
 }
 
@@ -461,6 +469,7 @@ pub fn is_responses_api_context_management_enabled() -> bool {
 pub fn get_model_responses_api_compact_threshold(model: &str) -> Option<f64> {
     let threshold = get_config()
         .model_responses_api_compact_thresholds
+        .as_ref()
         .and_then(|m| m.get(model).copied())?;
     if !threshold.is_finite() || threshold <= 0.0 {
         return None;
@@ -471,6 +480,7 @@ pub fn get_model_responses_api_compact_threshold(model: &str) -> Option<f64> {
 pub fn get_reasoning_effort_for_model(model: &str) -> String {
     get_config()
         .model_reasoning_efforts
+        .as_ref()
         .and_then(|m| m.get(model).cloned())
         .unwrap_or_else(|| "high".to_string())
 }
@@ -528,6 +538,7 @@ pub fn get_raw_provider_config(name: &str) -> Option<ProviderConfig> {
     }
     get_config()
         .providers
+        .as_ref()
         .and_then(|p| p.get(provider_name).cloned())
 }
 
@@ -619,6 +630,7 @@ pub fn list_enabled_providers() -> Vec<String> {
     let config = get_config();
     let names: Vec<String> = config
         .providers
+        .as_ref()
         .map(|p| p.keys().cloned().collect())
         .unwrap_or_default();
     names
@@ -642,6 +654,7 @@ pub fn is_responses_api_web_socket_enabled() -> bool {
 pub fn get_anthropic_api_key() -> Option<String> {
     get_config()
         .anthropic_api_key
+        .clone()
         .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
 }
 
@@ -652,6 +665,7 @@ pub fn is_responses_api_web_search_enabled() -> bool {
 pub fn get_message_api_web_search_model() -> Option<String> {
     let model = get_config()
         .message_api_web_search_model
+        .clone()
         .unwrap_or_else(|| "gpt-5-mini".to_string());
     if !model.trim().is_empty() {
         Some(model)
