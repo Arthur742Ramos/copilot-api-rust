@@ -7,8 +7,10 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /app
 
-# Copy manifests and source, then build the release binary.
-COPY Cargo.toml Cargo.lock ./
+# Copy manifests and source, then build the release binary. build.rs captures
+# the git SHA / build timestamp; git is absent in this stage, so it falls back
+# to "unknown" for the SHA, which is fine.
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 RUN cargo build --release --locked --bin copilot-api
 
@@ -33,10 +35,16 @@ ENV COPILOT_API_HOME=/data
 RUN mkdir -p /data
 VOLUME ["/data"]
 
+# The default listen port; COPILOT_API_PORT overrides it for both the server
+# (via the clap env binding) and the healthcheck below.
+ENV COPILOT_API_PORT=4141
 EXPOSE 4141
 
+# Probe /readyz (ready only once a Copilot token and the model list are loaded)
+# rather than / (always 200), and derive the port from COPILOT_API_PORT so a
+# remapped port stays in sync with the server.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:4141/ || exit 1
+    CMD curl -fsS "http://localhost:${COPILOT_API_PORT}/readyz" || exit 1
 
 ENTRYPOINT ["copilot-api"]
 CMD ["start"]
