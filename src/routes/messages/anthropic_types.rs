@@ -409,6 +409,10 @@ pub struct AnthropicStreamState {
     pub deferred_content: Option<String>,
     /// openAIToolIndex -> { id, name, anthropic_block_index }
     pub tool_calls: std::collections::HashMap<i64, AnthropicStreamToolCall>,
+    /// Set once a terminal `message_stop` has been emitted, so the end-of-stream
+    /// flush can detect an upstream that ended without a `finish_reason` and
+    /// synthesize a well-formed close instead of leaving the stream dangling.
+    pub message_stop_emitted: bool,
 }
 
 #[cfg(test)]

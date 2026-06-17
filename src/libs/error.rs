@@ -76,6 +76,10 @@ pub async fn http_error_from_response(
 #[derive(Debug)]
 pub enum AppError {
     Http(HttpError),
+    /// A client-side input error: rendered as HTTP 400 with the Anthropic
+    /// `invalid_request_error` type so clients (e.g. Claude Code) treat it as a
+    /// permanent failure and do NOT retry, unlike a 500.
+    BadRequest(String),
     Other(anyhow::Error),
 }
 
@@ -107,6 +111,7 @@ impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AppError::Http(e) => write!(f, "{e}"),
+            AppError::BadRequest(m) => write!(f, "{m}"),
             AppError::Other(e) => write!(f, "{e}"),
         }
     }
@@ -175,6 +180,16 @@ impl IntoResponse for AppError {
                     }))
                 };
                 (e.status, out_headers, body).into_response()
+            }
+            AppError::BadRequest(message) => {
+                tracing::warn!("Bad request: {message}");
+                let body = Json(json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                    }
+                }));
+                (StatusCode::BAD_REQUEST, body).into_response()
             }
             AppError::Other(e) => {
                 tracing::error!("Error occurred: {}", e);
@@ -290,6 +305,20 @@ mod tests {
         assert_eq!(body["error"]["type"], "error");
         assert_eq!(body["error"]["message"], "internal upstream error");
         assert!(body.get("type").is_none());
+    }
+
+    #[tokio::test]
+    async fn bad_request_renders_400_invalid_request_error() {
+        let err =
+            AppError::BadRequest("Invalid request payload: missing field `model`".to_string());
+        let (status, _headers, body) = render(err).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Invalid request payload: missing field `model`"
+        );
     }
 
     #[tokio::test]

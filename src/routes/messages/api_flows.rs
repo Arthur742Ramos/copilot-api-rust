@@ -446,6 +446,12 @@ pub async fn handle_with_messages_api(
         CreateMessagesResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
                 let mut usage = UsageTokens::default();
+                // Track terminal framing so a passthrough upstream that ends
+                // without a `message_stop` (clean end / [DONE]) doesn't leave the
+                // client hanging. We only synthesize a close if a message was
+                // actually started.
+                let mut message_started = false;
+                let mut message_stopped = false;
 
                 let sse = crate::libs::sse::events(upstream);
                 futures_util::pin_mut!(sse);
@@ -477,6 +483,7 @@ pub async fn handle_with_messages_api(
                     if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
                         match parsed.get("type").and_then(Value::as_str) {
                             Some("message_start") => {
+                                message_started = true;
                                 let next = normalize_anthropic_usage(
                                     parsed.get("message").and_then(|m| m.get("usage")),
                                 );
@@ -485,6 +492,9 @@ pub async fn handle_with_messages_api(
                             Some("message_delta") => {
                                 let next = normalize_anthropic_usage(parsed.get("usage"));
                                 usage = merge_anthropic_usage(usage, next);
+                            }
+                            Some("message_stop") => {
+                                message_stopped = true;
                             }
                             _ => {}
                         }
@@ -495,6 +505,17 @@ pub async fn handle_with_messages_api(
                         None => format!("data: {data}\n\n"),
                     };
                     yield Ok(Bytes::from(frame));
+                }
+
+                // Upstream ended without terminating a started message: synthesize
+                // a message_stop so the client's SSE consumer doesn't hang.
+                if message_started && !message_stopped {
+                    tracing::warn!(
+                        "messages stream ended without message_stop; synthesizing terminal event"
+                    );
+                    if let Some(frame) = emit_event(&AnthropicStreamEventData::MessageStop) {
+                        yield Ok(Bytes::from(frame));
+                    }
                 }
 
                 recorder.record(usage);

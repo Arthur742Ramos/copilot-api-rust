@@ -20,7 +20,7 @@ use crate::services::copilot::create_chat_completions::{
 /// Mirrors routes/chat-completions/handler.ts `handleCompletion`.
 pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
     let mut payload: ChatCompletionsPayload = serde_json::from_value(body)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))?;
+        .map_err(|e| AppError::BadRequest(format!("Invalid request payload: {e}")))?;
 
     let requested_model = payload.model.clone();
     payload.model = resolve_mapped_model(&payload.model);
