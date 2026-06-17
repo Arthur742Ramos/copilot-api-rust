@@ -4,7 +4,7 @@
 //! OpenAI-style `/v1/chat/completions` + `/v1/responses` forwarders emit the
 //! same two histograms so the latency dashboards cover every streaming route.
 
-use metrics::histogram;
+use metrics::{gauge, histogram};
 
 /// How the stream's bytes were produced, so the two measurement methods are
 /// distinguishable on the same metric. `translated` = the messages flows that
@@ -25,6 +25,13 @@ pub mod transport {
 ///
 /// Both histograms carry a bounded `flow` (chat_completions | responses |
 /// messages) and `transport` (translated | native) label.
+///
+/// While alive, the timer also holds the `proxy_streams_active` gauge up by one
+/// (same `flow`/`transport` labels). Because the decrement runs in `Drop`, the
+/// gauge falls back to zero on every exit path — including a stream wedged on a
+/// silent upstream that never produces a terminal frame, which the
+/// drop-recorded completion histogram cannot surface (it only records once the
+/// stream actually ends).
 pub struct StreamTimer {
     flow: &'static str,
     transport: &'static str,
@@ -35,6 +42,12 @@ pub struct StreamTimer {
 
 impl StreamTimer {
     pub fn new(flow: &'static str, transport: &'static str) -> Self {
+        gauge!(
+            "proxy_streams_active",
+            "flow" => flow,
+            "transport" => transport,
+        )
+        .increment(1.0);
         Self {
             flow,
             transport,
@@ -66,6 +79,12 @@ impl StreamTimer {
 
 impl Drop for StreamTimer {
     fn drop(&mut self) {
+        gauge!(
+            "proxy_streams_active",
+            "flow" => self.flow,
+            "transport" => self.transport,
+        )
+        .decrement(1.0);
         let outcome = if self.errored { "error" } else { "ok" };
         histogram!(
             "proxy_stream_complete_seconds",

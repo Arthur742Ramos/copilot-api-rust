@@ -859,6 +859,7 @@ fn create_web_socket_responses(
         PooledWebSocketStreamOptions {
             create_chunk: ws_chunk_from_data,
             idle_timeout_ms: None,
+            read_timeout_ms: None,
             is_terminal_chunk: is_terminal_ws_chunk,
             open_error_message: "Failed to create responses websocket".to_string(),
             stream_error_message: "Responses websocket stream error".to_string(),
