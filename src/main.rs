@@ -301,18 +301,20 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
         );
     }
     tracing::info!("Listening on {addr} ({server_url})");
+
+    // The --claude-code clipboard/setup flow blocks on interactive model prompts,
+    // so run it BEFORE the ready banner (and before axum::serve) — otherwise the
+    // banner would announce "ready" while the prompt is still blocking and the
+    // server is not yet accepting requests. It runs after the listener bound, so
+    // the command it generates points at a server that actually bound.
+    if options.claude_code {
+        run_claude_code_setup(&server_url).await;
+    }
+
     print_ready_banner(&server_url);
     // Emitted after the ready banner so this Windows-only advisory doesn't lead
     // the startup output and read as something being wrong on a single-user box.
     crate::libs::paths::warn_if_file_perms_unrestricted();
-
-    // The --claude-code clipboard/setup flow runs only once the listener has
-    // bound, so the command it generates points at a server that actually bound
-    // (rather than one that may have failed to bind). The interactive model
-    // prompts block here before axum::serve begins accepting requests.
-    if options.claude_code {
-        run_claude_code_setup(&server_url).await;
-    }
 
     // Run the server, but flush the token-usage WAL on the way out whether serve
     // returns Ok (graceful shutdown) or Err — otherwise a serve error would skip
