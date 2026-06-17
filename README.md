@@ -295,7 +295,10 @@ Key fields (from `src/libs/config.rs`):
   "smallModel": "gpt-5-mini",
   "extraPrompts": { "<model>": "..." },
   "modelReasoningEfforts": { "<model>": "high" },
-  "anthropicApiKey": "..."
+  "anthropicApiKey": "...",
+  "dailyTokenBudget": 5000000 // reject new requests with 429 once this many
+                              // tokens are recorded in the local day (omit or
+                              // <= 0 to disable)
 }
 ```
 
@@ -305,6 +308,9 @@ Notes:
   `apiKey`, unless it is the builtin `codex` provider using `oauth2`).
 - `adminApiKey` is generated automatically on startup if not set; it is required
   to call the `/admin/*` routes.
+- `dailyTokenBudget` is a coarse spend guardrail: usage is recorded after each
+  response completes, so enforcement gates on cumulative spend so far and can
+  overshoot by at most the requests already in flight when the cap is crossed.
 
 ### Exact token counts for Claude models
 

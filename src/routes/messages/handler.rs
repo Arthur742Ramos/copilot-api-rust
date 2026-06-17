@@ -122,6 +122,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     normalize_system_messages(&mut payload);
 
     check_rate_limit().await?;
+    crate::libs::token_budget::check_token_budget()?;
 
     sanitize_ide_tools(&mut payload);
 

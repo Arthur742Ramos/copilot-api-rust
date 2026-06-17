@@ -48,6 +48,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     }
 
     check_rate_limit().await?;
+    crate::libs::token_budget::check_token_budget()?;
 
     // Find the selected model from the cache.
     let selected_model = state::with_state(|s| {
