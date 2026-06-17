@@ -167,13 +167,19 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         apply_last_message_cache_control(&mut payload, last_cache_control.as_ref());
     }
 
-    // 6. Request id + session id.
-    let messages: Vec<Value> = payload
-        .get("messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let request_id = generate_request_id_from_payload(&messages, session_id.as_deref());
+    // 6. Request id + session id. Derive the id from a borrowed view of the
+    // messages array rather than cloning it: the previous `.cloned()` allocated
+    // a full copy of the (potentially multi-MB) conversation that then lived as
+    // a function-scope local across the entire upstream await. The scoped block
+    // ends the immutable borrow of `payload` before later `&mut` uses.
+    let request_id = {
+        let messages = payload
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        generate_request_id_from_payload(messages, session_id.as_deref())
+    };
     tracing::debug!("Generated request ID: {request_id}");
 
     if session_id.is_none() {
