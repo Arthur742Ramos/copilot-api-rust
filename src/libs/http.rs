@@ -52,9 +52,9 @@ pub fn client() -> &'static reqwest::Client {
 /// A `reqwest` error where `is_connect()` is true means the TCP/TLS connection
 /// to the upstream never established — the request did not reach the model, so
 /// retrying cannot duplicate or double-bill a generation. We deliberately do
-/// NOT retry on read/body errors (the connection was live, a stream may have
-/// started) or on HTTP 5xx status (those reached the model — that's the caller's
-/// to handle). One short fixed backoff smooths the sporadic stale-keepalive /
+/// NOT on read/body errors (the connection was live, a stream may have
+/// started) or on HTTP 5xx status (those reached the model, so the caller
+/// handles them). One short fixed backoff smooths the sporadic stale-keepalive /
 /// transient-connect failures seen under concurrency.
 ///
 /// `endpoint` is a bounded label (messages | chat | responses) used only for the
