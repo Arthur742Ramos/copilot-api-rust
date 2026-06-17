@@ -246,6 +246,8 @@ By default the server binds to `127.0.0.1:<port>` (loopback only). Pass
 | `POST` | `/v1/messages` | Anthropic-compatible messages. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. |
 | `GET` / `POST` | `/admin/config/model-mappings` | Read / write the model-mapping table (admin auth). |
+| `GET` / `POST` | `/admin/config/providers` | List / upsert third-party providers; `apiKey` is redacted to `apiKeySet` in responses (admin auth). |
+| `POST` | `/admin/config/reload` | Re-read `config.json` from disk without restarting; returns a secret-redacted summary (admin auth). |
 | `POST` | `/:provider/v1/messages` | Provider-routed Anthropic messages. |
 | `POST` | `/:provider/v1/messages/count_tokens` | Provider-routed token counting. |
 | `GET`  | `/:provider/v1/models` | Provider-routed model list. |

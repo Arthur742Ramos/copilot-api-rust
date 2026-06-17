@@ -79,6 +79,15 @@ pub fn build_router() -> Router {
                 .post(crate::routes::admin_config::post_model_mappings_route),
         )
         .route(
+            "/admin/config/reload",
+            post(crate::routes::admin_config::post_reload_route),
+        )
+        .route(
+            "/admin/config/providers",
+            get(crate::routes::admin_config::get_providers_route)
+                .post(crate::routes::admin_config::post_providers_route),
+        )
+        .route(
             "/:provider/v1/messages",
             post(crate::routes::provider::messages::post_provider_messages),
         )

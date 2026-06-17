@@ -81,13 +81,18 @@ struct StartArgs {
     )]
     account_type: String,
     /// Enable manual request approval
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, env = "COPILOT_API_MANUAL")]
     manual: bool,
     /// Rate limit in seconds between requests
-    #[arg(short = 'r', long = "rate-limit")]
+    #[arg(short = 'r', long = "rate-limit", env = "COPILOT_API_RATE_LIMIT")]
     rate_limit: Option<u64>,
     /// Wait instead of error when rate limit is hit
-    #[arg(short = 'w', long = "wait", default_value_t = false)]
+    #[arg(
+        short = 'w',
+        long = "wait",
+        default_value_t = false,
+        env = "COPILOT_API_WAIT"
+    )]
     wait: bool,
     /// Provide GitHub token directly (generated via the `auth` subcommand)
     #[arg(short = 'g', long = "github-token", env = "COPILOT_API_GITHUB_TOKEN")]
