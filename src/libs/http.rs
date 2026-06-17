@@ -46,3 +46,43 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 pub fn client() -> &'static reqwest::Client {
     &CLIENT
 }
+
+/// Max bytes buffered from a non-streaming upstream JSON response (16 MiB).
+/// Generous for any real Copilot completion (output is bounded by `max_tokens`)
+/// while preventing a misbehaving/compromised upstream from driving unbounded
+/// memory growth. Streaming responses are NOT buffered and are unaffected.
+pub const MAX_UPSTREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read a non-streaming upstream response body into memory with a hard byte cap,
+/// then deserialize it as `T`. Mirrors `response.json::<T>()` but bounds the
+/// buffer: `reqwest`'s own `.json()`/`.bytes()` read the entire body regardless
+/// of size. Returns `Err(message)` on a transport error, an oversize body, or a
+/// JSON parse failure — the caller wraps it into the appropriate `HttpError`.
+pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, String> {
+    use futures_util::StreamExt;
+
+    // Fast-fail on an advertised Content-Length over the cap before reading.
+    if let Some(len) = response.content_length() {
+        if len as usize > MAX_UPSTREAM_RESPONSE_BYTES {
+            return Err(format!(
+                "upstream response too large: {len} bytes > {MAX_UPSTREAM_RESPONSE_BYTES} cap"
+            ));
+        }
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("error reading upstream response: {e}"))?;
+        if buf.len() + chunk.len() > MAX_UPSTREAM_RESPONSE_BYTES {
+            return Err(format!(
+                "upstream response exceeded {MAX_UPSTREAM_RESPONSE_BYTES} byte cap"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&buf).map_err(|e| format!("failed to parse upstream response: {e}"))
+}

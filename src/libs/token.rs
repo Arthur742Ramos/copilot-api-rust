@@ -201,8 +201,22 @@ const RETRY_REFRESH_DELAY_MS: i64 = 15_000;
 const MAX_RETRY_REFRESH_DELAY_MS: i64 = 600_000;
 const RETRY_REFRESH_JITTER_MS: i64 = 15_000;
 const MIN_REFRESH_DELAY_MS: i64 = 1_000;
+/// Fallback token lifetime (seconds) when the upstream omits or zeroes
+/// `refresh_in`. GitHub's Copilot token endpoint normally returns ~1500s; a
+/// missing/`0` value is treated as this default rather than producing a ~1s
+/// hot-refresh loop that would hammer the token endpoint (and risk a 429 that
+/// disables every proxied request). Positive-but-small values are left alone —
+/// they signal a genuinely imminent expiry and are clamped by MIN below.
+const DEFAULT_REFRESH_IN_SECS: i64 = 1_500;
 
 pub fn get_refresh_deadline_ms(refresh_in: i64, now_ms: i64) -> i64 {
+    // A non-positive refresh_in is missing/invalid, not "refresh now": substitute
+    // a sane default so an upstream that omits the field can't drive a hot loop.
+    let refresh_in = if refresh_in <= 0 {
+        DEFAULT_REFRESH_IN_SECS
+    } else {
+        refresh_in
+    };
     now_ms
         + std::cmp::max(
             refresh_in * 1000 - EARLY_REFRESH_BUFFER_MS,
