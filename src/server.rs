@@ -248,7 +248,7 @@ async fn trace_middleware(req: Request, next: Next) -> Response {
 }
 
 /// Decrements the in-flight gauge on drop, so a panicking handler can't leak the
-/// counter (the panic unwinds through this guard before the CatchPanicLayer).
+/// gauge (the panic unwinds through this guard before the CatchPanicLayer).
 struct InFlightGuard;
 
 impl Drop for InFlightGuard {

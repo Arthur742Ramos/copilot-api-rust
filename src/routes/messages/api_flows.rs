@@ -109,10 +109,15 @@ pub struct FlowOptions {
 // SSE helpers
 // ---------------------------------------------------------------------------
 
-/// Records streaming-latency metrics for one SSE response: time-to-first-token
-/// (recorded once, when the first frame is yielded) and stream-complete (recorded
-/// on drop, so it fires whether the stream ends cleanly, errors out, or the client
-/// disconnects). `flow` is a bounded label (chat_completions | responses | messages).
+/// Records streaming-latency metrics for one SSE response:
+/// - `proxy_stream_ttft_seconds` — time to the first **content** frame yielded
+///   to the client (recorded once). Keep-alive pings and terminal error frames
+///   do NOT count, so this reflects time-to-first-token, not first-byte.
+/// - `proxy_stream_complete_seconds` — total stream duration, recorded on drop
+///   so it fires on every exit (clean end, upstream error, or client disconnect),
+///   labelled `outcome` = ok | error.
+///
+/// `flow` is a bounded label (chat_completions | responses | messages).
 struct StreamTimer {
     flow: &'static str,
     start: std::time::Instant,
@@ -130,8 +135,9 @@ impl StreamTimer {
         }
     }
 
-    /// Call as each frame is about to be yielded; records TTFT on the first one.
-    fn on_frame(&mut self) {
+    /// Call as each genuine **content** frame is about to be yielded; records
+    /// TTFT on the first such frame. Do NOT call for pings or error frames.
+    fn on_content_frame(&mut self) {
         if !self.ttft_recorded {
             self.ttft_recorded = true;
             histogram!("proxy_stream_ttft_seconds", "flow" => self.flow)
@@ -255,7 +261,6 @@ pub async fn handle_with_chat_completions(
                             if let Some(frame) =
                                 emit_event(&translate_error_to_anthropic_error_event())
                             {
-                                timer.on_frame();
                                 yield Ok(Bytes::from(frame));
                             }
                             return;
@@ -281,7 +286,7 @@ pub async fn handle_with_chat_completions(
 
                     for event in translate_chunk_to_anthropic_events(&chunk, &mut state) {
                         if let Some(frame) = emit_event(&event) {
-                            timer.on_frame();
+                            timer.on_content_frame();
                             yield Ok(Bytes::from(frame));
                         }
                     }
@@ -289,7 +294,7 @@ pub async fn handle_with_chat_completions(
 
                 for event in flush_pending_anthropic_stream_events(&mut state) {
                     if let Some(frame) = emit_event(&event) {
-                        timer.on_frame();
+                        timer.on_content_frame();
                         yield Ok(Bytes::from(frame));
                     }
                 }
@@ -387,7 +392,6 @@ pub async fn handle_with_responses_api(
                             let error_event =
                                 build_error_event("An unexpected error occurred during streaming.");
                             if let Some(frame) = emit_event(&error_event) {
-                                timer.on_frame();
                                 yield Ok(Bytes::from(frame));
                             }
                             return;
@@ -395,7 +399,8 @@ pub async fn handle_with_responses_api(
                     };
 
                     if chunk.event.as_deref() == Some("ping") {
-                        timer.on_frame();
+                        // Pings are keep-alives, not content — don't count them
+                        // toward TTFT (they'd systematically under-report it).
                         yield Ok(Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));
                         continue;
                     }
@@ -419,7 +424,7 @@ pub async fn handle_with_responses_api(
 
                     for event in translate_responses_stream_event(&response_event, &mut state) {
                         if let Some(frame) = emit_event(&event) {
-                            timer.on_frame();
+                            timer.on_content_frame();
                             yield Ok(Bytes::from(frame));
                         }
                     }
@@ -437,7 +442,6 @@ pub async fn handle_with_responses_api(
                     let error_event =
                         build_error_event("Responses stream ended without completion");
                     if let Some(frame) = emit_event(&error_event) {
-                        timer.on_frame();
                         yield Ok(Bytes::from(frame));
                     }
                 }
@@ -522,7 +526,6 @@ pub async fn handle_with_messages_api(
                             if let Some(frame) =
                                 emit_event(&translate_error_to_anthropic_error_event())
                             {
-                                timer.on_frame();
                                 yield Ok(Bytes::from(frame));
                             }
                             return;
@@ -564,7 +567,7 @@ pub async fn handle_with_messages_api(
                         Some(name) => format!("event: {name}\ndata: {data}\n\n"),
                         None => format!("data: {data}\n\n"),
                     };
-                    timer.on_frame();
+                    timer.on_content_frame();
                     yield Ok(Bytes::from(frame));
                 }
 
@@ -575,7 +578,6 @@ pub async fn handle_with_messages_api(
                         "messages stream ended without message_stop; synthesizing terminal event"
                     );
                     if let Some(frame) = emit_event(&AnthropicStreamEventData::MessageStop) {
-                        timer.on_frame();
                         yield Ok(Bytes::from(frame));
                     }
                 }

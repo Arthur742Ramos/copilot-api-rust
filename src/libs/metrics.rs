@@ -66,9 +66,11 @@ pub fn init_build_info() {
 
 /// Record an upstream Copilot request's latency under
 /// `copilot_upstream_request_seconds`, labelled by a bounded `endpoint`
-/// (messages | chat | responses) and a coarse `status` class so proxy overhead
-/// can be separated from upstream generation time without label-cardinality
-/// blowup. `status` is one of: ok, client_error, server_error, transport_error.
+/// (messages | chat | responses) and a coarse `status` class. This measures
+/// time-to-response-headers (the `send().await`), i.e. upstream TTFB — NOT the
+/// time to consume a streaming body. Paired with the proxy_stream_* histograms,
+/// it lets you separate "slow to respond" from "long but healthy output".
+/// `status` is one of: ok, client_error, server_error, transport_error.
 pub fn record_upstream_request(endpoint: &'static str, status: UpstreamStatus, elapsed_secs: f64) {
     metrics::histogram!(
         "copilot_upstream_request_seconds",
