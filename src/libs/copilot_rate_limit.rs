@@ -69,6 +69,28 @@ pub fn log_copilot_rate_limits(headers: &HeaderMap) {
                 usage.remaining,
                 usage.reset_at
             );
+            record_rate_limit_metrics(&usage);
         }
+    }
+}
+
+/// Surface the parsed quota as bounded Prometheus gauges so the one failure mode
+/// that disables the whole proxy (a session/weekly cap exhaustion → upstream
+/// 429/529) is alertable as a leading indicator, not just visible in logs.
+/// `type` is bounded to {session, weekly}; values that don't parse are skipped.
+fn record_rate_limit_metrics(usage: &RateLimitUsage) {
+    if let Ok(remaining) = usage.remaining.trim().parse::<f64>() {
+        metrics::gauge!("copilot_rate_limit_remaining", "type" => usage.type_name).set(remaining);
+    }
+    // `rst` is a unix timestamp (seconds); expose seconds-until-reset, clamped at
+    // 0, which is more directly useful for alerting than the raw epoch.
+    if let Ok(reset_at) = usage.reset_at.trim().parse::<i64>() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let seconds_until = (reset_at - now).max(0) as f64;
+        metrics::gauge!("copilot_rate_limit_reset_seconds", "type" => usage.type_name)
+            .set(seconds_until);
     }
 }

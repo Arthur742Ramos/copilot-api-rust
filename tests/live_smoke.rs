@@ -13,9 +13,8 @@
 //!   2. `cache_models` fetches the live model catalogue (non-empty).
 //!   3. A minimal `/v1/chat/completions` request through the real router returns
 //!      200 with a non-empty body.
-//!
-//! To extend: add a `/v1/messages` (Anthropic) request, or assert on the parsed
-//! choices. Keep it best-effort — the goal is a human-run end-to-end check.
+//!   4. A minimal streaming `/v1/messages` request returns 200, exercising the
+//!      Anthropic translation flow and its streaming metric paths.
 
 mod common;
 
@@ -86,4 +85,36 @@ async fn live_chat_completion_smoke() {
     );
     assert!(!body.is_empty(), "response body should be non-empty");
     eprintln!("live_smoke: chat completion OK ({} bytes)", body.len());
+
+    // Also exercise the Anthropic /v1/messages path so the messages/responses
+    // flow (and its metric label paths: proxy_stream_*{flow=...},
+    // copilot_upstream_request_seconds{endpoint=...}) is covered end-to-end, not
+    // just chat_completions. Streaming so the SSE translation + StreamTimer run.
+    let messages_payload = json!({
+        "model": model_id,
+        "max_tokens": 16,
+        "stream": true,
+        "messages": [
+            { "role": "user", "content": "Reply with the single word: pong" }
+        ],
+    });
+    let messages_request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(Body::from(messages_payload.to_string()))
+        .unwrap();
+    let (status, body) = send(messages_request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/v1/messages should return 200; body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        !body.is_empty(),
+        "/v1/messages response body should be non-empty"
+    );
+    eprintln!("live_smoke: /v1/messages OK ({} bytes)", body.len());
 }
