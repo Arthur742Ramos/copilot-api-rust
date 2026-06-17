@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CODEX_API_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
-const CALLBACK_HOST: &str = "127.0.0.1";
 const CALLBACK_PORT: u16 = 1455;
 const CALLBACK_PATH: &str = "/auth/callback";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -17,7 +16,7 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const SCOPE: &str = "openid profile email offline_access";
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 const REFRESH_BUFFER_MS: i64 = 60_000;
-const CALLBACK_TIMEOUT_MS: u64 = 45_000;
+const CALLBACK_TIMEOUT_MS: u64 = 180_000;
 
 fn redirect_uri() -> String {
     format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}")
@@ -194,63 +193,97 @@ fn escape_html(value: &str) -> String {
 
 /// Run a one-shot local HTTP server on the callback port, returning the captured
 /// authorization `code` once the browser redirects (or None on timeout/error).
+///
+/// Binds the callback on BOTH `127.0.0.1` and `[::1]`: the redirect URL OpenAI
+/// sends the browser to uses `localhost`, which on many systems (notably
+/// Windows) resolves to IPv6 `::1` first. Binding only IPv4 there would leave the
+/// browser knocking on a dead `[::1]:1455` and the user stuck on a "connection
+/// refused" page, so we listen on both stacks and take whichever fires.
 async fn wait_for_authorization_code(state: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let listener = tokio::net::TcpListener::bind((CALLBACK_HOST, CALLBACK_PORT))
+    // Try both loopback families; succeed if at least one binds.
+    let v4 = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
         .await
-        .ok()?;
+        .ok();
+    let v6 = tokio::net::TcpListener::bind(("::1", CALLBACK_PORT))
+        .await
+        .ok();
+    if v4.is_none() && v6.is_none() {
+        return None;
+    }
 
-    let accept_loop = async {
+    // Handle one accepted connection: parse the callback, write the response,
+    // and return Some(code) once the matching-state code arrives.
+    async fn handle_conn(socket: &mut tokio::net::TcpStream, state: &str) -> Option<String> {
+        let mut buf = vec![0u8; 8192];
+        let n = socket.read(&mut buf).await.ok()?;
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let request_line = request.lines().next().unwrap_or("");
+        // "GET /auth/callback?code=...&state=... HTTP/1.1"
+        let target = request_line.split_whitespace().nth(1).unwrap_or("");
+
+        let full = format!("http://localhost{target}");
+        let parsed = url::Url::parse(&full).ok();
+
+        let (status_line, message, code) = match parsed {
+            Some(u) if u.path() == CALLBACK_PATH => {
+                let q_state = u
+                    .query_pairs()
+                    .find(|(k, _)| k == "state")
+                    .map(|(_, v)| v.to_string());
+                let q_code = u
+                    .query_pairs()
+                    .find(|(k, _)| k == "code")
+                    .map(|(_, v)| v.to_string());
+                if q_state.as_deref() != Some(state) {
+                    ("400 Bad Request", "State mismatch.".to_string(), None)
+                } else if let Some(code) = q_code {
+                    ("200 OK", SUCCESS_BODY.to_string(), Some(code))
+                } else {
+                    (
+                        "400 Bad Request",
+                        "Missing authorization code.".to_string(),
+                        None,
+                    )
+                }
+            }
+            _ => (
+                "404 Not Found",
+                "Callback route not found.".to_string(),
+                None,
+            ),
+        };
+
+        let _ = socket
+            .write_all(http_response(status_line, &message).as_bytes())
+            .await;
+        let _ = socket.flush().await;
+        code
+    }
+
+    // Accept on a single listener until a valid code arrives (skipping
+    // favicon/preflight/non-matching hits).
+    async fn accept_on(listener: tokio::net::TcpListener, state: &str) -> Option<String> {
         loop {
             let (mut socket, _) = listener.accept().await.ok()?;
-            let mut buf = vec![0u8; 8192];
-            let n = socket.read(&mut buf).await.ok()?;
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let request_line = request.lines().next().unwrap_or("");
-            // "GET /auth/callback?code=...&state=... HTTP/1.1"
-            let target = request_line.split_whitespace().nth(1).unwrap_or("");
-
-            let full = format!("http://localhost{target}");
-            let parsed = url::Url::parse(&full).ok();
-
-            let (status_line, message, code) = match parsed {
-                Some(u) if u.path() == CALLBACK_PATH => {
-                    let q_state = u
-                        .query_pairs()
-                        .find(|(k, _)| k == "state")
-                        .map(|(_, v)| v.to_string());
-                    let q_code = u
-                        .query_pairs()
-                        .find(|(k, _)| k == "code")
-                        .map(|(_, v)| v.to_string());
-                    if q_state.as_deref() != Some(state) {
-                        ("400 Bad Request", "State mismatch.".to_string(), None)
-                    } else if let Some(code) = q_code {
-                        ("200 OK", SUCCESS_BODY.to_string(), Some(code))
-                    } else {
-                        (
-                            "400 Bad Request",
-                            "Missing authorization code.".to_string(),
-                            None,
-                        )
-                    }
-                }
-                _ => (
-                    "404 Not Found",
-                    "Callback route not found.".to_string(),
-                    None,
-                ),
-            };
-
-            let _ = socket
-                .write_all(http_response(status_line, &message).as_bytes())
-                .await;
-            let _ = socket.flush().await;
-
-            if let Some(code) = code {
+            if let Some(code) = handle_conn(&mut socket, state).await {
                 return Some(code);
             }
+        }
+    }
+
+    let accept_loop = async {
+        match (v4, v6) {
+            (Some(l4), Some(l6)) => {
+                tokio::select! {
+                    r = accept_on(l4, state) => r,
+                    r = accept_on(l6, state) => r,
+                }
+            }
+            (Some(l4), None) => accept_on(l4, state).await,
+            (None, Some(l6)) => accept_on(l6, state).await,
+            (None, None) => None,
         }
     };
 
