@@ -126,6 +126,7 @@ fn stream_sse(
     upstream: reqwest::Response,
     recorder: crate::libs::token_usage::TokenUsageRecorder,
 ) -> Response {
+    use crate::libs::stream_metrics::{transport, StreamTimer};
     use crate::libs::token_usage::UsageTokens;
     use std::sync::{Arc, Mutex};
 
@@ -133,9 +134,25 @@ fn stream_sse(
     let usage_for_stream = usage_acc.clone();
     let recorder = Arc::new(recorder);
 
+    // Time the native (raw byte-forwarded) stream so /v1/chat/completions is
+    // covered by the same proxy_stream_* dashboards as the messages flows. TTFT
+    // here is a coarser first-non-empty-chunk approximation (transport=native).
+    // The timer is held by the stream closure and drops (recording
+    // stream-complete) when the stream ends or the client disconnects.
+    let timer_for_stream = Arc::new(Mutex::new(StreamTimer::new(
+        "chat_completions",
+        transport::NATIVE,
+    )));
+
     let byte_stream = upstream.bytes_stream();
     let mapped = byte_stream.map(move |chunk| {
         if let Ok(bytes) = &chunk {
+            if chunk_has_content(bytes) {
+                timer_for_stream
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .on_content_frame();
+            }
             if let Some(usage) = sniff_usage(bytes) {
                 *usage_for_stream
                     .lock()
@@ -146,7 +163,9 @@ fn stream_sse(
     });
 
     // Record usage when the stream completes (the recorder is held by the
-    // stream's closure; cloning the Arc lets us record on the final chunk).
+    // stream's closure; cloning the Arc lets us record on the final chunk). The
+    // `timer` Arc is moved in here too, so it drops — recording stream-complete —
+    // when this terminal future runs at end-of-stream.
     let recorder_final = recorder.clone();
     let usage_final = usage_acc.clone();
     let finalizing = mapped.chain(futures_util::stream::once(async move {
@@ -167,6 +186,19 @@ fn stream_sse(
         .header(header::CONNECTION, "keep-alive")
         .body(body)
         .unwrap()
+}
+
+/// Whether an SSE chunk carries a real content `data:` line (not empty / `[DONE]`).
+/// Used to start time-to-first-token on the first genuine content frame.
+fn chunk_has_content(bytes: &[u8]) -> bool {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    text.lines().any(|line| {
+        let data = line.strip_prefix("data:").map(str::trim).unwrap_or("");
+        !data.is_empty() && data != "[DONE]"
+    })
 }
 
 /// Parse `data: {json}` lines out of an SSE chunk and return normalized usage

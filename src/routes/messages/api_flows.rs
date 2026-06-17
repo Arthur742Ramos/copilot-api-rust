@@ -24,10 +24,11 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use metrics::histogram;
+
 use serde_json::{json, Value};
 
 use crate::libs::error::AppError;
+use crate::libs::stream_metrics::{transport, StreamTimer};
 use crate::libs::subagent::SubagentMarker;
 use crate::libs::token_usage::{
     create_copilot_token_usage_recorder, merge_anthropic_usage, normalize_anthropic_usage,
@@ -108,56 +109,6 @@ pub struct FlowOptions {
 // ---------------------------------------------------------------------------
 // SSE helpers
 // ---------------------------------------------------------------------------
-
-/// Records streaming-latency metrics for one SSE response:
-/// - `proxy_stream_ttft_seconds` — time to the first **content** frame yielded
-///   to the client (recorded once). Keep-alive pings and terminal error frames
-///   do NOT count, so this reflects time-to-first-token, not first-byte.
-/// - `proxy_stream_complete_seconds` — total stream duration, recorded on drop
-///   so it fires on every exit (clean end, upstream error, or client disconnect),
-///   labelled `outcome` = ok | error.
-///
-/// `flow` is a bounded label (chat_completions | responses | messages).
-struct StreamTimer {
-    flow: &'static str,
-    start: std::time::Instant,
-    ttft_recorded: bool,
-    errored: bool,
-}
-
-impl StreamTimer {
-    fn new(flow: &'static str) -> Self {
-        Self {
-            flow,
-            start: std::time::Instant::now(),
-            ttft_recorded: false,
-            errored: false,
-        }
-    }
-
-    /// Call as each genuine **content** frame is about to be yielded; records
-    /// TTFT on the first such frame. Do NOT call for pings or error frames.
-    fn on_content_frame(&mut self) {
-        if !self.ttft_recorded {
-            self.ttft_recorded = true;
-            histogram!("proxy_stream_ttft_seconds", "flow" => self.flow)
-                .record(self.start.elapsed().as_secs_f64());
-        }
-    }
-
-    /// Mark that the stream is ending via the upstream-error path.
-    fn mark_error(&mut self) {
-        self.errored = true;
-    }
-}
-
-impl Drop for StreamTimer {
-    fn drop(&mut self) {
-        let outcome = if self.errored { "error" } else { "ok" };
-        histogram!("proxy_stream_complete_seconds", "flow" => self.flow, "outcome" => outcome)
-            .record(self.start.elapsed().as_secs_f64());
-    }
-}
 
 /// Render one translated Anthropic event as an SSE frame
 /// (`event: {type}\ndata: {json}\n\n`). Returns `None` if the event cannot be
@@ -246,7 +197,7 @@ pub async fn handle_with_chat_completions(
         }
         ChatCompletionsResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("chat_completions");
+                let mut timer = StreamTimer::new("chat_completions", transport::TRANSLATED);
                 let mut state = AnthropicStreamState::default();
                 let mut usage = UsageTokens::default();
 
@@ -380,7 +331,7 @@ pub async fn handle_with_responses_api(
     match result {
         CreateResponsesReturn::Stream(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("responses");
+                let mut timer = StreamTimer::new("responses", transport::TRANSLATED);
                 let mut state = ResponsesStreamState::new(Some(tool_search_name));
                 let mut usage = UsageTokens::default();
 
@@ -510,7 +461,7 @@ pub async fn handle_with_messages_api(
         }
         CreateMessagesResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("messages");
+                let mut timer = StreamTimer::new("messages", transport::TRANSLATED);
                 let mut usage = UsageTokens::default();
                 // Track terminal framing so a passthrough upstream that ends
                 // without a `message_stop` (clean end / [DONE]) doesn't leave the

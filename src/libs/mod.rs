@@ -26,6 +26,7 @@ pub mod shell;
 pub mod sqlite;
 pub mod sse;
 pub mod state;
+pub mod stream_metrics;
 pub mod subagent;
 pub mod token;
 pub mod token_usage;

@@ -174,11 +174,16 @@ fn stream_responses_sse(
     upstream: crate::services::copilot::create_responses::ResponsesEventStream,
     recorder: crate::libs::token_usage::TokenUsageRecorder,
 ) -> Response {
+    use crate::libs::stream_metrics::{transport, StreamTimer};
     use crate::libs::token_usage::UsageTokens;
 
     let event_stream = upstream;
 
     let body = Body::from_stream(async_stream::stream! {
+        // Cover the native /v1/responses stream with the same proxy_stream_*
+        // dashboards as the messages flows (transport=native). The timer drops
+        // at end-of-stream (or client disconnect), recording stream-complete.
+        let mut timer = StreamTimer::new("responses", transport::NATIVE);
         let mut tracker = StreamIdTracker::new();
         let mut usage: UsageTokens = UsageTokens::default();
         futures_util::pin_mut!(event_stream);
@@ -188,6 +193,7 @@ fn stream_responses_sse(
             let ev = match item {
                 Ok(ev) => ev,
                 Err(err) => {
+                    timer.mark_error();
                     yield Err(err);
                     return;
                 }
@@ -199,6 +205,8 @@ fn stream_responses_sse(
 
             let processed = fix_stream_ids(&ev.data, ev.event.as_deref(), &mut tracker);
             let frame = build_sse_frame(ev.id.as_deref(), ev.event.as_deref(), &processed);
+            // Each forwarded event is a content frame for this raw transport.
+            timer.on_content_frame();
             yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(frame));
         }
 
