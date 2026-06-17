@@ -261,7 +261,31 @@ fn read_editable_config_from_disk() -> Result<AppConfig, anyhow::Error> {
 
 fn write_config_to_disk(config: &AppConfig) -> std::io::Result<()> {
     std::fs::create_dir_all(&PATHS.app_dir)?;
-    std::fs::write(&PATHS.config_path, serialize_pretty(config))
+    // Write to a sibling temp file then atomically rename over the target so a
+    // crash mid-write can never leave a truncated/corrupt secrets file (the
+    // config holds adminApiKey and provider apiKeys). std::fs::rename is an
+    // atomic replace on both Unix and Windows.
+    let target = &PATHS.config_path;
+    let pid = std::process::id();
+    let tmp_path = PATHS.app_dir.join(format!("config.json.tmp.{pid}"));
+    let contents = serialize_pretty(config);
+
+    let write_result = (|| -> std::io::Result<()> {
+        std::fs::write(&tmp_path, &contents)?;
+        // Re-assert 0600 on every write, not just first create: a rename that
+        // lands a brand-new inode would otherwise inherit umask perms.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp_path, target)
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
 }
 
 /// Returns (merged, changed). Adds any missing default extraPrompts /

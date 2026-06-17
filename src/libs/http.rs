@@ -155,6 +155,42 @@ pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&buf).map_err(|e| format!("failed to parse upstream response: {e}"))
 }
 
+/// Max bytes buffered from a non-2xx upstream *error* body (1 MiB). Error bodies
+/// are only used for envelope-sniffing, message-lifting, and client display, so a
+/// tighter bound than [`MAX_UPSTREAM_RESPONSE_BYTES`] is fine — truncation can't
+/// lose meaningful error text — while still keeping the error path from buffering
+/// a multi-GB body a misbehaving upstream might return.
+pub const MAX_UPSTREAM_ERROR_BYTES: usize = 1024 * 1024;
+
+/// Read an upstream response body into a bounded `String`, truncating at
+/// [`MAX_UPSTREAM_ERROR_BYTES`]. Mirrors `response.text()` but caps the buffer so
+/// the error path enjoys the same memory protection as [`read_json_capped`].
+/// Bytes are decoded with `from_utf8_lossy`; a transport error yields whatever was
+/// read so far (error display is best-effort).
+pub async fn read_text_capped(response: reqwest::Response) -> String {
+    use futures_util::StreamExt;
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        let remaining = MAX_UPSTREAM_ERROR_BYTES.saturating_sub(buf.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(chunk.len());
+        buf.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break;
+        }
+    }
+
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
