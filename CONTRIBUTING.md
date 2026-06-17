@@ -1,10 +1,12 @@
 # Contributing
 
-Thanks for your interest in improving `copilot-api`. This crate is a Rust port
-of [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api); please
-preserve behavioral parity with the TypeScript original wherever the two
-overlap (wire formats, header construction, request/response shaping, edge-case
-handling). When in doubt, match what the TS code does.
+Thanks for your interest in improving `copilot-api`. This crate began as a Rust
+port of [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api).
+The port is established, and **parity with the TypeScript original is no longer a
+requirement** — prefer the better engineering choice (correctness, client
+experience, performance, clarity) over matching upstream behavior. The TS source
+is still useful for understanding the original intent of a behavior, but you are
+free to diverge; when you do, add or update tests to cover the new behavior.
 
 ## Building and testing
 
@@ -50,6 +52,8 @@ Run `cargo fmt` before committing so the formatting check passes.
 
 ## Style
 
-- Keep parity-sensitive code annotated with references to the corresponding TS
-  source (e.g. `src/lib/api-config.ts`) when it helps future maintainers.
+- Where code intentionally tracks a subtle TS behavior, a reference to the
+  corresponding TS source (e.g. `src/lib/api-config.ts`) can help future
+  maintainers -- but it's optional, not required, and never a reason to keep a
+  worse behavior.
 - Don't introduce behavior changes in cleanup/docs PRs.

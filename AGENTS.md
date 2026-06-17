@@ -1,10 +1,12 @@
 # AGENTS.md
 
-Guidance for AI coding agents working in this repository. This crate is a
-**faithful Rust port** of [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api)
-(a TypeScript proxy). The reference TS source is checked out at
-`/tmp/copilot-api-orig` — consult it whenever behavior is ambiguous and mirror
-it rather than inventing new logic.
+Guidance for AI coding agents working in this repository. This crate began as a
+Rust port of [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api)
+(a TypeScript proxy), and the reference TS source is checked out at
+`/tmp/copilot-api-orig` — a useful place to understand the *original intent* of a
+behavior. **But parity is no longer a goal.** The port is established and working;
+prefer the better engineering choice over matching the TS upstream. Diverge freely
+when it improves correctness, client experience, performance, or clarity.
 
 ## Architecture
 
@@ -25,28 +27,25 @@ entry point.
 
 ## Key conventions
 
-- **Parity first.** Match the TS original's wire format and edge-case handling.
-  Annotate non-obvious code with the corresponding TS path (e.g.
-  `src/lib/api-config.ts`).
+- **Improve freely; parity is not a constraint.** The TS original is reference
+  material for understanding intent, not a spec to match. When the TS behavior is
+  suboptimal, improve it — add tests for the new behavior and update any test that
+  locked the old one. (Historically this codebase carried a "parity first" rule;
+  that has been removed.)
 - **Serde:** types that round-trip JSON use `#[serde(flatten)]` to preserve
   unknown keys and the `preserve_order` feature so key order is stable. Don't
   drop fields you don't recognize.
-- **Errors:** use `AppError` for internal failures and `HttpError`
-  (`src/libs/error.rs`) to forward an upstream response's status/headers/body
-  unchanged. Avoid silent failures.
+- **Errors:** use `AppError` for client/internal failures and `HttpError`
+  (`src/libs/error.rs`) to carry an upstream response's status/headers/body.
+  Surface errors in the Anthropic JSON shape (`{error:{message,type}}`) with an
+  appropriate `type`; avoid silent failures.
 - **Preprocessing:** request bodies are often manipulated as `serde_json::Value`
-  trees ("Value-walking") rather than fully-typed structs, mirroring the TS
-  approach of mutating the request object in place.
+  trees ("Value-walking") rather than fully-typed structs. This was inherited from
+  the TS in-place-mutation approach; it's fine where it's simplest, but typed
+  structs are welcome where they're clearer or avoid redundant clones.
 - **Dead code:** the crate root has `#![allow(dead_code)]` because some ported
   subsystems are wired but not yet reachable. Don't delete an item unless `grep`
   proves it is unreferenced.
-- **Some "wrong-looking" values are deliberate parity, not bugs.** They mirror
-  the TS upstream and may be test-locked. Known examples: the streaming error
-  envelope uses `type: "error"` (not an Anthropic-specific error type; locked by
-  a test in `src/libs/error.rs`), and `message_start` reports `input_tokens: 0`
-  (Copilot only reports usage on the final chunk). Don't "correct" these unless
-  you are explicitly deciding to diverge from upstream — and update the locking
-  test if you do.
 
 ## Before you finish
 
