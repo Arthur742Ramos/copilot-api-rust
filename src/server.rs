@@ -8,7 +8,7 @@ use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use serde_json::json;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -247,6 +247,16 @@ async fn trace_middleware(req: Request, next: Next) -> Response {
     response
 }
 
+/// Decrements the in-flight gauge on drop, so a panicking handler can't leak the
+/// counter (the panic unwinds through this guard before the CatchPanicLayer).
+struct InFlightGuard;
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        gauge!("http_requests_in_flight").decrement(1.0);
+    }
+}
+
 /// Times each request and records a total-requests counter plus a
 /// latency histogram, labelled by method, matched route and response status.
 async fn metrics_middleware(req: Request, next: Next) -> Response {
@@ -261,6 +271,11 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".to_owned());
     let start = std::time::Instant::now();
+    // Track concurrent in-flight requests. A drop guard decrements even if a
+    // handler panics (the CatchPanicLayer is outside this middleware), so the
+    // gauge can't leak upward on the error path.
+    gauge!("http_requests_in_flight").increment(1.0);
+    let _in_flight = InFlightGuard;
     let response = next.run(req).await;
     let elapsed = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
@@ -274,8 +289,10 @@ async fn metrics_middleware(req: Request, next: Next) -> Response {
     response
 }
 
-/// Prometheus text-exposition endpoint. Mounted outside auth via the general
-/// layer's `allow_unauthenticated_paths` so scrapers need no API key.
+/// Prometheus text-exposition endpoint. NOT in the unauthenticated allowlist: it
+/// is subject to the normal API-key check (see `request_auth.rs`), so it is open
+/// only when `auth.apiKeys` is empty and requires a valid key once keys are
+/// configured — this avoids leaking LAN traffic patterns to anonymous clients.
 async fn metrics_handler() -> Response {
     Response::builder()
         .status(StatusCode::OK)

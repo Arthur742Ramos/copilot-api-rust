@@ -69,13 +69,26 @@ pub async fn create_chat_completions(
 
     let base = copilot_base_url(&st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    let upstream_start = std::time::Instant::now();
     let response = client()
         .post(format!("{base}/chat/completions"))
         .headers(headers)
         .body(body)
         .send()
         .await
-        .map_err(|e| HttpError::internal(format!("Failed to create chat completions: {e}")))?;
+        .map_err(|e| {
+            crate::libs::metrics::record_upstream_request(
+                "chat",
+                crate::libs::metrics::UpstreamStatus::TransportError,
+                upstream_start.elapsed().as_secs_f64(),
+            );
+            HttpError::internal(format!("Failed to create chat completions: {e}"))
+        })?;
+    crate::libs::metrics::record_upstream_request(
+        "chat",
+        crate::libs::metrics::UpstreamStatus::from_code(response.status().as_u16()),
+        upstream_start.elapsed().as_secs_f64(),
+    );
 
     {
         // Convert reqwest headers to axum HeaderMap for the rate-limit logger.

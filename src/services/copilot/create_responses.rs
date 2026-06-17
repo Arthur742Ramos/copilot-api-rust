@@ -911,13 +911,26 @@ async fn create_http_responses(
 ) -> Result<CreateResponsesReturn, HttpError> {
     let base = copilot_base_url(st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    let upstream_start = std::time::Instant::now();
     let response = client()
         .post(format!("{base}/responses"))
         .headers(headers)
         .body(body)
         .send()
         .await
-        .map_err(|e| HttpError::internal(format!("Failed to create responses: {e}")))?;
+        .map_err(|e| {
+            crate::libs::metrics::record_upstream_request(
+                "responses",
+                crate::libs::metrics::UpstreamStatus::TransportError,
+                upstream_start.elapsed().as_secs_f64(),
+            );
+            HttpError::internal(format!("Failed to create responses: {e}"))
+        })?;
+    crate::libs::metrics::record_upstream_request(
+        "responses",
+        crate::libs::metrics::UpstreamStatus::from_code(response.status().as_u16()),
+        upstream_start.elapsed().as_secs_f64(),
+    );
 
     {
         let axum_headers = reqwest_headers_to_axum(response.headers());
