@@ -119,16 +119,17 @@ pub struct AuthOptions {
 impl AuthOptions {
     /// The general auth middleware: skips `/admin/` (handled by the admin layer)
     /// and allows the unauthenticated landing / usage-viewer paths.
+    ///
+    /// `/metrics` is intentionally NOT listed here: it would otherwise leak LAN
+    /// traffic patterns (request counts / latency labels) to any unauthenticated
+    /// client. By relying on the normal key check instead, `/metrics` stays open
+    /// only when no API keys are configured (`allow_when_no_api_keys`) and
+    /// requires a valid key once keys are set. `/readyz` remains always-open so
+    /// orchestrators can probe readiness without credentials.
     pub fn general() -> Self {
         AuthOptions {
             get_api_keys: get_configured_api_keys,
-            allow_unauthenticated_paths: &[
-                "/",
-                "/usage-viewer",
-                "/usage-viewer/",
-                "/metrics",
-                "/readyz",
-            ],
+            allow_unauthenticated_paths: &["/", "/usage-viewer", "/usage-viewer/", "/readyz"],
             allow_options_bypass: true,
             allow_when_no_api_keys: true,
             skip_admin_prefix: true,

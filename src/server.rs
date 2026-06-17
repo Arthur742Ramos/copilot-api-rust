@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use metrics::{counter, histogram};
 use serde_json::json;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::{info_span, Instrument, Level};
 
@@ -132,22 +132,29 @@ pub fn build_router() -> Router {
 
 /// CORS policy for the API.
 ///
-/// We intentionally allow any origin: the OpenAI / Anthropic browser SDKs call
-/// this gateway directly from arbitrary web origins, so origin-restricting would
-/// break client compatibility. Methods and headers are restricted to the set the
-/// SDKs actually use rather than `Any`, making the policy explicit.
+/// SECURITY: the previous policy reflected `Any` origin (ACAO: `*`) router-wide.
+/// Combined with a `0.0.0.0` bind, that turned `/token` and the other sensitive
+/// routes into a cross-origin drive-by target: any web page the operator visited
+/// could `fetch()` this gateway and read the response. We instead reflect an
+/// explicit allowlist of *loopback* origins (`http://localhost`, `127.0.0.1`,
+/// `[::1]` on any port). This keeps the local usage-viewer / usage endpoints
+/// working when served from a different local port, but no longer hands an
+/// `Access-Control-Allow-Origin` to arbitrary internet origins, so a malicious
+/// remote page cannot read `/token` (or anything else) from a victim's browser.
 ///
-/// SECURITY: credentials are NOT allowed (`allow_credentials` is never set), so
-/// browsers will not send cookies / HTTP-auth on cross-origin requests and the
-/// wildcard origin cannot be combined with credentials. This gateway relies on
-/// bearer/x-api-key tokens in request headers for auth, not ambient credentials.
-/// Operators SHOULD still front this service with their own authentication.
+/// Credentials are NOT allowed (`allow_credentials` is never set), so browsers
+/// will not send cookies / HTTP-auth cross-origin. This gateway relies on
+/// bearer / x-api-key tokens in request headers for auth, not ambient
+/// credentials. Non-browser clients (curl, SDKs) are unaffected: CORS only
+/// constrains browser script, never the server-side auth check.
 fn cors_layer() -> CorsLayer {
     use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
     use axum::http::{HeaderName, Method};
 
     CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(|origin, _request_parts| {
+            is_loopback_origin(origin.as_bytes())
+        }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
             CONTENT_TYPE,
@@ -156,6 +163,37 @@ fn cors_layer() -> CorsLayer {
             HeaderName::from_static("anthropic-version"),
             HeaderName::from_static("anthropic-beta"),
         ])
+}
+
+/// Whether an `Origin` header value names a loopback host (localhost / 127.0.0.0/8
+/// / ::1) on any port and scheme. Used to scope CORS to local browser tooling
+/// without reflecting arbitrary remote origins.
+fn is_loopback_origin(origin: &[u8]) -> bool {
+    let origin = match std::str::from_utf8(origin) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // Strip scheme (http:// or https://).
+    let host_port = match origin.split_once("://") {
+        Some((_, rest)) => rest,
+        None => return false,
+    };
+    // An origin has no path; the authority is everything up to an optional port.
+    // Handle bracketed IPv6 hosts (`[::1]:8080`) before splitting on ':'.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    // 127.0.0.0/8 loopback range.
+    matches!(host.parse::<std::net::Ipv4Addr>(), Ok(ip) if ip.is_loopback())
 }
 
 /// Render a handler panic as a 500 JSON error (instead of dropping the
@@ -245,10 +283,27 @@ async fn metrics_handler() -> Response {
         .unwrap()
 }
 
-/// Readiness probe: ready only once a copilot token is held and the model list
-/// has been cached. Distinct from `/` (liveness), which is always 200.
+/// Readiness probe: ready only once a copilot token is held, that token is not
+/// already past its expiry, and the model list has been cached. Distinct from
+/// `/` (liveness), which is always 200.
+///
+/// Asserting freshness (not just presence) avoids a false-green during a refresh
+/// outage: the refresh loop retries with backoff while continuing to hold the
+/// now-expired token, so a presence-only check would keep reporting "ready" even
+/// though every upstream call is failing with 401. Tokens without a parseable
+/// `exp=` fall back to presence-based readiness.
 async fn readyz() -> Response {
-    let ready = crate::libs::state::with_state(|s| s.copilot_token.is_some() && s.models.is_some());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let ready = crate::libs::state::with_state(|s| {
+        let token_fresh = s
+            .copilot_token
+            .as_deref()
+            .is_some_and(|t| crate::routes::token::copilot_token_is_fresh(t, now_secs));
+        token_fresh && s.models.is_some()
+    });
     if ready {
         (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
     } else {

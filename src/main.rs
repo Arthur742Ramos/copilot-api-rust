@@ -60,6 +60,10 @@ struct StartArgs {
     /// Port to listen on
     #[arg(short = 'p', long, default_value = "4141")]
     port: u16,
+    /// Host/interface to bind to. Defaults to loopback (127.0.0.1) to limit the
+    /// blast radius; pass 0.0.0.0 to expose the gateway on the LAN.
+    #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    host: String,
     /// Enable verbose logging
     #[arg(short = 'v', long, default_value_t = false)]
     verbose: bool,
@@ -196,6 +200,7 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
 
     ensure_paths().await?;
+    crate::libs::paths::warn_if_file_perms_unrestricted();
     cache_vscode_version().await;
     cache_mac_machine_id();
     cache_vscode_session_id();
@@ -226,7 +231,29 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     });
     tracing::info!("Available models: \n{model_list}");
 
-    let server_url = format!("http://localhost:{}", options.port);
+    // Resolve the bind host once into an IpAddr (single source of truth for both
+    // the advertised URL and the listen SocketAddr below). Accepts an IP literal
+    // (e.g. 127.0.0.1, ::1, 0.0.0.0) and defaults to loopback to limit exposure.
+    // We parse to an IpAddr rather than DNS-resolving so the listen interface is
+    // unambiguous.
+    let ip: std::net::IpAddr = options.host.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid --host '{}': expected an IP address such as 127.0.0.1 or 0.0.0.0",
+            options.host
+        )
+    })?;
+
+    // Derive the advertised URL from the actual bind IP. Unspecified binds
+    // (0.0.0.0 / ::) aren't directly reachable, so fall back to "localhost" for
+    // display; otherwise advertise the concrete IP (bracketing IPv6 literals).
+    let server_host = if ip.is_unspecified() {
+        "localhost".to_string()
+    } else if ip.is_ipv6() {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    };
+    let server_url = format!("http://{server_host}:{}", options.port);
     if options.claude_code {
         run_claude_code_setup(&server_url).await;
     }
@@ -243,9 +270,15 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
 
     let app = server::build_router();
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], options.port));
+    let addr = std::net::SocketAddr::new(ip, options.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Listening on {server_url}");
+    if !ip.is_loopback() {
+        tracing::warn!(
+            "Binding to non-loopback host {ip}: the gateway is reachable from other machines. \
+             Configure auth.apiKeys so /token, /metrics and the proxy routes require a key."
+        );
+    }
+    tracing::info!("Listening on {addr} ({server_url})");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
