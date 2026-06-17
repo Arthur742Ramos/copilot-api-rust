@@ -110,7 +110,24 @@ pub async fn get_vscode_device_id() -> String {
 
     let new_device_id = create_vscode_device_id();
     if let Err(e) = set_stored_vscode_device_id(&new_device_id).await {
-        tracing::warn!("Failed to persist VSCode device id, using ephemeral id {e}");
+        // On platforms where persistence isn't ported (e.g. Windows registry),
+        // an ephemeral per-session id is the expected, documented fallback — log
+        // it at debug so it doesn't read as a failure on every start. A failure
+        // on a platform that *does* support persistence is unexpected → warn.
+        if DEVICE_ID_PERSISTENCE_SUPPORTED {
+            tracing::warn!("Failed to persist VSCode device id, using ephemeral id: {e}");
+        } else {
+            tracing::debug!(
+                "VSCode device id is not persisted on this platform; using a per-session id"
+            );
+        }
     }
     new_device_id
 }
+
+/// Whether [`set_stored_vscode_device_id`] is implemented for the target OS.
+/// macOS/Linux persist to a file; other platforms degrade to an ephemeral id.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const DEVICE_ID_PERSISTENCE_SUPPORTED: bool = true;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const DEVICE_ID_PERSISTENCE_SUPPORTED: bool = false;
