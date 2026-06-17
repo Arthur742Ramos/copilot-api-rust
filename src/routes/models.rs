@@ -29,22 +29,35 @@ pub async fn get_model_route(Path(requested): Path<String>) -> Response {
         }
     }
 
-    let models = state::with_state(|s| {
-        s.models
-            .as_ref()
-            .map(|m| m.data.clone())
-            .unwrap_or_default()
-    });
+    // Clone the `Arc<ModelsResponse>` (a refcount bump), not the model `Vec`.
+    let models = state::with_state(|s| s.models.clone());
+    let models = match models {
+        Some(m) => m,
+        None => return model_not_found(&requested),
+    };
 
+    // Normalize the requested id the same way the list route advertises ids, so
+    // a date-suffixed / raw upstream id resolves like every other endpoint.
     let want_1m = is_context_1m_model(&requested);
-    let base_requested = strip_context_1m_suffix(&requested);
+    let base_requested = to_client_model_id(strip_context_1m_suffix(&requested));
 
     let found = models
+        .data
         .iter()
         .find(|model| to_client_model_id(&model.id) == base_requested);
 
     match found {
-        Some(model) => Json(shape_model(model, want_1m)).into_response(),
+        Some(model) => {
+            // Only advertise the [1m] variant when the model is actually
+            // 1M-context-capable, matching the list route's own gating.
+            let is_1m_capable = model
+                .capabilities
+                .limits
+                .max_context_window_tokens
+                .unwrap_or(0)
+                >= 1_000_000;
+            Json(shape_model(model, want_1m && is_1m_capable)).into_response()
+        }
         None => model_not_found(&requested),
     }
 }
