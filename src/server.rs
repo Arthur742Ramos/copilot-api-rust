@@ -103,18 +103,31 @@ pub fn build_router() -> Router {
         // Convert a panic in any handler into a 500 JSON response instead of an
         // abruptly reset connection.
         .layer(CatchPanicLayer::custom(handle_panic))
-        .layer(from_fn(trace_middleware))
-        // Record request count + latency metrics for every request.
-        .layer(from_fn(metrics_middleware))
         // Per-request access logging (method/path/status/latency) for all
         // requests, including those rejected by auth. The default `on_response`
         // emits at DEBUG, which is below the prod `info` filter — bump the
         // success line to INFO and failures to WARN so per-request logs appear.
+        //
+        // ORDERING: tower applies layers bottom-up, so the LAST `.layer()` call is
+        // the OUTERMOST middleware. `trace_middleware` (below) creates the
+        // `info_span!("request", trace_id, ...)`, so it MUST be listed AFTER
+        // (outermost of) this `TraceLayer`. That way the TraceLayer's
+        // `on_response`/`on_failure` access logs are emitted INSIDE the trace_id
+        // span and inherit `trace_id` — otherwise they would fire outside the span
+        // and the per-request access log lines would lack the trace id.
         .layer(
             TraceLayer::new_for_http()
                 .on_response(DefaultOnResponse::new().level(Level::INFO))
                 .on_failure(DefaultOnFailure::new().level(Level::WARN)),
         )
+        // Record request count + latency metrics for every request. Inside the
+        // trace span (listed before trace_middleware), outside the access log.
+        .layer(from_fn(metrics_middleware))
+        // Outermost application middleware: establishes the trace_id span +
+        // task-local RequestContext so EVERY inner layer (metrics + TraceLayer
+        // access logs) and handler runs within the span. Must remain the last
+        // `.layer()` call.
+        .layer(from_fn(trace_middleware))
 }
 
 /// CORS policy for the API.
