@@ -8,12 +8,15 @@
 //!
 //! Two nuances drive the design:
 //! - Usage is recorded *after* a response completes (SSE finalizers), so
-//!   enforcement gates on spend-so-far and can overshoot by at most the tokens
-//!   of the requests already in flight when the cap is crossed.
-//! - `get_token_usage_summary` is a synchronous SQLite read behind the single
-//!   global usage mutex. Re-querying it on every request would serialize the hot
-//!   path on that mutex, so the daily total is cached with a short TTL and only
-//!   refreshed when stale.
+//!   enforcement gates on spend-so-far and can overshoot by the tokens of the
+//!   requests already in flight when the cap is crossed.
+//! - `get_token_usage_summary` is a synchronous SQLite read (via the token-usage
+//!   connection pool in [`crate::libs::sqlite`]). Re-querying it on every request
+//!   would add a pooled DB round-trip to the hot path, so the daily total is
+//!   cached with a short TTL and only refreshed when stale. The refresh runs
+//!   while holding the cache lock, so a burst of concurrent requests that find
+//!   the cache stale collapses into a single DB read rather than a thundering
+//!   herd.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -28,7 +31,7 @@ use crate::libs::token_usage::get_token_usage_summary;
 
 /// How long a cached daily total stays fresh before the next admission check
 /// re-reads it from SQLite. Short enough that the cap engages promptly, long
-/// enough that a burst of requests doesn't hammer the usage mutex.
+/// enough that a burst of requests doesn't repeatedly hit the usage store.
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
 struct CachedTotal {
@@ -51,20 +54,20 @@ fn local_day_key() -> i32 {
 
 /// Read today's total tokens, using the short-TTL cache when fresh. Only called
 /// when a budget is configured, so the SQLite read cost is paid solely by
-/// budget-enabled deployments.
+/// budget-enabled deployments. Holds the cache lock across the refresh so that
+/// concurrent callers finding the cache stale collapse into one DB read.
 fn current_daily_total() -> i64 {
     let day_key = local_day_key();
-    {
-        let guard = CACHED_DAILY_TOTAL.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(cached) = guard.as_ref() {
-            if cached.day_key == day_key && cached.fetched_at.elapsed() < CACHE_TTL {
-                return cached.total_tokens;
-            }
+    let mut guard = CACHED_DAILY_TOTAL.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(cached) = guard.as_ref() {
+        if cached.day_key == day_key && cached.fetched_at.elapsed() < CACHE_TTL {
+            return cached.total_tokens;
         }
     }
 
+    // Stale or absent: refresh under the lock. The DB read is held off the hot
+    // path by the TTL, and serializing the refresh avoids a thundering herd.
     let total = get_token_usage_summary("day").totals.total_tokens;
-    let mut guard = CACHED_DAILY_TOTAL.lock().unwrap_or_else(|p| p.into_inner());
     *guard = Some(CachedTotal {
         day_key,
         total_tokens: total,
@@ -109,6 +112,21 @@ mod tests {
         reset_cached_config_for_test, set_cached_config_for_test, AppConfig,
     };
 
+    /// Seed the daily-total cache so the rejection path can be exercised without
+    /// touching SQLite. The fresh `fetched_at` keeps it within the TTL.
+    fn seed_cache(total_tokens: i64) {
+        let mut guard = CACHED_DAILY_TOTAL.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(CachedTotal {
+            day_key: local_day_key(),
+            total_tokens,
+            fetched_at: Instant::now(),
+        });
+    }
+
+    fn clear_cache() {
+        *CACHED_DAILY_TOTAL.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
     #[test]
     fn local_day_key_is_ordered_yyyymmdd() {
         // Sanity: the key is a positive YYYYMMDD-shaped integer, so a rollover
@@ -137,6 +155,32 @@ mod tests {
         set_cached_config_for_test(cfg);
         // A zero/negative budget is treated as "no budget", not "block everything".
         assert!(check_token_budget().is_ok());
+        reset_cached_config_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rejects_once_at_or_over_budget() {
+        let cfg = AppConfig {
+            daily_token_budget: Some(1000),
+            ..Default::default()
+        };
+        set_cached_config_for_test(cfg);
+
+        // Under budget: passes.
+        seed_cache(999);
+        assert!(check_token_budget().is_ok());
+
+        // At the cap: rejected with a 429.
+        seed_cache(1000);
+        let err = check_token_budget().expect_err("should reject at the cap");
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+
+        // Over the cap: also rejected.
+        seed_cache(5000);
+        assert!(check_token_budget().is_err());
+
+        clear_cache();
         reset_cached_config_for_test();
     }
 }

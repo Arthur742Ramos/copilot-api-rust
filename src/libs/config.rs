@@ -130,8 +130,8 @@ pub struct AppConfig {
     /// Cap on total tokens recorded across the current local day. When exceeded,
     /// new requests are rejected with a 429 until the day rolls over. `None` or a
     /// value `<= 0` disables the cap. Enforcement gates on cumulative spend so
-    /// far and lags by at most one in-flight request (usage is recorded after the
-    /// response completes).
+    /// far and can overshoot by the tokens of the requests already in flight when
+    /// the cap is crossed (usage is recorded after each response completes).
     #[serde(skip_serializing_if = "Option::is_none", rename = "dailyTokenBudget")]
     pub daily_token_budget: Option<i64>,
     /// Preserve unknown top-level keys (e.g. desktop-only fields).
