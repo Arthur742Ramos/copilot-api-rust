@@ -39,6 +39,16 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 60_000;
 
+/// Per-operation deadline for the pooled WebSocket transport: it bounds the
+/// initial request-frame send and each subsequent awaited frame independently
+/// (the timer resets on every frame received, including control frames). Mirrors
+/// the 120s reqwest `read_timeout` on the shared HTTP path — it caps the gap
+/// between successive operations, not the total stream duration. Without it a
+/// silent upstream would hang the request forever: the pooled idle-close only
+/// fires once `request_count` hits 0, which never happens while a request is
+/// in-flight.
+const DEFAULT_WEBSOCKET_READ_TIMEOUT_MS: u64 = 120_000;
+
 /// A single pooled request description. Mirrors `PooledWebSocketRequest<TPayload>`.
 #[derive(Debug, Clone)]
 pub struct PooledWebSocketRequest {
@@ -60,6 +70,11 @@ pub struct PooledWebSocketStreamOptions {
     pub create_chunk: fn(String) -> SseChunk,
     /// Idle window before a pooled socket is closed. Defaults to 60s when `None`.
     pub idle_timeout_ms: Option<u64>,
+    /// Per-operation deadline (in ms) bounding the initial request-frame send
+    /// and each subsequently awaited frame independently; resets on every frame
+    /// received. Defaults to 120s when `None`, matching the HTTP path's
+    /// read timeout. It caps the gap between operations, not total duration.
+    pub read_timeout_ms: Option<u64>,
     /// Returns true once a chunk signals the end of the response.
     pub is_terminal_chunk: fn(&SseChunk) -> bool,
     /// Error text if the socket fails to open.
@@ -452,19 +467,56 @@ pub fn create_pooled_web_socket_stream(
         // The live socket is serialized behind this async mutex for the request.
         let mut ws = handle.conn.ws.lock().await;
 
-        if let Err(err) = ws.send(Message::Text(payload)).await {
-            if pooled {
-                remove_pooled_entry(&pool_key, id);
+        let read_timeout = std::time::Duration::from_millis(
+            options
+                .read_timeout_ms
+                .unwrap_or(DEFAULT_WEBSOCKET_READ_TIMEOUT_MS),
+        );
+
+        match tokio::time::timeout(read_timeout, ws.send(Message::Text(payload))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                if pooled {
+                    remove_pooled_entry(&pool_key, id);
+                }
+                yield Err(std::io::Error::other(format!(
+                    "{}: {err}",
+                    options.stream_error_message
+                )));
+                return;
             }
-            yield Err(std::io::Error::other(format!(
-                "{}: {err}",
-                options.stream_error_message
-            )));
-            return;
+            Err(_elapsed) => {
+                if pooled {
+                    remove_pooled_entry(&pool_key, id);
+                }
+                yield Err(std::io::Error::other(format!(
+                    "{}: timed out sending request frame after {}ms",
+                    options.stream_error_message,
+                    read_timeout.as_millis()
+                )));
+                return;
+            }
         }
 
         loop {
-            match ws.next().await {
+            let next = match tokio::time::timeout(read_timeout, ws.next()).await {
+                Ok(next) => next,
+                Err(_elapsed) => {
+                    // No frame (data or control) within the deadline: treat the
+                    // socket as wedged, drop it from the pool, and surface a
+                    // terminal error so the client stops waiting.
+                    if pooled {
+                        remove_pooled_entry(&pool_key, id);
+                    }
+                    yield Err(std::io::Error::other(format!(
+                        "{}: no data within {}ms",
+                        options.stream_error_message,
+                        read_timeout.as_millis()
+                    )));
+                    return;
+                }
+            };
+            match next {
                 Some(Ok(message)) => {
                     let Some(data) = normalize_message(message) else {
                         // Control frame (ping/pong) -> keep reading.
