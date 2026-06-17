@@ -54,6 +54,6 @@ Run `cargo fmt` before committing so the formatting check passes.
 
 - Where code intentionally tracks a subtle TS behavior, a reference to the
   corresponding TS source (e.g. `src/lib/api-config.ts`) can help future
-  maintainers -- but it's optional, not required, and never a reason to keep a
+  maintainers — but it's optional, not required, and never a reason to keep a
   worse behavior.
 - Don't introduce behavior changes in cleanup/docs PRs.

@@ -37,8 +37,10 @@ entry point.
   drop fields you don't recognize.
 - **Errors:** use `AppError` for client/internal failures and `HttpError`
   (`src/libs/error.rs`) to carry an upstream response's status/headers/body.
-  Surface errors in the Anthropic JSON shape (`{error:{message,type}}`) with an
-  appropriate `type`; avoid silent failures.
+  Surface errors in the Anthropic JSON shape with an appropriate `type` — either
+  the bare `{error:{message,type}}` or, for the retryable rate-limit/overload
+  cases, the full `{type:"error", error:{type,message}}` envelope the SDK
+  recognizes (see `error.rs`). Avoid silent failures.
 - **Preprocessing:** request bodies are often manipulated as `serde_json::Value`
   trees ("Value-walking") rather than fully-typed structs. This was inherited from
   the TS in-place-mutation approach; it's fine where it's simplest, but typed
