@@ -143,6 +143,21 @@ fn lift_upstream_error_message(body: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Map an upstream HTTP status to the Anthropic-recognized `error.type` string,
+/// so clients can classify a failure (permanent vs retryable, needs re-auth,
+/// etc.) instead of seeing the generic `"error"`. 429/529 are handled separately
+/// (rate_limit_error / overloaded_error); this covers everything else.
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 | 408 | 409 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        _ => "api_error",
+    }
+}
+
 /// Mirrors `forwardError` in src/lib/error.ts: 429/529s forward retry-after /
 /// x-* headers and are reshaped into the Anthropic-recognized rate-limit shape
 /// (`{ type: "error", error: { type: "rate_limit_error"|"overloaded_error",
@@ -203,12 +218,16 @@ impl IntoResponse for AppError {
                     // verbatim so the client sees the real structured error.
                     Json(envelope)
                 } else {
-                    // Non-envelope JSON or plain text: wrap a lifted/plain message.
+                    // Non-envelope JSON or plain text: synthesize the Anthropic
+                    // error envelope with a status-derived `error.type` so clients
+                    // can classify the failure (a 401 vs a transient 500), and the
+                    // top-level `type: "error"` wrapper matching the rate-limit path.
                     let message = lift_upstream_error_message(&e.body).unwrap_or(fallback_message);
                     Json(json!({
+                        "type": "error",
                         "error": {
+                            "type": anthropic_error_type(e.status),
                             "message": message,
-                            "type": "error",
                         }
                     }))
                 };
@@ -227,9 +246,10 @@ impl IntoResponse for AppError {
             AppError::Other(e) => {
                 tracing::error!("Error occurred: {}", e);
                 let body = Json(json!({
+                    "type": "error",
                     "error": {
+                        "type": "api_error",
                         "message": e.to_string(),
-                        "type": "error",
                     }
                 }));
                 (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
@@ -324,7 +344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_rate_limit_500_renders_generic_shape() {
+    async fn non_rate_limit_500_renders_api_error_shape() {
         let err = AppError::Http(HttpError::new(
             "boom",
             status(500),
@@ -334,10 +354,51 @@ mod tests {
         let (status, _headers, body) = render(err).await;
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        // Unchanged TS-parity shape: outer `error` object, type "error".
-        assert_eq!(body["error"]["type"], "error");
+        // A 5xx without a recognizable upstream envelope maps to api_error and
+        // carries the full Anthropic `{type:"error", error:{...}}` envelope.
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
         assert_eq!(body["error"]["message"], "internal upstream error");
-        assert!(body.get("type").is_none());
+    }
+
+    #[tokio::test]
+    async fn upstream_status_maps_to_anthropic_error_type() {
+        // Non-envelope upstream errors derive error.type from the status so
+        // clients can classify the failure instead of seeing generic "error".
+        for (code, expected) in [
+            (400u16, "invalid_request_error"),
+            (408, "invalid_request_error"),
+            (409, "invalid_request_error"),
+            (422, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (413, "request_too_large"),
+        ] {
+            let err = AppError::Http(HttpError::new(
+                "upstream said no",
+                status(code),
+                HeaderMap::new(),
+                "plain text error".to_string(),
+            ));
+            let (rstatus, _headers, body) = render(err).await;
+            assert_eq!(rstatus.as_u16(), code);
+            assert_eq!(body["type"], "error");
+            assert_eq!(
+                body["error"]["type"], expected,
+                "status {code} should map to {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn app_error_other_renders_500_api_error() {
+        let err = AppError::Other(anyhow::anyhow!("something broke internally"));
+        let (status, _headers, body) = render(err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "something broke internally");
     }
 
     #[tokio::test]
@@ -386,7 +447,8 @@ mod tests {
         ));
         let (_status, _headers, body) = render(err).await;
         assert_eq!(body["error"]["message"], "upstream exploded");
-        assert_eq!(body["error"]["type"], "error");
+        // 500 with no recognizable envelope -> api_error.
+        assert_eq!(body["error"]["type"], "api_error");
     }
 
     #[tokio::test]
@@ -399,9 +461,11 @@ mod tests {
             headers,
             "nope".to_string(),
         ));
-        let (status, out_headers, _body) = render(err).await;
+        let (status, out_headers, body) = render(err).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        // Only 429/529 forward retry-after; other errors keep TS parity.
+        // Only 429/529 forward retry-after; other errors do not.
         assert!(out_headers.get("retry-after").is_none());
+        // 403 maps to permission_error.
+        assert_eq!(body["error"]["type"], "permission_error");
     }
 }
