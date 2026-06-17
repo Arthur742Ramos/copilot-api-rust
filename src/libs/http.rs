@@ -47,6 +47,23 @@ pub fn client() -> &'static reqwest::Client {
     &CLIENT
 }
 
+/// The upstream endpoints that route through [`send_with_connect_retry`]. Used
+/// both as the `endpoint` label values and to pre-register the retry counter, so
+/// the label set can't drift between the call sites and the pre-registration.
+pub const RETRY_ENDPOINTS: [&str; 3] = ["messages", "chat", "responses"];
+
+/// Register `copilot_upstream_retry_total{endpoint=...}` at 0 for every known
+/// endpoint so the series exists from startup. Without this the counter only
+/// appears after the first connect failure, which makes `rate()`/`increase()`
+/// and "retries > N" alerts read "no data" instead of 0 — exactly when the first
+/// upstream failure occurs. `increment(0)` registers without changing the value.
+/// Call once at startup (after the recorder is installed).
+pub fn preregister_retry_metrics() {
+    for endpoint in RETRY_ENDPOINTS {
+        metrics::counter!("copilot_upstream_retry_total", "endpoint" => endpoint).increment(0);
+    }
+}
+
 /// Send a request, retrying ONCE on a genuine connection failure.
 ///
 /// A `reqwest` error where `is_connect()` is true means the TCP/TLS connection
@@ -140,5 +157,22 @@ mod tests {
             "owned-body requests must be cloneable so the retry can replay them"
         );
         drop(req);
+    }
+
+    #[test]
+    fn retry_counter_is_preregistered_at_zero() {
+        // After startup pre-registration, the retry counter series must exist at
+        // 0 for every known endpoint so dashboards/alerts read 0, not "no data".
+        crate::libs::metrics::init_build_info(); // installs the recorder
+        preregister_retry_metrics();
+        let out = crate::libs::metrics::render();
+        for endpoint in RETRY_ENDPOINTS {
+            assert!(
+                out.contains(&format!(
+                    "copilot_upstream_retry_total{{endpoint=\"{endpoint}\"}} 0"
+                )),
+                "expected pre-registered retry counter at 0 for endpoint={endpoint}, got:\n{out}"
+            );
+        }
     }
 }

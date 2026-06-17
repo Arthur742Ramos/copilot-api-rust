@@ -293,6 +293,7 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
 
     let app = server::build_router();
     crate::libs::metrics::init_build_info();
+    crate::libs::http::preregister_retry_metrics();
     let addr = std::net::SocketAddr::new(ip, options.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     if !ip.is_loopback() {
