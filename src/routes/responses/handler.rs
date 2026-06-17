@@ -205,8 +205,13 @@ fn stream_responses_sse(
 
             let processed = fix_stream_ids(&ev.data, ev.event.as_deref(), &mut tracker);
             let frame = build_sse_frame(ev.id.as_deref(), ev.event.as_deref(), &processed);
-            // Each forwarded event is a content frame for this raw transport.
-            timer.on_content_frame();
+            // Count only genuine content events toward TTFT: skip keep-alive
+            // pings and empty/[DONE] data so first-token timing isn't under-reported.
+            let data_trimmed = ev.data.trim();
+            let is_ping = ev.event.as_deref() == Some("ping");
+            if !is_ping && !data_trimmed.is_empty() && data_trimmed != "[DONE]" {
+                timer.on_content_frame();
+            }
             yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(frame));
         }
 

@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::libs::error::AppError;
-use crate::libs::stream_metrics::{transport, StreamTimer};
+use crate::libs::stream_metrics::{transport as stream_transport, StreamTimer};
 use crate::libs::subagent::SubagentMarker;
 use crate::libs::token_usage::{
     create_copilot_token_usage_recorder, merge_anthropic_usage, normalize_anthropic_usage,
@@ -197,7 +197,7 @@ pub async fn handle_with_chat_completions(
         }
         ChatCompletionsResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("chat_completions", transport::TRANSLATED);
+                let mut timer = StreamTimer::new("chat_completions", stream_transport::TRANSLATED);
                 let mut state = AnthropicStreamState::default();
                 let mut usage = UsageTokens::default();
 
@@ -331,7 +331,7 @@ pub async fn handle_with_responses_api(
     match result {
         CreateResponsesReturn::Stream(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("responses", transport::TRANSLATED);
+                let mut timer = StreamTimer::new("responses", stream_transport::TRANSLATED);
                 let mut state = ResponsesStreamState::new(Some(tool_search_name));
                 let mut usage = UsageTokens::default();
 
@@ -461,7 +461,7 @@ pub async fn handle_with_messages_api(
         }
         CreateMessagesResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("messages", transport::TRANSLATED);
+                let mut timer = StreamTimer::new("messages", stream_transport::TRANSLATED);
                 let mut usage = UsageTokens::default();
                 // Track terminal framing so a passthrough upstream that ends
                 // without a `message_stop` (clean end / [DONE]) doesn't leave the

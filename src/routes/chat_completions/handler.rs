@@ -146,26 +146,36 @@ fn stream_sse(
 
     let byte_stream = upstream.bytes_stream();
     let mapped = byte_stream.map(move |chunk| {
-        if let Ok(bytes) = &chunk {
-            if chunk_has_content(bytes) {
+        match &chunk {
+            Ok(bytes) => {
+                if chunk_has_content(bytes) {
+                    timer_for_stream
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .on_content_frame();
+                }
+                if let Some(usage) = sniff_usage(bytes) {
+                    *usage_for_stream
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = usage;
+                }
+            }
+            Err(_) => {
+                // Upstream read failure: record the stream as errored so
+                // proxy_stream_complete_seconds is labelled outcome="error".
                 timer_for_stream
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .on_content_frame();
-            }
-            if let Some(usage) = sniff_usage(bytes) {
-                *usage_for_stream
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = usage;
+                    .mark_error();
             }
         }
         chunk.map_err(std::io::Error::other)
     });
 
-    // Record usage when the stream completes (the recorder is held by the
-    // stream's closure; cloning the Arc lets us record on the final chunk). The
-    // `timer` Arc is moved in here too, so it drops — recording stream-complete —
-    // when this terminal future runs at end-of-stream.
+    // Record usage when the stream completes. The StreamTimer is captured by the
+    // `map` closure above (via `timer_for_stream`), so it drops — recording
+    // stream-complete — when the whole stream is dropped/exhausted, not in this
+    // terminal future. This `once` only flushes the accumulated usage.
     let recorder_final = recorder.clone();
     let usage_final = usage_acc.clone();
     let finalizing = mapped.chain(futures_util::stream::once(async move {
