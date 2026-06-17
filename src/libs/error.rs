@@ -367,6 +367,9 @@ mod tests {
         // clients can classify the failure instead of seeing generic "error".
         for (code, expected) in [
             (400u16, "invalid_request_error"),
+            (408, "invalid_request_error"),
+            (409, "invalid_request_error"),
+            (422, "invalid_request_error"),
             (401, "authentication_error"),
             (403, "permission_error"),
             (404, "not_found_error"),
