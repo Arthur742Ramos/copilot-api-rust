@@ -117,6 +117,32 @@ impl std::fmt::Display for AppError {
     }
 }
 
+/// If `body` is a JSON object that already looks like an error envelope, return
+/// it parsed so it can be forwarded to the client verbatim (avoids the
+/// double-encoding where a JSON error body is stringified into our `message`).
+/// Recognizes both `{"error": {...}}` and `{"type":"error","error":{...}}`.
+fn parse_upstream_error_envelope(body: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let obj = value.as_object()?;
+    if obj.get("error").map(|e| e.is_object()).unwrap_or(false) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Best-effort extraction of a human-readable message from a non-envelope JSON
+/// error body (e.g. `{"message": "..."}`), so we don't embed raw JSON in our
+/// `message` field. Returns `None` when no string message is found.
+fn lift_upstream_error_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    value
+        .get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| value.pointer("/error/message").and_then(|m| m.as_str()))
+        .map(|s| s.to_string())
+}
+
 /// Mirrors `forwardError` in src/lib/error.ts: 429/529s forward retry-after /
 /// x-* headers and are reshaped into the Anthropic-recognized rate-limit shape
 /// (`{ type: "error", error: { type: "rate_limit_error"|"overloaded_error",
@@ -144,11 +170,13 @@ impl IntoResponse for AppError {
                         }
                     }
                 }
-                // TS forwardError renders an upstream HTTPError from its response
-                // body text, and a synthetic Error from its `.message`. Our
-                // synthetic errors (HttpError::internal) carry an empty body, so
-                // fall back to the message text in that case.
-                let message = if e.body.is_empty() {
+                // The upstream error body (when present) is forwarded to the
+                // client. Rather than stringifying a JSON error body into our
+                // `message` field (which double-encodes it as an escaped string),
+                // surface it directly: if the upstream already sent an Anthropic-
+                // style error envelope, forward it verbatim; if it's some other
+                // JSON, lift a human message out of it; otherwise use the raw text.
+                let fallback_message = if e.body.is_empty() {
                     e.message.clone()
                 } else {
                     e.body.clone()
@@ -167,11 +195,16 @@ impl IntoResponse for AppError {
                         "type": "error",
                         "error": {
                             "type": error_type,
-                            "message": message,
+                            "message": fallback_message,
                         }
                     }))
+                } else if let Some(envelope) = parse_upstream_error_envelope(&e.body) {
+                    // Upstream sent a recognizable error envelope — forward it
+                    // verbatim so the client sees the real structured error.
+                    Json(envelope)
                 } else {
-                    // Non-rate-limit HTTP errors keep the existing TS-parity shape.
+                    // Non-envelope JSON or plain text: wrap a lifted/plain message.
+                    let message = lift_upstream_error_message(&e.body).unwrap_or(fallback_message);
                     Json(json!({
                         "error": {
                             "message": message,
@@ -319,6 +352,41 @@ mod tests {
             body["error"]["message"],
             "Invalid request payload: missing field `model`"
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_json_error_envelope_is_forwarded_verbatim() {
+        // A JSON error envelope from upstream must be forwarded as structured
+        // JSON, not stringified into our `message` (the double-encoding bug).
+        let err = AppError::Http(HttpError::new(
+            "Failed",
+            status(400),
+            HeaderMap::new(),
+            r#"{"error":{"type":"invalid_request_error","message":"The requested model is not supported."}}"#.to_string(),
+        ));
+        let (status, _headers, body) = render(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["message"],
+            "The requested model is not supported."
+        );
+        // The message must be a string, not escaped JSON.
+        assert!(body["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn upstream_non_envelope_json_lifts_message() {
+        // A JSON body that isn't an error envelope: lift its message string.
+        let err = AppError::Http(HttpError::new(
+            "Failed",
+            status(500),
+            HeaderMap::new(),
+            r#"{"message":"upstream exploded","code":42}"#.to_string(),
+        ));
+        let (_status, _headers, body) = render(err).await;
+        assert_eq!(body["error"]["message"], "upstream exploded");
+        assert_eq!(body["error"]["type"], "error");
     }
 
     #[tokio::test]

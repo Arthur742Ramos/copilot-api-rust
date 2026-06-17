@@ -31,6 +31,12 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
     let mut payload: ResponsesPayload = serde_json::from_value(body)
         .map_err(|e| AppError::BadRequest(format!("Invalid request payload: {e}")))?;
 
+    if payload.model.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "model: field required and must be a non-empty string".to_string(),
+        ));
+    }
+
     let requested_model = payload.model.clone();
     payload.model = resolve_mapped_model(&payload.model);
     if payload.model != requested_model {

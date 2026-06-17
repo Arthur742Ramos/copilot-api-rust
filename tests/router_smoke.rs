@@ -69,3 +69,47 @@ async fn usage_viewer_returns_dashboard() {
     let html = String::from_utf8_lossy(&body);
     assert!(html.contains("Token Usage Dashboard"));
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn malformed_json_returns_invalid_request_error_shape() {
+    // A malformed body must produce the Anthropic JSON error shape, not axum's
+    // default plain-text Json<Value> rejection. The parse happens before any
+    // upstream call, so no token/config seam is needed.
+    set_config(&[], None);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from("{not valid json"))
+        .unwrap();
+    let (status, body) = send(request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("error body must be JSON, not plain text");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Invalid JSON"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn empty_model_returns_invalid_request_error() {
+    // An empty model field is rejected up front with a 400, not silently mapped
+    // to a default and run (which previously returned 200).
+    set_config(&[], None);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .unwrap();
+    let (status, body) = send(request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+}

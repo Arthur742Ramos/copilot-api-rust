@@ -1,16 +1,22 @@
 //! `/v1/embeddings` endpoint: forwards embedding requests to the Copilot API.
 
+use axum::body::Bytes;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::Value;
 
 use crate::libs::error::AppError;
 use crate::libs::token_usage::{create_copilot_token_usage_recorder, UsageTokens};
+use crate::routes::parse_json_body;
 use crate::services::copilot::create_embeddings::{create_embeddings, EmbeddingRequest};
 
 /// POST /embeddings — mirrors routes/embeddings/route.ts.
-pub async fn post_embeddings(body: Json<Value>) -> Response {
-    match handle(body.0).await {
+pub async fn post_embeddings(body: Bytes) -> Response {
+    let payload = match parse_json_body(&body) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    match handle(payload).await {
         Ok(value) => Json(value).into_response(),
         Err(error) => AppError::into_response(error),
     }
@@ -18,7 +24,7 @@ pub async fn post_embeddings(body: Json<Value>) -> Response {
 
 async fn handle(body: Value) -> Result<Value, AppError> {
     let payload: EmbeddingRequest = serde_json::from_value(body)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid embeddings request: {e}")))?;
+        .map_err(|e| AppError::BadRequest(format!("Invalid embeddings request: {e}")))?;
 
     let response = create_embeddings(&payload).await?;
 
