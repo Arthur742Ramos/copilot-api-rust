@@ -60,6 +60,10 @@ struct StartArgs {
     /// Port to listen on
     #[arg(short = 'p', long, default_value = "4141")]
     port: u16,
+    /// Host/interface to bind to. Defaults to loopback (127.0.0.1) to limit the
+    /// blast radius; pass 0.0.0.0 to expose the gateway on the LAN.
+    #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    host: String,
     /// Enable verbose logging
     #[arg(short = 'v', long, default_value_t = false)]
     verbose: bool,
@@ -196,6 +200,7 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
 
     ensure_paths().await?;
+    crate::libs::paths::warn_if_file_perms_unrestricted();
     cache_vscode_version().await;
     cache_mac_machine_id();
     cache_vscode_session_id();
@@ -243,9 +248,24 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
 
     let app = server::build_router();
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], options.port));
+    // Resolve the bind host. Accepts an IP literal (e.g. 127.0.0.1, ::1,
+    // 0.0.0.0) and defaults to loopback to limit exposure. We parse to an
+    // IpAddr rather than DNS-resolving so the listen interface is unambiguous.
+    let ip: std::net::IpAddr = options.host.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid --host '{}': expected an IP address such as 127.0.0.1 or 0.0.0.0",
+            options.host
+        )
+    })?;
+    let addr = std::net::SocketAddr::new(ip, options.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Listening on {server_url}");
+    if !ip.is_loopback() {
+        tracing::warn!(
+            "Binding to non-loopback host {ip}: the gateway is reachable from other machines. \
+             Configure auth.apiKeys so /token, /metrics and the proxy routes require a key."
+        );
+    }
+    tracing::info!("Listening on {addr} ({server_url})");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

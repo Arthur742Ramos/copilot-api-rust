@@ -69,11 +69,35 @@ async fn ensure_file(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Restrict a credential file to owner-only access (`0600`) on unix.
+///
+/// On non-unix targets (notably win32) the unix permission bits do not apply,
+/// so this is a no-op: the github token / admin key are written with whatever
+/// ACL the parent directory grants (typically inheriting broader access). Call
+/// [`warn_if_file_perms_unrestricted`] once at startup so operators know the
+/// on-disk secrets are NOT locked down on those platforms.
 #[cfg(unix)]
 pub async fn set_permissions_600(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
 }
 
+/// No-op on non-unix targets: unix `0600` mode bits do not exist on win32, so
+/// credential files inherit the directory's ACL rather than being restricted to
+/// the current user. See [`warn_if_file_perms_unrestricted`].
 #[cfg(not(unix))]
 pub async fn set_permissions_600(_path: &std::path::Path) {}
+
+/// Emit a one-line startup warning on platforms where [`set_permissions_600`]
+/// cannot restrict file permissions (non-unix, i.e. win32). No-op on unix.
+pub fn warn_if_file_perms_unrestricted() {
+    #[cfg(not(unix))]
+    {
+        tracing::warn!(
+            "File permissions are not restricted on this platform (win32): the GitHub token and \
+             admin key in {} are stored without owner-only (0600) access control. Protect this \
+             directory with NTFS ACLs if other users share the machine.",
+            PATHS.app_dir.display()
+        );
+    }
+}
