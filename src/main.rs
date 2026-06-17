@@ -77,7 +77,8 @@ struct StartArgs {
         short = 'a',
         long = "account-type",
         default_value = "individual",
-        env = "COPILOT_API_ACCOUNT_TYPE"
+        env = "COPILOT_API_ACCOUNT_TYPE",
+        value_parser = ["individual", "business", "enterprise"]
     )]
     account_type: String,
     /// Enable manual request approval

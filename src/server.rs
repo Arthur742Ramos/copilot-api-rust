@@ -41,6 +41,11 @@ pub fn build_router() -> Router {
         )
         .route("/models", get(crate::routes::models::get_models_route))
         .route("/v1/models", get(crate::routes::models::get_models_route))
+        .route("/models/:id", get(crate::routes::models::get_model_route))
+        .route(
+            "/v1/models/:id",
+            get(crate::routes::models::get_model_route),
+        )
         .route(
             "/embeddings",
             post(crate::routes::embeddings::post_embeddings),
