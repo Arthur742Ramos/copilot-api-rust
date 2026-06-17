@@ -105,7 +105,12 @@ async fn live_chat_completion_smoke() {
         .header("anthropic-version", "2023-06-01")
         .body(Body::from(messages_payload.to_string()))
         .unwrap();
-    let (status, body) = send(messages_request).await;
+    // Bound the streamed request so a stalled/never-closing SSE connection makes
+    // this human-run test fail fast instead of hanging indefinitely.
+    let (status, body) =
+        tokio::time::timeout(std::time::Duration::from_secs(60), send(messages_request))
+            .await
+            .expect("/v1/messages should complete within 60s (SSE did not close)");
     assert_eq!(
         status,
         StatusCode::OK,
