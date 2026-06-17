@@ -230,7 +230,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 #[allow(clippy::result_large_err)]
 fn deserialize_payload(payload: &Value) -> Result<AnthropicMessagesPayload, AppError> {
     serde_json::from_value(payload.clone())
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))
+        .map_err(|e| AppError::BadRequest(format!("Invalid request payload: {e}")))
 }
 
 /// Like [`deserialize_payload`] but consumes the `Value`, avoiding the deep
@@ -238,7 +238,7 @@ fn deserialize_payload(payload: &Value) -> Result<AnthropicMessagesPayload, AppE
 #[allow(clippy::result_large_err)]
 fn deserialize_payload_owned(payload: Value) -> Result<AnthropicMessagesPayload, AppError> {
     serde_json::from_value(payload)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))
+        .map_err(|e| AppError::BadRequest(format!("Invalid request payload: {e}")))
 }
 
 /// Folds the `context-1m-2025-08-07` beta into an existing comma-separated

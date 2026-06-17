@@ -118,11 +118,56 @@ pub fn translate_chunk_to_anthropic_events(
 
 /// `flushPendingAnthropicStreamEvents` — emit any queued `message_delta` plus
 /// `message_stop` when the upstream stream ends without a usage-bearing chunk.
+///
+/// Also handles the degenerate case where the upstream ended (clean end, a
+/// `[DONE]` with no prior `finish_reason`, or a finishing chunk that failed to
+/// parse and was dropped) WITHOUT ever queueing a `message_delta`: a content
+/// block may still be open and no `message_stop` was emitted, which leaves a
+/// client like Claude Code waiting forever. In that case we synthesize a
+/// well-formed terminal close (close any open block, then `message_delta` +
+/// `message_stop`) so every stream is terminated.
 pub fn flush_pending_anthropic_stream_events(
     state: &mut AnthropicStreamState,
 ) -> Vec<AnthropicStreamEventData> {
     let mut events: Vec<AnthropicStreamEventData> = Vec::new();
-    complete_pending_message(state, &mut events, None);
+
+    if state.pending_message_delta.is_some() {
+        complete_pending_message(state, &mut events, None);
+        return events;
+    }
+
+    // Nothing queued. If we already emitted a terminal message_stop the stream is
+    // well-formed and there is nothing to do. Likewise, if message_start was never
+    // sent there is no open message to close — emitting a bare message_delta would
+    // itself be malformed, so leave the (empty) stream as-is.
+    if state.message_stop_emitted || !state.message_start_sent {
+        return events;
+    }
+
+    // Upstream ended without a finishing chunk. Close any block left open
+    // (thinking or content/tool) so the stream stays well-formed, then synthesize
+    // the terminal message_delta + message_stop.
+    close_thinking_block_if_open(state, &mut events);
+    if state.content_block_open {
+        events.push(AnthropicStreamEventData::ContentBlockStop {
+            index: state.content_block_index,
+        });
+        state.content_block_open = false;
+        state.content_block_index += 1;
+    }
+
+    events.push(AnthropicStreamEventData::MessageDelta {
+        delta: AnthropicMessageDeltaBody {
+            // No finish_reason was delivered; "end_turn" is the safe Anthropic
+            // default for a normally-terminated turn.
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+        },
+        usage: None,
+    });
+    events.push(AnthropicStreamEventData::MessageStop);
+    state.message_stop_emitted = true;
+
     events
 }
 
@@ -174,6 +219,7 @@ fn complete_pending_message(
 
     events.push(pending);
     events.push(AnthropicStreamEventData::MessageStop);
+    state.message_stop_emitted = true;
 }
 
 /// `handleFinish` — on a finishing chunk, close the open block, flush deferred
@@ -189,6 +235,13 @@ fn handle_finish(
     let Some(finish_reason) = finish_reason.filter(|s| !s.is_empty()) else {
         return;
     };
+
+    // Already terminated: a well-behaved upstream sends one finishing chunk, but
+    // an aggregator could send a second usage-bearing one. Ignore it so we never
+    // emit a second message_delta/message_stop after the terminal stop.
+    if state.message_stop_emitted {
+        return;
+    }
 
     // A reasoning-only turn leaves a `content_block_start{thinking}` open with no
     // matching content block; close it here so the stream stays well-formed.
@@ -992,6 +1045,76 @@ mod tests {
                 "error": { "type": "api_error", "message": "An unexpected error occurred during streaming." }
             })
         );
+    }
+
+    #[test]
+    fn unterminated_stream_synthesizes_close_with_open_block() {
+        // Upstream sends content then ends WITHOUT a finish_reason (e.g. dropped
+        // the finishing chunk or sent [DONE] early). A content block is left open
+        // and no message_stop was emitted; the flush must close the block and
+        // synthesize message_delta + message_stop so the client doesn't hang.
+        let mut state = AnthropicStreamState::default();
+        let mut all: Vec<Value> = Vec::new();
+
+        let chunk = json!({
+            "id": "x", "model": "m",
+            "choices": [{ "index": 0, "delta": { "content": "Hi" }, "finish_reason": null }],
+        });
+        all.extend(to_values(&translate_chunk_to_anthropic_events(
+            &chunk, &mut state,
+        )));
+        assert!(state.content_block_open);
+        assert!(!state.message_stop_emitted);
+
+        let got = to_values(&flush_pending_anthropic_stream_events(&mut state));
+        all.extend(got.clone());
+
+        assert_eq!(
+            got,
+            vec![
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" }
+                }),
+                json!({ "type": "message_stop" }),
+            ]
+        );
+        assert!(state.message_stop_emitted);
+        assert_single_open_block_invariant(&all);
+    }
+
+    #[test]
+    fn unterminated_empty_stream_synthesizes_nothing() {
+        // A stream that never even sent message_start has no open message to
+        // close; the flush must emit nothing rather than a bare message_delta.
+        let mut state = AnthropicStreamState::default();
+        let got = to_values(&flush_pending_anthropic_stream_events(&mut state));
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn flush_is_idempotent_after_normal_finish() {
+        // After a normal finishing chunk emits message_stop, a follow-up flush
+        // must not emit a second terminal close.
+        let mut state = AnthropicStreamState::default();
+
+        let start = json!({
+            "id": "x", "model": "m",
+            "choices": [{ "index": 0, "delta": { "content": "Hi" }, "finish_reason": null }],
+        });
+        let _ = translate_chunk_to_anthropic_events(&start, &mut state);
+
+        let finish = json!({
+            "id": "x", "model": "m",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+        });
+        let _ = translate_chunk_to_anthropic_events(&finish, &mut state);
+        assert!(state.message_stop_emitted);
+
+        let got = to_values(&flush_pending_anthropic_stream_events(&mut state));
+        assert!(got.is_empty(), "flush after a clean finish must be a no-op");
     }
 
     #[test]

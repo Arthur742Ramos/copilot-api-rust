@@ -29,7 +29,7 @@ use crate::routes::responses::utils::{
 /// Mirrors routes/responses/handler.ts `handleResponses`.
 pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
     let mut payload: ResponsesPayload = serde_json::from_value(body)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))?;
+        .map_err(|e| AppError::BadRequest(format!("Invalid request payload: {e}")))?;
 
     let requested_model = payload.model.clone();
     payload.model = resolve_mapped_model(&payload.model);

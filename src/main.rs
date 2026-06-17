@@ -210,7 +210,6 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
 
     ensure_paths().await?;
-    crate::libs::paths::warn_if_file_perms_unrestricted();
     cache_vscode_version().await;
     cache_mac_machine_id();
     cache_vscode_session_id();
@@ -263,19 +262,23 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     };
 
     // Derive the advertised URL from the actual bind IP. Unspecified binds
-    // (0.0.0.0 / ::) aren't directly reachable, so fall back to "localhost" for
-    // display; otherwise advertise the concrete IP (bracketing IPv6 literals).
+    // (0.0.0.0 / ::) aren't directly reachable, so advertise a concrete loopback
+    // address of the matching family: 127.0.0.1 for IPv4 `0.0.0.0`, [::1] for
+    // IPv6 `::` (advertising the name "localhost" could resolve to the wrong
+    // family — e.g. 127.0.0.1 for a v6-only `::` socket on Windows). Concrete
+    // binds advertise themselves (bracketing IPv6 literals).
     let server_host = if ip.is_unspecified() {
-        "localhost".to_string()
+        if ip.is_ipv6() {
+            "[::1]".to_string()
+        } else {
+            "127.0.0.1".to_string()
+        }
     } else if ip.is_ipv6() {
         format!("[{ip}]")
     } else {
         ip.to_string()
     };
     let server_url = format!("http://{server_host}:{}", options.port);
-    if options.claude_code {
-        run_claude_code_setup(&server_url).await;
-    }
     tracing::info!("Usage Viewer: {server_url}/usage-viewer?endpoint={server_url}/usage");
 
     if crate::libs::config::get_anthropic_api_key().is_some() {
@@ -299,17 +302,32 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
     tracing::info!("Listening on {addr} ({server_url})");
     print_ready_banner(&server_url);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Emitted after the ready banner so this Windows-only advisory doesn't lead
+    // the startup output and read as something being wrong on a single-user box.
+    crate::libs::paths::warn_if_file_perms_unrestricted();
 
-    // Flush the token-usage WAL on a clean shutdown.
+    // The --claude-code clipboard/setup flow runs only once the listener has
+    // bound, so the command it generates points at a server that actually bound
+    // (rather than one that may have failed to bind). The interactive model
+    // prompts block here before axum::serve begins accepting requests.
+    if options.claude_code {
+        run_claude_code_setup(&server_url).await;
+    }
+
+    // Run the server, but flush the token-usage WAL on the way out whether serve
+    // returns Ok (graceful shutdown) or Err — otherwise a serve error would skip
+    // the checkpoint exactly when something went wrong.
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+
     if crate::libs::token_usage::is_token_usage_storage_enabled() {
         crate::libs::sqlite::with_usage_conn(|conn| {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         });
     }
 
+    serve_result?;
     Ok(())
 }
 
