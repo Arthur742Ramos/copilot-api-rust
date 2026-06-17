@@ -78,6 +78,12 @@ pub fn log_copilot_rate_limits(headers: &HeaderMap) {
 /// that disables the whole proxy (a session/weekly cap exhaustion → upstream
 /// 429/529) is alertable as a leading indicator, not just visible in logs.
 /// `type` is bounded to {session, weekly}; values that don't parse are skipped.
+///
+/// NOTE: these series only appear when the upstream actually sends the
+/// `x-usage-ratelimit-{session,weekly}` headers (in `rem=&rst=` form). In
+/// practice GitHub Copilot does NOT send them on the messages/chat/responses
+/// endpoints, so an empty series is expected, not a bug — see the matching
+/// absence of "quota remaining" log lines.
 fn record_rate_limit_metrics(usage: &RateLimitUsage) {
     if let Ok(remaining) = usage.remaining.trim().parse::<f64>() {
         metrics::gauge!("copilot_rate_limit_remaining", "type" => usage.type_name).set(remaining);
