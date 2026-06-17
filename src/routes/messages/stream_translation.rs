@@ -474,6 +474,7 @@ fn handle_message_start(
             cache_read_input_tokens: usage_field_present(chunk, "cached_tokens")
                 .then_some(cached_tokens),
             service_tier: None,
+            extra: serde_json::Map::new(),
         },
     };
 

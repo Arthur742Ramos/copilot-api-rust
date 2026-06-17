@@ -789,6 +789,7 @@ pub fn translate_to_anthropic(response: &Value) -> AnthropicResponse {
             .map(|s| s.to_string()),
         stop_sequence: None,
         usage: map_openai_chat_completion_usage(response),
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -818,6 +819,7 @@ fn map_openai_chat_completion_usage(response: &Value) -> AnthropicUsage {
         cache_creation_input_tokens: None,
         cache_read_input_tokens: None,
         service_tier: None,
+        extra: serde_json::Map::new(),
     };
 
     // `!== undefined` checks: present (even if 0) -> emit.

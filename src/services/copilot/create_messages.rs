@@ -22,12 +22,17 @@ use super::create_chat_completions::reqwest_headers_to_axum;
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+/// The 1M-context beta. Requested implicitly via the `[1m]` model-id suffix
+/// (see `libs::models`); the handler folds it into the `anthropic-beta` header,
+/// so it must survive the allowlist filter below.
+pub const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
 
 fn allowed_anthropic_betas() -> HashSet<&'static str> {
     HashSet::from([
         INTERLEAVED_THINKING_BETA,
         CONTEXT_MANAGEMENT_BETA,
         ADVANCED_TOOL_USE_BETA,
+        CONTEXT_1M_BETA,
     ])
 }
 
@@ -41,6 +46,10 @@ pub struct CreateMessagesOptions<'a> {
 
 /// The result of a `/v1/messages` call: either a fully-buffered JSON response
 /// (non-streaming) or a streaming reqwest response whose SSE body is forwarded.
+// The non-streaming variant carries a full buffered `AnthropicResponse`; the
+// size gap to the streaming handle is inherent and short-lived (consumed
+// immediately by the flow handler), so boxing would only add churn.
+#[allow(clippy::large_enum_variant)]
 pub enum CreateMessagesResult {
     NonStreaming(AnthropicResponse),
     Streaming(reqwest::Response),
@@ -250,6 +259,14 @@ mod tests {
     fn beta_header_empty_after_filter_is_none() {
         let out = build_anthropic_beta_header(Some("bogus, also-bogus"), None, "m");
         assert_eq!(out, None);
+    }
+
+    #[test]
+    fn beta_header_keeps_context_1m_beta() {
+        // The [1m] model variant folds context-1m-2025-08-07 into the header; it
+        // must survive the allowlist filter.
+        let out = build_anthropic_beta_header(Some(CONTEXT_1M_BETA), None, "claude-opus-4.8");
+        assert_eq!(out.as_deref(), Some(CONTEXT_1M_BETA));
     }
 
     #[test]

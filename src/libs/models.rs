@@ -3,6 +3,23 @@ use crate::services::copilot::get_models::Model;
 
 // Mirrors src/lib/models.ts.
 
+/// The bracketed suffix the `/v1/models` route advertises on the 1M-context
+/// variant of a model (e.g. `claude-opus-4.8[1m]`). It is non-standard: the
+/// upstream only understands the base id, so resolution strips it. Its presence
+/// signals that the `context-1m-2025-08-07` beta must be enabled.
+pub const CONTEXT_1M_SUFFIX: &str = "[1m]";
+
+/// Whether `model_id` carries the `[1m]` 1M-context variant suffix.
+pub fn is_context_1m_model(model_id: &str) -> bool {
+    model_id.ends_with(CONTEXT_1M_SUFFIX)
+}
+
+/// Strips a trailing `[1m]` variant suffix, returning the base model id. A model
+/// id without the suffix is returned unchanged.
+pub fn strip_context_1m_suffix(model_id: &str) -> &str {
+    model_id.strip_suffix(CONTEXT_1M_SUFFIX).unwrap_or(model_id)
+}
+
 pub struct NormalizedSdkModelId {
     pub family: String,
     pub version: String,
@@ -21,6 +38,11 @@ pub fn to_client_model_id(model_id: &str) -> String {
 }
 
 pub fn find_endpoint_model(sdk_model_id: &str) -> Option<Model> {
+    // The `/v1/models` route advertises the 1M-context variant with a `[1m]`
+    // suffix; the upstream catalogue only knows the base id, so resolve against
+    // that. The beta header carrying the variant is injected separately.
+    let sdk_model_id = strip_context_1m_suffix(sdk_model_id);
+
     let models = state::with_state(|s| {
         s.models
             .as_ref()
@@ -101,4 +123,40 @@ fn regex_match(haystack: &str, pattern: &str) -> Option<Vec<String>> {
             .map(|m| m.map(|x| x.as_str().to_string()).unwrap_or_default())
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_and_strips_context_1m_suffix() {
+        assert!(is_context_1m_model("claude-opus-4.8[1m]"));
+        assert!(!is_context_1m_model("claude-opus-4.8"));
+        assert_eq!(
+            strip_context_1m_suffix("claude-opus-4.8[1m]"),
+            "claude-opus-4.8"
+        );
+        assert_eq!(
+            strip_context_1m_suffix("claude-opus-4.8"),
+            "claude-opus-4.8"
+        );
+    }
+
+    #[test]
+    fn bracketed_1m_resolves_to_base_for_client_id() {
+        // to_client_model_id strips the date suffix etc. via normalize; the [1m]
+        // variant must normalize the same as its base after the suffix is gone.
+        assert_eq!(
+            to_client_model_id(strip_context_1m_suffix("claude-opus-4.8[1m]")),
+            to_client_model_id("claude-opus-4.8")
+        );
+    }
+
+    #[test]
+    fn normalize_resolves_base_after_suffix_strip() {
+        let n = normalize_sdk_model_id(strip_context_1m_suffix("claude-opus-4.8[1m]")).unwrap();
+        assert_eq!(n.family, "opus");
+        assert_eq!(n.version, "4.8");
+    }
 }

@@ -401,6 +401,7 @@ fn message_start(
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: input_cached_tokens,
                 service_tier: None,
+                extra: serde_json::Map::new(),
             },
         },
     }]

@@ -149,7 +149,13 @@ pub async fn handle_count_tokens(body: Value, headers: HeaderMap) -> Result<Resp
         tracing::warn!("Model '{requested_model}' not found, using o200k_base fallback tokenizer");
     }
 
-    let (mut input, output) = get_token_count(&openai_payload, &selected_model);
+    // tiktoken BPE is CPU-bound; offload it so it does not stall the Tokio
+    // worker thread (and any in-flight streams sharing it). Mirrors the repo
+    // idiom for blocking work on the request path.
+    let (mut input, output) =
+        tokio::task::spawn_blocking(move || get_token_count(&openai_payload, &selected_model))
+            .await
+            .map_err(|e| AppError::Other(anyhow::anyhow!("count_tokens task failed: {e}")))?;
 
     if let Some(tools) = anthropic_payload.tools.as_ref() {
         if !tools.is_empty() {

@@ -213,7 +213,10 @@ pub struct AnthropicMessagesPayload {
 // Response
 // ---------------------------------------------------------------------------
 
-/// `AnthropicResponse["usage"]`.
+/// `AnthropicResponse["usage"]`. Open shape: Anthropic adds fields over time
+/// (`cache_creation`, `server_tool_use`, etc.) and the non-streaming native
+/// `/v1/messages` path must round-trip them unchanged, matching the streaming
+/// path which forwards raw bytes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnthropicUsage {
     pub input_tokens: i64,
@@ -224,9 +227,12 @@ pub struct AnthropicUsage {
     pub cache_read_input_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
-/// `AnthropicResponse` — the non-streaming `message` result.
+/// `AnthropicResponse` — the non-streaming `message` result. Open shape so any
+/// top-level fields the upstream adds (e.g. `container`) survive the round-trip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicResponse {
     pub id: String,
@@ -238,6 +244,8 @@ pub struct AnthropicResponse {
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
     pub usage: AnthropicUsage,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl Default for AnthropicResponse {
@@ -251,6 +259,7 @@ impl Default for AnthropicResponse {
             stop_reason: None,
             stop_sequence: None,
             usage: AnthropicUsage::default(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -342,6 +351,10 @@ pub struct AnthropicErrorBody {
 /// `AnthropicStreamEventData` — discriminated by `type`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+// The `message_start` variant carries a full `AnthropicMessageStart` (id, model,
+// usage, ...) and is inherently larger than the small delta/stop variants; this
+// is a wire type, so boxing it would only add indirection for no real benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum AnthropicStreamEventData {
     #[serde(rename = "message_start")]
     MessageStart { message: AnthropicMessageStart },
@@ -421,6 +434,18 @@ mod tests {
         let input = r#"{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}"#;
         let payload: AnthropicMessagesPayload = serde_json::from_str(input).unwrap();
         assert_eq!(payload.max_tokens, None);
+    }
+
+    #[test]
+    fn response_round_trips_unknown_usage_and_top_level_fields() {
+        // The non-streaming native /v1/messages path deserializes into
+        // AnthropicResponse then re-serializes. Unknown usage fields
+        // (cache_creation, server_tool_use) and unknown top-level fields
+        // (container) must survive unchanged.
+        let input = r#"{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-4.8","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":3},"server_tool_use":{"web_search_requests":1}},"container":{"id":"c_1"}}"#;
+        let response: AnthropicResponse = serde_json::from_str(input).unwrap();
+        let output = serde_json::to_string(&response).unwrap();
+        assert_eq!(input, output);
     }
 
     #[test]
