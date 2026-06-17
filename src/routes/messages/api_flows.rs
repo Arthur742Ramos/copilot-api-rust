@@ -263,6 +263,9 @@ pub async fn handle_with_chat_completions(
                             {
                                 yield Ok(Bytes::from(frame));
                             }
+                            // Record whatever usage was sniffed before the error so
+                            // partial-stream accounting isn't silently dropped.
+                            recorder.record(usage);
                             return;
                         }
                     };
@@ -394,6 +397,7 @@ pub async fn handle_with_responses_api(
                             if let Some(frame) = emit_event(&error_event) {
                                 yield Ok(Bytes::from(frame));
                             }
+                            recorder.record(usage);
                             return;
                         }
                     };
@@ -528,6 +532,9 @@ pub async fn handle_with_messages_api(
                             {
                                 yield Ok(Bytes::from(frame));
                             }
+                            // Record sniffed usage (message_start input tokens are
+                            // captured early here) before bailing on the error.
+                            recorder.record(usage);
                             return;
                         }
                     };
