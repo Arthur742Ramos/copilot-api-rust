@@ -127,6 +127,13 @@ pub struct AppConfig {
         rename = "claudeTokenMultiplier"
     )]
     pub claude_token_multiplier: Option<f64>,
+    /// Cap on total tokens recorded across the current local day. When exceeded,
+    /// new requests are rejected with a 429 until the day rolls over. `None` or a
+    /// value `<= 0` disables the cap. Enforcement gates on cumulative spend so
+    /// far and lags by at most one in-flight request (usage is recorded after the
+    /// response completes).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "dailyTokenBudget")]
+    pub daily_token_budget: Option<i64>,
     /// Preserve unknown top-level keys (e.g. desktop-only fields).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -713,4 +720,10 @@ pub fn get_message_api_web_search_model() -> Option<String> {
 
 pub fn get_claude_token_multiplier() -> f64 {
     get_config().claude_token_multiplier.unwrap_or(1.15)
+}
+
+/// The configured daily token budget, or `None` when unset or non-positive
+/// (treated as disabled).
+pub fn get_daily_token_budget() -> Option<i64> {
+    get_config().daily_token_budget.filter(|&b| b > 0)
 }

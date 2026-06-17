@@ -29,6 +29,7 @@ pub mod state;
 pub mod stream_metrics;
 pub mod subagent;
 pub mod token;
+pub mod token_budget;
 pub mod token_usage;
 pub mod tokenizer;
 pub mod tool_search;
