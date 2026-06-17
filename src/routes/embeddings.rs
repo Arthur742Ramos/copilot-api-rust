@@ -23,8 +23,14 @@ pub async fn post_embeddings(body: Bytes) -> Response {
 }
 
 async fn handle(body: Value) -> Result<Value, AppError> {
-    let payload: EmbeddingRequest = serde_json::from_value(body)
+    let mut payload: EmbeddingRequest = serde_json::from_value(body)
         .map_err(|e| AppError::BadRequest(format!("Invalid embeddings request: {e}")))?;
+
+    // The OpenAI embeddings contract accepts a bare string OR an array for
+    // `input`, but Copilot's upstream rejects a bare string. Normalize a string
+    // into a single-element array so standard OpenAI clients work unchanged;
+    // arrays (of strings or token-id arrays) pass through untouched.
+    normalize_embedding_input(&mut payload.input);
 
     let response = create_embeddings(&payload).await?;
 
@@ -41,4 +47,36 @@ async fn handle(body: Value) -> Result<Value, AppError> {
     });
 
     Ok(response)
+}
+
+/// Wrap a bare-string `input` into a single-element array. Leaves arrays and any
+/// other shape untouched.
+fn normalize_embedding_input(input: &mut Value) {
+    if input.is_string() {
+        *input = Value::Array(vec![input.take()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_embedding_input;
+    use serde_json::json;
+
+    #[test]
+    fn string_input_is_wrapped_in_array() {
+        let mut input = json!("hello world");
+        normalize_embedding_input(&mut input);
+        assert_eq!(input, json!(["hello world"]));
+    }
+
+    #[test]
+    fn array_input_is_unchanged() {
+        let mut input = json!(["a", "b"]);
+        normalize_embedding_input(&mut input);
+        assert_eq!(input, json!(["a", "b"]));
+        // Token-id arrays (arrays of arrays) also pass through.
+        let mut tokens = json!([[1, 2, 3]]);
+        normalize_embedding_input(&mut tokens);
+        assert_eq!(tokens, json!([[1, 2, 3]]));
+    }
 }
