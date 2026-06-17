@@ -294,6 +294,7 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     let app = server::build_router();
     crate::libs::metrics::init_build_info();
     crate::libs::http::preregister_retry_metrics();
+    spawn_token_usage_retention();
     let addr = std::net::SocketAddr::new(ip, options.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     if !ip.is_loopback() {
@@ -333,6 +334,49 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
 
     serve_result?;
     Ok(())
+}
+
+/// Default retention window (days) for `token_usage_events`. Comfortably beyond
+/// the widest queryable window (~30 days) so no reachable row is ever pruned.
+const DEFAULT_TOKEN_USAGE_RETENTION_DAYS: i64 = 45;
+
+/// Spawn a background task that prunes old `token_usage_events` rows so the table
+/// can't grow without bound on a long-lived proxy. Runs once at startup, then on
+/// a ~12h interval. The window is read from `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS`
+/// (default 45); a value `<= 0` disables pruning. The blocking SQLite delete runs
+/// on a blocking thread so it never sits on an async worker.
+fn spawn_token_usage_retention() {
+    if !crate::libs::token_usage::is_token_usage_storage_enabled() {
+        return;
+    }
+    let retention_days = std::env::var("COPILOT_API_TOKEN_USAGE_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(DEFAULT_TOKEN_USAGE_RETENTION_DAYS);
+    if retention_days <= 0 {
+        tracing::debug!("Token-usage retention disabled (retention_days <= 0)");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 60 * 60));
+        // If a tick is delayed (long checkpoint, paused runtime), skip the missed
+        // ticks instead of firing several prunes back-to-back.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let join = tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::libs::token_usage::prune_token_usage_events(retention_days) {
+                    tracing::warn!("Token-usage retention prune failed: {e}");
+                }
+            })
+            .await;
+            if let Err(e) = join {
+                // Surface a panic/cancellation in the blocking prune rather than
+                // silently dropping it.
+                tracing::warn!("Token-usage retention task did not complete: {e}");
+            }
+        }
+    });
 }
 
 /// Compact, copy-pasteable startup banner so a new user immediately knows the

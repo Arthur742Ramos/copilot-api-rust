@@ -613,6 +613,45 @@ pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Re
     Ok(())
 }
 
+/// Delete `token_usage_events` rows older than `retention_days`, then truncate
+/// the WAL to bound on-disk growth. The widest queryable window is ~30 days
+/// (`get_period_range("month")`), so any sensible retention (default 45d) keeps
+/// every reachable row while preventing the table — append-only on every
+/// request — from growing without bound on a long-lived proxy.
+///
+/// `retention_days <= 0` disables pruning (returns `Ok(0)`). Returns the number
+/// of rows deleted. Note: `DELETE` under WAL frees pages for reuse (the file
+/// plateaus) but does not shrink the file; reclaiming size would need a locking
+/// `VACUUM`, which we deliberately avoid against the connection pool.
+pub fn prune_token_usage_events(retention_days: i64) -> rusqlite::Result<usize> {
+    if retention_days <= 0 {
+        return Ok(0);
+    }
+    // Clamp to a sane upper bound before the *86_400_000 multiply so a huge value
+    // can't overflow the i64 arithmetic (saturating_mul alone wouldn't help — the
+    // outer `now - saturated` would still overflow). 10 years is far beyond any
+    // useful retention and keeps the result well within i64.
+    let retention_days = retention_days.min(3_650);
+    let cutoff_ms = Utc::now().timestamp_millis() - retention_days * 86_400_000;
+    let deleted = with_usage_conn(|conn| {
+        let n = conn.execute(
+            "DELETE FROM token_usage_events WHERE created_at_ms < ?",
+            params![cutoff_ms],
+        )?;
+        // Keep the WAL from growing unbounded after a large delete. A SQLITE_BUSY
+        // here (another pooled connection active) is non-fatal — the next prune
+        // retries — but log it so continued WAL growth is diagnosable.
+        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            tracing::warn!("token-usage WAL checkpoint after prune failed: {e}");
+        }
+        Ok::<usize, rusqlite::Error>(n)
+    })?;
+    if deleted > 0 {
+        tracing::info!("Pruned {deleted} token-usage event(s) older than {retention_days} day(s)");
+    }
+    Ok(deleted)
+}
+
 /// Increment a per-token counter labelled by the bounded {source, endpoint}
 /// pair. Non-positive values are skipped so a monotonic counter never moves
 /// backwards (`normalize_token` already precludes negatives).
@@ -1280,5 +1319,84 @@ mod tests {
             .position(|s| s.session_id == "session-b")
             .unwrap();
         assert!(pos_a < pos_b);
+    }
+
+    #[test]
+    fn prune_removes_old_rows_keeps_recent() {
+        // Same process-global-pool guard as the other DB tests.
+        let dir = std::env::temp_dir().join(format!("copilot-api-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("usage.sqlite");
+        std::env::set_var("COPILOT_API_SQLITE_DB_PATH", &db_path);
+
+        let path_matches = with_usage_conn(|conn| {
+            conn.path()
+                .map(|p| std::path::Path::new(p) == db_path)
+                .unwrap_or(false)
+        });
+        if !path_matches {
+            return;
+        }
+
+        let usage = UsageTokens {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            ..Default::default()
+        };
+        // Build a recent event and an old one (backdated 100 days). created_at_ms
+        // is public, so override it after to_persisted_event stamps `now`.
+        let recent = to_persisted_event(
+            "chat_completions",
+            "copilot",
+            "prune-recent",
+            None,
+            None,
+            None,
+            Some("trace-recent"),
+            &usage,
+        )
+        .expect("event present");
+        let mut old = to_persisted_event(
+            "chat_completions",
+            "copilot",
+            "prune-old",
+            None,
+            None,
+            None,
+            Some("trace-old"),
+            &usage,
+        )
+        .expect("event present");
+        old.created_at_ms = Utc::now().timestamp_millis() - 100 * 86_400_000;
+
+        write_token_usage_event(&recent).expect("write recent");
+        write_token_usage_event(&old).expect("write old");
+
+        // Prune anything older than 45 days: the old row goes, the recent stays.
+        let deleted = prune_token_usage_events(45).expect("prune succeeds");
+        assert!(deleted >= 1, "expected the 100-day-old row to be deleted");
+
+        let remaining = with_usage_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM token_usage_events WHERE model = 'prune-old'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .unwrap();
+        assert_eq!(remaining, 0, "old row should be gone");
+
+        let recent_count = with_usage_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM token_usage_events WHERE model = 'prune-recent'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .unwrap();
+        assert_eq!(recent_count, 1, "recent row should be kept");
+
+        // A non-positive window disables pruning.
+        assert_eq!(prune_token_usage_events(0).expect("noop"), 0);
     }
 }
