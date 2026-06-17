@@ -134,6 +134,16 @@ pub struct AppConfig {
     /// the cap is crossed (usage is recorded after each response completes).
     #[serde(skip_serializing_if = "Option::is_none", rename = "dailyTokenBudget")]
     pub daily_token_budget: Option<i64>,
+    /// Top-level Responses model used to drive image generation over the Codex
+    /// transport (the actual image model is selected via the `image_generation`
+    /// tool). These model slugs drift on OpenAI's side, so they are configurable.
+    /// Defaults to `gpt-5.5`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "imageChatModel")]
+    pub image_chat_model: Option<String>,
+    /// The image model the `image_generation` tool requests. Defaults to
+    /// `gpt-image-2`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "imageModel")]
+    pub image_model: Option<String>,
     /// Preserve unknown top-level keys (e.g. desktop-only fields).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -726,4 +736,24 @@ pub fn get_claude_token_multiplier() -> f64 {
 /// (treated as disabled).
 pub fn get_daily_token_budget() -> Option<i64> {
     get_config().daily_token_budget.filter(|&b| b > 0)
+}
+
+/// Top-level Responses model that drives Codex image generation. Defaults to
+/// `gpt-5.5`.
+pub fn get_image_chat_model() -> String {
+    get_config()
+        .image_chat_model
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "gpt-5.5".to_string())
+}
+
+/// The image model requested by the `image_generation` tool. Defaults to
+/// `gpt-image-2`.
+pub fn get_image_model() -> String {
+    get_config()
+        .image_model
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "gpt-image-2".to_string())
 }

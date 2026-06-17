@@ -54,6 +54,14 @@ pub fn build_router() -> Router {
             "/v1/embeddings",
             post(crate::routes::embeddings::post_embeddings),
         )
+        .route(
+            "/images/generations",
+            post(crate::routes::images::post_images),
+        )
+        .route(
+            "/v1/images/generations",
+            post(crate::routes::images::post_images),
+        )
         .route("/usage", get(crate::routes::usage::get_usage))
         .route("/token", get(crate::routes::token::get_token))
         // Token-usage subsystem (implemented). A single `nest` already serves
