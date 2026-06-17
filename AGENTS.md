@@ -40,9 +40,41 @@ entry point.
 - **Dead code:** the crate root has `#![allow(dead_code)]` because some ported
   subsystems are wired but not yet reachable. Don't delete an item unless `grep`
   proves it is unreferenced.
+- **Some "wrong-looking" values are deliberate parity, not bugs.** They mirror
+  the TS upstream and may be test-locked. Known examples: the streaming error
+  envelope uses `type: "error"` (not an Anthropic-specific error type; locked by
+  a test in `src/libs/error.rs`), and `message_start` reports `input_tokens: 0`
+  (Copilot only reports usage on the final chunk). Don't "correct" these unless
+  you are explicitly deciding to diverge from upstream — and update the locking
+  test if you do.
 
 ## Before you finish
 
 Run the CI gates locally (see `CONTRIBUTING.md`): `cargo fmt`,
 `cargo clippy --all-targets -- -D warnings`, `cargo build`, `cargo test`. Keep
 changes surgical and never alter runtime behavior in a cleanup or docs change.
+
+## Working with PRs and CI
+
+- **CI trigger scope.** `.github/workflows/ci.yml` runs on `push` to `main` and
+  on `pull_request` with the default activity types only
+  (`opened`/`synchronize`/`reopened`). Retargeting a PR's base branch is an
+  `edited` event and does **not** re-run CI — push a new commit to force a fresh
+  run. Relevant when landing stacked PRs (merge the base, retarget the child to
+  `main`, then push).
+- **Requesting a Copilot review.** `gh pr edit --add-reviewer @copilot` does not
+  resolve. Use the API:
+  `gh api repos/<owner>/<repo>/pulls/<N>/requested_reviewers -X POST -f "reviewers[]=copilot-pull-request-reviewer[bot]"`.
+  Copilot posts a `COMMENTED` review within a minute or two; read it with
+  `gh api repos/<owner>/<repo>/pulls/<N>/comments`.
+
+## Dogfooding
+
+This proxy may be running locally (default port `4141`) as the backend for the
+very Claude Code session editing it. Stopping that server cuts the model
+connection mid-task, so don't restart `4141` casually. When rebuilding the
+running server, validate the new binary on a scratch port first (e.g. `4142` via
+`/readyz`) before swapping, and prefer an atomic detached swap with
+auto-rollback. `/version` reports `git_sha` + `build_timestamp` so you can
+confirm which binary is live. See the `hot-swap-server` skill for the full
+runbook.
