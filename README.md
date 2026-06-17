@@ -13,7 +13,7 @@ third-party LLM providers.
 into GitHub Copilot requests, using your own Copilot subscription. It exposes:
 
 - **OpenAI-compatible** endpoints: `POST /v1/chat/completions`,
-  `GET /v1/models`, `POST /v1/embeddings`
+  `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/images/generations`
 - **Anthropic-compatible** endpoints: `POST /v1/messages` and
   `POST /v1/messages/count_tokens`
 - **OpenAI Responses API**: `POST /v1/responses`
@@ -241,6 +241,7 @@ By default the server binds to `127.0.0.1:<port>` (loopback only). Pass
 | `POST` | `/chat/completions`, `/v1/chat/completions` | OpenAI-compatible chat completions. |
 | `GET`  | `/models`, `/v1/models` | List available models. |
 | `POST` | `/embeddings`, `/v1/embeddings` | OpenAI-compatible embeddings. |
+| `POST` | `/images/generations`, `/v1/images/generations` | OpenAI-compatible image generation via the Codex `image_generation` tool (requires Codex / Sign in with ChatGPT credentials). |
 | `GET`  | `/usage` | Copilot usage data. |
 | `GET`  | `/token` | Returns the live Copilot bearer token (see [Security](#security-warning)). |
 | `*`    | `/token-usage`, `/token-usage/` | Token-usage subsystem routes. |
@@ -296,9 +297,11 @@ Key fields (from `src/libs/config.rs`):
   "extraPrompts": { "<model>": "..." },
   "modelReasoningEfforts": { "<model>": "high" },
   "anthropicApiKey": "...",
-  "dailyTokenBudget": 5000000 // reject new requests with 429 once this many
-                              // tokens are recorded in the local day (omit or
-                              // <= 0 to disable)
+  "dailyTokenBudget": 5000000, // reject new requests with 429 once this many
+                               // tokens are recorded in the local day (omit or
+                               // <= 0 to disable)
+  "imageChatModel": "gpt-5.5",  // Responses model that drives image generation
+  "imageModel": "gpt-image-2"   // image model the image_generation tool requests
 }
 ```
 
@@ -311,6 +314,12 @@ Notes:
 - `dailyTokenBudget` is a coarse spend guardrail: usage is recorded after each
   response completes, so enforcement gates on cumulative spend so far and can
   overshoot by at most the requests already in flight when the cap is crossed.
+- `POST /v1/images/generations` forwards to the Codex `image_generation` tool
+  using your Codex (Sign in with ChatGPT) credentials, so it requires
+  `copilot-api auth --provider codex`. It returns the OpenAI shape
+  (`{ created, data: [{ b64_json }] }`). `imageChatModel` / `imageModel` let you
+  pin the model slugs, which OpenAI changes over time. Note this rides an
+  undocumented Codex backend, so it may change without notice.
 
 ### Exact token counts for Claude models
 

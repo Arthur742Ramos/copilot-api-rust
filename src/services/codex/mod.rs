@@ -1,2 +1,3 @@
+pub mod create_image;
 pub mod create_responses;
 pub mod get_models;
