@@ -37,7 +37,6 @@ pub struct DeviceCodeResponse {
     pub device_code: String,
     pub user_code: String,
     pub verification_uri: String,
-    #[allow(dead_code)]
     pub expires_in: u64,
     pub interval: u64,
 }

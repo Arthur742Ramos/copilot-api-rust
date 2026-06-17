@@ -62,7 +62,12 @@ struct StartArgs {
     port: u16,
     /// Host/interface to bind to. Defaults to loopback (127.0.0.1) to limit the
     /// blast radius; pass 0.0.0.0 to expose the gateway on the LAN.
-    #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    #[arg(
+        short = 'H',
+        long,
+        default_value = "127.0.0.1",
+        env = "COPILOT_API_HOST"
+    )]
     host: String,
     /// Enable verbose logging
     #[arg(short = 'v', long, default_value_t = false)]
@@ -234,19 +239,28 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
             })
             .unwrap_or_default()
     });
-    tracing::info!("Available models: \n{model_list}");
+    let model_count = state::with_state(|s| s.models.as_ref().map(|m| m.data.len()).unwrap_or(0));
+    // Full list at debug so it doesn't bury the ready banner; a count at info.
+    tracing::info!("Loaded {model_count} models (run with -v to list them).");
+    tracing::debug!("Available models: \n{model_list}");
 
     // Resolve the bind host once into an IpAddr (single source of truth for both
     // the advertised URL and the listen SocketAddr below). Accepts an IP literal
     // (e.g. 127.0.0.1, ::1, 0.0.0.0) and defaults to loopback to limit exposure.
     // We parse to an IpAddr rather than DNS-resolving so the listen interface is
-    // unambiguous.
-    let ip: std::net::IpAddr = options.host.trim().parse().map_err(|_| {
-        anyhow::anyhow!(
-            "Invalid --host '{}': expected an IP address such as 127.0.0.1 or 0.0.0.0",
-            options.host
-        )
-    })?;
+    // unambiguous; `localhost` is accepted as a friendly alias for 127.0.0.1
+    // since it's a common invocation that would otherwise hard-fail.
+    let host = options.host.trim();
+    let ip: std::net::IpAddr = if host.eq_ignore_ascii_case("localhost") {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    } else {
+        host.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid --host '{}': expected an IP address such as 127.0.0.1 or 0.0.0.0 (or 'localhost')",
+                options.host
+            )
+        })?
+    };
 
     // Derive the advertised URL from the actual bind IP. Unspecified binds
     // (0.0.0.0 / ::) aren't directly reachable, so fall back to "localhost" for
@@ -284,6 +298,7 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
         );
     }
     tracing::info!("Listening on {addr} ({server_url})");
+    print_ready_banner(&server_url);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -298,10 +313,33 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Compact, copy-pasteable startup banner so a new user immediately knows the
+/// server is up and how to point a client at it. Emitted once after the listener
+/// binds. Reuses the configured-API-keys check to flag the unauthenticated case.
+fn print_ready_banner(server_url: &str) {
+    let unauthenticated = crate::libs::request_auth::get_configured_api_keys().is_empty();
+    let auth_line = if unauthenticated {
+        "  Auth:    UNAUTHENTICATED (any key works). Set auth.apiKeys in config.json to require one."
+    } else {
+        "  Auth:    API key required (auth.apiKeys is set)."
+    };
+    tracing::info!(
+        "\n\
+         ============================================================\n\
+         copilot-api is ready.\n\
+         ------------------------------------------------------------\n\
+         OpenAI clients:    base_url = {server_url}/v1\n\
+         Anthropic / Claude Code:\n\
+           ANTHROPIC_BASE_URL={server_url}\n\
+           ANTHROPIC_AUTH_TOKEN=dummy\n\
+         {auth_line}\n\
+         ============================================================"
+    );
+}
+
 /// Resolves when the process receives a Ctrl-C, or (on unix) a SIGTERM, so the
 /// server can drain in-flight requests before exiting.
-async fn shutdown_signal() {
-    let ctrl_c = async {
+async fn shutdown_signal() {    let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
 

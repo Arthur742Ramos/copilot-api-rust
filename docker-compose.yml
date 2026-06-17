@@ -1,0 +1,29 @@
+# One-service compose for copilot-api.
+#
+# First-time login (device-code flow, interactive) — run once; the token is
+# saved to the named volume and reused on every subsequent `up`:
+#
+#   docker compose run --rm copilot-api auth
+#
+# Then start the server:
+#
+#   docker compose up
+#
+# Alternatively, skip the interactive step by exporting a pre-generated token on
+# the host (COPILOT_API_GITHUB_TOKEN is passed through below) and just `up`.
+services:
+  copilot-api:
+    build: .
+    image: copilot-api
+    ports:
+      - "4141:4141"
+    volumes:
+      - copilot-api-data:/data
+    environment:
+      # The image already sets COPILOT_API_HOST=0.0.0.0 so the published port
+      # works; pass a token through from the host to skip interactive auth.
+      COPILOT_API_GITHUB_TOKEN: ${COPILOT_API_GITHUB_TOKEN:-}
+    restart: unless-stopped
+
+volumes:
+  copilot-api-data:

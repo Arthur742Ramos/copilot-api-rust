@@ -39,24 +39,35 @@ via the full path to the built binary.
 
 ## Quick start
 
-1. **Authenticate with GitHub** (device-code flow):
-
-   ```sh
-   copilot-api auth
-   ```
-
-   This opens the GitHub device-login flow and stores your GitHub token locally.
-
-2. **Start the server:**
+1. **Start the server:**
 
    ```sh
    copilot-api start
    ```
 
-   By default it listens on port `4141`.
+   On first run, if you are not already authenticated, this kicks off the GitHub
+   device-login flow automatically: it prints a code, opens your browser to
+   GitHub's device page (best-effort), and waits for you to authorize. The
+   GitHub token is then stored locally and reused on subsequent runs. By default
+   the server listens on `127.0.0.1:4141` (loopback only).
 
-3. **Point a client at it.** OpenAI-style clients use the base URL
+   On startup it prints a ready banner showing the exact base URLs to point your
+   clients at.
+
+2. **Point a client at it.** OpenAI-style clients use the base URL
    `http://localhost:4141/v1`.
+
+### Pre-authenticating separately
+
+If you prefer to run the GitHub login as its own step (for example before
+scripting `start`), use the `auth` subcommand:
+
+```sh
+copilot-api auth
+```
+
+This runs the same device-login flow and stores your GitHub token locally,
+without starting the server.
 
 ### Non-interactive auth
 
@@ -98,6 +109,24 @@ server persists its GitHub token and config under `COPILOT_API_HOME` (set to
 `/data` in the image and exposed as a volume), so mount a volume there to keep
 state across restarts.
 
+The image sets `COPILOT_API_HOST=0.0.0.0` so the server binds all interfaces
+inside the container and Docker's published port (`-p`) is reachable. (The
+binary itself defaults to `127.0.0.1`; see [Security](#security-warning).)
+
+### With Docker Compose (recommended)
+
+A [`docker-compose.yml`](./docker-compose.yml) is provided:
+
+```sh
+# First run: authenticate (device-code flow). State is kept in a named volume.
+docker compose run --rm copilot-api auth
+
+# Start the server (published on http://localhost:4141).
+docker compose up
+```
+
+### With plain `docker run`
+
 ```sh
 # Build the image
 docker build -t copilot-api .
@@ -118,6 +147,7 @@ containers (the `start` flags below have matching `COPILOT_API_*` variables):
 | Variable | Equivalent flag | Description |
 | -------- | --------------- | ----------- |
 | `COPILOT_API_PORT` | `--port` | Port to listen on (also used by the healthcheck). |
+| `COPILOT_API_HOST` | `--host` | Interface to bind. The image defaults this to `0.0.0.0`. |
 | `COPILOT_API_ACCOUNT_TYPE` | `--account-type` | Account type: `individual`, `business`, `enterprise`. |
 | `COPILOT_API_GITHUB_TOKEN` | `--github-token` | GitHub token for non-interactive startup. |
 | `COPILOT_API_HOME` | `--api-home` | App data / token directory. |
@@ -174,6 +204,7 @@ These apply to every subcommand:
 | Flag | Alias | Default | Description |
 | ---- | ----- | ------- | ----------- |
 | `--port <PORT>` | `-p` | `4141` | Port to listen on. Env: `COPILOT_API_PORT`. |
+| `--host <HOST>` | `-H` | `127.0.0.1` | Interface to bind. Accepts an IP literal or `localhost`. Use `0.0.0.0` to expose on the LAN / make Docker `-p` work. Env: `COPILOT_API_HOST`. |
 | `--verbose` | `-v` | `false` | Enable verbose (debug) logging. |
 | `--account-type <TYPE>` | `-a` | `individual` | Account type: `individual`, `business`, or `enterprise`. Env: `COPILOT_API_ACCOUNT_TYPE`. |
 | `--manual` | | `false` | Enable manual request approval. |
@@ -194,13 +225,16 @@ These apply to every subcommand:
 
 ## Endpoints
 
-The server binds to `0.0.0.0:<port>`. Routes (from `src/server.rs`):
+By default the server binds to `127.0.0.1:<port>` (loopback only). Pass
+`-H/--host 0.0.0.0` to expose it on all interfaces (LAN). Routes (from
+`src/server.rs`):
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | `GET`  | `/` | Liveness check (`Server running`). |
 | `GET`  | `/readyz` | Readiness probe; `200` only once a Copilot token and the model list are loaded, `503` otherwise. |
 | `GET`  | `/version` | Build metadata: crate version, git SHA, and build timestamp. |
+| `GET`  | `/metrics` | Prometheus metrics (text exposition). Subject to the normal API-key check: open only when `auth.apiKeys` is empty, otherwise a key is required. |
 | `GET`  | `/usage-viewer`, `/usage-viewer/` | Self-contained usage dashboard (renders the `/token-usage` data). |
 | `POST` | `/chat/completions`, `/v1/chat/completions` | OpenAI-compatible chat completions. |
 | `GET`  | `/models`, `/v1/models` | List available models. |
@@ -299,8 +333,11 @@ through with no API key. That means anyone who can reach the listening port can:
 - use your GitHub Copilot subscription through the gateway, and
 - read your **live GitHub Copilot bearer token** via `GET /token`.
 
-The server also binds to `0.0.0.0`, so without a firewall it is reachable from
-other machines on your network.
+By default the server binds to loopback (`127.0.0.1`), so it is only reachable
+from the same machine. If you pass `-H 0.0.0.0` (or another non-loopback host —
+as the Docker image does), it becomes reachable from other machines on your
+network; in that case configure `auth.apiKeys` and/or a firewall. The server
+logs a warning whenever it binds to a non-loopback interface.
 
 If you are on a shared or untrusted machine/network:
 
