@@ -131,3 +131,33 @@ async fn landing_path_is_unauthenticated() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(String::from_utf8_lossy(&body), "Server running");
 }
+
+// `/version` is unauthenticated and returns build metadata even when regular
+// API keys are configured.
+#[tokio::test]
+#[serial_test::serial]
+async fn version_path_is_unauthenticated() {
+    set_config(&[REGULAR_KEY], Some(ADMIN_KEY));
+    let (status, body) = send(get("/version")).await;
+    assert_eq!(status, StatusCode::OK);
+    let value = common::json_body(&body);
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    let git_sha = &value["git_sha"];
+    assert!(
+        git_sha.is_string(),
+        "git_sha should be a string: {git_sha:?}"
+    );
+    assert!(
+        !git_sha.as_str().unwrap().is_empty(),
+        "git_sha should be non-empty"
+    );
+    let build_timestamp = &value["build_timestamp"];
+    assert!(
+        build_timestamp.is_string(),
+        "build_timestamp should be a string: {build_timestamp:?}"
+    );
+    assert!(
+        !build_timestamp.as_str().unwrap().is_empty(),
+        "build_timestamp should be non-empty"
+    );
+}

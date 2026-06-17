@@ -28,6 +28,7 @@ pub fn build_router() -> Router {
     Router::new()
         .route("/", get(|| async { "Server running" }))
         .route("/readyz", get(readyz))
+        .route("/version", get(version))
         .route("/metrics", get(metrics_handler))
         .route("/usage-viewer", get(usage_viewer))
         .route("/usage-viewer/", get(usage_viewer_redirect))
@@ -313,6 +314,21 @@ async fn readyz() -> Response {
         )
             .into_response()
     }
+}
+
+/// Build/version metadata endpoint: returns the git SHA and build timestamp
+/// captured at compile time by `build.rs`, plus the crate version. Mounted
+/// outside auth so liveness/version probes need no API key.
+async fn version() -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "git_sha": env!("GIT_SHA"),
+            "build_timestamp": env!("BUILD_TIMESTAMP"),
+        })),
+    )
+        .into_response()
 }
 
 fn header_string(req: &Request, name: &str) -> Option<String> {

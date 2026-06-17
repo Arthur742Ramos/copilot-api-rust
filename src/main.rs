@@ -58,7 +58,7 @@ enum Command {
 #[derive(Args, Debug)]
 struct StartArgs {
     /// Port to listen on
-    #[arg(short = 'p', long, default_value = "4141")]
+    #[arg(short = 'p', long, default_value = "4141", env = "COPILOT_API_PORT")]
     port: u16,
     /// Host/interface to bind to. Defaults to loopback (127.0.0.1) to limit the
     /// blast radius; pass 0.0.0.0 to expose the gateway on the LAN.
@@ -68,7 +68,12 @@ struct StartArgs {
     #[arg(short = 'v', long, default_value_t = false)]
     verbose: bool,
     /// Account type to use (individual, business, enterprise)
-    #[arg(short = 'a', long = "account-type", default_value = "individual")]
+    #[arg(
+        short = 'a',
+        long = "account-type",
+        default_value = "individual",
+        env = "COPILOT_API_ACCOUNT_TYPE"
+    )]
     account_type: String,
     /// Enable manual request approval
     #[arg(long, default_value_t = false)]
@@ -80,7 +85,7 @@ struct StartArgs {
     #[arg(short = 'w', long = "wait", default_value_t = false)]
     wait: bool,
     /// Provide GitHub token directly (generated via the `auth` subcommand)
-    #[arg(short = 'g', long = "github-token")]
+    #[arg(short = 'g', long = "github-token", env = "COPILOT_API_GITHUB_TOKEN")]
     github_token: Option<String>,
     /// Generate a command to launch Claude Code with Copilot API config
     #[arg(short = 'c', long = "claude-code", default_value_t = false)]

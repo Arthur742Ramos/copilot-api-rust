@@ -25,7 +25,7 @@ at a local endpoint backed by GitHub Copilot.
 
 ## Install / build
 
-This is a Rust project. There are no published binaries yet — build from source:
+This is a Rust project. Build from source with Cargo:
 
 ```sh
 cargo build --release
@@ -91,6 +91,60 @@ copilot-api start --claude-code
   `ANTHROPIC_BASE_URL=http://localhost:4141` and
   `ANTHROPIC_AUTH_TOKEN` to any non-empty value (e.g. `dummy`).
 
+## Running with Docker
+
+A multi-stage [`Dockerfile`](./Dockerfile) builds a slim runtime image. The
+server persists its GitHub token and config under `COPILOT_API_HOME` (set to
+`/data` in the image and exposed as a volume), so mount a volume there to keep
+state across restarts.
+
+```sh
+# Build the image
+docker build -t copilot-api .
+
+# First run: authenticate (device-code flow). Keep state in a named volume.
+docker run -it --rm -v copilot-api-data:/data copilot-api auth
+
+# Start the server, publishing the port.
+docker run --rm -p 4141:4141 -v copilot-api-data:/data copilot-api
+```
+
+The container `HEALTHCHECK` probes `/readyz`, so Docker only reports the
+container healthy once a Copilot token and the model list are loaded.
+
+Configuration is available via environment variables, which is convenient in
+containers (the `start` flags below have matching `COPILOT_API_*` variables):
+
+| Variable | Equivalent flag | Description |
+| -------- | --------------- | ----------- |
+| `COPILOT_API_PORT` | `--port` | Port to listen on (also used by the healthcheck). |
+| `COPILOT_API_ACCOUNT_TYPE` | `--account-type` | Account type: `individual`, `business`, `enterprise`. |
+| `COPILOT_API_GITHUB_TOKEN` | `--github-token` | GitHub token for non-interactive startup. |
+| `COPILOT_API_HOME` | `--api-home` | App data / token directory. |
+| `COPILOT_API_OAUTH_APP` | `--oauth-app` | OAuth app identifier. |
+| `COPILOT_API_ENTERPRISE_URL` | `--enterprise-url` | Enterprise URL for GitHub. |
+
+Example:
+
+```sh
+docker run --rm -p 8080:8080 \
+  -e COPILOT_API_PORT=8080 \
+  -e COPILOT_API_GITHUB_TOKEN=<github-token> \
+  -v copilot-api-data:/data copilot-api
+```
+
+## Logging
+
+Logging uses the [`tracing`](https://docs.rs/tracing) ecosystem and is
+controlled by environment variables:
+
+- `RUST_LOG` sets the log filter (e.g. `RUST_LOG=debug`,
+  `RUST_LOG=copilot_api=debug,hyper=warn`). When unset, the level defaults to
+  `info` (or `debug` when `--verbose` / `-v` is passed).
+- `COPILOT_API_LOG_FORMAT=json` switches log output from the default
+  human-readable format to structured JSON lines, which is handy for shipping
+  logs to a collector. Any other value keeps the default format.
+
 ## CLI reference
 
 Global usage: `copilot-api [GLOBAL OPTIONS] <SUBCOMMAND>`
@@ -119,13 +173,13 @@ These apply to every subcommand:
 
 | Flag | Alias | Default | Description |
 | ---- | ----- | ------- | ----------- |
-| `--port <PORT>` | `-p` | `4141` | Port to listen on. |
+| `--port <PORT>` | `-p` | `4141` | Port to listen on. Env: `COPILOT_API_PORT`. |
 | `--verbose` | `-v` | `false` | Enable verbose (debug) logging. |
-| `--account-type <TYPE>` | `-a` | `individual` | Account type: `individual`, `business`, or `enterprise`. |
+| `--account-type <TYPE>` | `-a` | `individual` | Account type: `individual`, `business`, or `enterprise`. Env: `COPILOT_API_ACCOUNT_TYPE`. |
 | `--manual` | | `false` | Enable manual request approval. |
 | `--rate-limit <SECONDS>` | `-r` | (none) | Minimum seconds between requests. |
 | `--wait` | `-w` | `false` | Wait instead of erroring when the rate limit is hit. |
-| `--github-token <TOKEN>` | `-g` | (none) | Provide a GitHub token directly (non-interactive). |
+| `--github-token <TOKEN>` | `-g` | (none) | Provide a GitHub token directly (non-interactive). Env: `COPILOT_API_GITHUB_TOKEN`. |
 | `--claude-code` | `-c` | `false` | Generate a clipboard command to launch Claude Code against the gateway. |
 | `--show-token` | | `false` | Show GitHub and Copilot tokens on fetch and refresh. |
 | `--proxy-env` | | `false` | Initialize the HTTP proxy from environment variables. |
@@ -145,7 +199,9 @@ The server binds to `0.0.0.0:<port>`. Routes (from `src/server.rs`):
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | `GET`  | `/` | Liveness check (`Server running`). |
-| `GET`  | `/usage-viewer`, `/usage-viewer/` | Usage dashboard (placeholder in this build). |
+| `GET`  | `/readyz` | Readiness probe; `200` only once a Copilot token and the model list are loaded, `503` otherwise. |
+| `GET`  | `/version` | Build metadata: crate version, git SHA, and build timestamp. |
+| `GET`  | `/usage-viewer`, `/usage-viewer/` | Self-contained usage dashboard (renders the `/token-usage` data). |
 | `POST` | `/chat/completions`, `/v1/chat/completions` | OpenAI-compatible chat completions. |
 | `GET`  | `/models`, `/v1/models` | List available models. |
 | `POST` | `/embeddings`, `/v1/embeddings` | OpenAI-compatible embeddings. |
