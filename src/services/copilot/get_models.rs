@@ -3,7 +3,8 @@ use serde_json::{Map, Value};
 
 use crate::libs::api_config::{copilot_base_url, copilot_models_headers};
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::client;
+use crate::libs::http::{client, read_json_capped, retry_endpoint, send_with_connect_retry};
+use crate::libs::metrics::{record_upstream_request, UpstreamStatus};
 use crate::libs::state;
 
 pub async fn get_models() -> Result<ModelsResponse, HttpError> {
@@ -11,19 +12,23 @@ pub async fn get_models() -> Result<ModelsResponse, HttpError> {
     let base = copilot_base_url(&st);
     tracing::info!("Fetching models from {base}/models");
     let headers = copilot_models_headers(&st);
-    let response = client()
-        .get(format!("{base}/models"))
-        .headers(headers)
-        .send()
+    let upstream_start = std::time::Instant::now();
+    let request = client().get(format!("{base}/models")).headers(headers);
+    let response = send_with_connect_retry(request, retry_endpoint::MODELS)
         .await
         .map_err(|e| {
-            HttpError::new(
-                format!("Failed to get models: {e}"),
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Default::default(),
-                String::new(),
-            )
+            record_upstream_request(
+                retry_endpoint::MODELS,
+                UpstreamStatus::TransportError,
+                upstream_start.elapsed().as_secs_f64(),
+            );
+            HttpError::internal(format!("Failed to get models: {e}"))
         })?;
+    record_upstream_request(
+        retry_endpoint::MODELS,
+        UpstreamStatus::from_code(response.status().as_u16()),
+        upstream_start.elapsed().as_secs_f64(),
+    );
 
     if !response.status().is_success() {
         let err = http_error_from_response("Failed to get models", response).await;
@@ -31,14 +36,9 @@ pub async fn get_models() -> Result<ModelsResponse, HttpError> {
         return Err(err);
     }
 
-    response.json::<ModelsResponse>().await.map_err(|e| {
-        HttpError::new(
-            format!("Failed to parse models: {e}"),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Default::default(),
-            String::new(),
-        )
-    })
+    read_json_capped::<ModelsResponse>(response)
+        .await
+        .map_err(|e| HttpError::internal(format!("Failed to parse models: {e}")))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
