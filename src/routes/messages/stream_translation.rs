@@ -21,9 +21,9 @@ use super::anthropic_types::{
 };
 use super::utils::map_openai_stop_reason_to_anthropic;
 
-/// Re-exported from [`super::utils`] so all translation modules share one
-/// source of truth for the user-visible "Thinking..." placeholder. Compatible
-/// with opencode, which filters out thinking blocks whose text is empty, so a
+/// Imported from [`super::utils`] so all translation modules share one source of
+/// truth for the user-visible "Thinking..." placeholder. Compatible with
+/// opencode, which filters out thinking blocks whose text is empty, so a
 /// non-empty default is emitted.
 use super::utils::THINKING_TEXT;
 

@@ -34,8 +34,8 @@ use super::anthropic_types::{
 /// `const MAX_CONSECUTIVE_FUNCTION_CALL_WHITESPACE = 20`
 const MAX_CONSECUTIVE_FUNCTION_CALL_WHITESPACE: i64 = 20;
 
-/// Re-exported from [`super::utils`] so all translation modules share one
-/// source of truth for the "Thinking..." placeholder.
+/// Imported from [`super::utils`] so all translation modules share one source of
+/// truth for the "Thinking..." placeholder.
 use super::utils::THINKING_TEXT;
 
 /// Shared with [`super::responses_translation`] so the byte-exact compaction
