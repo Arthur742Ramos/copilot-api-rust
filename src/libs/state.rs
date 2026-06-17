@@ -57,7 +57,7 @@ pub static STATE: Lazy<RwLock<State>> = Lazy::new(|| RwLock::new(State::initial(
 /// Read a clone of the current state. Mirrors the many `state.foo` reads in TS;
 /// callers that need a consistent snapshot for header building clone once.
 pub fn snapshot() -> State {
-    STATE.read().unwrap().clone()
+    STATE.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// Mutate the global state under the write lock.
@@ -65,7 +65,7 @@ pub fn with_state_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut State) -> R,
 {
-    let mut guard = STATE.write().unwrap();
+    let mut guard = STATE.write().unwrap_or_else(|p| p.into_inner());
     f(&mut guard)
 }
 
@@ -74,6 +74,6 @@ pub fn with_state<F, R>(f: F) -> R
 where
     F: FnOnce(&State) -> R,
 {
-    let guard = STATE.read().unwrap();
+    let guard = STATE.read().unwrap_or_else(|p| p.into_inner());
     f(&guard)
 }

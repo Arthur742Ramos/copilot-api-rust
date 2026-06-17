@@ -190,6 +190,10 @@ fn handle_finish(
         return;
     };
 
+    // A reasoning-only turn leaves a `content_block_start{thinking}` open with no
+    // matching content block; close it here so the stream stays well-formed.
+    close_thinking_block_if_open(state, events);
+
     if state.content_block_open {
         let tool_block_open = is_tool_block_open(state);
         events.push(AnthropicStreamEventData::ContentBlockStop {
@@ -987,6 +991,53 @@ mod tests {
                 "error": { "type": "api_error", "message": "An unexpected error occurred during streaming." }
             })
         );
+    }
+
+    #[test]
+    fn reasoning_only_turn_closes_thinking_block_on_finish() {
+        // A turn that only ever emits reasoning text leaves a thinking block open;
+        // the finishing chunk must close it (signature_delta "" + stop) so the
+        // stream is well-formed rather than leaving a dangling content_block_start.
+        let mut state = AnthropicStreamState::default();
+        let mut all: Vec<Value> = Vec::new();
+
+        let c1 = json!({
+            "id": "x", "model": "m",
+            "choices": [{ "index": 0, "delta": { "reasoning_text": "pondering" }, "finish_reason": null }],
+        });
+        all.extend(to_values(&translate_chunk_to_anthropic_events(
+            &c1, &mut state,
+        )));
+        assert!(state.thinking_block_open);
+
+        let finish = json!({
+            "id": "x", "model": "m",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 },
+        });
+        let got = to_values(&translate_chunk_to_anthropic_events(&finish, &mut state));
+        all.extend(got.clone());
+
+        // The thinking block is closed before the message_delta/stop are emitted.
+        assert_eq!(
+            got,
+            vec![
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                    "usage": { "input_tokens": 3, "output_tokens": 2 }
+                }),
+                json!({ "type": "message_stop" }),
+            ]
+        );
+        assert!(!state.thinking_block_open);
+        assert_single_open_block_invariant(&all);
     }
 
     #[test]
