@@ -967,6 +967,7 @@ pub fn translate_responses_result_to_anthropic(
         stop_reason,
         stop_sequence: None,
         usage,
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -1242,6 +1243,7 @@ fn map_responses_usage(response: &ResponsesResult) -> AnthropicUsage {
         cache_creation_input_tokens: None,
         cache_read_input_tokens: cached_tokens,
         service_tier: None,
+        extra: serde_json::Map::new(),
     }
 }
 

@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::libs::compact::COMPACT_REQUEST;
 use crate::libs::config::{get_small_model, is_messages_api_enabled, resolve_mapped_model};
 use crate::libs::error::AppError;
-use crate::libs::models::find_endpoint_model;
+use crate::libs::models::{find_endpoint_model, is_context_1m_model};
 use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::rate_limit::check_rate_limit;
 use crate::libs::state;
@@ -28,6 +28,7 @@ use crate::routes::messages::preprocess::{
     strip_tool_reference_turn_boundary,
 };
 use crate::routes::responses::utils::get_responses_transport_for_model;
+use crate::services::copilot::create_messages::CONTEXT_1M_BETA;
 use crate::services::copilot::get_models::Model;
 
 const MESSAGES_ENDPOINT: &str = "/v1/messages";
@@ -185,13 +186,27 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     }
 
     // 7. Resolve the concrete endpoint model and pin the payload model to it.
+    //
+    // A `[1m]` suffix on the requested model selects the 1M-context variant: the
+    // base model id resolves the endpoint, and the `context-1m-2025-08-07` beta
+    // must be folded into the `anthropic-beta` header so the upstream actually
+    // enables the larger window. Detect it before `find_endpoint_model` strips
+    // the suffix while pinning the payload to the concrete model id.
+    let anthropic_beta = if is_context_1m_model(&model_of(&payload)) {
+        Some(merge_context_1m_beta(anthropic_beta.as_deref()))
+    } else {
+        anthropic_beta
+    };
+
     let selected_model = find_endpoint_model(&model_of(&payload));
     if let Some(model) = selected_model.as_ref() {
         set_model(&mut payload, &model.id);
     }
 
     // 8. Dispatch. Deserialize the fully-preprocessed payload for the flows.
-    let mut typed = deserialize_payload(&payload)?;
+    // `payload` is not read after this point, so consume it (`from_value` takes
+    // the `Value` by value) rather than cloning a potentially multi-MB body.
+    let mut typed = deserialize_payload_owned(payload)?;
     let options = FlowOptions {
         subagent_marker,
         selected_model: selected_model.clone(),
@@ -216,6 +231,33 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 fn deserialize_payload(payload: &Value) -> Result<AnthropicMessagesPayload, AppError> {
     serde_json::from_value(payload.clone())
         .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))
+}
+
+/// Like [`deserialize_payload`] but consumes the `Value`, avoiding the deep
+/// clone. Use at the final dispatch where the working `Value` is no longer read.
+#[allow(clippy::result_large_err)]
+fn deserialize_payload_owned(payload: Value) -> Result<AnthropicMessagesPayload, AppError> {
+    serde_json::from_value(payload)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("Invalid request payload: {e}")))
+}
+
+/// Folds the `context-1m-2025-08-07` beta into an existing comma-separated
+/// `anthropic-beta` header value (or produces a header carrying just that beta).
+/// Idempotent: a header already listing the beta is returned unchanged.
+fn merge_context_1m_beta(existing: Option<&str>) -> String {
+    let header = existing.unwrap_or("").trim();
+    if header.is_empty() {
+        return CONTEXT_1M_BETA.to_string();
+    }
+    let already_present = header
+        .split(',')
+        .map(str::trim)
+        .any(|item| item == CONTEXT_1M_BETA);
+    if already_present {
+        header.to_string()
+    } else {
+        format!("{header},{CONTEXT_1M_BETA}")
+    }
 }
 
 /// Cheap `Value`-level probe for an Anthropic `web_search` server tool: a
@@ -253,4 +295,30 @@ fn should_use_messages_api(selected_model: Option<&Model>) -> bool {
         .and_then(|m| m.supported_endpoints.as_ref())
         .map(|endpoints| endpoints.iter().any(|e| e == MESSAGES_ENDPOINT))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_1m_beta_added_when_no_existing_header() {
+        assert_eq!(merge_context_1m_beta(None), CONTEXT_1M_BETA);
+        assert_eq!(merge_context_1m_beta(Some("")), CONTEXT_1M_BETA);
+        assert_eq!(merge_context_1m_beta(Some("   ")), CONTEXT_1M_BETA);
+    }
+
+    #[test]
+    fn context_1m_beta_appended_to_existing_header() {
+        assert_eq!(
+            merge_context_1m_beta(Some("interleaved-thinking-2025-05-14")),
+            format!("interleaved-thinking-2025-05-14,{CONTEXT_1M_BETA}")
+        );
+    }
+
+    #[test]
+    fn context_1m_beta_is_idempotent() {
+        let already = format!("foo,{CONTEXT_1M_BETA}");
+        assert_eq!(merge_context_1m_beta(Some(&already)), already);
+    }
 }
