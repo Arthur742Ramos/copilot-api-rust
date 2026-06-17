@@ -627,14 +627,23 @@ pub fn prune_token_usage_events(retention_days: i64) -> rusqlite::Result<usize> 
     if retention_days <= 0 {
         return Ok(0);
     }
-    let cutoff_ms = Utc::now().timestamp_millis() - retention_days.saturating_mul(86_400_000);
+    // Clamp to a sane upper bound before the *86_400_000 multiply so a huge value
+    // can't overflow the i64 arithmetic (saturating_mul alone wouldn't help — the
+    // outer `now - saturated` would still overflow). 10 years is far beyond any
+    // useful retention and keeps the result well within i64.
+    let retention_days = retention_days.min(3_650);
+    let cutoff_ms = Utc::now().timestamp_millis() - retention_days * 86_400_000;
     let deleted = with_usage_conn(|conn| {
         let n = conn.execute(
             "DELETE FROM token_usage_events WHERE created_at_ms < ?",
             params![cutoff_ms],
         )?;
-        // Keep the WAL from growing unbounded after a large delete.
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        // Keep the WAL from growing unbounded after a large delete. A SQLITE_BUSY
+        // here (another pooled connection active) is non-fatal — the next prune
+        // retries — but log it so continued WAL growth is diagnosable.
+        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            tracing::warn!("token-usage WAL checkpoint after prune failed: {e}");
+        }
         Ok::<usize, rusqlite::Error>(n)
     })?;
     if deleted > 0 {

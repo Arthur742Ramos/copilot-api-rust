@@ -359,14 +359,22 @@ fn spawn_token_usage_retention() {
     }
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 60 * 60));
+        // If a tick is delayed (long checkpoint, paused runtime), skip the missed
+        // ticks instead of firing several prunes back-to-back.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let _ = tokio::task::spawn_blocking(move || {
+            let join = tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::libs::token_usage::prune_token_usage_events(retention_days) {
                     tracing::warn!("Token-usage retention prune failed: {e}");
                 }
             })
             .await;
+            if let Err(e) = join {
+                // Surface a panic/cancellation in the blocking prune rather than
+                // silently dropping it.
+                tracing::warn!("Token-usage retention task did not complete: {e}");
+            }
         }
     });
 }
