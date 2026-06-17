@@ -30,6 +30,12 @@ const ALLOW_PRIVATE_PROVIDERS_ENV: &str = "COPILOT_API_ALLOW_PRIVATE_PROVIDERS";
 static PROVIDER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        // read_timeout bounds the gap between successive reads, NOT the total
+        // request duration, so it never caps a healthy long SSE stream that
+        // keeps producing bytes (slow thinking gaps stay under 120s) but does
+        // rescue a stalled-open upstream connection. An overall `.timeout(...)`
+        // would truncate legitimate long streams, so it is intentionally absent.
+        .read_timeout(Duration::from_secs(120))
         .pool_idle_timeout(Duration::from_secs(90))
         .redirect(reqwest::redirect::Policy::none());
     if !proxy_from_env_enabled() {

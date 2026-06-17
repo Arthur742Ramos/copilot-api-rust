@@ -29,6 +29,13 @@ pub fn proxy_from_env_enabled() -> bool {
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        // read_timeout bounds the gap between successive reads, NOT the total
+        // request duration. A healthy SSE stream that keeps producing bytes
+        // (including slow model "thinking" gaps under 120s) is unaffected, but a
+        // connection that wedges open with no further data is killed instead of
+        // hanging forever. An overall `.timeout(...)` would wrongly cap long
+        // legitimate streams, so we deliberately do not use one here.
+        .read_timeout(Duration::from_secs(120))
         .pool_idle_timeout(Duration::from_secs(90));
     if !PROXY_FROM_ENV.load(Ordering::SeqCst) {
         builder = builder.no_proxy();
