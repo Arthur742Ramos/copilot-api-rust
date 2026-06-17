@@ -113,3 +113,26 @@ async fn empty_model_returns_invalid_request_error() {
     let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
     assert_eq!(json["error"]["type"], "invalid_request_error");
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn oversize_body_returns_json_shaped_413() {
+    // A body over the 32 MiB limit must return a 413 with the Anthropic JSON
+    // error shape, not axum's plain-text "length limit exceeded" rejection.
+    set_config(&[], None);
+    // 33 MiB of filler — just over MAX_REQUEST_BODY_BYTES.
+    let big = "x".repeat(33 * 1024 * 1024);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"model":"claude-haiku-4.5","max_tokens":8,"messages":[{{"role":"user","content":"{big}"}}]}}"#
+        )))
+        .unwrap();
+    let (status, body) = send(request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("413 body must be JSON, not plain text");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+}

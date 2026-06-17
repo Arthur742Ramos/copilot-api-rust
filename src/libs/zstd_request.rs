@@ -17,10 +17,12 @@ const ZSTD_CONTENT_ENCODING: &str = "zstd";
 /// Maximum size of the *compressed* request body we will read (16 MiB).
 const MAX_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum size of the *decompressed* output (64 MiB). Bounds a zstd
-/// decompression bomb: a small frame can otherwise expand to many GiB and
-/// OOM-kill the worker.
-const MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum size of the *decompressed* output. Bounds a zstd decompression bomb:
+/// a small frame can otherwise expand to many GiB and OOM-kill the worker. Tied
+/// to the per-request body limit so the middleware buffer can never exceed the
+/// same advertised bound the rest of the stack enforces (a decompressed body over
+/// this is rejected by the handler's extractor anyway).
+const MAX_DECOMPRESSED_BYTES: usize = crate::libs::http::MAX_REQUEST_BODY_BYTES;
 
 /// Failure modes of [`decompress_zstd`].
 #[derive(Debug)]

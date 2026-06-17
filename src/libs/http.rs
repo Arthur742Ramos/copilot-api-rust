@@ -115,6 +115,12 @@ pub async fn send_with_connect_retry(
 /// memory growth. Streaming responses are NOT buffered and are unaffected.
 pub const MAX_UPSTREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Max accepted *request* body size (32 MiB). The single source of truth for both
+/// the router's `DefaultBodyLimit` (which caps the buffered request body) and the
+/// zstd middleware's decompressed-output ceiling, so a decompressed body can never
+/// exceed the same advertised per-request bound.
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Read a non-streaming upstream response body into memory with a hard byte cap,
 /// then deserialize it as `T`. Mirrors `response.json::<T>()` but bounds the
 /// buffer: `reqwest`'s own `.json()`/`.bytes()` read the entire body regardless
