@@ -49,6 +49,7 @@ use crate::routes::messages::responses_translation::{
 };
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, translate_chunk_to_anthropic_events,
+    translate_error_to_anthropic_error_event,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
@@ -203,7 +204,12 @@ pub async fn handle_with_chat_completions(
                     let raw_event = match item {
                         Ok(ev) => ev,
                         Err(e) => {
-                            yield Err(e);
+                            tracing::warn!("chat-completions stream error: {e}; sending terminal error event");
+                            if let Some(frame) =
+                                emit_event(&translate_error_to_anthropic_error_event())
+                            {
+                                yield Ok(Bytes::from(frame));
+                            }
                             return;
                         }
                     };
@@ -325,7 +331,12 @@ pub async fn handle_with_responses_api(
                     let chunk = match item {
                         Ok(ev) => ev,
                         Err(e) => {
-                            yield Err(e);
+                            tracing::warn!("responses stream error: {e}; sending terminal error event");
+                            let error_event =
+                                build_error_event("An unexpected error occurred during streaming.");
+                            if let Some(frame) = emit_event(&error_event) {
+                                yield Ok(Bytes::from(frame));
+                            }
                             return;
                         }
                     };
@@ -442,7 +453,12 @@ pub async fn handle_with_messages_api(
                     let event = match item {
                         Ok(ev) => ev,
                         Err(e) => {
-                            yield Err(e);
+                            tracing::warn!("messages stream error: {e}; sending terminal error event");
+                            if let Some(frame) =
+                                emit_event(&translate_error_to_anthropic_error_event())
+                            {
+                                yield Ok(Bytes::from(frame));
+                            }
                             return;
                         }
                     };
@@ -649,6 +665,32 @@ mod tests {
         assert_eq!(
             frame,
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn terminal_error_frame_is_well_formed() {
+        // The frame yielded when a streaming flow hits an upstream error must be a
+        // complete Anthropic `error` SSE event so Claude Code can retry instead of
+        // hanging on a truncated body.
+        let frame = emit_event(&translate_error_to_anthropic_error_event()).unwrap();
+        assert!(frame.starts_with("event: error\ndata: "));
+        assert!(frame.ends_with("\n\n"));
+
+        let data = frame
+            .strip_prefix("event: error\ndata: ")
+            .and_then(|s| s.strip_suffix("\n\n"))
+            .unwrap();
+        let parsed: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "An unexpected error occurred during streaming."
+                }
+            })
         );
     }
 }
