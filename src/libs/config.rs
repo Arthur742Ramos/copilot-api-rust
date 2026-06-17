@@ -260,25 +260,38 @@ fn read_editable_config_from_disk() -> Result<AppConfig, anyhow::Error> {
 }
 
 fn write_config_to_disk(config: &AppConfig) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     std::fs::create_dir_all(&PATHS.app_dir)?;
     // Write to a sibling temp file then atomically rename over the target so a
     // crash mid-write can never leave a truncated/corrupt secrets file (the
     // config holds adminApiKey and provider apiKeys). std::fs::rename is an
     // atomic replace on both Unix and Windows.
     let target = &PATHS.config_path;
-    let pid = std::process::id();
-    let tmp_path = PATHS.app_dir.join(format!("config.json.tmp.{pid}"));
+    // Unique per write: pid plus a monotonic counter, so two concurrent writes
+    // in the same process can't collide on the same tmp path.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = PATHS
+        .app_dir
+        .join(format!("config.json.tmp.{}.{seq}", std::process::id()));
     let contents = serialize_pretty(config);
 
     let write_result = (|| -> std::io::Result<()> {
-        std::fs::write(&tmp_path, &contents)?;
-        // Re-assert 0600 on every write, not just first create: a rename that
-        // lands a brand-new inode would otherwise inherit umask perms.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        // Create the tmp file with 0600 from the start so the secrets in it are
+        // never briefly world/group-readable under a permissive umask.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp_path, target)
     })();
 
