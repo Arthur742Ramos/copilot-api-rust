@@ -22,6 +22,12 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     let mut payload: ChatCompletionsPayload = serde_json::from_value(body)
         .map_err(|e| AppError::BadRequest(format!("Invalid request payload: {e}")))?;
 
+    if payload.model.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "model: field required and must be a non-empty string".to_string(),
+        ));
+    }
+
     let requested_model = payload.model.clone();
     payload.model = resolve_mapped_model(&payload.model);
     if payload.model != requested_model {

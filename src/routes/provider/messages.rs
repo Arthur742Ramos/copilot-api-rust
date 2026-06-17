@@ -68,9 +68,13 @@ const OPENAI_COMPATIBLE_CONTEXT_CACHE_ROLES: [&str; 4] = ["system", "user", "ass
 pub async fn post_provider_messages(
     axum::extract::Path(provider): axum::extract::Path<String>,
     headers: HeaderMap,
-    body: Json<Value>,
+    body: axum::body::Bytes,
 ) -> Response {
-    let payload: AnthropicMessagesPayload = match serde_json::from_value(body.0) {
+    let value = match crate::routes::parse_json_body(&body) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let payload: AnthropicMessagesPayload = match serde_json::from_value(value) {
         Ok(p) => p,
         Err(e) => {
             return (

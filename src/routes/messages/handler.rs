@@ -56,6 +56,16 @@ fn set_model(payload: &mut Value, model: &str) {
 pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
     let mut payload = body;
 
+    // Reject a missing/empty `model` up front: a legitimate client always sends
+    // a concrete model id. Without this, an empty string flows through model
+    // resolution and silently succeeds against a default — a 200 for what is
+    // really an invalid request.
+    if model_of(&payload).trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "model: field required and must be a non-empty string".to_string(),
+        ));
+    }
+
     // 1. Resolve configured model mappings.
     let requested_model = model_of(&payload);
     let mapped_model = resolve_mapped_model(&requested_model);
