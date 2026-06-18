@@ -78,9 +78,15 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
 }
 
 fn is_blocked_ipv4(v4: Ipv4Addr) -> bool {
+    let [a, b, _, _] = v4.octets();
     v4.is_loopback()        // 127.0.0.0/8
         || v4.is_private()  // 10/8, 172.16/12, 192.168/16
         || v4.is_link_local() // 169.254.0.0/16 (cloud metadata)
+        // 100.64.0.0/10 — carrier-grade NAT (RFC 6598). Some clouds expose
+        // internal/metadata services here (e.g. Alibaba Cloud metadata at
+        // 100.100.100.200). `Ipv4Addr::is_shared()` is unstable, so check the
+        // range explicitly.
+        || (a == 100 && (64..=127).contains(&b))
         || v4.is_unspecified() // 0.0.0.0
         || v4.is_broadcast()
 }
@@ -434,6 +440,20 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(ALLOW_PRIVATE_PROVIDERS_ENV);
         assert!(validate_upstream_url("http://169.254.169.254").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cgnat_metadata_ip() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(ALLOW_PRIVATE_PROVIDERS_ENV);
+        // 100.64.0.0/10 (carrier-grade NAT) hosts cloud metadata on some clouds,
+        // e.g. Alibaba Cloud at 100.100.100.200.
+        assert!(validate_upstream_url("http://100.100.100.200").is_err());
+        assert!(validate_upstream_url("http://100.64.0.1").is_err());
+        assert!(validate_upstream_url("http://100.127.255.255/v1").is_err());
+        // Boundaries just outside the range must still be allowed.
+        assert!(validate_upstream_url("http://100.63.255.255").is_ok());
+        assert!(validate_upstream_url("http://100.128.0.1").is_ok());
     }
 
     #[test]
