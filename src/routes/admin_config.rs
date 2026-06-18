@@ -113,24 +113,27 @@ pub async fn get_providers_route() -> Response {
     .into_response()
 }
 
-/// Redact a secret string value in-place to a boolean `<key>Set` flag (true when
-/// it is a non-empty string) and remove the raw value, so the effective-config
-/// view never echoes a secret.
-fn redact_secret(obj: &mut serde_json::Map<String, Value>, key: &str, set_key: &str) {
-    let present = obj
-        .get(key)
-        .and_then(Value::as_str)
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    obj.remove(key);
-    obj.insert(set_key.to_string(), json!(present));
+/// Strip a secret string key from a config object and report whether it held a
+/// non-empty value. The indicator is returned (not written back into the config
+/// object) so it can't collide with a user-supplied `#[serde(flatten)] extra`
+/// key of the same name.
+fn strip_secret(obj: &mut serde_json::Map<String, Value>, key: &str) -> bool {
+    obj.remove(key)
+        .and_then(|v| v.as_str().map(|s| !s.trim().is_empty()))
+        .unwrap_or(false)
 }
 
 /// GET /admin/config — the effective merged runtime config with all secrets
 /// redacted, so an operator can confirm what the gateway is actually running
 /// (budget, model slugs, feature flags, providers) without filesystem access to
-/// config.json. Secrets become booleans: `auth.adminApiKey`/`anthropicApiKey` ->
-/// `*Set`, `auth.apiKeys` -> a count, and each provider `apiKey` -> `apiKeySet`.
+/// config.json.
+///
+/// Secret values are STRIPPED from the returned `config` object entirely; the
+/// presence indicators (which secrets are set, the apiKeys count, which
+/// providers have a key) are reported in a separate top-level `secrets` object,
+/// not as sibling keys inside `config` — `AppConfig`/`ProviderConfig` round-trip
+/// unknown keys via `#[serde(flatten)]`, so writing synthetic `*Set` keys inside
+/// the config could collide with a real user-supplied key.
 pub async fn get_effective_config_route() -> Response {
     let cfg = crate::libs::config::get_config();
     let mut value = match serde_json::to_value(&*cfg) {
@@ -140,24 +143,24 @@ pub async fn get_effective_config_route() -> Response {
         }
     };
 
-    // Redact auth.adminApiKey and auth.apiKeys (count only).
+    let mut admin_key_set = false;
+    let mut api_keys_count = 0usize;
     if let Some(Value::Object(auth)) = value.get_mut("auth") {
-        redact_secret(auth, "adminApiKey", "adminApiKeySet");
-        let key_count = auth
-            .get("apiKeys")
-            .and_then(Value::as_array)
-            .map(|a| a.len())
+        admin_key_set = strip_secret(auth, "adminApiKey");
+        api_keys_count = auth
+            .remove("apiKeys")
+            .and_then(|v| v.as_array().map(|a| a.len()))
             .unwrap_or(0);
-        auth.remove("apiKeys");
-        auth.insert("apiKeysCount".to_string(), json!(key_count));
     }
-    // Redact the top-level anthropicApiKey.
-    redact_secret(&mut value, "anthropicApiKey", "anthropicApiKeySet");
-    // Redact each provider's apiKey.
+    let anthropic_key_set = strip_secret(&mut value, "anthropicApiKey");
+
+    // Strip each provider's apiKey and record which providers have one set.
+    let mut providers_with_key: serde_json::Map<String, Value> = serde_json::Map::new();
     if let Some(Value::Object(providers)) = value.get_mut("providers") {
-        for (_name, prov) in providers.iter_mut() {
+        for (name, prov) in providers.iter_mut() {
             if let Value::Object(p) = prov {
-                redact_secret(p, "apiKey", "apiKeySet");
+                let set = strip_secret(p, "apiKey");
+                providers_with_key.insert(name.clone(), json!(set));
             }
         }
     }
@@ -165,6 +168,12 @@ pub async fn get_effective_config_route() -> Response {
     Json(json!({
         "configPath": config_path_string(),
         "config": value,
+        "secrets": {
+            "adminApiKeySet": admin_key_set,
+            "apiKeysCount": api_keys_count,
+            "anthropicApiKeySet": anthropic_key_set,
+            "providerApiKeySet": providers_with_key,
+        },
     }))
     .into_response()
 }

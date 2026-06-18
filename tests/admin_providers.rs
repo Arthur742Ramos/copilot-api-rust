@@ -184,15 +184,18 @@ async fn effective_config_redacts_secrets() {
 
     let value = json_body(&body);
     let cfg = &value["config"];
-    // Secrets are redacted to booleans / counts; non-secret knobs are visible.
-    assert_eq!(cfg["auth"]["adminApiKeySet"], true);
-    assert_eq!(cfg["auth"]["apiKeysCount"], 2);
-    assert_eq!(cfg["anthropicApiKeySet"], true);
+    // Non-secret knobs are visible in the config object.
     assert_eq!(cfg["dailyTokenBudget"], 1234);
-    // Raw secret keys are gone.
+    // Raw secret keys are stripped from the config object entirely.
     assert!(cfg["auth"].get("adminApiKey").is_none());
     assert!(cfg["auth"].get("apiKeys").is_none());
     assert!(cfg.get("anthropicApiKey").is_none());
+    // Presence indicators live under a separate `secrets` object (not inline in
+    // config, to avoid colliding with serde-flatten extra keys).
+    let secrets = &value["secrets"];
+    assert_eq!(secrets["adminApiKeySet"], true);
+    assert_eq!(secrets["apiKeysCount"], 2);
+    assert_eq!(secrets["anthropicApiKeySet"], true);
 }
 
 fn body_contains(body: &[u8], needle: &str) -> bool {
