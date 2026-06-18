@@ -208,7 +208,11 @@ fn handle_search_call(id: Value, params: Option<&Value>) -> Value {
 /// inline image content (so the model can see it when the host converts it to a
 /// vision block). Errors map to JSON-RPC error envelopes.
 async fn handle_generate_image_call(id: Value, params: Option<&Value>) -> Value {
+    use crate::libs::config::get_image_chat_model;
     use crate::libs::provider_resolver::resolve_provider_config;
+    use crate::libs::token_usage::{
+        create_provider_token_usage_recorder, normalize_responses_usage,
+    };
     use crate::services::codex::create_image::{create_codex_image, ImageGenerationRequest};
 
     let arguments = params
@@ -220,6 +224,19 @@ async fn handle_generate_image_call(id: Value, params: Option<&Value>) -> Value 
         Ok(req) => req,
         Err(e) => return error(id, -32602, format!("Invalid image request: {e}")),
     };
+
+    // Apply the same admission gate as the HTTP /v1/images/generations route so
+    // MCP image generation respects the daily token budget rather than being an
+    // unmetered hole. (Rate limit is intentionally omitted here: it is a coarse
+    // time-since-last-request gate tied to the HTTP server's process state, and
+    // the MCP server runs as a separate stdio process where it has no meaning.)
+    if let Err(e) = crate::libs::token_budget::check_token_budget() {
+        return error(
+            id,
+            -32603,
+            format!("Image generation blocked: {}", e.message),
+        );
+    }
 
     // Resolve Codex credentials (loads/refreshes the OAuth token from disk into
     // state). The MCP server has no inbound HTTP headers, so an empty HeaderMap
@@ -244,21 +261,27 @@ async fn handle_generate_image_call(id: Value, params: Option<&Value>) -> Value 
         Err(e) => return error(id, -32603, format!("Image generation failed: {e}")),
     };
 
+    // Record token usage so MCP image spend appears in the usage DB / /token-usage
+    // / budget totals, consistent with the HTTP route.
+    let recorder =
+        create_provider_token_usage_recorder("images", get_image_chat_model(), "codex", None);
+    recorder.record(normalize_responses_usage(result.usage.as_ref()));
+
     let mime = mime_for_format(&req.output_format);
     let ext = ext_for_format(&req.output_format);
 
     let mut content: Vec<Value> = Vec::new();
-    for (idx, b64) in result.images.iter().enumerate() {
+    for b64 in result.images.iter() {
         // Save to disk so the user reliably gets a file regardless of whether the
         // host renders/forwards the inline image.
-        match save_image(b64, ext, idx) {
+        match save_image(b64, ext) {
             Ok(path) => content.push(json!({
                 "type": "text",
                 "text": format!("Saved image to {path}"),
             })),
             Err(e) => content.push(json!({
                 "type": "text",
-                "text": format!("(could not save image {idx} to disk: {e})"),
+                "text": format!("(could not save image to disk: {e})"),
             })),
         }
         // Inline image content (MCP ImageContent: flat data + mimeType). The host
@@ -294,10 +317,14 @@ fn ext_for_format(output_format: &str) -> &'static str {
 }
 
 /// Decode a base64 image and write it under the app data dir, returning the
-/// saved path. Filenames are unique per (pid, index, timestamp) so concurrent
-/// generations don't collide.
-fn save_image(b64: &str, ext: &str, idx: usize) -> Result<String, String> {
+/// saved path. A process-global atomic counter guarantees a unique filename per
+/// saved image, so concurrent generations (even within the same millisecond)
+/// never collide.
+fn save_image(b64: &str, ext: &str) -> Result<String, String> {
     use base64::Engine;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
@@ -310,7 +337,8 @@ fn save_image(b64: &str, ext: &str, idx: usize) -> Result<String, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = dir.join(format!("image-{stamp}-{}-{idx}.{ext}", std::process::id()));
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("image-{stamp}-{}-{seq}.{ext}", std::process::id()));
     std::fs::write(&path, &bytes).map_err(|e| format!("write file: {e}"))?;
     Ok(path.to_string_lossy().into_owned())
 }
