@@ -171,13 +171,62 @@ pub fn flush_pending_anthropic_stream_events(
 }
 
 /// `translateErrorToAnthropicErrorEvent` — the terminal `error` event.
-pub fn translate_error_to_anthropic_error_event() -> AnthropicStreamEventData {
+///
+/// When the upstream stream breaks mid-flight (a truncated/reset SSE body or our
+/// own read-timeout firing on a stalled-open connection), the failure is
+/// transient and the request is safe to retry. We surface those as
+/// `overloaded_error` — the type Anthropic clients (Claude Code included) treat
+/// as retryable with backoff — instead of the generic `api_error`, which reads
+/// like a permanent server fault and discourages an automatic retry. Pass the
+/// `io::Error` yielded by [`crate::libs::sse::events`] so the cause can be
+/// classified; pass `None` when no cause is available (the type then stays
+/// `api_error`).
+pub fn translate_error_to_anthropic_error_event(
+    cause: Option<&std::io::Error>,
+) -> AnthropicStreamEventData {
+    if cause.map(is_transient_transport_error).unwrap_or(false) {
+        return AnthropicStreamEventData::Error {
+            error: super::anthropic_types::AnthropicErrorBody {
+                kind: "overloaded_error".to_string(),
+                message: "The upstream model stream ended unexpectedly. This is usually transient — retry the request.".to_string(),
+            },
+        };
+    }
     AnthropicStreamEventData::Error {
         error: super::anthropic_types::AnthropicErrorBody {
             kind: "api_error".to_string(),
             message: "An unexpected error occurred during streaming.".to_string(),
         },
     }
+}
+
+/// Whether a stream error from [`crate::libs::sse::events`] is a transient
+/// transport failure (so the caller should signal a retryable `overloaded_error`
+/// rather than `api_error`).
+///
+/// `sse::events` boxes the originating `reqwest::Error` inside the yielded
+/// `io::Error`, so we recover it via `source()` and consult reqwest's own
+/// predicates: a read-timeout (`is_timeout`), a connection failure
+/// (`is_connect`), or a truncated/aborted body (`is_body`) are all transient.
+/// The internal SSE-record overflow guard carries a `&str` (not a reqwest error)
+/// and so is correctly treated as non-transient. As a fallback for any non-
+/// reqwest source, a `TimedOut`/`ConnectionReset`/`UnexpectedEof` `ErrorKind`
+/// also counts as transient.
+fn is_transient_transport_error(err: &std::io::Error) -> bool {
+    use std::error::Error as _;
+    if let Some(re) = err
+        .source()
+        .and_then(|s| s.downcast_ref::<reqwest::Error>())
+    {
+        return re.is_timeout() || re.is_connect() || re.is_body();
+    }
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,7 +1085,7 @@ mod tests {
 
     #[test]
     fn error_event_shape() {
-        let ev = translate_error_to_anthropic_error_event();
+        let ev = translate_error_to_anthropic_error_event(None);
         assert_eq!(
             serde_json::to_value(&ev).unwrap(),
             json!({
@@ -1044,6 +1093,42 @@ mod tests {
                 "error": { "type": "api_error", "message": "An unexpected error occurred during streaming." }
             })
         );
+    }
+
+    #[test]
+    fn transient_transport_cause_maps_to_overloaded_error() {
+        // A stalled/truncated upstream connection (here modeled by a TimedOut
+        // io::Error) is transient, so the terminal event must be the retryable
+        // `overloaded_error` type rather than `api_error`.
+        let cause = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        let ev = translate_error_to_anthropic_error_event(Some(&cause));
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(value["error"]["type"], "overloaded_error");
+    }
+
+    #[test]
+    fn non_transport_cause_stays_api_error() {
+        // The internal SSE-overflow guard is a plain message error, not a
+        // transport failure, so it must NOT be mislabeled as retryable.
+        let cause = std::io::Error::other("SSE record exceeded the maximum buffered size");
+        let ev = translate_error_to_anthropic_error_event(Some(&cause));
+        let value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(value["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn classifies_transient_error_kinds() {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(is_transient_transport_error(&std::io::Error::from(kind)));
+        }
+        assert!(!is_transient_transport_error(&std::io::Error::other(
+            "internal guard"
+        )));
     }
 
     #[test]
