@@ -58,17 +58,19 @@ pub mod retry_endpoint {
     pub const RESPONSES: &str = "responses";
     pub const EMBEDDINGS: &str = "embeddings";
     pub const MODELS: &str = "models";
+    pub const CODEX: &str = "codex";
 }
 
 /// Every endpoint label that routes through [`send_with_connect_retry`], used to
 /// pre-register the retry counter. Built from [`retry_endpoint`] so it stays in
 /// lockstep with the call sites.
-pub const RETRY_ENDPOINTS: [&str; 5] = [
+pub const RETRY_ENDPOINTS: [&str; 6] = [
     retry_endpoint::MESSAGES,
     retry_endpoint::CHAT,
     retry_endpoint::RESPONSES,
     retry_endpoint::EMBEDDINGS,
     retry_endpoint::MODELS,
+    retry_endpoint::CODEX,
 ];
 
 /// Register `copilot_upstream_retry_total{endpoint=...}` at 0 for every known
@@ -94,7 +96,7 @@ pub fn preregister_retry_metrics() {
 /// transient-connect failures seen under concurrency.
 ///
 /// `endpoint` is a bounded label (messages | chat | responses | embeddings |
-/// models) used only for the retry counter metric. The builder must be cloneable (our bodies are owned
+/// models | codex) used only for the retry counter metric. The builder must be cloneable (our bodies are owned
 /// `Vec<u8>`, so `try_clone` always succeeds); if it somehow isn't, we send once.
 pub async fn send_with_connect_retry(
     builder: reqwest::RequestBuilder,
