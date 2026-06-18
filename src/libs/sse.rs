@@ -64,6 +64,13 @@ impl Decoder {
     /// split off, so a multi-byte char spanning a chunk boundary is never
     /// corrupted.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+        // Once overflowed, the decoder is in a terminal error state: stop
+        // buffering so a caller that hasn't yet checked `overflowed()` can't
+        // drive further memory growth.
+        if self.overflowed {
+            return Vec::new();
+        }
+
         self.buf.extend_from_slice(bytes);
 
         let mut out = Vec::new();
@@ -88,6 +95,9 @@ impl Decoder {
 
         if self.buf.len() > MAX_SSE_RECORD_BYTES {
             self.overflowed = true;
+            // Release the oversized allocation promptly; `events()` surfaces the
+            // overflow via the latch, so the retained bytes serve no purpose.
+            self.buf = Vec::new();
         }
         out
     }
@@ -416,6 +426,18 @@ mod tests {
             decoder.push(&chunk);
         }
         assert!(decoder.overflowed(), "expected overflow latch to trip");
+        // On overflow the oversized allocation is released...
+        assert!(
+            decoder.buf.is_empty(),
+            "buffer should be cleared on overflow"
+        );
+        // ...and further pushes are no-ops that cannot regrow memory.
+        let out = decoder.push(&chunk);
+        assert!(out.is_empty());
+        assert!(
+            decoder.buf.is_empty(),
+            "push after overflow must not buffer"
+        );
     }
 
     #[test]
