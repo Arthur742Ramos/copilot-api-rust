@@ -185,19 +185,41 @@ pub async fn create_codex_image(
     Ok(ImageResult { images, usage })
 }
 
-/// Sum two upstream usage objects field-by-field (input/output/total tokens), so
-/// looping per-image image generation reports the aggregate spend. Returns the
-/// non-None side when only one is present.
+/// Sum two upstream usage objects so looping per-image image generation reports
+/// the aggregate spend. Returns the non-None side when only one is present.
+///
+/// Sums the top-level token fields plus the nested
+/// `input_tokens_details.cached_tokens` that `normalize_responses_usage` reads,
+/// so cached-token accounting isn't lost when `n > 1`.
 fn sum_usage(acc: Option<Value>, next: Option<Value>) -> Option<Value> {
     match (acc, next) {
         (None, other) | (other, None) => other,
         (Some(a), Some(b)) => {
             let get = |v: &Value, k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
-            Some(json!({
+            let nested = |v: &Value, parent: &str, k: &str| {
+                v.get(parent)
+                    .and_then(|p| p.get(k))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            };
+            let cached = nested(&a, "input_tokens_details", "cached_tokens")
+                + nested(&b, "input_tokens_details", "cached_tokens");
+            let mut out = json!({
                 "input_tokens": get(&a, "input_tokens") + get(&b, "input_tokens"),
                 "output_tokens": get(&a, "output_tokens") + get(&b, "output_tokens"),
                 "total_tokens": get(&a, "total_tokens") + get(&b, "total_tokens"),
-            }))
+            });
+            // Only emit input_tokens_details when at least one side reported it,
+            // so we don't fabricate a zero where the upstream sent nothing.
+            if a.get("input_tokens_details").is_some() || b.get("input_tokens_details").is_some() {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert(
+                        "input_tokens_details".to_string(),
+                        json!({ "cached_tokens": cached }),
+                    );
+                }
+            }
+            Some(out)
         }
     }
 }
@@ -478,17 +500,32 @@ data: {\"type\":\"response.created\"}\n\
 
     #[test]
     fn sum_usage_adds_token_fields() {
-        let a = json!({ "input_tokens": 10, "output_tokens": 1290, "total_tokens": 1300 });
-        let b = json!({ "input_tokens": 5, "output_tokens": 1290, "total_tokens": 1295 });
+        let a = json!({
+            "input_tokens": 10, "output_tokens": 1290, "total_tokens": 1300,
+            "input_tokens_details": { "cached_tokens": 4 }
+        });
+        let b = json!({
+            "input_tokens": 5, "output_tokens": 1290, "total_tokens": 1295,
+            "input_tokens_details": { "cached_tokens": 1 }
+        });
         let summed = sum_usage(Some(a), Some(b)).unwrap();
         assert_eq!(summed["input_tokens"], 15);
         assert_eq!(summed["output_tokens"], 2580);
         assert_eq!(summed["total_tokens"], 2595);
+        // Nested cached-token detail is summed and preserved (not dropped).
+        assert_eq!(summed["input_tokens_details"]["cached_tokens"], 5);
         // One-sided cases return the present side.
         assert!(sum_usage(None, None).is_none());
         assert_eq!(
             sum_usage(None, Some(json!({"total_tokens": 7}))).unwrap()["total_tokens"],
             7
         );
+        // When neither side reports details, none is fabricated.
+        let no_details = sum_usage(
+            Some(json!({"input_tokens": 1})),
+            Some(json!({"input_tokens": 2})),
+        )
+        .unwrap();
+        assert!(no_details.get("input_tokens_details").is_none());
     }
 }
