@@ -156,13 +156,16 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+          # Write helper files outside the repo working tree so `cargo publish
+          # --locked` later sees a clean git tree (untracked files abort it).
+          resp="${RUNNER_TEMP:-/tmp}/response.json"
           # crates.io REQUIRES a non-empty User-Agent or it returns 403 (data-access-policy).
           ua="copilot-api-release-ci (https://github.com/${GITHUB_REPOSITORY})"
           # Retry transient failures (curl errors, 5xx, 403) before giving up, so an
           # otherwise-valid re-run is not hard-failed by a momentary blip.
           http_code="000"
           for attempt in 1 2 3; do
-            http_code="$(curl -sS -o response.json -w '%{http_code}' \
+            http_code="$(curl -sS -o "${resp}" -w '%{http_code}' \
               -H "User-Agent: ${ua}" \
               "https://crates.io/api/v1/crates/copilot-api")" || http_code="000"
             case "${http_code}" in
@@ -180,7 +183,7 @@ jobs:
               echo "published=false" >> "$GITHUB_OUTPUT"
               ;;
             200)
-              if jq -e --arg v "${VERSION}" '.versions[]? | select(.num == $v)' response.json >/dev/null; then
+              if jq -e --arg v "${VERSION}" '.versions[]? | select(.num == $v)' "${resp}" >/dev/null; then
                 echo "Version ${VERSION} is already on crates.io; skipping publish (idempotent re-run)."
                 echo "published=true" >> "$GITHUB_OUTPUT"
               else
@@ -192,7 +195,7 @@ jobs:
               # Could not get an authoritative answer. Do not hard-fail: fall through to
               # publish, where cargo's own already-exists rejection is absorbed as success.
               echo "::warning::Could not confirm published state (last HTTP ${http_code}); will attempt publish and rely on the already-exists guard."
-              cat response.json >&2 || true
+              cat "${resp}" >&2 || true
               echo "published=false" >> "$GITHUB_OUTPUT"
               ;;
           esac
@@ -204,13 +207,16 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -uo pipefail
-          if cargo publish --locked 2> >(tee publish.err >&2); then
+          # Keep the captured stderr outside the repo tree so it doesn't dirty
+          # the working directory for `cargo publish --locked`.
+          err="${RUNNER_TEMP:-/tmp}/publish.err"
+          if cargo publish --locked 2> >(tee "${err}" >&2); then
             echo "Published successfully."
             exit 0
           fi
           # Absorb the race / eventual-consistency case where the version is already on
           # crates.io, so an idempotent re-run never fails.
-          if grep -qiE 'already (exists|uploaded)|crate version .* is already' publish.err; then
+          if grep -qiE 'already (exists|uploaded)|crate version .* is already' "${err}"; then
             echo "::warning::Version already on crates.io; treating as an idempotent success."
             exit 0
           fi
