@@ -63,9 +63,16 @@ new version to take effect. You can confirm the running build at any time with
 
 > **Maintainer note:** `update` needs published GitHub releases to exist. Each
 > release is built by `.github/workflows/release.yml` when a `v*` tag is pushed,
-> so cut releases by tagging: `git tag v1.12.5 && git push origin v1.12.5`.
+> so cut releases by tagging: `git tag v1.12.5 && git push origin v1.12.5`. The
+> same tag push also publishes the crate to [crates.io][cratesio] (so
+> `cargo install copilot-api` gets the new version): the `publish-crate` job
+> verifies the tag matches the `Cargo.toml` version, then publishes — skipping
+> cleanly if that version is already on crates.io, so re-running a release is
+> safe. Bump the `version` in `Cargo.toml` before tagging, or the job fails the
+> version-match check.
 
 [releases]: https://github.com/Arthur742Ramos/copilot-api-rust/releases
+[cratesio]: https://crates.io/crates/copilot-api
 
 ## Quick start
 
