@@ -87,7 +87,13 @@ pub fn check_token_budget() -> Result<(), HttpError> {
     };
 
     let used = current_daily_total();
+    // Export the spend-vs-cap so operators can chart "approaching daily budget"
+    // and alert before clients start getting 429'd. Both are single-series
+    // gauges (no labels), set on each check.
+    metrics::gauge!("token_budget_daily_tokens_used").set(used as f64);
+    metrics::gauge!("token_budget_daily_limit").set(budget as f64);
     if used >= budget {
+        metrics::counter!("token_budget_rejections_total").increment(1);
         tracing::warn!("Daily token budget exceeded: {used} >= {budget}");
         return Err(HttpError::new(
             "Daily token budget exceeded",
@@ -179,6 +185,38 @@ mod tests {
         // Over the cap: also rejected.
         seed_cache(5000);
         assert!(check_token_budget().is_err());
+
+        clear_cache();
+        reset_cached_config_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn exports_budget_metrics() {
+        crate::libs::metrics::init_build_info(); // installs the recorder
+        let cfg = AppConfig {
+            daily_token_budget: Some(1000),
+            ..Default::default()
+        };
+        set_cached_config_for_test(cfg);
+
+        // Over the cap -> rejection counter + usage/limit gauges are emitted.
+        seed_cache(2000);
+        assert!(check_token_budget().is_err());
+
+        let out = crate::libs::metrics::render();
+        assert!(
+            out.contains("token_budget_rejections_total"),
+            "expected rejection counter, got:\n{out}"
+        );
+        assert!(
+            out.contains("token_budget_daily_tokens_used"),
+            "expected used gauge"
+        );
+        assert!(
+            out.contains("token_budget_daily_limit"),
+            "expected limit gauge"
+        );
 
         clear_cache();
         reset_cached_config_for_test();
