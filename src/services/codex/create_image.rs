@@ -83,12 +83,16 @@ impl ImageGenerationRequest {
     }
 }
 
-/// Build the Responses payload that invokes the `image_generation` tool. The
-/// top-level model is a chat model (`gpt-5.x`); the image model is requested
-/// inside the tool. `tool_choice` is forced so the backend always produces an
-/// image rather than answering with text.
+/// Build the Responses payload that invokes the `image_generation` tool for ONE
+/// image. The top-level model is a chat model (`gpt-5.x`); the image model is
+/// requested inside the tool. `tool_choice` is forced so the backend always
+/// produces an image rather than answering with text.
+///
+/// The Codex `image_generation` tool produces exactly one image per call and
+/// rejects a tool-level `n` with a 400, so `n > 1` is handled by the caller
+/// looping this single-image call, not by a batch parameter here.
 fn build_image_payload(req: &ImageGenerationRequest) -> ResponsesPayload {
-    let mut tool = json!({
+    let tool = json!({
         "type": "image_generation",
         "model": get_image_model(),
         "output_format": req.output_format,
@@ -96,12 +100,6 @@ fn build_image_payload(req: &ImageGenerationRequest) -> ResponsesPayload {
         "quality": req.quality,
         "background": req.background,
     });
-    // Request all N images from the single tool call when supported.
-    if req.n > 1 {
-        if let Some(obj) = tool.as_object_mut() {
-            obj.insert("n".to_string(), json!(req.n));
-        }
-    }
 
     let input = InputField::Items(vec![ResponseInputItem::Message(ResponseInputMessage {
         item_type: Some("message".to_string()),
@@ -160,14 +158,52 @@ pub struct ImageResult {
     pub usage: Option<Value>,
 }
 
-/// Generate one or more images, returning the base64-encoded bytes in order
-/// plus any upstream usage. `request_headers` is forwarded to the Codex
-/// transport (it strips and re-auths them); pass the inbound request's headers.
-/// `base_url` is the resolved Codex provider base URL (empty string for the
-/// default ChatGPT backend), threaded so an operator-configured custom Codex
-/// `baseUrl` (and its SSRF validation) is honored exactly as on the other Codex
-/// routes.
+/// Generate `req.n` images, returning the base64-encoded bytes in order plus
+/// any upstream usage. `request_headers` is forwarded to the Codex transport (it
+/// strips and re-auths them); pass the inbound request's headers. `base_url` is
+/// the resolved Codex provider base URL (empty string for the default ChatGPT
+/// backend), threaded so an operator-configured custom Codex `baseUrl` (and its
+/// SSRF validation) is honored exactly as on the other Codex routes.
+///
+/// The Codex `image_generation` tool produces one image per call (it rejects a
+/// tool-level `n` with a 400), so `n > 1` is fulfilled by calling it `n` times
+/// sequentially and concatenating the results. Usage from each call is summed.
 pub async fn create_codex_image(
+    req: &ImageGenerationRequest,
+    request_headers: &axum::http::HeaderMap,
+    base_url: &str,
+) -> Result<ImageResult, AppError> {
+    let mut images: Vec<String> = Vec::new();
+    let mut usage: Option<Value> = None;
+
+    for _ in 0..req.n.max(1) {
+        let one = generate_one_image(req, request_headers, base_url).await?;
+        images.extend(one.images);
+        usage = sum_usage(usage, one.usage);
+    }
+
+    Ok(ImageResult { images, usage })
+}
+
+/// Sum two upstream usage objects field-by-field (input/output/total tokens), so
+/// looping per-image image generation reports the aggregate spend. Returns the
+/// non-None side when only one is present.
+fn sum_usage(acc: Option<Value>, next: Option<Value>) -> Option<Value> {
+    match (acc, next) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => {
+            let get = |v: &Value, k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
+            Some(json!({
+                "input_tokens": get(&a, "input_tokens") + get(&b, "input_tokens"),
+                "output_tokens": get(&a, "output_tokens") + get(&b, "output_tokens"),
+                "total_tokens": get(&a, "total_tokens") + get(&b, "total_tokens"),
+            }))
+        }
+    }
+}
+
+/// Generate exactly one image via a single Codex `image_generation` tool call.
+async fn generate_one_image(
     req: &ImageGenerationRequest,
     request_headers: &axum::http::HeaderMap,
     base_url: &str,
@@ -431,10 +467,28 @@ data: {\"type\":\"response.created\"}\n\
     }
 
     #[test]
-    fn build_image_payload_sets_n_when_multiple() {
+    fn build_image_payload_never_sets_tool_n() {
+        // The Codex image_generation tool 400s on a tool-level `n`; n>1 is
+        // handled by looping the call, so the payload must never carry `n`.
         let req = ImageGenerationRequest::from_value(&json!({ "prompt": "x", "n": 3 })).unwrap();
         let payload = build_image_payload(&req);
         let tools = payload.tools.unwrap();
-        assert_eq!(tools[0].get("n").and_then(Value::as_i64), Some(3));
+        assert!(tools[0].get("n").is_none());
+    }
+
+    #[test]
+    fn sum_usage_adds_token_fields() {
+        let a = json!({ "input_tokens": 10, "output_tokens": 1290, "total_tokens": 1300 });
+        let b = json!({ "input_tokens": 5, "output_tokens": 1290, "total_tokens": 1295 });
+        let summed = sum_usage(Some(a), Some(b)).unwrap();
+        assert_eq!(summed["input_tokens"], 15);
+        assert_eq!(summed["output_tokens"], 2580);
+        assert_eq!(summed["total_tokens"], 2595);
+        // One-sided cases return the present side.
+        assert!(sum_usage(None, None).is_none());
+        assert_eq!(
+            sum_usage(None, Some(json!({"total_tokens": 7}))).unwrap()["total_tokens"],
+            7
+        );
     }
 }
