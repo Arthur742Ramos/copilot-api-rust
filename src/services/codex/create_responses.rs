@@ -335,13 +335,13 @@ pub async fn forward_codex_responses(
         HttpError::internal(format!("Failed to serialize codex responses payload: {e}"))
     })?;
 
-    let response = client()
-        .post(url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
+    let request = client().post(url).headers(headers).body(body);
+    let response = crate::libs::http::send_with_connect_retry(
+        request,
+        crate::libs::http::retry_endpoint::CODEX,
+    )
+    .await
+    .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
 
     Ok(response)
 }
