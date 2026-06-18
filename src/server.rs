@@ -369,22 +369,36 @@ async fn readyz() -> Response {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let ready = crate::libs::state::with_state(|s| {
-        let token_fresh = s
-            .copilot_token
-            .as_deref()
-            .is_some_and(|t| crate::routes::token::copilot_token_is_fresh(t, now_secs));
-        token_fresh && s.models.is_some()
+    // Compute the three readiness signals separately so a 503 can report WHICH
+    // one failed — "token refresh failing" (auth/network) and "models never
+    // loaded" (cold start) are different incidents an operator must distinguish
+    // without log-diving.
+    let (token_present, token_fresh, models_cached) = crate::libs::state::with_state(|s| {
+        let token = s.copilot_token.as_deref();
+        let present = token.is_some_and(|t| !t.is_empty());
+        let fresh =
+            token.is_some_and(|t| crate::routes::token::copilot_token_is_fresh(t, now_secs));
+        (present, fresh, s.models.is_some())
     });
-    if ready {
-        (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "not_ready"})),
-        )
-            .into_response()
+
+    if token_present && token_fresh && models_cached {
+        return (StatusCode::OK, Json(json!({"status": "ready"}))).into_response();
     }
+
+    let mut reasons: Vec<&str> = Vec::new();
+    if !token_present {
+        reasons.push("token_missing");
+    } else if !token_fresh {
+        reasons.push("token_expired");
+    }
+    if !models_cached {
+        reasons.push("models_not_loaded");
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"status": "not_ready", "reasons": reasons})),
+    )
+        .into_response()
 }
 
 /// Build/version metadata endpoint: returns the git SHA and build timestamp
