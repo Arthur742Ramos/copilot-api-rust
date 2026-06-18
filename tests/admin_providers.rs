@@ -136,6 +136,65 @@ async fn reload_returns_summary() {
     assert!(value.get("providers").is_some());
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn effective_config_get_requires_admin_key() {
+    init_home();
+    set_config(&[], Some(ADMIN_KEY));
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/admin/config")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn effective_config_redacts_secrets() {
+    init_home();
+    // Install a cached config carrying secrets via the test seam; the GET reads
+    // get_config() and must never echo the raw secret values.
+    use copilot_api::libs::config::{set_cached_config_for_test, AppConfig, AuthConfig};
+    set_cached_config_for_test(AppConfig {
+        auth: Some(AuthConfig {
+            api_keys: Some(vec![json!("sk-secret-1"), json!("sk-secret-2")]),
+            admin_api_key: Some(json!(ADMIN_KEY)),
+        }),
+        anthropic_api_key: Some("sk-ant-secret".to_string()),
+        daily_token_budget: Some(1234),
+        ..Default::default()
+    });
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/admin/config")
+        .header("authorization", format!("Bearer {ADMIN_KEY}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // No raw secret may appear anywhere in the response.
+    assert!(!body_contains(&body, ADMIN_KEY));
+    assert!(!body_contains(&body, "sk-secret-1"));
+    assert!(!body_contains(&body, "sk-ant-secret"));
+
+    let value = json_body(&body);
+    let cfg = &value["config"];
+    // Secrets are redacted to booleans / counts; non-secret knobs are visible.
+    assert_eq!(cfg["auth"]["adminApiKeySet"], true);
+    assert_eq!(cfg["auth"]["apiKeysCount"], 2);
+    assert_eq!(cfg["anthropicApiKeySet"], true);
+    assert_eq!(cfg["dailyTokenBudget"], 1234);
+    // Raw secret keys are gone.
+    assert!(cfg["auth"].get("adminApiKey").is_none());
+    assert!(cfg["auth"].get("apiKeys").is_none());
+    assert!(cfg.get("anthropicApiKey").is_none());
+}
+
 fn body_contains(body: &[u8], needle: &str) -> bool {
     String::from_utf8_lossy(body).contains(needle)
 }

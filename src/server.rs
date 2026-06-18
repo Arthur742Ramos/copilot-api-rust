@@ -101,6 +101,10 @@ pub fn build_router() -> Router {
                 .post(crate::routes::admin_config::post_providers_route),
         )
         .route(
+            "/admin/config",
+            get(crate::routes::admin_config::get_effective_config_route),
+        )
+        .route(
             "/:provider/v1/messages",
             post(crate::routes::provider::messages::post_provider_messages),
         )

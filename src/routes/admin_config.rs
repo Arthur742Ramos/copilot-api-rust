@@ -113,6 +113,62 @@ pub async fn get_providers_route() -> Response {
     .into_response()
 }
 
+/// Redact a secret string value in-place to a boolean `<key>Set` flag (true when
+/// it is a non-empty string) and remove the raw value, so the effective-config
+/// view never echoes a secret.
+fn redact_secret(obj: &mut serde_json::Map<String, Value>, key: &str, set_key: &str) {
+    let present = obj
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    obj.remove(key);
+    obj.insert(set_key.to_string(), json!(present));
+}
+
+/// GET /admin/config — the effective merged runtime config with all secrets
+/// redacted, so an operator can confirm what the gateway is actually running
+/// (budget, model slugs, feature flags, providers) without filesystem access to
+/// config.json. Secrets become booleans: `auth.adminApiKey`/`anthropicApiKey` ->
+/// `*Set`, `auth.apiKeys` -> a count, and each provider `apiKey` -> `apiKeySet`.
+pub async fn get_effective_config_route() -> Response {
+    let cfg = crate::libs::config::get_config();
+    let mut value = match serde_json::to_value(&*cfg) {
+        Ok(Value::Object(map)) => map,
+        _ => {
+            return forwarded_error("Failed to serialize effective config");
+        }
+    };
+
+    // Redact auth.adminApiKey and auth.apiKeys (count only).
+    if let Some(Value::Object(auth)) = value.get_mut("auth") {
+        redact_secret(auth, "adminApiKey", "adminApiKeySet");
+        let key_count = auth
+            .get("apiKeys")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        auth.remove("apiKeys");
+        auth.insert("apiKeysCount".to_string(), json!(key_count));
+    }
+    // Redact the top-level anthropicApiKey.
+    redact_secret(&mut value, "anthropicApiKey", "anthropicApiKeySet");
+    // Redact each provider's apiKey.
+    if let Some(Value::Object(providers)) = value.get_mut("providers") {
+        for (_name, prov) in providers.iter_mut() {
+            if let Value::Object(p) = prov {
+                redact_secret(p, "apiKey", "apiKeySet");
+            }
+        }
+    }
+
+    Json(json!({
+        "configPath": config_path_string(),
+        "config": value,
+    }))
+    .into_response()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpsertProviderRequest {
