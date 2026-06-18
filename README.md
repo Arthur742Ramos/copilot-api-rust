@@ -317,9 +317,12 @@ Notes:
 - `POST /v1/images/generations` forwards to the Codex `image_generation` tool
   using your Codex (Sign in with ChatGPT) credentials, so it requires
   `copilot-api auth --provider codex`. It returns the OpenAI shape
-  (`{ created, data: [{ b64_json }] }`). `imageChatModel` / `imageModel` let you
-  pin the model slugs, which OpenAI changes over time. Note this rides an
-  undocumented Codex backend, so it may change without notice.
+  (`{ created, data: [{ b64_json }], usage }`, where `usage` is included when the
+  upstream reports it). `imageChatModel` / `imageModel` let you pin the model
+  slugs, which OpenAI changes over time. Image generations are subject to the
+  same rate-limit / `dailyTokenBudget` admission gates and are recorded in the
+  token-usage subsystem (endpoint `images`). Note this rides an undocumented
+  Codex backend, so it may change without notice.
 
 ### Exact token counts for Claude models
 

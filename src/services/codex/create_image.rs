@@ -151,17 +151,27 @@ fn default_responses_payload() -> ResponsesPayload {
     }
 }
 
-/// Generate one or more images, returning the base64-encoded bytes in order.
-/// `request_headers` is forwarded to the Codex transport (it strips and re-auths
-/// them); pass the inbound request's headers. `base_url` is the resolved Codex
-/// provider base URL (empty string for the default ChatGPT backend), threaded
-/// so an operator-configured custom Codex `baseUrl` (and its SSRF validation) is
-/// honored exactly as on the other Codex routes.
+/// The outcome of an image generation: the base64 image(s) in order, plus the
+/// upstream `usage` object from `response.completed` (when present) so the
+/// caller can both record token usage and surface it in the OpenAI response.
+#[derive(Debug, Clone)]
+pub struct ImageResult {
+    pub images: Vec<String>,
+    pub usage: Option<Value>,
+}
+
+/// Generate one or more images, returning the base64-encoded bytes in order
+/// plus any upstream usage. `request_headers` is forwarded to the Codex
+/// transport (it strips and re-auths them); pass the inbound request's headers.
+/// `base_url` is the resolved Codex provider base URL (empty string for the
+/// default ChatGPT backend), threaded so an operator-configured custom Codex
+/// `baseUrl` (and its SSRF validation) is honored exactly as on the other Codex
+/// routes.
 pub async fn create_codex_image(
     req: &ImageGenerationRequest,
     request_headers: &axum::http::HeaderMap,
     base_url: &str,
-) -> Result<Vec<String>, AppError> {
+) -> Result<ImageResult, AppError> {
     let payload = build_image_payload(req);
     let response = forward_codex_responses(payload, request_headers, base_url).await?;
 
@@ -193,18 +203,21 @@ pub async fn create_codex_image(
     parse_image_results(&buf).map_err(|e| AppError::Http(HttpError::internal(e)))
 }
 
-/// Extract base64 image(s) from the buffered Codex Responses SSE stream.
+/// Extract base64 image(s) and the upstream usage from the buffered Codex
+/// Responses SSE stream.
 ///
-/// Tiers, in priority order:
+/// Image tiers, in priority order:
 /// 1. `response.completed` -> `response.output[]` -> every `image_generation_call`
 ///    item's `.result` (the authoritative final set, preserving order for n>1).
 /// 2. fallback: each `response.output_item.done` whose `item.type` is
 ///    `image_generation_call` -> `item.result`.
 /// 3. last resort: the highest-index `partial_image_b64` (a progressive preview).
 ///
+/// Usage is taken from the `response.completed` event's `/response/usage`.
+///
 /// An error event (`type == "error"` or `response.failed`) short-circuits with
 /// its message so refusals/quota failures surface their real reason.
-fn parse_image_results(sse_bytes: &[u8]) -> Result<Vec<String>, String> {
+fn parse_image_results(sse_bytes: &[u8]) -> Result<ImageResult, String> {
     let mut decoder = Decoder::new();
     let mut events = decoder.push(sse_bytes);
     if let Some(ev) = decoder.finish() {
@@ -214,6 +227,7 @@ fn parse_image_results(sse_bytes: &[u8]) -> Result<Vec<String>, String> {
     let mut completed: Vec<String> = Vec::new();
     let mut done_items: Vec<String> = Vec::new();
     let mut best_partial: Option<(i64, String)> = None;
+    let mut usage: Option<Value> = None;
 
     for ev in &events {
         if ev.data == "[DONE]" {
@@ -242,7 +256,7 @@ fn parse_image_results(sse_bytes: &[u8]) -> Result<Vec<String>, String> {
                     .unwrap_or("Codex image generation failed");
                 return Err(msg.to_string());
             }
-            // Tier 1: authoritative final output set.
+            // Tier 1: authoritative final output set (also carries usage).
             "response.completed" => {
                 if let Some(out) = v.pointer("/response/output").and_then(Value::as_array) {
                     for item in out {
@@ -252,6 +266,11 @@ fn parse_image_results(sse_bytes: &[u8]) -> Result<Vec<String>, String> {
                                 completed.push(b64.to_string());
                             }
                         }
+                    }
+                }
+                if let Some(u) = v.pointer("/response/usage") {
+                    if u.is_object() {
+                        usage = Some(u.clone());
                     }
                 }
             }
@@ -285,16 +304,17 @@ fn parse_image_results(sse_bytes: &[u8]) -> Result<Vec<String>, String> {
         }
     }
 
-    if !completed.is_empty() {
-        return Ok(completed);
-    }
-    if !done_items.is_empty() {
-        return Ok(done_items);
-    }
-    if let Some((_, b64)) = best_partial {
-        return Ok(vec![b64]);
-    }
-    Err("Codex image generation produced no image".to_string())
+    let images = if !completed.is_empty() {
+        completed
+    } else if !done_items.is_empty() {
+        done_items
+    } else if let Some((_, b64)) = best_partial {
+        vec![b64]
+    } else {
+        return Err("Codex image generation produced no image".to_string());
+    };
+
+    Ok(ImageResult { images, usage })
 }
 
 #[cfg(test)]
@@ -308,12 +328,18 @@ event: response.image_generation_call.partial_image\n\
 data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_b64\":\"PARTIAL\",\"partial_image_index\":0}\n\
 \n\
 event: response.completed\n\
-data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"FINAL_B64\"}]}}\n\
+data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"FINAL_B64\"}],\"usage\":{\"input_tokens\":11,\"output_tokens\":1290,\"total_tokens\":1301}}}\n\
 \n\
 data: [DONE]\n\
 \n";
         let out = parse_image_results(sse.as_bytes()).expect("should extract");
-        assert_eq!(out, vec!["FINAL_B64"]);
+        assert_eq!(out.images, vec!["FINAL_B64"]);
+        // Usage from response.completed is captured.
+        let usage = out.usage.expect("usage present");
+        assert_eq!(
+            usage.pointer("/total_tokens").and_then(Value::as_i64),
+            Some(1301)
+        );
     }
 
     #[test]
@@ -323,7 +349,8 @@ event: response.completed\n\
 data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"A\"},{\"type\":\"message\"},{\"type\":\"image_generation_call\",\"result\":\"B\"}]}}\n\
 \n";
         let out = parse_image_results(sse.as_bytes()).expect("should extract");
-        assert_eq!(out, vec!["A", "B"]);
+        assert_eq!(out.images, vec!["A", "B"]);
+        assert!(out.usage.is_none());
     }
 
     #[test]
@@ -333,7 +360,7 @@ event: response.output_item.done\n\
 data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"FROM_ITEM\"}}\n\
 \n";
         let out = parse_image_results(sse.as_bytes()).expect("should extract");
-        assert_eq!(out, vec!["FROM_ITEM"]);
+        assert_eq!(out.images, vec!["FROM_ITEM"]);
     }
 
     #[test]
@@ -371,5 +398,43 @@ data: {\"type\":\"response.created\"}\n\
         assert_eq!(req.n, 10);
         let req = ImageGenerationRequest::from_value(&json!({ "prompt": "x", "n": 0 })).unwrap();
         assert_eq!(req.n, 1);
+    }
+
+    #[test]
+    fn build_image_payload_enforces_backend_contract() {
+        let req = ImageGenerationRequest::from_value(&json!({ "prompt": "a cat" })).unwrap();
+        let payload = build_image_payload(&req);
+        // The image_generation tool is forced so the backend always emits an
+        // image rather than answering with text, and stream/store/parallel are
+        // pinned to the values the Codex backend expects for this flow.
+        assert_eq!(
+            payload.tool_choice,
+            Some(json!({ "type": "image_generation" }))
+        );
+        assert_eq!(payload.parallel_tool_calls, Some(false));
+        assert_eq!(payload.store, Some(false));
+        assert_eq!(payload.stream, Some(true));
+        let tools = payload.tools.expect("tools present");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].get("type").and_then(Value::as_str),
+            Some("image_generation")
+        );
+        // Default model slugs flow through.
+        assert_eq!(payload.model, "gpt-5.5");
+        assert_eq!(
+            tools[0].get("model").and_then(Value::as_str),
+            Some("gpt-image-2")
+        );
+        // n==1 omits the "n" key from the tool.
+        assert!(tools[0].get("n").is_none());
+    }
+
+    #[test]
+    fn build_image_payload_sets_n_when_multiple() {
+        let req = ImageGenerationRequest::from_value(&json!({ "prompt": "x", "n": 3 })).unwrap();
+        let payload = build_image_payload(&req);
+        let tools = payload.tools.unwrap();
+        assert_eq!(tools[0].get("n").and_then(Value::as_i64), Some(3));
     }
 }

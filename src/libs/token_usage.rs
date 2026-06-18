@@ -23,7 +23,7 @@ pub struct UsageTokens {
     pub total_tokens: Option<i64>,
 }
 
-pub type TokenUsageEndpoint = &'static str; // chat_completions | embeddings | messages | provider_messages | responses
+pub type TokenUsageEndpoint = &'static str; // chat_completions | embeddings | images | messages | provider_messages | responses
 pub type TokenUsageSource = &'static str; // copilot | provider
 
 fn normalize_token(value: Option<f64>) -> i64 {
