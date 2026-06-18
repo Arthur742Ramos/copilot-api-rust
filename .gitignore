@@ -8,3 +8,7 @@
 # Editor / OS noise
 *.swp
 .DS_Store
+
+# Local debug artifacts (image-probe output)
+/probe_image.png
+/route_probe_image.png
