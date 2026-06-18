@@ -118,6 +118,18 @@ fn emit_event(event: &AnthropicStreamEventData) -> Option<String> {
     Some(format!("event: {}\ndata: {data}\n\n", event.event_name()))
 }
 
+/// Count an upstream SSE chunk we could not JSON-parse, so a flaky upstream
+/// emitting partial/garbage deltas is detectable on dashboards rather than
+/// silently dropped. `flow` is a bounded label (chat_completions | responses).
+/// A dropped chunk can also desync the translation state machine, so this is the
+/// only signal that an SSE-reassembly bug or upstream corruption occurred. The
+/// parse error is logged (as a structured field) to aid diagnosis, but the raw
+/// chunk is never logged so user content can't leak.
+fn record_stream_chunk_parse_failure(flow: &'static str, error: &serde_json::Error) {
+    metrics::counter!("proxy_stream_chunk_parse_failures_total", "flow" => flow).increment(1);
+    tracing::warn!(error = %error, "dropped unparseable upstream SSE chunk on {flow} stream");
+}
+
 /// Build a `text/event-stream` response over a byte stream, with the same header
 /// set the chat handler uses for streaming.
 fn sse_response<S>(stream: S) -> Response
@@ -228,7 +240,10 @@ pub async fn handle_with_chat_completions(
 
                     let chunk: Value = match serde_json::from_str(&raw_event.data) {
                         Ok(c) => c,
-                        Err(_) => continue,
+                        Err(e) => {
+                            record_stream_chunk_parse_failure("chat_completions", &e);
+                            continue;
+                        }
                     };
                     if let Some(u) = chunk.get("usage") {
                         if !u.is_null() {
@@ -242,6 +257,26 @@ pub async fn handle_with_chat_completions(
                             yield Ok(Bytes::from(frame));
                         }
                     }
+                }
+
+                // A message was started but we never emitted `message_stop`, and
+                // no deferred usage delta is pending — i.e. the upstream stream
+                // ended (whether via an early `[DONE]`, a dropped finishing
+                // chunk, or a silent close) before a proper terminal event. Mark
+                // the timer as an error so a truncated/incomplete stream is
+                // distinguishable from a clean completion on the latency/outcome
+                // dashboards (mirrors the responses flow). The
+                // `pending_message_delta` guard avoids flagging the legitimate
+                // deferred-usage path where a finish_reason was received but its
+                // usage arrived on a later/absent chunk.
+                let truncated = state.message_start_sent
+                    && !state.message_stop_emitted
+                    && state.pending_message_delta.is_none();
+                if truncated {
+                    tracing::warn!(
+                        "chat-completions stream ended after message start without emitting message_stop (truncated)"
+                    );
+                    timer.mark_error();
                 }
 
                 for event in flush_pending_anthropic_stream_events(&mut state) {
@@ -363,7 +398,10 @@ pub async fn handle_with_responses_api(
 
                     let response_event: Value = match serde_json::from_str(&chunk.data) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(e) => {
+                            record_stream_chunk_parse_failure("responses", &e);
+                            continue;
+                        }
                     };
                     match response_event.get("type").and_then(Value::as_str) {
                         Some("response.completed") | Some("response.failed")
