@@ -37,6 +37,36 @@ The binary is produced at `target/release/copilot-api` (on Windows,
 All examples below assume `copilot-api` is on your `PATH`; otherwise invoke it
 via the full path to the built binary.
 
+## Updating
+
+If you are running a release binary, update it in place with the built-in
+self-updater:
+
+```sh
+copilot-api update          # check, then prompt before replacing the binary
+copilot-api update --yes    # update immediately, no prompt (for scripts/CI)
+copilot-api update --check  # report whether a newer release exists; change nothing
+```
+
+`update` queries the latest [GitHub release][releases], compares it against the
+running version, and — if newer — downloads the binary for your platform and
+atomically swaps the running executable. Restart `copilot-api` afterward for the
+new version to take effect. You can confirm the running build at any time with
+`copilot-api --version` or the `/version` endpoint.
+
+> The self-updater fetches prebuilt release assets, so it works only on the
+> platforms the [release workflow][releases] publishes (Linux x86-64, macOS
+> Apple Silicon, Windows x86-64). On other targets, build from source instead.
+>
+> **Docker users:** don't use `update` inside a container — pull the new image
+> instead (`docker compose pull` / `docker pull ghcr.io/arthur742ramos/copilot-api-rust:latest`).
+
+> **Maintainer note:** `update` needs published GitHub releases to exist. Each
+> release is built by `.github/workflows/release.yml` when a `v*` tag is pushed,
+> so cut releases by tagging: `git tag v1.12.5 && git push origin v1.12.5`.
+
+[releases]: https://github.com/Arthur742Ramos/copilot-api-rust/releases
+
 ## Quick start
 
 1. **Start the server:**
@@ -190,6 +220,7 @@ Global usage: `copilot-api [GLOBAL OPTIONS] <SUBCOMMAND>`
 | `check-usage`  | Show current GitHub Copilot usage / quota information. |
 | `debug`        | Print environment, provider, and path diagnostics. Add `--json` for JSON output. |
 | `mcp`          | Start the MCP bridge server over stdio (`tool_search` + `generate_image` tools). |
+| `update`       | Update copilot-api in place to the latest GitHub release. |
 
 ### Global options
 

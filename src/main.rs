@@ -53,6 +53,8 @@ enum Command {
     },
     /// Start the MCP tool_search bridge server over stdio
     Mcp,
+    /// Update copilot-api to the latest released version
+    Update(UpdateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -122,6 +124,16 @@ struct AuthArgs {
     show_token: bool,
 }
 
+#[derive(Args, Debug)]
+struct UpdateArgs {
+    /// Only check whether a newer release exists; do not download or install.
+    #[arg(long, default_value_t = false)]
+    check: bool,
+    /// Skip the confirmation prompt and update immediately if newer.
+    #[arg(short = 'y', long, default_value_t = false)]
+    yes: bool,
+}
+
 fn apply_global_env(cli: &Cli) {
     if let Some(v) = &cli.api_home {
         std::env::set_var("COPILOT_API_HOME", v);
@@ -155,6 +167,7 @@ async fn main() {
             Ok(())
         }
         Command::Mcp => mcp::run_mcp_server().await,
+        Command::Update(args) => run_update(args).await,
     };
 
     if let Err(e) = result {
@@ -444,6 +457,45 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received, stopping server");
+}
+
+async fn run_update(args: UpdateArgs) -> anyhow::Result<()> {
+    use crate::libs::update::{apply_update, check_for_update};
+
+    let info = check_for_update().await?;
+
+    tracing::info!("current version: {}", info.current);
+    tracing::info!("latest release:  {} ({})", info.latest, info.tag);
+
+    if !info.is_newer {
+        tracing::info!("Already up to date.");
+        return Ok(());
+    }
+
+    tracing::info!("An update is available: {} -> {}", info.current, info.latest);
+
+    if args.check {
+        // --check is a dry run: report availability and exit without changing anything.
+        return Ok(());
+    }
+
+    if !args.yes {
+        print_prompt(&format!("Update to {} now? [y/N]", info.latest));
+        let answer = read_line().await;
+        let yes = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        if !yes {
+            tracing::info!("Update cancelled.");
+            return Ok(());
+        }
+    }
+
+    tracing::info!("Downloading {}...", info.asset_name);
+    apply_update(&info).await?;
+    tracing::info!(
+        "Updated to {}. Restart copilot-api for the new version to take effect.",
+        info.latest
+    );
+    Ok(())
 }
 
 async fn run_auth(options: AuthArgs) -> anyhow::Result<()> {

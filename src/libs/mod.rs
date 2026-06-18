@@ -33,5 +33,6 @@ pub mod token_budget;
 pub mod token_usage;
 pub mod tokenizer;
 pub mod tool_search;
+pub mod update;
 pub mod utils;
 pub mod zstd_request;
