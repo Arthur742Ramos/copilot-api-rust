@@ -14,36 +14,80 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// Maximum bytes the decoder will buffer between record terminators. A
+/// legitimate SSE record from an LLM upstream is tiny (a single JSON delta), so
+/// this never trips on real traffic; it bounds memory against an upstream that
+/// streams a large body without ever emitting a blank-line terminator (an OOM
+/// vector otherwise, since the buffer would grow without limit).
+pub const MAX_SSE_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
 /// Incremental SSE parser. Feed raw bytes via [`Decoder::push`]; it buffers
 /// across chunk boundaries and returns the records that became complete.
 ///
 /// Factored out so the parsing core is unit-testable without a
 /// `reqwest::Response`.
+///
+/// The buffer holds RAW bytes (not decoded text): a multi-byte UTF-8 sequence
+/// can straddle a chunk boundary, and decoding each chunk independently would
+/// turn each half into a `U+FFFD` replacement char, silently corrupting the
+/// token. Instead, records are split on ASCII newline boundaries (which can
+/// never fall inside a multi-byte code point) and only a *complete* record is
+/// lossily decoded, by which point any multi-byte sequence is fully buffered.
 #[derive(Debug, Default)]
 pub struct Decoder {
-    /// Rolling buffer of not-yet-dispatched bytes (UTF-8 text).
-    buf: String,
+    /// Rolling buffer of not-yet-dispatched raw bytes.
+    buf: Vec<u8>,
+    /// Set once the buffer exceeds [`MAX_SSE_RECORD_BYTES`] without a record
+    /// terminator. [`events`] checks this and terminates the stream with an
+    /// error, since [`push`] cannot itself return one.
+    overflowed: bool,
 }
 
 impl Decoder {
     pub fn new() -> Self {
-        Self { buf: String::new() }
+        Self {
+            buf: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    /// Whether the buffer overflowed the record-size cap. Once set, the decoder
+    /// should be abandoned and the stream errored.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// Push a chunk of bytes and return any records completed by it.
     ///
-    /// A record is completed by a blank line (`\n\n`, tolerating `\r\n\r\n`).
+    /// A record is completed by a blank line (`\n\n`, tolerating `\r\n\r\n` and
+    /// `\r\r`). Bytes are buffered raw and decoded only once a full record is
+    /// split off, so a multi-byte char spanning a chunk boundary is never
+    /// corrupted.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
-        // SSE is UTF-8; lossily decode so a stray invalid byte cannot wedge the
-        // stream. Split points are ASCII newlines, so multi-byte chars are safe.
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        self.buf.extend_from_slice(bytes);
 
         let mut out = Vec::new();
-        while let Some((record, rest)) = split_record(&self.buf) {
+        // Cursor into `buf` of the next unscanned byte. Draining once after the
+        // loop (rather than per-record) keeps this O(n) instead of O(n^2).
+        let mut consumed = 0usize;
+        while let Some((record_end, boundary_len)) = next_boundary(&self.buf[consumed..]) {
+            let record_start = consumed;
+            let record_bytes = &self.buf[record_start..record_start + record_end];
+            // The full record is buffered, so lossy decode is safe here (any
+            // partial multi-byte sequence would have been at the buffer tail,
+            // past this boundary).
+            let record = String::from_utf8_lossy(record_bytes);
             if let Some(ev) = parse_record(&record) {
                 out.push(ev);
             }
-            self.buf = rest;
+            consumed = record_start + record_end + boundary_len;
+        }
+        if consumed > 0 {
+            self.buf.drain(..consumed);
+        }
+
+        if self.buf.len() > MAX_SSE_RECORD_BYTES {
+            self.overflowed = true;
         }
         out
     }
@@ -53,30 +97,37 @@ impl Decoder {
         if self.buf.is_empty() {
             return None;
         }
-        let record = std::mem::take(&mut self.buf);
+        let bytes = std::mem::take(&mut self.buf);
+        let record = String::from_utf8_lossy(&bytes);
         parse_record(&record)
     }
 }
 
-/// Split off the first complete record (terminated by a blank line) from `buf`.
-/// Returns `(record_without_terminator, remainder)` or `None` if incomplete.
-fn split_record(buf: &str) -> Option<(String, String)> {
-    // Find the earliest record boundary. Records end at a blank line, which the
-    // SSE spec defines after normalizing line endings; tolerate both `\n\n` and
-    // `\r\n\r\n` (and the mixed `\n\r\n`).
+/// Find the earliest blank-line record boundary in `buf`, returning
+/// `(offset_of_boundary, boundary_len)` or `None` if no complete record yet.
+/// All boundary byte sequences are ASCII, so they can never fall inside a
+/// multi-byte UTF-8 code point.
+fn next_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None; // (boundary_start, boundary_len)
-    for (pat, len) in [("\r\n\r\n", 4usize), ("\n\n", 2), ("\r\r", 2)] {
-        if let Some(idx) = buf.find(pat) {
+    for (pat, len) in [(b"\r\n\r\n".as_slice(), 4usize), (b"\n\n", 2), (b"\r\r", 2)] {
+        if let Some(idx) = find_subslice(buf, pat) {
             match best {
                 Some((b, _)) if b <= idx => {}
                 _ => best = Some((idx, len)),
             }
         }
     }
-    let (idx, len) = best?;
-    let record = buf[..idx].to_string();
-    let rest = buf[idx + len..].to_string();
-    Some((record, rest))
+    best
+}
+
+/// First index of `needle` within `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Parse a single record (block of lines) into an [`SseEvent`].
@@ -153,6 +204,13 @@ pub fn events(resp: reqwest::Response) -> impl Stream<Item = Result<SseEvent, st
             let bytes: Bytes = chunk.map_err(std::io::Error::other)?;
             for ev in decoder.push(&bytes) {
                 yield ev;
+            }
+            // Bound memory: an upstream that never terminates a record would
+            // otherwise grow the buffer without limit. Terminate the stream.
+            if decoder.overflowed() {
+                Err(std::io::Error::other(
+                    "SSE record exceeded the maximum buffered size",
+                ))?;
             }
         }
         if let Some(ev) = decoder.finish() {
@@ -291,6 +349,83 @@ mod tests {
         assert_eq!(events[0].data, "a");
         assert_eq!(events[1].data, "b");
         assert_eq!(events[2].data, "c");
+    }
+
+    #[test]
+    fn multibyte_char_split_across_chunks_is_not_corrupted() {
+        // A 4-byte emoji (🚀 = f0 9f 9a 80) split across two push() calls must
+        // decode intact. The old String-per-chunk lossy decode turned each half
+        // into U+FFFD; the byte-buffered decoder must not.
+        let rocket = "🚀".as_bytes();
+        assert_eq!(rocket.len(), 4);
+        let mut decoder = Decoder::new();
+        let mut out = Vec::new();
+        // Split the emoji: first 2 bytes in chunk 1, last 2 + terminator in chunk 2.
+        out.extend(decoder.push(b"data: "));
+        out.extend(decoder.push(&rocket[..2]));
+        out.extend(decoder.push(&rocket[2..]));
+        out.extend(decoder.push(b"\n\n"));
+        if let Some(ev) = decoder.finish() {
+            out.push(ev);
+        }
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data, "data: 🚀".trim_start_matches("data: ")); // "🚀"
+        assert_eq!(out[0].data, "🚀");
+    }
+
+    #[test]
+    fn multibyte_char_split_with_cjk() {
+        // 3-byte CJK char 世 (e4 b8 96) straddling a boundary.
+        let cjk = "世".as_bytes();
+        assert_eq!(cjk.len(), 3);
+        let mut decoder = Decoder::new();
+        let mut out = Vec::new();
+        out.extend(decoder.push(b"data: a"));
+        out.extend(decoder.push(&cjk[..1]));
+        out.extend(decoder.push(&cjk[1..]));
+        out.extend(decoder.push(b"b\n\n"));
+        if let Some(ev) = decoder.finish() {
+            out.push(ev);
+        }
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data, "a世b");
+    }
+
+    #[test]
+    fn many_records_in_one_push_all_parsed() {
+        // Linearity regression: a single push carrying many records must yield
+        // them all (and, with the cursor-drain rewrite, do so in O(n)).
+        let mut blob = Vec::new();
+        for i in 0..1000 {
+            blob.extend_from_slice(format!("data: {i}\n\n").as_bytes());
+        }
+        let mut decoder = Decoder::new();
+        let out = decoder.push(&blob);
+        assert_eq!(out.len(), 1000);
+        assert_eq!(out[0].data, "0");
+        assert_eq!(out[999].data, "999");
+        assert!(decoder.finish().is_none());
+    }
+
+    #[test]
+    fn overflow_latch_trips_without_terminator() {
+        let mut decoder = Decoder::new();
+        // Push more than the cap with no record terminator.
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..((MAX_SSE_RECORD_BYTES / chunk.len()) + 2) {
+            decoder.push(&chunk);
+        }
+        assert!(decoder.overflowed(), "expected overflow latch to trip");
+    }
+
+    #[test]
+    fn no_overflow_for_normal_terminated_records() {
+        let mut decoder = Decoder::new();
+        for _ in 0..10_000 {
+            decoder.push(b"data: small record\n\n");
+        }
+        assert!(!decoder.overflowed());
+        assert!(decoder.buf.is_empty());
     }
 
     #[tokio::test]
