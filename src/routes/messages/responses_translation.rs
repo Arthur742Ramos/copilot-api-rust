@@ -221,8 +221,16 @@ pub fn translate_anthropic_messages_to_responses_payload(
     // missing value to 0 so the 12800 floor applies.
     let max_output_tokens = payload.max_tokens.unwrap_or(0).max(12800);
 
+    let resolved_effort = get_reasoning_effort_for_model(&payload.model);
+    tracing::info!(
+        target: "audit",
+        model = %payload.model,
+        effort = %resolved_effort,
+        api = "responses",
+        "resolved reasoning effort"
+    );
     let reasoning = json!({
-        "effort": get_reasoning_effort_for_model(&payload.model),
+        "effort": resolved_effort,
         "summary": "detailed",
     });
 
