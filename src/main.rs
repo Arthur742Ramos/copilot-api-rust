@@ -472,7 +472,11 @@ async fn run_update(args: UpdateArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing::info!("An update is available: {} -> {}", info.current, info.latest);
+    tracing::info!(
+        "An update is available: {} -> {}",
+        info.current,
+        info.latest
+    );
 
     if args.check {
         // --check is a dry run: report availability and exit without changing anything.

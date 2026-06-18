@@ -56,23 +56,21 @@ fn user_agent() -> String {
 /// must match the `asset` names in `.github/workflows/release.yml` exactly.
 /// Returns an error on any target the release workflow does not build.
 fn current_asset_name() -> anyhow::Result<&'static str> {
-    Ok(
-        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            "copilot-api-x86_64-unknown-linux-gnu"
-        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            "copilot-api-aarch64-apple-darwin"
-        } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-            "copilot-api-x86_64-pc-windows-msvc.exe"
-        } else {
-            anyhow::bail!(
-                "self-update has no prebuilt binary for this platform ({}/{}). \
+    Ok(if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "copilot-api-x86_64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "copilot-api-aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "copilot-api-x86_64-pc-windows-msvc.exe"
+    } else {
+        anyhow::bail!(
+            "self-update has no prebuilt binary for this platform ({}/{}). \
                  Download a binary manually from https://github.com/{REPO_SLUG}/releases \
                  or rebuild from source.",
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-            )
-        },
-    )
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    })
 }
 
 /// Parse a `MAJOR.MINOR.PATCH` version, tolerating a leading `v` and ignoring any
@@ -183,7 +181,10 @@ async fn download(url: &str) -> anyhow::Result<Vec<u8>> {
         .with_context(|| format!("downloading {url}"))?;
 
     if !response.status().is_success() {
-        anyhow::bail!("downloading the release asset failed: HTTP {}", response.status());
+        anyhow::bail!(
+            "downloading the release asset failed: HTTP {}",
+            response.status()
+        );
     }
 
     let bytes = response
