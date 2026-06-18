@@ -1151,11 +1151,25 @@ pub fn prepare_messages_api_payload(payload: &mut Value, selected_model: Option<
         }
     }
 
-    payload["output_config"] = if effort_undefined {
-        json!({})
+    if effort_undefined {
+        tracing::info!(
+            target: "audit",
+            model = %model,
+            effort = "none",
+            api = "messages",
+            "resolved reasoning effort (output_config cleared; model declares no supported efforts)"
+        );
+        payload["output_config"] = json!({});
     } else {
-        json!({ "effort": effort })
-    };
+        tracing::info!(
+            target: "audit",
+            model = %model,
+            effort = %effort,
+            api = "messages",
+            "resolved reasoning effort"
+        );
+        payload["output_config"] = json!({ "effort": effort });
+    }
 }
 
 #[cfg(test)]
