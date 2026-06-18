@@ -22,12 +22,8 @@ fn user_agent() -> String {
 }
 const CLAUDE_AGENT_USER_AGENT: &str =
     "vscode_claude_code/2.1.112 (external, sdk-ts, agent-sdk/0.2.112)";
-fn editor_websocket_plugin_version() -> String {
-    format!("copilot-chat/{COPILOT_VERSION}")
-}
 
 const API_VERSION: &str = "2026-06-01";
-const WEBSOCKET_API_VERSION: &str = API_VERSION;
 
 pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 pub const GITHUB_BASE_URL: &str = "https://github.com";
