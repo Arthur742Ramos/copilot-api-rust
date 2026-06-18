@@ -220,7 +220,7 @@ pub async fn handle_with_chat_completions(
                             tracing::warn!("chat-completions stream error: {e}; sending terminal error event");
                             timer.mark_error();
                             if let Some(frame) =
-                                emit_event(&translate_error_to_anthropic_error_event())
+                                emit_event(&translate_error_to_anthropic_error_event(Some(&e)))
                             {
                                 yield Ok(Bytes::from(frame));
                             }
@@ -515,7 +515,7 @@ pub async fn handle_with_messages_api(
                             tracing::warn!("messages stream error: {e}; sending terminal error event");
                             timer.mark_error();
                             if let Some(frame) =
-                                emit_event(&translate_error_to_anthropic_error_event())
+                                emit_event(&translate_error_to_anthropic_error_event(Some(&e)))
                             {
                                 yield Ok(Bytes::from(frame));
                             }
@@ -752,7 +752,7 @@ mod tests {
         // The frame yielded when a streaming flow hits an upstream error must be a
         // complete Anthropic `error` SSE event so Claude Code can retry instead of
         // hanging on a truncated body.
-        let frame = emit_event(&translate_error_to_anthropic_error_event()).unwrap();
+        let frame = emit_event(&translate_error_to_anthropic_error_event(None)).unwrap();
         assert!(frame.starts_with("event: error\ndata: "));
         assert!(frame.ends_with("\n\n"));
 

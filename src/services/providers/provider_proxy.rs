@@ -32,12 +32,15 @@ static PROVIDER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .connect_timeout(Duration::from_secs(30))
         // read_timeout bounds the gap between successive reads, NOT the total
         // request duration, so it never caps a healthy long SSE stream that
-        // keeps producing bytes (slow thinking gaps stay under 120s) but does
-        // rescue a stalled-open upstream connection. An overall `.timeout(...)`
-        // would truncate legitimate long streams, so it is intentionally absent.
-        .read_timeout(Duration::from_secs(120))
+        // keeps producing bytes but does rescue a stalled-open upstream
+        // connection. An overall `.timeout(...)` would truncate legitimate long
+        // streams, so it is intentionally absent. Shares the shared client's
+        // COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS knob (default 120; 0 disables).
         .pool_idle_timeout(Duration::from_secs(90))
         .redirect(reqwest::redirect::Policy::none());
+    if let Some(read_timeout) = crate::libs::http::upstream_read_timeout() {
+        builder = builder.read_timeout(read_timeout);
+    }
     if !proxy_from_env_enabled() {
         builder = builder.no_proxy();
     }

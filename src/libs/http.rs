@@ -23,6 +23,29 @@ pub fn proxy_from_env_enabled() -> bool {
     PROXY_FROM_ENV.load(Ordering::SeqCst)
 }
 
+/// Default upstream read-timeout (seconds): the maximum gap between successive
+/// reads before a stalled-open connection is killed. Bounds a wedged upstream
+/// without capping a healthy long stream.
+pub const DEFAULT_UPSTREAM_READ_TIMEOUT_SECS: u64 = 120;
+
+/// The upstream read-timeout, overridable via `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS`.
+///
+/// `read_timeout` bounds the gap between successive reads, NOT the total request
+/// duration, so it never caps a healthy long SSE stream that keeps producing
+/// bytes — but a very long model "thinking" gap that exceeds it is killed as if
+/// the connection had wedged. Operators seeing spurious ~120s stall failures on
+/// legitimately slow generations can raise this; a value of `0` disables the
+/// read timeout entirely (a wedged connection then relies on the pool idle
+/// timeout instead). Read once when each client is first built. Shared by both
+/// [`client`] and the provider-forwarding client so they stay consistent.
+pub fn upstream_read_timeout() -> Option<Duration> {
+    let secs = std::env::var("COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// Shared reqwest client. The TS code uses a global monkey-patched `fetch`
 /// (electron-fetch / undici with system CA). Here we use a single reqwest
 /// client configured with native roots and no global timeout (streaming).
@@ -31,12 +54,16 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .connect_timeout(Duration::from_secs(30))
         // read_timeout bounds the gap between successive reads, NOT the total
         // request duration. A healthy SSE stream that keeps producing bytes
-        // (including slow model "thinking" gaps under 120s) is unaffected, but a
-        // connection that wedges open with no further data is killed instead of
-        // hanging forever. An overall `.timeout(...)` would wrongly cap long
-        // legitimate streams, so we deliberately do not use one here.
-        .read_timeout(Duration::from_secs(120))
+        // (including slow model "thinking" gaps under the timeout) is unaffected,
+        // but a connection that wedges open with no further data is killed
+        // instead of hanging forever. An overall `.timeout(...)` would wrongly
+        // cap long legitimate streams, so we deliberately do not use one here.
+        // The window is configurable via COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS
+        // (default 120; 0 disables it).
         .pool_idle_timeout(Duration::from_secs(90));
+    if let Some(read_timeout) = upstream_read_timeout() {
+        builder = builder.read_timeout(read_timeout);
+    }
     if !PROXY_FROM_ENV.load(Ordering::SeqCst) {
         builder = builder.no_proxy();
     }

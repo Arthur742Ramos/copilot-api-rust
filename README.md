@@ -185,6 +185,7 @@ containers (the `start` flags below have matching `COPILOT_API_*` variables):
 | `COPILOT_API_ENTERPRISE_URL` | `--enterprise-url` | Enterprise URL for GitHub. |
 | `COPILOT_API_LOG_FORMAT` | _(env only)_ | Set to `json` for structured JSON logs; defaults to the human-readable format. |
 | `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS` | _(env only)_ | Days of `token_usage_events` to retain before pruning (default `45`; `<= 0` disables pruning). |
+| `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | _(env only)_ | Max seconds of silence on an upstream stream before the connection is treated as stalled and dropped (default `120`; `0` disables the read timeout). Raise it if legitimately slow generations are being cut off mid-stream. |
 
 Example:
 
