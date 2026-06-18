@@ -1,9 +1,14 @@
+#[cfg(not(windows))]
 use std::path::PathBuf;
 
 // Mirrors src/lib/deviceid.ts. Reads (or lazily creates + persists) the stable
 // VSCode "device id" GUID used in the `editor-device-id` Copilot header,
 // matching VSCode's own storage location per-platform.
 
+// Only the POSIX device-id paths (macOS / Linux) resolve a home dir this way;
+// Windows uses its own path logic below, so this helper is gated to match its
+// callers and isn't compiled (or flagged dead) elsewhere.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn get_posix_home_dir() -> Result<PathBuf, anyhow::Error> {
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() => Ok(PathBuf::from(home)),

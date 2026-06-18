@@ -3,11 +3,6 @@
 // link against this `copilot_api` library. The binary (src/main.rs) `use`s these
 // same modules, so there is a single compiled copy of the process-global state
 // (STATE, CACHED_CONFIG, the SQLite connection, ...).
-//
-// Deferred subsystems (provider routing, Codex OAuth, MCP, usage store) are
-// translated and wired but not yet reachable from the core proxy spine, so
-// their items read as dead code until those features are turned on.
-#![allow(dead_code)]
 
 pub mod libs;
 pub mod routes;
