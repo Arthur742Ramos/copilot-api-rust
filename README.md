@@ -189,7 +189,7 @@ Global usage: `copilot-api [GLOBAL OPTIONS] <SUBCOMMAND>`
 | `auth`         | Run authentication flows without starting the server. |
 | `check-usage`  | Show current GitHub Copilot usage / quota information. |
 | `debug`        | Print environment, provider, and path diagnostics. Add `--json` for JSON output. |
-| `mcp`          | Start the MCP `tool_search` bridge server over stdio. |
+| `mcp`          | Start the MCP bridge server over stdio (`tool_search` + `generate_image` tools). |
 
 ### Global options
 
@@ -224,6 +224,36 @@ These apply to every subcommand:
 | `--provider <NAME>` | `copilot` | Provider to log in with: `copilot` or `codex`. |
 | `--verbose` / `-v` | `false` | Enable verbose logging. |
 | `--show-token` | `false` | Show the provider access token on auth. |
+
+## MCP bridge (image generation in Claude Code)
+
+The `mcp` subcommand runs a stdio MCP server exposing a `generate_image` tool, so
+Claude Code (or any MCP host) can generate images natively — you ask in plain
+language and the model calls the tool.
+
+It uses the same Codex (Sign in with ChatGPT) backend as
+`POST /v1/images/generations`, so it requires `copilot-api auth --provider codex`
+first.
+
+Register it with Claude Code once:
+
+```sh
+claude mcp add copilot-images -- copilot-api mcp
+```
+
+Then in a session, just ask: *"generate an image of a red fox in a snowy
+forest"*. The tool returns two things:
+
+- a **saved file** under `<app-data>/images/` (always reliable — you get a PNG on
+  disk regardless of how the host renders it), and
+- the **inline image** as MCP image content, which the host converts into a
+  vision block so the model can see the result and you can iterate ("make it
+  wider", "now at night").
+
+> Note: whether the host forwards the full inline image to the model (vs.
+> truncating it on its MCP output-token cap) is host-dependent; the saved file
+> path is the reliable signal that generation succeeded. As with the HTTP image
+> route, this rides an undocumented Codex backend and may change without notice.
 
 ## Endpoints
 
