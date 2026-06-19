@@ -210,10 +210,26 @@ pub fn stop_premium_interactions_refresh_loop() {
     }
 }
 
+/// Whether either admission-gate knob is configured. The refresher only polls
+/// the shared `/copilot_internal/user` endpoint when at least one knob is set,
+/// so an operator who never opts in pays no background polling (and sees no
+/// warn-log churn on transient failures).
+fn gate_is_configured() -> bool {
+    get_min_premium_interactions_remaining().is_some() || get_block_on_premium_overage()
+}
+
 /// Spawn the background refresher. Mirrors the structure of the token refresh
 /// loop: a single owned task with an abort flag, replacing any prior loop.
+/// No-op when neither guardrail knob is configured, keeping the feature truly
+/// opt-in (re-evaluated whenever this is called, e.g. after a config reload).
 pub fn start_premium_interactions_refresh_loop() {
     stop_premium_interactions_refresh_loop();
+    if !gate_is_configured() {
+        tracing::debug!(
+            "Premium-interaction guardrail unconfigured; not starting the usage refresher"
+        );
+        return;
+    }
     let aborted = Arc::new(AtomicBool::new(false));
     let aborted_clone = aborted.clone();
     let handle = tokio::spawn(async move {
@@ -266,8 +282,13 @@ async fn run_premium_refresh_loop(aborted: Arc<AtomicBool>) {
                         snap.unlimited
                     );
                 } else {
+                    // The plan no longer reports a premium_interactions quota
+                    // (plan change, or GitHub stopped returning it). Clear any
+                    // cached snapshot so the gate fails OPEN on fresh data rather
+                    // than enforcing a stale snapshot indefinitely.
+                    state::with_state_mut(|s| s.premium_interactions = None);
                     tracing::debug!(
-                        "Copilot usage has no premium_interactions snapshot; gate stays a no-op"
+                        "Copilot usage has no premium_interactions snapshot; cleared cache, gate stays a no-op"
                     );
                 }
                 let jitter = (rand::random::<u64>() % PREMIUM_REFRESH_JITTER_MS as u64) as i64;
