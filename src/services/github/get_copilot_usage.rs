@@ -4,6 +4,7 @@ use crate::libs::api_config::{get_github_api_base_url, github_headers};
 use crate::libs::error::{http_error_from_response, HttpError};
 use crate::libs::http::client;
 use crate::libs::state::State;
+use crate::services::copilot::create_responses::null_to_default;
 
 /// Coarse account tier derived from the Copilot plan name. Distinct from
 /// `State.account_type` (a plain string).
@@ -78,21 +79,25 @@ pub async fn get_copilot_account_type(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaDetail {
-    #[serde(default)]
+    // `#[serde(default)]` only covers an *absent* key; an explicit JSON `null`
+    // is a present value and would fail (`invalid type: null, expected f64`),
+    // 500-ing the whole /usage response. `null_to_default` coerces null to the
+    // default so plan/account variation degrades gracefully (cf. commit d28a472).
+    #[serde(default, deserialize_with = "null_to_default")]
     pub entitlement: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub overage_count: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub overage_permitted: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub percent_remaining: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub quota_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub quota_remaining: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub remaining: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub unlimited: bool,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,

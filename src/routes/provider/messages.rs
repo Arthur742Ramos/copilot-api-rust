@@ -232,6 +232,19 @@ async fn handle_openai_responses_provider_messages(
         let upstream_response =
             forward_codex_responses(responses_payload, headers, &provider_config.base_url).await?;
 
+        // forward_codex_responses relays non-401 errors verbatim, so guard the
+        // status here too (mirrors the generic branch below) to avoid wrapping a
+        // 4xx/5xx error body in an HTTP 200.
+        if !upstream_response.status().is_success() {
+            tracing::error!("Failed to create provider responses: {provider}");
+            return Err(http_error_from_response(
+                "Failed to create provider responses",
+                upstream_response,
+            )
+            .await
+            .into());
+        }
+
         if is_stream {
             return Ok(stream_responses_provider_messages(
                 upstream_response,
@@ -302,6 +315,15 @@ async fn handle_openai_responses_provider_web_search_messages(
     let body: ResponsesResult = if is_codex {
         let upstream_response =
             forward_codex_responses(responses_payload, headers, &provider_config.base_url).await?;
+        if !upstream_response.status().is_success() {
+            tracing::error!("Failed to create provider web search responses: {provider}");
+            return Err(http_error_from_response(
+                "Failed to create provider web search responses",
+                upstream_response,
+            )
+            .await
+            .into());
+        }
         let stream = Box::pin(crate::libs::sse::events(upstream_response));
         collect_web_search_responses_stream_result(stream, &error_prefix).await?
     } else {

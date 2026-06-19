@@ -1258,7 +1258,10 @@ fn events_page_inner(
     start_ms: i64,
     end_ms: i64,
 ) -> rusqlite::Result<TokenUsageEventsPage> {
-    let offset = (page - 1) * page_size;
+    // `page` is only lower-bounded (>= 1) by the caller; a huge value would
+    // overflow `(page - 1) * page_size` (panic in debug, wrap in release).
+    // Saturate instead — SQLite simply returns no rows for an out-of-range offset.
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
     with_usage_conn(|conn| {
         let total: i64 = conn.query_row(
             r#"

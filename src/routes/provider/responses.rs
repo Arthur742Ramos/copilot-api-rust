@@ -79,6 +79,19 @@ pub async fn handle_provider_responses_for_provider(
         let upstream_response =
             forward_codex_responses(payload.clone(), &headers, &provider_config.base_url).await?;
 
+        // forward_codex_responses only special-cases 401 (refresh + retry) and
+        // otherwise hands back the live response verbatim, so a 4xx/5xx error
+        // body would otherwise be relayed to the client as HTTP 200. Mirror the
+        // generic branch and surface upstream failures as real errors.
+        if !upstream_response.status().is_success() {
+            return Err(http_error_from_response(
+                format!("Failed to create {provider} responses"),
+                upstream_response,
+            )
+            .await
+            .into());
+        }
+
         // forward_codex_responses returns the live reqwest::Response; the TS
         // `isResponsesStream` check maps to "the request asked to stream".
         if is_stream {
@@ -331,7 +344,10 @@ fn build_proxy_response_from_parts(
             HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            headers.insert(n, v);
+            // append, not insert: insert collapses repeated headers (e.g.
+            // multiple set-cookie) to the last value. Matches the streaming
+            // proxy path in provider_proxy.rs.
+            headers.append(n, v);
         }
     }
 
