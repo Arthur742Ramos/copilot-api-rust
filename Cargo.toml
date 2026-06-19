@@ -1,6 +1,6 @@
 [package]
 name = "copilot-api"
-version = "1.12.6"
+version = "1.12.7"
 edition = "2021"
 description = "OpenAI and Anthropic-compatible gateway for GitHub Copilot or Codex or third-party providers (Rust port)."
 license = "MIT"

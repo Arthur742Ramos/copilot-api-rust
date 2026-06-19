@@ -1057,7 +1057,16 @@ pub fn translate_responses_result_to_anthropic(
         content_blocks
     };
 
-    let stop_reason = map_responses_stop_reason(response, false);
+    // Derive `tool_use` stop_reason from whether a tool_use block was actually
+    // emitted, not from the mere presence of a FunctionCall/ToolSearchCall output
+    // item. A tool call whose id/name decoded to "" (e.g. upstream sent null,
+    // now coerced by `null_to_default`) is dropped by the block builders, so
+    // reporting `tool_use` here would leave stop_reason inconsistent with the
+    // content — a mismatch that can stall agent loops.
+    let has_tool_use = anthropic_content
+        .iter()
+        .any(|b| block_type(b) == Some("tool_use"));
+    let stop_reason = map_responses_stop_reason(response, has_tool_use);
 
     AnthropicResponse {
         id: response.id.clone(),
@@ -1295,24 +1304,18 @@ fn map_responses_stop_reason(response: &ResponsesResult, has_tool_call: bool) ->
     let status = response.status.as_str();
 
     if status == "completed" {
-        if response.output.is_empty() {
-            return Some(
-                if has_tool_call {
-                    "tool_use"
-                } else {
-                    "end_turn"
-                }
-                .to_string(),
-            );
-        }
-
-        let has_call = response.output.iter().any(|item| {
-            matches!(
-                item,
-                ResponseOutputItem::FunctionCall(_) | ResponseOutputItem::ToolSearchCall(_)
-            )
-        });
-        return Some(if has_call { "tool_use" } else { "end_turn" }.to_string());
+        // Consistent with the emitted content: `has_tool_call` reflects whether a
+        // tool_use block was actually produced (see caller), so a FunctionCall /
+        // ToolSearchCall item that was dropped for an empty id/name does not
+        // falsely yield `tool_use`.
+        return Some(
+            if has_tool_call {
+                "tool_use"
+            } else {
+                "end_turn"
+            }
+            .to_string(),
+        );
     }
 
     if status == "incomplete" {
@@ -1710,6 +1713,73 @@ mod tests {
             anthropic.content[1].get("text").and_then(Value::as_str),
             Some("the answer")
         );
+    }
+
+    #[test]
+    fn dropped_tool_call_keeps_stop_reason_consistent() {
+        use crate::services::copilot::create_responses::ResponseOutputFunctionCall;
+
+        // A function_call whose call_id/name decoded to "" (upstream sent null,
+        // now coerced by null_to_default) is dropped by the tool_use block
+        // builder. stop_reason must then be `end_turn`, NOT `tool_use`, so the
+        // Anthropic response stays internally consistent (no tool_use stop with
+        // zero tool_use blocks). Regression for PR #83 Copilot review.
+        let result = ResponsesResult {
+            id: "resp_x".to_string(),
+            model: "claude-opus-4-8".to_string(),
+            status: "completed".to_string(),
+            output: vec![ResponseOutputItem::FunctionCall(
+                ResponseOutputFunctionCall {
+                    id: None,
+                    item_type: "function_call".to_string(),
+                    call_id: String::new(),
+                    name: String::new(),
+                    arguments: "{}".to_string(),
+                    status: None,
+                    namespace: None,
+                },
+            )],
+            ..Default::default()
+        };
+
+        let anthropic = translate_responses_result_to_anthropic(&result, None);
+        assert!(
+            !anthropic
+                .content
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")),
+            "empty-id tool call must not emit a tool_use block"
+        );
+        assert_eq!(anthropic.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn valid_tool_call_still_reports_tool_use() {
+        use crate::services::copilot::create_responses::ResponseOutputFunctionCall;
+
+        let result = ResponsesResult {
+            id: "resp_y".to_string(),
+            status: "completed".to_string(),
+            output: vec![ResponseOutputItem::FunctionCall(
+                ResponseOutputFunctionCall {
+                    id: None,
+                    item_type: "function_call".to_string(),
+                    call_id: "call_1".to_string(),
+                    name: "list_files".to_string(),
+                    arguments: "{}".to_string(),
+                    status: None,
+                    namespace: None,
+                },
+            )],
+            ..Default::default()
+        };
+
+        let anthropic = translate_responses_result_to_anthropic(&result, None);
+        assert!(anthropic
+            .content
+            .iter()
+            .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")));
+        assert_eq!(anthropic.stop_reason.as_deref(), Some("tool_use"));
     }
 
     #[test]
