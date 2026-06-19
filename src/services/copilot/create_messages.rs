@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use once_cell::sync::Lazy;
+
 use axum::http::HeaderMap;
 use serde_json::Value;
 
@@ -25,13 +27,18 @@ const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 /// so it must survive the allowlist filter below.
 pub const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
 
-fn allowed_anthropic_betas() -> HashSet<&'static str> {
+// Built once for the process lifetime rather than re-allocated on every request.
+static ALLOWED_ANTHROPIC_BETAS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
         INTERLEAVED_THINKING_BETA,
         CONTEXT_MANAGEMENT_BETA,
         ADVANCED_TOOL_USE_BETA,
         CONTEXT_1M_BETA,
     ])
+});
+
+fn allowed_anthropic_betas() -> &'static HashSet<&'static str> {
+    &ALLOWED_ANTHROPIC_BETAS
 }
 
 /// Options for `create_messages`, mirroring the TS options object.

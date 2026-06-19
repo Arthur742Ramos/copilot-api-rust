@@ -180,7 +180,11 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn parse_record(record: &str) -> Option<SseEvent> {
     let mut id: Option<String> = None;
     let mut event: Option<String> = None;
-    let mut data_lines: Vec<String> = Vec::new();
+    // Build the data payload in place: avoids a per-event Vec allocation plus the
+    // extra String copy that `join("\n")` performs (this runs once per SSE event,
+    // i.e. per streamed token delta). Equivalent to joining the data lines with
+    // '\n'.
+    let mut data = String::new();
     let mut saw_data = false;
 
     for raw_line in record.split('\n') {
@@ -207,7 +211,10 @@ fn parse_record(record: &str) -> Option<SseEvent> {
 
         match field {
             "data" => {
-                data_lines.push(value.to_string());
+                if saw_data {
+                    data.push('\n');
+                }
+                data.push_str(value);
                 saw_data = true;
             }
             "event" => {
@@ -229,11 +236,7 @@ fn parse_record(record: &str) -> Option<SseEvent> {
         return None;
     }
 
-    Some(SseEvent {
-        id,
-        event,
-        data: data_lines.join("\n"),
-    })
+    Some(SseEvent { id, event, data })
 }
 
 /// Decode a `reqwest::Response` byte stream into a stream of [`SseEvent`]s.

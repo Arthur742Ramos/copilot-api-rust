@@ -1,3 +1,6 @@
+use once_cell::sync::Lazy;
+use regex::Regex;
+
 use crate::libs::state;
 use crate::services::copilot::get_models::Model;
 
@@ -43,20 +46,18 @@ pub fn find_endpoint_model(sdk_model_id: &str) -> Option<Model> {
     // that. The beta header carrying the variant is injected separately.
     let sdk_model_id = strip_context_1m_suffix(sdk_model_id);
 
-    let models = state::with_state(|s| {
-        s.models
-            .as_ref()
-            .map(|m| m.data.clone())
-            .unwrap_or_default()
-    });
+    // Clone the `Arc<ModelsResponse>` (cheap) rather than deep-cloning the whole
+    // model catalog; only the single matched `Model` is cloned out.
+    let models = state::with_state(|s| s.models.clone())?;
+    let data = &models.data;
 
-    if let Some(exact) = models.iter().find(|m| m.id == sdk_model_id) {
+    if let Some(exact) = data.iter().find(|m| m.id == sdk_model_id) {
         return Some(exact.clone());
     }
 
     let normalized = normalize_sdk_model_id(sdk_model_id)?;
     let model_name = format!("claude-{}-{}", normalized.family, normalized.version);
-    models.into_iter().find(|m| m.id == model_name)
+    data.iter().find(|m| m.id == model_name).cloned()
 }
 
 fn strip_date_suffix(lower: &str) -> &str {
@@ -77,35 +78,35 @@ pub fn normalize_sdk_model_id(sdk_model_id: &str) -> Option<NormalizedSdkModelId
     let without_date = strip_date_suffix(&lower);
 
     // Pattern 1: claude-{family}-{major}.{minor}
-    if let Some(c) = regex_match(without_date, r"^claude-(\w+)-(\d+)\.(\d+)$") {
+    if let Some(c) = regex_captures(&CLAUDE_FAMILY_MAJOR_DOT_MINOR, without_date) {
         return Some(NormalizedSdkModelId {
             family: c[0].clone(),
             version: format!("{}.{}", c[1], c[2]),
         });
     }
     // Pattern 2: claude-{family}-{major}-{minor}
-    if let Some(c) = regex_match(without_date, r"^claude-(\w+)-(\d+)-(\d+)$") {
+    if let Some(c) = regex_captures(&CLAUDE_FAMILY_MAJOR_DASH_MINOR, without_date) {
         return Some(NormalizedSdkModelId {
             family: c[0].clone(),
             version: format!("{}.{}", c[1], c[2]),
         });
     }
     // Pattern 3: claude-{major}-{minor}-{family}
-    if let Some(c) = regex_match(without_date, r"^claude-(\d+)-(\d+)-(\w+)$") {
+    if let Some(c) = regex_captures(&CLAUDE_MAJOR_MINOR_FAMILY, without_date) {
         return Some(NormalizedSdkModelId {
             family: c[2].clone(),
             version: format!("{}.{}", c[0], c[1]),
         });
     }
     // Pattern 4: claude-{family}-{major}
-    if let Some(c) = regex_match(without_date, r"^claude-(\w+)-(\d+)$") {
+    if let Some(c) = regex_captures(&CLAUDE_FAMILY_MAJOR, without_date) {
         return Some(NormalizedSdkModelId {
             family: c[0].clone(),
             version: c[1].clone(),
         });
     }
     // Pattern 5: claude-{major}-{family}
-    if let Some(c) = regex_match(without_date, r"^claude-(\d+)-(\w+)$") {
+    if let Some(c) = regex_captures(&CLAUDE_MAJOR_FAMILY, without_date) {
         return Some(NormalizedSdkModelId {
             family: c[1].clone(),
             version: c[0].clone(),
@@ -114,8 +115,21 @@ pub fn normalize_sdk_model_id(sdk_model_id: &str) -> Option<NormalizedSdkModelId
     None
 }
 
-fn regex_match(haystack: &str, pattern: &str) -> Option<Vec<String>> {
-    let re = regex::Regex::new(pattern).ok()?;
+// The five normalization patterns, compiled once for the process lifetime
+// instead of on every model resolution (a per-request hot path). Mirrors the
+// `SUPPORTS_MODEL_RE` convention in tool_search.rs.
+static CLAUDE_FAMILY_MAJOR_DOT_MINOR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^claude-(\w+)-(\d+)\.(\d+)$").expect("valid regex"));
+static CLAUDE_FAMILY_MAJOR_DASH_MINOR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^claude-(\w+)-(\d+)-(\d+)$").expect("valid regex"));
+static CLAUDE_MAJOR_MINOR_FAMILY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^claude-(\d+)-(\d+)-(\w+)$").expect("valid regex"));
+static CLAUDE_FAMILY_MAJOR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^claude-(\w+)-(\d+)$").expect("valid regex"));
+static CLAUDE_MAJOR_FAMILY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^claude-(\d+)-(\w+)$").expect("valid regex"));
+
+fn regex_captures(re: &Regex, haystack: &str) -> Option<Vec<String>> {
     let caps = re.captures(haystack)?;
     Some(
         caps.iter()
