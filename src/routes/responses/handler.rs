@@ -300,6 +300,16 @@ fn sniff_responses_usage(data: &str) -> Option<crate::libs::token_usage::UsageTo
     if data.is_empty() || data == "[DONE]" {
         return None;
     }
+    // Cheap substring pre-filter so the (overwhelmingly common) delta/reasoning
+    // events skip the full JSON parse — usage only ever rides on the three
+    // terminal event types. fix_stream_ids parses the data again downstream, so
+    // for non-terminal events this avoids a redundant second deserialization.
+    if !(data.contains("response.completed")
+        || data.contains("response.failed")
+        || data.contains("response.incomplete"))
+    {
+        return None;
+    }
     let parsed: Value = serde_json::from_str(data).ok()?;
     let event_type = parsed.get("type").and_then(Value::as_str)?;
     if !matches!(

@@ -299,8 +299,8 @@ pub fn parse_user_id_metadata(user_id: Option<&str>) -> UserIdMetadata {
         }
     };
 
-    let legacy_safety = regex_capture(user_id, r"user_([^_]+)_account");
-    let legacy_session = regex_capture(user_id, r"_session_(.+)$");
+    let legacy_safety = regex_capture(&LEGACY_SAFETY_RE, user_id);
+    let legacy_session = regex_capture(&LEGACY_SESSION_RE, user_id);
 
     let parsed: Option<serde_json::Value> = if legacy_safety.is_some() && legacy_session.is_some() {
         None
@@ -353,8 +353,13 @@ pub fn get_root_session_id(
     session_id.map(|s| get_uuid(&s))
 }
 
-fn regex_capture(haystack: &str, pattern: &str) -> Option<String> {
-    let re = regex::Regex::new(pattern).ok()?;
+// Compiled once instead of on every `parse_user_id_metadata` call (per request).
+static LEGACY_SAFETY_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"user_([^_]+)_account").expect("valid regex"));
+static LEGACY_SESSION_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"_session_(.+)$").expect("valid regex"));
+
+fn regex_capture(re: &regex::Regex, haystack: &str) -> Option<String> {
     re.captures(haystack)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
