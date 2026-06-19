@@ -17,9 +17,10 @@ pub async fn poll_access_token(device_code: &DeviceCodeResponse) -> Result<Strin
     let app_config = get_oauth_app_config();
     let urls = get_oauth_urls();
 
-    // Interval is seconds; +1 second of safety margin, then to milliseconds.
+    // Interval is seconds; +1 second of safety margin. `interval` is
+    // upstream-provided, so use saturating arithmetic to avoid a u64 overflow.
     // `mut` so a GitHub `slow_down` response can extend the backoff.
-    let mut sleep_duration = Duration::from_millis((device_code.interval + 1) * 1000);
+    let mut sleep_duration = Duration::from_secs(device_code.interval.saturating_add(1));
     // GitHub's verification code expires after `expires_in` seconds; stop polling
     // once it elapses so we never wait on a code the user can no longer redeem.
     let deadline = Instant::now() + Duration::from_secs(device_code.expires_in);
