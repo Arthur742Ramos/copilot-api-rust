@@ -147,40 +147,11 @@ pub async fn create_messages(
 
     let is_initiate = is_initiate_request(payload);
 
-    let mut headers: HeaderMap = copilot_headers(&st, Some(options.request_id), enable_vision);
-    set_header(
-        &mut headers,
-        "x-initiator",
-        if is_initiate { "user" } else { "agent" },
-    );
-
-    prepare_interaction_headers(
-        options.session_id,
-        options.subagent_marker.is_some(),
-        &mut headers,
-    );
-
-    prepare_for_compact(&mut headers, options.compact_type);
-
     let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
     let parsed = parse_user_id_metadata(user_id);
-
-    // claude-opus-4.8 is excluded: Copilot's upstream WAF returns a generic
-    // "Access to this endpoint is forbidden" 403 whenever a request carries
-    // the Claude-Code-style user-agent without a `copilot-integration-id`
-    // header. The exact same header set is accepted on claude-opus-4.7, so
-    // the gate is a model-id rollout gap on Copilot's side. Skipping the
-    // rewrite for 4.8 keeps the default Copilot identity
-    // (copilot-integration-id: vscode-chat + GitHubCopilotChat UA +
-    // conversation-agent intent) in place; that path is 200. Remove this
-    // skip once Copilot's upstream accepts the Claude-Code identity on 4.8.
-    // Probed 2026-05-29.
-    if parsed.safety_identifier.is_some()
+    let use_message_proxy = parsed.safety_identifier.is_some()
         && parsed.session_id.is_some()
-        && payload.model != "claude-opus-4.8"
-    {
-        prepare_message_proxy_headers(&mut headers);
-    }
+        && payload.model != "claude-opus-4.8";
 
     // align with vscode copilot extension anthropic-beta
     let anthropic_beta = build_anthropic_beta_header(
@@ -188,23 +159,55 @@ pub async fn create_messages(
         payload.thinking.as_ref(),
         &payload.model,
     );
-    if let Some(beta) = anthropic_beta {
-        set_header(&mut headers, "anthropic-beta", &beta);
-    }
 
     tracing::info!("<-- model: {}", payload.model);
 
     let base = copilot_base_url(&st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    let request = client()
-        .post(format!("{base}/v1/messages"))
-        .headers(headers)
-        .body(body);
-    let response = crate::libs::http::send_with_retry(
-        request,
+    // Auth headers are rebuilt from current state per attempt so the single
+    // 401-triggered replay carries the inline-refreshed token.
+    let build = || {
+        let st = state::snapshot();
+        let mut headers: HeaderMap = copilot_headers(&st, Some(options.request_id), enable_vision);
+        set_header(
+            &mut headers,
+            "x-initiator",
+            if is_initiate { "user" } else { "agent" },
+        );
+        prepare_interaction_headers(
+            options.session_id,
+            options.subagent_marker.is_some(),
+            &mut headers,
+        );
+        prepare_for_compact(&mut headers, options.compact_type);
+
+        // claude-opus-4.8 is excluded: Copilot's upstream WAF returns a generic
+        // "Access to this endpoint is forbidden" 403 whenever a request carries
+        // the Claude-Code-style user-agent without a `copilot-integration-id`
+        // header. The exact same header set is accepted on claude-opus-4.7, so
+        // the gate is a model-id rollout gap on Copilot's side. Skipping the
+        // rewrite for 4.8 keeps the default Copilot identity
+        // (copilot-integration-id: vscode-chat + GitHubCopilotChat UA +
+        // conversation-agent intent) in place; that path is 200. Remove this
+        // skip once Copilot's upstream accepts the Claude-Code identity on 4.8.
+        // Probed 2026-05-29.
+        if use_message_proxy {
+            prepare_message_proxy_headers(&mut headers);
+        }
+
+        if let Some(beta) = anthropic_beta.as_deref() {
+            set_header(&mut headers, "anthropic-beta", beta);
+        }
+
+        client()
+            .post(format!("{base}/v1/messages"))
+            .headers(headers)
+            .body(body.clone())
+    };
+    let response = crate::libs::token::send_copilot_with_401_retry(
         crate::libs::http::retry_endpoint::MESSAGES,
-        crate::libs::http::RetryPolicy::from_env(),
+        build,
     )
     .await
     .map_err(|e| {

@@ -50,34 +50,36 @@ pub async fn create_chat_completions(
         .map(|m| m.role == "assistant" || m.role == "tool")
         .unwrap_or(false);
 
-    let mut headers: HeaderMap = copilot_headers(&st, Some(&options.request_id), enable_vision);
-    set_header(
-        &mut headers,
-        "x-initiator",
-        if is_agent_call { "agent" } else { "user" },
-    );
-
-    prepare_interaction_headers(
-        options.session_id.as_deref(),
-        options.subagent_marker.is_some(),
-        &mut headers,
-    );
-
-    prepare_for_compact(&mut headers, options.compact_type);
-
     tracing::info!("<-- model: {}", payload.model);
 
     let base = copilot_base_url(&st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    let request = client()
-        .post(format!("{base}/chat/completions"))
-        .headers(headers)
-        .body(body);
-    let response = crate::libs::http::send_with_retry(
-        request,
+    // The request (auth headers in particular) is rebuilt from current state on
+    // every attempt so a 401-triggered inline token refresh is picked up on the
+    // single replay. Non-auth header inputs are captured by reference.
+    let build = || {
+        let st = state::snapshot();
+        let mut headers: HeaderMap = copilot_headers(&st, Some(&options.request_id), enable_vision);
+        set_header(
+            &mut headers,
+            "x-initiator",
+            if is_agent_call { "agent" } else { "user" },
+        );
+        prepare_interaction_headers(
+            options.session_id.as_deref(),
+            options.subagent_marker.is_some(),
+            &mut headers,
+        );
+        prepare_for_compact(&mut headers, options.compact_type);
+        client()
+            .post(format!("{base}/chat/completions"))
+            .headers(headers)
+            .body(body.clone())
+    };
+    let response = crate::libs::token::send_copilot_with_401_retry(
         crate::libs::http::retry_endpoint::CHAT,
-        crate::libs::http::RetryPolicy::from_env(),
+        build,
     )
     .await
     .map_err(|e| {

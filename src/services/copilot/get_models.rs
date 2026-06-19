@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 
 use crate::libs::api_config::{copilot_base_url, copilot_models_headers};
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::{client, read_json_capped, retry_endpoint, send_with_retry, RetryPolicy};
+use crate::libs::http::{client, read_json_capped, retry_endpoint};
 use crate::libs::metrics::{record_upstream_request, UpstreamStatus};
 use crate::libs::state;
 
@@ -11,10 +11,16 @@ pub async fn get_models() -> Result<ModelsResponse, HttpError> {
     let st = state::snapshot();
     let base = copilot_base_url(&st);
     tracing::info!("Fetching models from {base}/models");
-    let headers = copilot_models_headers(&st);
     let upstream_start = std::time::Instant::now();
-    let request = client().get(format!("{base}/models")).headers(headers);
-    let response = send_with_retry(request, retry_endpoint::MODELS, RetryPolicy::from_env())
+    // Rebuild auth headers from current state per attempt so a 401-triggered
+    // inline token refresh is picked up on the single replay.
+    let build = || {
+        let st = state::snapshot();
+        client()
+            .get(format!("{base}/models"))
+            .headers(copilot_models_headers(&st))
+    };
+    let response = crate::libs::token::send_copilot_with_401_retry(retry_endpoint::MODELS, build)
         .await
         .map_err(|e| {
             record_upstream_request(

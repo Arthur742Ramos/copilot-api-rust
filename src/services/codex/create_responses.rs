@@ -322,7 +322,6 @@ pub async fn forward_codex_responses(
 
     normalize_codex_responses_payload(&mut payload);
 
-    let headers = build_codex_responses_headers(request_headers, payload.stream)?;
     let url = resolve_codex_responses_url(base_url);
     // SSRF: when the operator has configured a custom Codex base URL it is
     // runtime-settable and therefore untrusted; validate it before forwarding.
@@ -335,14 +334,47 @@ pub async fn forward_codex_responses(
         HttpError::internal(format!("Failed to serialize codex responses payload: {e}"))
     })?;
 
-    let request = client().post(url).headers(headers).body(body);
-    let response = crate::libs::http::send_with_retry(
-        request,
-        crate::libs::http::retry_endpoint::CODEX,
-        crate::libs::http::RetryPolicy::from_env(),
-    )
-    .await
-    .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
+    // Inline 401 recovery: a stale/revoked Codex oauth token self-heals on the
+    // request that hit it. Codex auth is a DISTINCT path from the Copilot token
+    // (oauth2 access token), so it force-refreshes the Codex credential. The 401
+    // is read off the status line before any body streams, so replaying once is
+    // safe (no partial, already-billed generation is dropped). Unlike the HTTP
+    // call sites we build headers inline here because the auth-context lookup is
+    // fallible (`?`); the replay rebuilds them so it carries the fresh token.
+    let stale = state::with_state(|s| s.codex_access_token.clone()).unwrap_or_default();
+    let send = |headers: reqwest::header::HeaderMap| {
+        let request = client().post(&url).headers(headers).body(body.clone());
+        crate::libs::http::send_with_retry(
+            request,
+            crate::libs::http::retry_endpoint::CODEX,
+            crate::libs::http::RetryPolicy::from_env(),
+        )
+    };
+
+    let headers = build_codex_responses_headers(request_headers, payload.stream)?;
+    let response = send(headers)
+        .await
+        .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
+
+    if response.status().as_u16() != 401 {
+        return Ok(response);
+    }
+
+    tracing::warn!("codex upstream 401; attempting inline credential refresh + single replay");
+    if crate::libs::token::force_refresh_codex_token(&stale)
+        .await
+        .is_err()
+    {
+        // Refresh failed: surface the original 401 unchanged.
+        return Ok(response);
+    }
+
+    metrics::counter!("copilot_token_401_replay_total", "endpoint" => crate::libs::http::retry_endpoint::CODEX)
+        .increment(1);
+    let headers = build_codex_responses_headers(request_headers, payload.stream)?;
+    let response = send(headers)
+        .await
+        .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
 
     Ok(response)
 }

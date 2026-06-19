@@ -777,12 +777,22 @@ pub async fn create_responses(
     }
 
     let stream = payload.stream.unwrap_or(false);
-    create_http_responses(&payload, &st, headers, stream).await
+    create_http_responses(&payload, &st, &options, stream).await
 }
 
 /// Build and drive the pooled websocket `/responses` transport, returning a
 /// decoded SSE event stream identical in shape to the HTTP path. Mirrors
 /// `prepareResponsesWebSocketRequest` + `createPooledResponsesWebSocketStream`.
+///
+/// INLINE 401 RECOVERY LIMITATION: unlike the HTTP call sites, this path does
+/// NOT perform an inline refresh-and-replay on a 401. The pooled websocket
+/// transport is not a simple idempotent HTTP resend — a handshake/auth failure
+/// surfaces as an opaque stream `io::Error` (not an observable HTTP status), the
+/// socket is shared across requests via the pool, and a frame may already have
+/// been written, so a transparent replay could double-charge or corrupt pool
+/// state. The background refresh loop still keeps the token fresh, and the
+/// 60s `EARLY_REFRESH_BUFFER` makes expiry-driven 401s rare here; a websocket
+/// auth failure is surfaced to the client to retry rather than auto-replayed.
 #[allow(clippy::result_large_err)]
 fn create_web_socket_responses(
     payload: &ResponsesPayload,
@@ -903,23 +913,37 @@ fn is_terminal_ws_chunk(chunk: &crate::libs::sse::SseEvent) -> bool {
 /// Mirrors `createHttpResponses`: POST `{copilotBaseUrl}/responses`, log rate
 /// limits, error on non-2xx, then either hand back the streaming response or
 /// parse the buffered JSON body.
+///
+/// Auth headers are rebuilt from current state on each send attempt (via the
+/// `build` closure) so the single 401-triggered inline-refresh replay carries
+/// the freshly-rotated Copilot token.
 async fn create_http_responses(
     payload: &ResponsesPayload,
     st: &state::State,
-    headers: HeaderMap,
+    options: &ResponsesRequestOptions<'_>,
     stream: bool,
 ) -> Result<CreateResponsesReturn, HttpError> {
     let base = copilot_base_url(st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    let request = client()
-        .post(format!("{base}/responses"))
-        .headers(headers)
-        .body(body);
-    let response = crate::libs::http::send_with_retry(
-        request,
+    let build = || {
+        let st = state::snapshot();
+        let mut headers: HeaderMap = copilot_headers(&st, Some(options.request_id), options.vision);
+        set_header(&mut headers, "x-initiator", options.initiator);
+        prepare_interaction_headers(
+            options.session_id,
+            options.subagent_marker.is_some(),
+            &mut headers,
+        );
+        prepare_for_compact(&mut headers, options.compact_type);
+        client()
+            .post(format!("{base}/responses"))
+            .headers(headers)
+            .body(body.clone())
+    };
+    let response = crate::libs::token::send_copilot_with_401_retry(
         crate::libs::http::retry_endpoint::RESPONSES,
-        crate::libs::http::RetryPolicy::from_env(),
+        build,
     )
     .await
     .map_err(|e| {
