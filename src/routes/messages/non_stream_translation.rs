@@ -645,13 +645,19 @@ fn image_url_from_source(source: Option<&Value>) -> Result<String, AppError> {
         .unwrap_or("base64");
 
     match source_type {
-        "url" => source
-            .and_then(|s| s.get("url"))
-            .and_then(|u| u.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                AppError::BadRequest("Image source of type \"url\" is missing \"url\"".to_string())
-            }),
+        "url" => {
+            let url = source
+                .and_then(|s| s.get("url"))
+                .and_then(|u| u.as_str())
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Image source of type \"url\" is missing \"url\"".to_string(),
+                    )
+                })?;
+            Ok(url.to_string())
+        }
         "file" => Err(AppError::BadRequest(
             "Image source of type \"file\" (Files API ids) is not supported".to_string(),
         )),
@@ -659,12 +665,17 @@ fn image_url_from_source(source: Option<&Value>) -> Result<String, AppError> {
             let media_type = source
                 .and_then(|s| s.get("media_type"))
                 .and_then(|m| m.as_str())
-                .unwrap_or("");
+                .filter(|m| !m.is_empty());
             let data = source
                 .and_then(|s| s.get("data"))
                 .and_then(|d| d.as_str())
-                .unwrap_or("");
-            Ok(format!("data:{media_type};base64,{data}"))
+                .filter(|d| !d.is_empty());
+            match (media_type, data) {
+                (Some(media_type), Some(data)) => Ok(format!("data:{media_type};base64,{data}")),
+                _ => Err(AppError::BadRequest(
+                    "Base64 image source is missing \"media_type\" or \"data\"".to_string(),
+                )),
+            }
         }
         other => Err(AppError::BadRequest(format!(
             "Unsupported image source type \"{other}\""
@@ -1118,6 +1129,28 @@ mod tests {
         let parts = out.messages[0].content.as_ref().unwrap();
         assert_eq!(parts[0]["type"], "image_url");
         assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn image_base64_missing_or_empty_fields_is_rejected() {
+        // Empty media_type/data (or a blank url) must 400 instead of building a
+        // corrupt `data:;base64,` URL — the whole point of this fix.
+        for source in [
+            json!({ "type": "base64", "media_type": "image/png" }),
+            json!({ "type": "base64", "media_type": "", "data": "AAAA" }),
+            json!({ "type": "url", "url": "" }),
+        ] {
+            let payload = AnthropicMessagesPayload {
+                model: "gpt-4o".to_string(),
+                messages: vec![user_message(json!([
+                    { "type": "image", "source": source },
+                ]))],
+                max_tokens: Some(100),
+                ..Default::default()
+            };
+            let err = translate_to_openai(&payload).unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "source rejected");
+        }
     }
 
     #[test]

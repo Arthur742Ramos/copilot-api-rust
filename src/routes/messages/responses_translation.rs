@@ -509,23 +509,13 @@ fn create_image_content(block: &Value) -> Result<ResponseInputImage, AppError> {
         .unwrap_or("base64");
 
     let image_url = match source_type {
-        "url" => source
-            .and_then(|s| s.get("url"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                AppError::BadRequest("Image source of type \"url\" is missing \"url\"".to_string())
-            })?,
+        "url" => url_source(source, "Image")?,
         "file" => {
             return Err(AppError::BadRequest(
                 "Image source of type \"file\" (Files API ids) is not supported".to_string(),
             ));
         }
-        "base64" => {
-            let media_type = source_field(block, "media_type");
-            let data = source_field(block, "data");
-            format!("data:{media_type};base64,{data}")
-        }
+        "base64" => base64_data_url(block, "image")?,
         other => {
             return Err(AppError::BadRequest(format!(
                 "Unsupported image source type \"{other}\""
@@ -555,25 +545,13 @@ fn create_file_content(block: &Value) -> Result<ResponseInputFile, AppError> {
         .to_string();
 
     let file_data = match source_type {
-        "url" => source
-            .and_then(|s| s.get("url"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "Document source of type \"url\" is missing \"url\"".to_string(),
-                )
-            })?,
+        "url" => url_source(source, "Document")?,
         "file" => {
             return Err(AppError::BadRequest(
                 "Document source of type \"file\" (Files API ids) is not supported".to_string(),
             ));
         }
-        "base64" => {
-            let media_type = source_field(block, "media_type");
-            let data = source_field(block, "data");
-            format!("data:{media_type};base64,{data}")
-        }
+        "base64" => base64_data_url(block, "document")?,
         other => {
             return Err(AppError::BadRequest(format!(
                 "Unsupported document source type \"{other}\""
@@ -589,13 +567,45 @@ fn create_file_content(block: &Value) -> Result<ResponseInputFile, AppError> {
     })
 }
 
-fn source_field(block: &Value, field: &str) -> String {
+/// A trimmed, non-empty `source.<field>` string, or `None` when absent/blank.
+fn source_field_opt<'a>(block: &'a Value, field: &str) -> Option<&'a str> {
     block
         .get("source")
         .and_then(|s| s.get(field))
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// Extract a non-empty `url` from a `url` source, rejecting a missing/blank URL
+/// with a 400 rather than forwarding an empty image/file reference upstream.
+#[allow(clippy::result_large_err)]
+fn url_source(source: Option<&Value>, kind: &str) -> Result<String, AppError> {
+    let url = source
+        .and_then(|s| s.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("{kind} source of type \"url\" is missing \"url\""))
+        })?;
+    Ok(url.to_string())
+}
+
+/// Build a `data:` URL from a base64 source, rejecting missing/empty
+/// `media_type`/`data` with a 400 instead of emitting a corrupt
+/// `data:;base64,` payload.
+#[allow(clippy::result_large_err)]
+fn base64_data_url(block: &Value, kind: &str) -> Result<String, AppError> {
+    match (
+        source_field_opt(block, "media_type"),
+        source_field_opt(block, "data"),
+    ) {
+        (Some(media_type), Some(data)) => Ok(format!("data:{media_type};base64,{data}")),
+        _ => Err(AppError::BadRequest(format!(
+            "Base64 {kind} source is missing \"media_type\" or \"data\""
+        ))),
+    }
 }
 
 fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
@@ -1445,6 +1455,31 @@ mod tests {
         });
         let err = create_image_content(&block).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn image_content_base64_missing_fields_is_rejected() {
+        // Missing data, empty media_type, and blank url must all 400 rather than
+        // emit a corrupt `data:;base64,` / empty image reference upstream.
+        for block in [
+            json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png" } }),
+            json!({ "type": "image", "source": { "type": "base64", "media_type": "", "data": "AAAA" } }),
+            json!({ "type": "image", "source": { "type": "url", "url": "   " } }),
+        ] {
+            let err = create_image_content(&block).unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "block: {block}");
+        }
+    }
+
+    #[test]
+    fn file_content_base64_missing_fields_is_rejected() {
+        for block in [
+            json!({ "type": "document", "source": { "type": "base64", "data": "" } }),
+            json!({ "type": "document", "source": { "type": "url", "url": "" } }),
+        ] {
+            let err = create_file_content(&block).unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "block: {block}");
+        }
     }
 
     #[test]
