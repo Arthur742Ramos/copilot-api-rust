@@ -1308,7 +1308,14 @@ fn map_responses_stop_reason(response: &ResponsesResult, has_tool_call: bool) ->
         // tool_use block was actually produced (see caller), so a FunctionCall /
         // ToolSearchCall item that was dropped for an empty id/name does not
         // falsely yield `tool_use`.
-        return Some(if has_tool_call { "tool_use" } else { "end_turn" }.to_string());
+        return Some(
+            if has_tool_call {
+                "tool_use"
+            } else {
+                "end_turn"
+            }
+            .to_string(),
+        );
     }
 
     if status == "incomplete" {
