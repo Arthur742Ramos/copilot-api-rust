@@ -196,7 +196,25 @@ fn stream_responses_sse(
         futures_util::pin_mut!(event_stream);
 
         use futures_util::StreamExt;
-        while let Some(item) = event_stream.next().await {
+        let heartbeat = crate::libs::sse::sse_heartbeat_interval();
+        loop {
+            let item = match heartbeat {
+                Some(interval) => match tokio::time::timeout(interval, event_stream.next()).await {
+                    Ok(next) => next,
+                    // Idle-but-alive upstream (its read_timeout still bounds a
+                    // truly wedged connection): emit a comment keep-alive so
+                    // sub-120s intermediaries don't drop the stream. A comment is
+                    // not content, so it must not touch the timer/TTFT accounting.
+                    Err(_) => {
+                        yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(
+                            crate::libs::sse::SSE_COMMENT_PING,
+                        ));
+                        continue;
+                    }
+                },
+                None => event_stream.next().await,
+            };
+            let Some(item) = item else { break };
             let ev = match item {
                 Ok(ev) => ev,
                 Err(err) => {
@@ -382,6 +400,74 @@ fn get_trimmed_header(headers: &HeaderMap, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Env-mutating heartbeat tests share the `COPILOT_API_SSE_HEARTBEAT_SECS`
+    /// process-global, so they run serially (via `serial_test`) to avoid races.
+    #[test]
+    #[serial_test::serial(sse_heartbeat_env)]
+    fn heartbeat_interval_env_override() {
+        std::env::set_var("COPILOT_API_SSE_HEARTBEAT_SECS", "0");
+        assert!(crate::libs::sse::sse_heartbeat_interval().is_none());
+        std::env::set_var("COPILOT_API_SSE_HEARTBEAT_SECS", "7");
+        assert_eq!(
+            crate::libs::sse::sse_heartbeat_interval(),
+            Some(std::time::Duration::from_secs(7))
+        );
+        std::env::remove_var("COPILOT_API_SSE_HEARTBEAT_SECS");
+        assert_eq!(
+            crate::libs::sse::sse_heartbeat_interval(),
+            Some(std::time::Duration::from_secs(
+                crate::libs::sse::DEFAULT_SSE_HEARTBEAT_SECS
+            ))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(sse_heartbeat_env)]
+    async fn idle_responses_stream_emits_comment_heartbeats() {
+        std::env::set_var("COPILOT_API_SSE_HEARTBEAT_SECS", "10");
+
+        // Upstream stays silent for 25 virtual seconds, then emits one real event
+        // and ends. With a 10s heartbeat that idle gap must produce comment pings
+        // BEFORE the real frame, and the pings must not appear after the stream
+        // ends (a None read resolves immediately, breaking the loop).
+        let upstream: crate::services::copilot::create_responses::ResponsesEventStream =
+            Box::pin(async_stream::stream! {
+                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                yield Ok(crate::libs::sse::SseEvent {
+                    id: None,
+                    event: Some("response.created".to_string()),
+                    data: "{\"type\":\"response.created\"}".to_string(),
+                });
+            });
+
+        let recorder = crate::libs::token_usage::create_copilot_token_usage_recorder(
+            "responses",
+            "m".to_string(),
+            None,
+        );
+        let response = stream_responses_sse(upstream, recorder);
+        std::env::remove_var("COPILOT_API_SSE_HEARTBEAT_SECS");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // The 25s idle gap (heartbeat = 10s) must surface at least one comment
+        // ping, emitted BEFORE the real frame. The exact count depends on the
+        // paused-clock auto-advance granularity, so we assert presence + ordering
+        // rather than a brittle exact tally.
+        let ping_count = text.matches(":\n\n").count();
+        assert!(ping_count >= 1, "expected >=1 heartbeat ping, got {text:?}");
+        let first_data = text.find("data: ").expect("real data frame present");
+        let first_ping = text.find(":\n\n").expect("ping present");
+        assert!(
+            first_ping < first_data,
+            "heartbeat must precede the first real frame: {text:?}"
+        );
+        assert!(text.contains("response.created"));
+    }
 
     fn payload_with_tools(tools: Value) -> ResponsesPayload {
         let mut value = json!({ "model": "gpt-5" });

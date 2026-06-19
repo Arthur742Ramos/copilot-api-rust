@@ -3,8 +3,42 @@
 //! Mirrors the TS `fetch-event-stream` `events()` helper used pervasively by the
 //! streaming provider paths. Callers JSON-parse `SseEvent::data` themselves.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+
+/// Default interval between proxy-injected SSE heartbeat frames (seconds).
+///
+/// Long model "thinking" gaps can leave a streaming response idle-but-alive for
+/// tens of seconds. Intermediaries (nginx, ALB, ...) with sub-120s idle timeouts
+/// tear such a connection down even though the upstream is still working, so the
+/// proxy injects a keep-alive frame whenever no real chunk has arrived for this
+/// long. Kept well under the common ~60s defaults.
+pub const DEFAULT_SSE_HEARTBEAT_SECS: u64 = 15;
+
+/// SSE comment keep-alive used on OpenAI/Responses-style streams. A bare comment
+/// line is ignored by every conformant SSE client, so it warms the connection
+/// without perturbing the event stream.
+pub const SSE_COMMENT_PING: &[u8] = b":\n\n";
+
+/// Anthropic `ping` event keep-alive used on `/v1/messages` streams. Matches the
+/// ping shape the Responses->Anthropic translation already forwards, so clients
+/// see a single consistent ping frame regardless of source.
+pub const ANTHROPIC_PING_FRAME: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
+/// Interval between proxy-injected SSE heartbeat frames, overridable via
+/// `COPILOT_API_SSE_HEARTBEAT_SECS`. A value of `0` disables heartbeats entirely
+/// (returns `None`); any positive value is the idle window after which a single
+/// keep-alive frame is emitted while the upstream stays silent. Re-read per
+/// stream so an operator override takes effect without a restart.
+pub fn sse_heartbeat_interval() -> Option<Duration> {
+    let secs = std::env::var("COPILOT_API_SSE_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SSE_HEARTBEAT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
 
 /// A single parsed SSE record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -233,6 +267,25 @@ pub fn events(resp: reqwest::Response) -> impl Stream<Item = Result<SseEvent, st
 mod tests {
     use super::*;
     use futures_util::stream::{self, StreamExt};
+
+    #[test]
+    fn heartbeat_ping_frames_are_well_formed_sse() {
+        // The comment ping must be a bare SSE comment line; the Anthropic ping
+        // must match the `{"type":"ping"}` frame the translation path forwards.
+        assert_eq!(SSE_COMMENT_PING, b":\n\n");
+        assert_eq!(
+            std::str::from_utf8(ANTHROPIC_PING_FRAME).unwrap(),
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+        );
+        let data = std::str::from_utf8(ANTHROPIC_PING_FRAME)
+            .unwrap()
+            .strip_prefix("event: ping\ndata: ")
+            .and_then(|s| s.strip_suffix("\n\n"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(parsed["type"], "ping");
+        assert_eq!(DEFAULT_SSE_HEARTBEAT_SECS, 15);
+    }
 
     /// Drive the pure decoder over a sequence of byte chunks, including the
     /// final flush, returning all events in order.

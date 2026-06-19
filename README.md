@@ -193,6 +193,7 @@ containers (the `start` flags below have matching `COPILOT_API_*` variables):
 | `COPILOT_API_LOG_FORMAT` | _(env only)_ | Set to `json` for structured JSON logs; defaults to the human-readable format. |
 | `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS` | _(env only)_ | Days of `token_usage_events` to retain before pruning (default `45`; `<= 0` disables pruning). |
 | `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | _(env only)_ | Max seconds of silence on an upstream stream before the connection is treated as stalled and dropped (default `120`; `0` disables the read timeout). Raise it if legitimately slow generations are being cut off mid-stream. |
+| `COPILOT_API_SSE_HEARTBEAT_SECS` | _(env only)_ | Idle window (seconds) after which the proxy injects a keep-alive frame into a streaming response so long "thinking" gaps survive intermediaries (nginx/ALB) with sub-120s idle timeouts (default `15`; `0` disables heartbeats). A heartbeat is a no-op ping (Anthropic `event: ping` on `/v1/messages`, an SSE comment on `/responses`) and never affects token-usage or latency metrics. |
 
 Example:
 

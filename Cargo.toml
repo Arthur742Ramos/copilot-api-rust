@@ -66,6 +66,9 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# `start_paused` virtual-time tests (SSE heartbeat) need tokio's test-util,
+# which the `full` feature does not pull in.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3
