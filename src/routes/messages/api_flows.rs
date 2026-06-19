@@ -211,9 +211,28 @@ pub async fn handle_with_chat_completions(
                 let mut state = AnthropicStreamState::default();
                 let mut usage = UsageTokens::default();
 
+                let heartbeat = crate::libs::sse::sse_heartbeat_interval();
                 let sse = crate::libs::sse::events(upstream);
                 futures_util::pin_mut!(sse);
-                while let Some(item) = sse.next().await {
+                loop {
+                    let item = match heartbeat {
+                        Some(interval) => match tokio::time::timeout(interval, sse.next()).await {
+                            Ok(next) => next,
+                            // Upstream silent but still alive (its own read_timeout
+                            // still bounds a truly wedged connection): emit a ping
+                            // so sub-120s intermediaries keep the stream open. A
+                            // ping is not content, so it must not touch the
+                            // timer/TTFT accounting below.
+                            Err(_) => {
+                                yield Ok(Bytes::from_static(
+                                    crate::libs::sse::ANTHROPIC_PING_FRAME,
+                                ));
+                                continue;
+                            }
+                        },
+                        None => sse.next().await,
+                    };
+                    let Some(item) = item else { break };
                     let raw_event = match item {
                         Ok(ev) => ev,
                         Err(e) => {
@@ -368,9 +387,25 @@ pub async fn handle_with_responses_api(
                 let mut state = ResponsesStreamState::new(Some(tool_search_name));
                 let mut usage = UsageTokens::default();
 
+                let heartbeat = crate::libs::sse::sse_heartbeat_interval();
                 let sse = upstream;
                 futures_util::pin_mut!(sse);
-                while let Some(item) = sse.next().await {
+                loop {
+                    let item = match heartbeat {
+                        Some(interval) => match tokio::time::timeout(interval, sse.next()).await {
+                            Ok(next) => next,
+                            // Idle-but-alive upstream: keep downstream warm with a
+                            // ping. Not content — leaves timer/TTFT untouched.
+                            Err(_) => {
+                                yield Ok(Bytes::from_static(
+                                    crate::libs::sse::ANTHROPIC_PING_FRAME,
+                                ));
+                                continue;
+                            }
+                        },
+                        None => sse.next().await,
+                    };
+                    let Some(item) = item else { break };
                     let chunk = match item {
                         Ok(ev) => ev,
                         Err(e) => {
@@ -389,7 +424,7 @@ pub async fn handle_with_responses_api(
                     if chunk.event.as_deref() == Some("ping") {
                         // Pings are keep-alives, not content — don't count them
                         // toward TTFT (they'd systematically under-report it).
-                        yield Ok(Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));
+                        yield Ok(Bytes::from_static(crate::libs::sse::ANTHROPIC_PING_FRAME));
                         continue;
                     }
                     if chunk.data.is_empty() {
@@ -506,9 +541,25 @@ pub async fn handle_with_messages_api(
                 let mut message_started = false;
                 let mut message_stopped = false;
 
+                let heartbeat = crate::libs::sse::sse_heartbeat_interval();
                 let sse = crate::libs::sse::events(upstream);
                 futures_util::pin_mut!(sse);
-                while let Some(item) = sse.next().await {
+                loop {
+                    let item = match heartbeat {
+                        Some(interval) => match tokio::time::timeout(interval, sse.next()).await {
+                            Ok(next) => next,
+                            // Idle-but-alive upstream: keep downstream warm with a
+                            // ping. Not content — leaves timer/TTFT untouched.
+                            Err(_) => {
+                                yield Ok(Bytes::from_static(
+                                    crate::libs::sse::ANTHROPIC_PING_FRAME,
+                                ));
+                                continue;
+                            }
+                        },
+                        None => sse.next().await,
+                    };
+                    let Some(item) = item else { break };
                     let event = match item {
                         Ok(ev) => ev,
                         Err(e) => {
