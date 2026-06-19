@@ -549,9 +549,11 @@ pub struct ResponseOutputRefusal {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseUsage {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub input_tokens: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<i64>,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub total_tokens: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<ResponseUsageInputDetails>,
@@ -561,11 +563,13 @@ pub struct ResponseUsage {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseUsageInputDetails {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub cached_tokens: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseUsageOutputDetails {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reasoning_tokens: i64,
 }
 
@@ -1219,6 +1223,28 @@ mod tests {
             }
             other => panic!("expected typed message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn null_usage_token_counts_do_not_500() {
+        // Same null-class bug for the usage scalars: a `usage` object present
+        // with null token counts must decode to 0 rather than 500 the whole body.
+        let raw = r#"{
+            "id": "resp_4",
+            "output": [],
+            "usage": {
+                "input_tokens": null,
+                "total_tokens": null,
+                "input_tokens_details": { "cached_tokens": null },
+                "output_tokens_details": { "reasoning_tokens": null }
+            }
+        }"#;
+        let result: ResponsesResult = serde_json::from_str(raw).expect("null usage parses");
+        let usage = result.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+        assert_eq!(usage.input_tokens_details.unwrap().cached_tokens, 0);
+        assert_eq!(usage.output_tokens_details.unwrap().reasoning_tokens, 0);
     }
 
     #[test]
