@@ -74,9 +74,10 @@ pub async fn create_chat_completions(
         .post(format!("{base}/chat/completions"))
         .headers(headers)
         .body(body);
-    let response = crate::libs::http::send_with_connect_retry(
+    let response = crate::libs::http::send_with_retry(
         request,
         crate::libs::http::retry_endpoint::CHAT,
+        crate::libs::http::RetryPolicy::from_env(),
     )
     .await
     .map_err(|e| {

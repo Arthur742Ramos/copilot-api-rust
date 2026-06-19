@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::libs::api_config::{copilot_base_url, copilot_headers};
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::{client, read_json_capped, retry_endpoint, send_with_connect_retry};
+use crate::libs::http::{client, read_json_capped, retry_endpoint, send_with_retry, RetryPolicy};
 use crate::libs::metrics::{record_upstream_request, UpstreamStatus};
 use crate::libs::state;
 
@@ -23,7 +23,7 @@ pub async fn create_embeddings(payload: &EmbeddingRequest) -> Result<Value, Http
         .post(format!("{base}/embeddings"))
         .headers(copilot_headers(&st, None, false))
         .body(body);
-    let response = send_with_connect_retry(request, retry_endpoint::EMBEDDINGS)
+    let response = send_with_retry(request, retry_endpoint::EMBEDDINGS, RetryPolicy::from_env())
         .await
         .map_err(|e| {
             record_upstream_request(

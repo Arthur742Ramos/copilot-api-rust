@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 
 use crate::libs::api_config::{copilot_base_url, copilot_models_headers};
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::{client, read_json_capped, retry_endpoint, send_with_connect_retry};
+use crate::libs::http::{client, read_json_capped, retry_endpoint, send_with_retry, RetryPolicy};
 use crate::libs::metrics::{record_upstream_request, UpstreamStatus};
 use crate::libs::state;
 
@@ -14,7 +14,7 @@ pub async fn get_models() -> Result<ModelsResponse, HttpError> {
     let headers = copilot_models_headers(&st);
     let upstream_start = std::time::Instant::now();
     let request = client().get(format!("{base}/models")).headers(headers);
-    let response = send_with_connect_retry(request, retry_endpoint::MODELS)
+    let response = send_with_retry(request, retry_endpoint::MODELS, RetryPolicy::from_env())
         .await
         .map_err(|e| {
             record_upstream_request(

@@ -100,19 +100,37 @@ pub const RETRY_ENDPOINTS: [&str; 6] = [
     retry_endpoint::CODEX,
 ];
 
-/// Register `copilot_upstream_retry_total{endpoint=...}` at 0 for every known
-/// endpoint so the series exists from startup. Without this the counter only
-/// appears after the first connect failure, which makes `rate()`/`increase()`
-/// and "retries > N" alerts read "no data" instead of 0 — exactly when the first
-/// upstream failure occurs. `increment(0)` registers without changing the value.
-/// Call once at startup (after the recorder is installed).
+/// The `reason` label values for `copilot_upstream_retry_total`. `connect` is a
+/// genuine TCP/TLS connect failure (the request never reached the model);
+/// `status` is a retryable upstream HTTP status ({429, 502, 503, 504}) observed
+/// before any body streamed. Used at both the increment sites and the
+/// pre-registration so the two series always exist together.
+const RETRY_REASONS: [&str; 2] = [RETRY_REASON_CONNECT, RETRY_REASON_STATUS];
+
+const RETRY_REASON_CONNECT: &str = "connect";
+const RETRY_REASON_STATUS: &str = "status";
+
+/// Register `copilot_upstream_retry_total{endpoint=...,reason=...}` at 0 for
+/// every known endpoint/reason pair so the series exist from startup. Without
+/// this the counter only appears after the first retry, which makes
+/// `rate()`/`increase()` and "retries > N" alerts read "no data" instead of 0 —
+/// exactly when the first upstream failure occurs. `increment(0)` registers
+/// without changing the value. Call once at startup (after the recorder is
+/// installed).
 pub fn preregister_retry_metrics() {
     for endpoint in RETRY_ENDPOINTS {
-        metrics::counter!("copilot_upstream_retry_total", "endpoint" => endpoint).increment(0);
+        for reason in RETRY_REASONS {
+            metrics::counter!("copilot_upstream_retry_total", "endpoint" => endpoint, "reason" => reason)
+                .increment(0);
+        }
     }
 }
 
 /// Send a request, retrying ONCE on a genuine connection failure.
+///
+/// Superseded by [`send_with_retry`] (which also retries on transient upstream
+/// statuses) for the live call sites, but retained as the minimal connect-only
+/// helper for callers that must never retry on a status.
 ///
 /// A `reqwest` error where `is_connect()` is true means the TCP/TLS connection
 /// to the upstream never established — the request did not reach the model, so
@@ -134,11 +152,228 @@ pub async fn send_with_connect_retry(
     match first {
         Err(e) if e.is_connect() && retry.is_some() => {
             tracing::warn!("upstream connect error ({endpoint}); retrying once: {e}");
-            metrics::counter!("copilot_upstream_retry_total", "endpoint" => endpoint).increment(1);
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            metrics::counter!("copilot_upstream_retry_total", "endpoint" => endpoint, "reason" => RETRY_REASON_CONNECT)
+                .increment(1);
+            tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_BASE_MS)).await;
             retry.unwrap().send().await
         }
         other => other,
+    }
+}
+
+/// Default number of *retries* (extra attempts beyond the first) for
+/// [`send_with_retry`] — 1, i.e. ~2 attempts total. Operators can raise it via
+/// `COPILOT_API_UPSTREAM_MAX_RETRIES`; the value is clamped to
+/// [`MAX_UPSTREAM_MAX_RETRIES`] so a stray large env value can't turn a single
+/// mid-conversation request into a long stall storm.
+pub const DEFAULT_UPSTREAM_MAX_RETRIES: u32 = 1;
+
+/// Hard ceiling on the configurable retry count. Bounds total added latency to a
+/// few short backoffs even if `COPILOT_API_UPSTREAM_MAX_RETRIES` is set absurdly
+/// high.
+const MAX_UPSTREAM_MAX_RETRIES: u32 = 5;
+
+/// Base backoff before the first retry of a retryable upstream response (ms).
+/// Deliberately small (~250ms) and distinct from token.rs's 15s token-refresh
+/// cadence: a mid-conversation retry must feel near-instant, not introduce a
+/// multi-second stall the client perceives as a hang.
+const RETRY_BACKOFF_BASE_MS: u64 = 250;
+
+/// Maximum random jitter added on top of the exponential base (ms), to
+/// de-correlate retries from many concurrent requests all bouncing off the same
+/// briefly-overloaded upstream (thundering-herd avoidance).
+const RETRY_BACKOFF_JITTER_MS: u64 = 250;
+
+/// Sane cap (secs) on a honored `Retry-After` delay. Overloaded upstreams can
+/// advertise large values; we don't want to park a live client request for
+/// minutes, so we clamp to something a user will still wait through.
+const MAX_RETRY_AFTER_SECS: u64 = 5;
+
+/// Upstream HTTP statuses worth retrying: transient gateway / overload signals
+/// returned BEFORE any model output streamed. 429 (rate limited), 502/503/504
+/// (bad gateway / unavailable / gateway timeout). A bare 500 is excluded — it
+/// often reflects a deterministic request-shape error a retry won't fix and
+/// could double-bill.
+const RETRYABLE_STATUSES: [u16; 4] = [429, 502, 503, 504];
+
+/// Whether `status` is in the retryable set. Pure so it is unit-testable.
+fn is_retryable_status(status: u16) -> bool {
+    RETRYABLE_STATUSES.contains(&status)
+}
+
+/// Resolve the effective retry count from the environment, clamped to
+/// [`MAX_UPSTREAM_MAX_RETRIES`]. The override is effectively static for a running
+/// process (like [`upstream_read_timeout`]), so it is parsed once and cached
+/// rather than re-read on every request in the hot path. The pure parse lives in
+/// [`parse_max_retries`] so the fallbacks stay testable without touching env.
+fn upstream_max_retries() -> u32 {
+    static CACHED: Lazy<u32> = Lazy::new(|| {
+        parse_max_retries(
+            std::env::var("COPILOT_API_UPSTREAM_MAX_RETRIES")
+                .ok()
+                .as_deref(),
+        )
+    });
+    *CACHED
+}
+
+/// Parse the `COPILOT_API_UPSTREAM_MAX_RETRIES` override, falling back to
+/// [`DEFAULT_UPSTREAM_MAX_RETRIES`] on absent/garbage input and clamping to
+/// [`MAX_UPSTREAM_MAX_RETRIES`]. Split from [`upstream_max_retries`] so it is
+/// testable without mutating process env.
+fn parse_max_retries(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_UPSTREAM_MAX_RETRIES)
+        .min(MAX_UPSTREAM_MAX_RETRIES)
+}
+
+/// Deterministic exponential backoff base for retry `attempt` (0-indexed:
+/// `attempt = 0` is the wait before the first retry), WITHOUT jitter. Factored
+/// out so the growth curve is unit-testable; the live path adds up to
+/// [`RETRY_BACKOFF_JITTER_MS`] of random jitter on top. The shift is bounded so a
+/// large configured retry count can't overflow.
+fn retry_backoff_base_ms(attempt: u32) -> u64 {
+    RETRY_BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.min(10))
+}
+
+/// Combine the deterministic exponential base with a (caller-supplied) jitter
+/// value. Kept pure — the live path passes a random `jitter_ms`, tests pass a
+/// fixed one — so the exact delay is assertable.
+fn retry_backoff_with_jitter(attempt: u32, jitter_ms: u64) -> Duration {
+    Duration::from_millis(retry_backoff_base_ms(attempt).saturating_add(jitter_ms))
+}
+
+/// Parse a `Retry-After` header value as a delay, honoring the numeric
+/// "delta-seconds" form (the only form Copilot/Codex upstreams emit). The
+/// HTTP-date form is intentionally unhandled (it never appears here) and yields
+/// `None`, falling back to exponential backoff. The result is capped at
+/// [`MAX_RETRY_AFTER_SECS`] so a hostile or badly-overloaded upstream can't park
+/// a request for minutes. Pure, so the parse + cap are unit-testable.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let secs: u64 = value.trim().parse().ok()?;
+    Some(Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)))
+}
+
+/// How [`send_with_retry`] should bound its retries. Carried explicitly (rather
+/// than read inline) so call sites stay uniform and a future caller can opt into
+/// a tighter/looser budget without a new function.
+#[derive(Clone, Copy, Debug)]
+pub struct RetryPolicy {
+    /// Extra attempts beyond the first send.
+    pub max_retries: u32,
+}
+
+impl RetryPolicy {
+    /// Policy derived from the environment (`COPILOT_API_UPSTREAM_MAX_RETRIES`),
+    /// the standard policy for the retryable upstream call sites.
+    pub fn from_env() -> Self {
+        Self {
+            max_retries: upstream_max_retries(),
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+/// Compute the backoff before a retry: honor a parsed `Retry-After` when present,
+/// otherwise exponential base + random jitter. Returns the delay and `true` if it
+/// came from `Retry-After` (for logging). Pure given `retry_after` and `jitter_ms`.
+fn next_retry_delay(
+    attempt: u32,
+    retry_after: Option<Duration>,
+    jitter_ms: u64,
+) -> (Duration, bool) {
+    match retry_after {
+        Some(d) => (d, true),
+        None => (retry_backoff_with_jitter(attempt, jitter_ms), false),
+    }
+}
+
+/// Send a request, retrying on a genuine connection failure OR a retryable
+/// upstream HTTP status ({429, 502, 503, 504}).
+///
+/// CRITICAL SAFETY: a retry only ever happens *before any response byte has
+/// streamed*. The HTTP status line is observable as soon as `send().await`
+/// resolves — before the body is consumed — so retrying a retryable status drops
+/// the not-yet-read response and replays the request without risking a partial,
+/// already-billed generation. We deliberately do NOT retry on read/body errors
+/// mid-stream (the connection was live and output may have flowed; replaying
+/// could double-bill). Connect failures are safe for the same reason as
+/// [`send_with_connect_retry`]: the request never reached the model.
+///
+/// Backoff is small and jittered (~250ms base, see [`RETRY_BACKOFF_BASE_MS`]); a
+/// `Retry-After` header on a retryable status is honored and capped. `endpoint`
+/// is a bounded label used only for the retry counter. Bodies are owned
+/// `Vec<u8>`, so `try_clone` always succeeds; if it somehow doesn't, the request
+/// is sent once with no retry.
+pub async fn send_with_retry(
+    builder: reqwest::RequestBuilder,
+    endpoint: &'static str,
+    policy: RetryPolicy,
+) -> reqwest::Result<reqwest::Response> {
+    let max_retries = policy.max_retries;
+    let mut current = builder;
+    let mut attempt: u32 = 0;
+    loop {
+        // Clone for a possible replay BEFORE consuming `current` in send().
+        let next = (attempt < max_retries)
+            .then(|| current.try_clone())
+            .flatten();
+        let result = current.send().await;
+
+        // Decide whether this outcome is retryable, and why. Only the status
+        // line / connect error is inspected — no body is read here, so no stream
+        // byte has flowed.
+        let reason: Option<&'static str> = match &result {
+            Err(e) if e.is_connect() => Some(RETRY_REASON_CONNECT),
+            Ok(resp) if is_retryable_status(resp.status().as_u16()) => Some(RETRY_REASON_STATUS),
+            _ => None,
+        };
+
+        let Some(reason) = reason else {
+            return result;
+        };
+        let Some(next) = next else {
+            // Out of retries (or un-cloneable): surface the last outcome.
+            return result;
+        };
+
+        // Honor Retry-After only for a status response; a connect error has no
+        // response to read it from.
+        let retry_after = match &result {
+            Ok(resp) => resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after),
+            Err(_) => None,
+        };
+        let jitter_ms = rand::random::<u64>() % (RETRY_BACKOFF_JITTER_MS + 1);
+        let (delay, from_header) = next_retry_delay(attempt, retry_after, jitter_ms);
+
+        match &result {
+            Err(e) => tracing::warn!(
+                "upstream connect error ({endpoint}); retry {}/{max_retries} in {}ms: {e}",
+                attempt + 1,
+                delay.as_millis()
+            ),
+            Ok(resp) => tracing::warn!(
+                "upstream retryable status {} ({endpoint}); retry {}/{max_retries} in {}ms{}",
+                resp.status().as_u16(),
+                attempt + 1,
+                delay.as_millis(),
+                if from_header { " (Retry-After)" } else { "" }
+            ),
+        }
+        metrics::counter!("copilot_upstream_retry_total", "endpoint" => endpoint, "reason" => reason)
+            .increment(1);
+        tokio::time::sleep(delay).await;
+        current = next;
+        attempt += 1;
     }
 }
 
@@ -285,17 +520,97 @@ mod tests {
     #[test]
     fn retry_counter_is_preregistered_at_zero() {
         // After startup pre-registration, the retry counter series must exist at
-        // 0 for every known endpoint so dashboards/alerts read 0, not "no data".
+        // 0 for every known endpoint/reason pair so dashboards/alerts read 0, not
+        // "no data".
         crate::libs::metrics::init_build_info(); // installs the recorder
         preregister_retry_metrics();
         let out = crate::libs::metrics::render();
         for endpoint in RETRY_ENDPOINTS {
-            assert!(
-                out.contains(&format!(
-                    "copilot_upstream_retry_total{{endpoint=\"{endpoint}\"}} 0"
-                )),
-                "expected pre-registered retry counter at 0 for endpoint={endpoint}, got:\n{out}"
-            );
+            for reason in RETRY_REASONS {
+                assert!(
+                    out.contains(&format!(
+                        "copilot_upstream_retry_total{{endpoint=\"{endpoint}\",reason=\"{reason}\"}} 0"
+                    )),
+                    "expected pre-registered retry counter at 0 for endpoint={endpoint} reason={reason}, got:\n{out}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn only_known_transient_statuses_are_retryable() {
+        for code in [429, 502, 503, 504] {
+            assert!(is_retryable_status(code), "{code} should be retryable");
+        }
+        // 500 is deliberately excluded (often deterministic / double-bill risk),
+        // and success / 4xx-other are not retried.
+        for code in [200, 400, 401, 403, 404, 418, 500, 501] {
+            assert!(!is_retryable_status(code), "{code} should not be retryable");
+        }
+    }
+
+    #[test]
+    fn parse_max_retries_clamps_and_falls_back() {
+        assert_eq!(parse_max_retries(None), DEFAULT_UPSTREAM_MAX_RETRIES);
+        assert_eq!(
+            parse_max_retries(Some("not-a-number")),
+            DEFAULT_UPSTREAM_MAX_RETRIES
+        );
+        assert_eq!(parse_max_retries(Some("")), DEFAULT_UPSTREAM_MAX_RETRIES);
+        assert_eq!(parse_max_retries(Some(" 3 ")), 3);
+        assert_eq!(parse_max_retries(Some("0")), 0);
+        // Absurd values are clamped to the ceiling.
+        assert_eq!(parse_max_retries(Some("9999")), MAX_UPSTREAM_MAX_RETRIES);
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_with_jitter() {
+        // attempt 0 -> base, attempt 1 -> 2*base, attempt 2 -> 4*base (no jitter).
+        assert_eq!(
+            retry_backoff_with_jitter(0, 0),
+            Duration::from_millis(RETRY_BACKOFF_BASE_MS)
+        );
+        assert_eq!(
+            retry_backoff_with_jitter(1, 0),
+            Duration::from_millis(RETRY_BACKOFF_BASE_MS * 2)
+        );
+        assert_eq!(
+            retry_backoff_with_jitter(2, 0),
+            Duration::from_millis(RETRY_BACKOFF_BASE_MS * 4)
+        );
+        // Jitter is added on top of the deterministic base.
+        assert_eq!(
+            retry_backoff_with_jitter(0, 100),
+            Duration::from_millis(RETRY_BACKOFF_BASE_MS + 100)
+        );
+        // A large attempt count must not overflow the shift.
+        let _ = retry_backoff_base_ms(u32::MAX);
+    }
+
+    #[test]
+    fn parse_retry_after_handles_seconds_and_caps() {
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after("  1  "), Some(Duration::from_secs(1)));
+        // Capped to the sane ceiling.
+        assert_eq!(
+            parse_retry_after("120"),
+            Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+        );
+        // HTTP-date form and garbage are not honored.
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    #[test]
+    fn next_retry_delay_prefers_retry_after() {
+        // Retry-After wins over computed backoff and is flagged as header-sourced.
+        let (d, from_header) = next_retry_delay(3, Some(Duration::from_secs(2)), 9999);
+        assert_eq!(d, Duration::from_secs(2));
+        assert!(from_header);
+        // Without a header, falls back to exponential base + jitter.
+        let (d, from_header) = next_retry_delay(0, None, 50);
+        assert_eq!(d, Duration::from_millis(RETRY_BACKOFF_BASE_MS + 50));
+        assert!(!from_header);
     }
 }

@@ -336,9 +336,10 @@ pub async fn forward_codex_responses(
     })?;
 
     let request = client().post(url).headers(headers).body(body);
-    let response = crate::libs::http::send_with_connect_retry(
+    let response = crate::libs::http::send_with_retry(
         request,
         crate::libs::http::retry_endpoint::CODEX,
+        crate::libs::http::RetryPolicy::from_env(),
     )
     .await
     .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
