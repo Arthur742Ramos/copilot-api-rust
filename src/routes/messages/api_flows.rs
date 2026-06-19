@@ -178,7 +178,7 @@ pub async fn handle_with_chat_completions(
     payload: &AnthropicMessagesPayload,
     opts: FlowOptions,
 ) -> Result<Response, AppError> {
-    let mut openai_payload = translate_to_openai(payload);
+    let mut openai_payload = translate_to_openai(payload)?;
     prepare_copilot_chat_completions_payload(&mut openai_payload);
 
     let recorder = build_recorder(
@@ -323,7 +323,7 @@ pub async fn handle_with_responses_api(
 ) -> Result<Response, AppError> {
     let subagent_agent_id = opts.subagent_marker.as_ref().map(|m| m.agent_id.as_str());
     let mut responses_payload =
-        translate_anthropic_messages_to_responses_payload(payload, subagent_agent_id);
+        translate_anthropic_messages_to_responses_payload(payload, subagent_agent_id)?;
 
     let recorder = build_recorder(
         "responses",

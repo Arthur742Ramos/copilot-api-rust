@@ -18,6 +18,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::libs::config::{get_extra_prompt_for_model, get_reasoning_effort_for_model};
+use crate::libs::error::AppError;
 use crate::libs::request_context::request_context_store;
 use crate::libs::tool_search::{
     format_tool_search_bridge_arguments, is_bridge_tool_search_name, is_deferred_tool_name,
@@ -168,10 +169,11 @@ fn tools_as_values(tools: Option<&Vec<AnthropicTool>>) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+#[allow(clippy::result_large_err)]
 pub fn translate_anthropic_messages_to_responses_payload(
     payload: &AnthropicMessagesPayload,
     subagent_agent_id: Option<&str>,
-) -> ResponsesPayload {
+) -> Result<ResponsesPayload, AppError> {
     let mut input: Vec<ResponseInputItem> = Vec::new();
     let apply_phase = should_apply_phase(&payload.model);
 
@@ -190,7 +192,7 @@ pub fn translate_anthropic_messages_to_responses_payload(
     };
 
     for message in &payload.messages {
-        let items = translate_message(message, &payload.model, apply_phase, &mut state);
+        let items = translate_message(message, &payload.model, apply_phase, &mut state)?;
         input.extend(items);
     }
 
@@ -261,40 +263,47 @@ pub fn translate_anthropic_messages_to_responses_payload(
         responses_payload.prompt_cache_key = prompt_cache_key;
     }
 
-    responses_payload
+    Ok(responses_payload)
 }
 
 fn should_apply_phase(_model: &str) -> bool {
     true
 }
 
+#[allow(clippy::result_large_err)]
 fn translate_message(
     message: &AnthropicInputMessage,
     model: &str,
     apply_phase: bool,
     state: &mut TranslationState,
-) -> Vec<ResponseInputItem> {
+) -> Result<Vec<ResponseInputItem>, AppError> {
     if message.role == "user" {
         translate_user_message(message, state)
     } else {
-        translate_assistant_message(message, model, apply_phase, state)
+        Ok(translate_assistant_message(
+            message,
+            model,
+            apply_phase,
+            state,
+        ))
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn translate_user_message(
     message: &AnthropicInputMessage,
     state: &mut TranslationState,
-) -> Vec<ResponseInputItem> {
+) -> Result<Vec<ResponseInputItem>, AppError> {
     if let Some(text) = message.content.as_str() {
-        return vec![create_message(
+        return Ok(vec![create_message(
             "user",
             MessageContent::Text(text.to_string()),
             None,
-        )];
+        )]);
     }
 
     let Some(blocks) = message.content.as_array() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut items: Vec<ResponseInputItem> = Vec::new();
@@ -303,16 +312,16 @@ fn translate_user_message(
     for block in blocks {
         if block_type(block) == Some("tool_result") {
             flush_pending_content(&mut pending, &mut items, "user", None);
-            items.push(create_tool_call_output(block, state));
+            items.push(create_tool_call_output(block, state)?);
             continue;
         }
 
-        let converted = translate_user_content_block(block);
+        let converted = translate_user_content_block(block)?;
         pending.extend(converted);
     }
 
     flush_pending_content(&mut pending, &mut items, "user", None);
-    items
+    Ok(items)
 }
 
 fn translate_assistant_message(
@@ -399,13 +408,14 @@ fn translate_assistant_message(
     items
 }
 
-fn translate_user_content_block(block: &Value) -> Vec<ResponseInputContent> {
-    match block_type(block) {
+#[allow(clippy::result_large_err)]
+fn translate_user_content_block(block: &Value) -> Result<Vec<ResponseInputContent>, AppError> {
+    Ok(match block_type(block) {
         Some("text") => vec![create_text_content(text_field(block))],
-        Some("image") => vec![ResponseInputContent::Image(create_image_content(block))],
-        Some("document") => vec![ResponseInputContent::File(create_file_content(block))],
+        Some("image") => vec![ResponseInputContent::Image(create_image_content(block)?)],
+        Some("document") => vec![ResponseInputContent::File(create_file_content(block)?)],
         _ => Vec::new(),
-    }
+    })
 }
 
 fn translate_assistant_content_block(block: &Value) -> Option<ResponseInputContent> {
@@ -489,40 +499,113 @@ fn create_output_text_content(text: String) -> ResponseInputContent {
     })
 }
 
-fn create_image_content(block: &Value) -> ResponseInputImage {
-    let media_type = source_field(block, "media_type");
-    let data = source_field(block, "data");
-    ResponseInputImage {
+#[allow(clippy::result_large_err)]
+fn create_image_content(block: &Value) -> Result<ResponseInputImage, AppError> {
+    let source = block.get("source");
+    let source_type = source
+        .and_then(|s| s.get("type"))
+        .and_then(Value::as_str)
+        // Anthropic historically omitted `type` for base64 sources; default to it.
+        .unwrap_or("base64");
+
+    let image_url = match source_type {
+        "url" => url_source(source, "Image")?,
+        "file" => {
+            return Err(AppError::BadRequest(
+                "Image source of type \"file\" (Files API ids) is not supported".to_string(),
+            ));
+        }
+        "base64" => base64_data_url(block, "image")?,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported image source type \"{other}\""
+            )));
+        }
+    };
+
+    Ok(ResponseInputImage {
         block_type: "input_image".to_string(),
-        image_url: Some(format!("data:{media_type};base64,{data}")),
+        image_url: Some(image_url),
         file_id: None,
         detail: "auto".to_string(),
-    }
+    })
 }
 
-fn create_file_content(block: &Value) -> ResponseInputFile {
-    let media_type = source_field(block, "media_type");
-    let data = source_field(block, "data");
+#[allow(clippy::result_large_err)]
+fn create_file_content(block: &Value) -> Result<ResponseInputFile, AppError> {
+    let source = block.get("source");
+    let source_type = source
+        .and_then(|s| s.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("base64");
     let filename = block
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or("document.pdf")
         .to_string();
-    ResponseInputFile {
+
+    let file_data = match source_type {
+        "url" => url_source(source, "Document")?,
+        "file" => {
+            return Err(AppError::BadRequest(
+                "Document source of type \"file\" (Files API ids) is not supported".to_string(),
+            ));
+        }
+        "base64" => base64_data_url(block, "document")?,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported document source type \"{other}\""
+            )));
+        }
+    };
+
+    Ok(ResponseInputFile {
         block_type: "input_file".to_string(),
-        file_data: Some(format!("data:{media_type};base64,{data}")),
+        file_data: Some(file_data),
         file_id: None,
         filename: Some(filename),
-    }
+    })
 }
 
-fn source_field(block: &Value, field: &str) -> String {
+/// A trimmed, non-empty `source.<field>` string, or `None` when absent/blank.
+fn source_field_opt<'a>(block: &'a Value, field: &str) -> Option<&'a str> {
     block
         .get("source")
         .and_then(|s| s.get(field))
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// Extract a non-empty `url` from a `url` source, rejecting a missing/blank URL
+/// with a 400 rather than forwarding an empty image/file reference upstream.
+#[allow(clippy::result_large_err)]
+fn url_source(source: Option<&Value>, kind: &str) -> Result<String, AppError> {
+    let url = source
+        .and_then(|s| s.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("{kind} source of type \"url\" is missing \"url\""))
+        })?;
+    Ok(url.to_string())
+}
+
+/// Build a `data:` URL from a base64 source, rejecting missing/empty
+/// `media_type`/`data` with a 400 instead of emitting a corrupt
+/// `data:;base64,` payload.
+#[allow(clippy::result_large_err)]
+fn base64_data_url(block: &Value, kind: &str) -> Result<String, AppError> {
+    match (
+        source_field_opt(block, "media_type"),
+        source_field_opt(block, "data"),
+    ) {
+        (Some(media_type), Some(data)) => Ok(format!("data:{media_type};base64,{data}")),
+        _ => Err(AppError::BadRequest(format!(
+            "Base64 {kind} source is missing \"media_type\" or \"data\""
+        ))),
+    }
 }
 
 fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
@@ -619,7 +702,8 @@ fn create_tool_call(block: &Value, state: &TranslationState) -> ResponseInputIte
     }
 }
 
-fn create_function_call_output(block: &Value) -> ResponseFunctionCallOutputItem {
+#[allow(clippy::result_large_err)]
+fn create_function_call_output(block: &Value) -> Result<ResponseFunctionCallOutputItem, AppError> {
     let call_id = block
         .get("tool_use_id")
         .and_then(Value::as_str)
@@ -628,15 +712,19 @@ fn create_function_call_output(block: &Value) -> ResponseFunctionCallOutputItem 
         .get("is_error")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    ResponseFunctionCallOutputItem {
+    Ok(ResponseFunctionCallOutputItem {
         item_type: "function_call_output".to_string(),
         call_id: call_id.to_string(),
-        output: convert_tool_result_content(block.get("content")),
+        output: convert_tool_result_content(block.get("content"))?,
         status: Some(if is_error { "incomplete" } else { "completed" }.to_string()),
-    }
+    })
 }
 
-fn create_tool_call_output(block: &Value, state: &TranslationState) -> ResponseInputItem {
+#[allow(clippy::result_large_err)]
+fn create_tool_call_output(
+    block: &Value,
+    state: &TranslationState,
+) -> Result<ResponseInputItem, AppError> {
     let tool_use_id = block
         .get("tool_use_id")
         .and_then(Value::as_str)
@@ -647,9 +735,13 @@ fn create_tool_call_output(block: &Value, state: &TranslationState) -> ResponseI
         .map(String::as_str)
         .unwrap_or("");
     if state.tool_search_enabled && is_bridge_tool_search_name(tool_use_name) {
-        ResponseInputItem::ToolSearchOutput(create_tool_search_output(block, &state.original_tools))
+        Ok(ResponseInputItem::ToolSearchOutput(
+            create_tool_search_output(block, &state.original_tools),
+        ))
     } else {
-        ResponseInputItem::FunctionCallOutput(create_function_call_output(block))
+        Ok(ResponseInputItem::FunctionCallOutput(
+            create_function_call_output(block)?,
+        ))
     }
 }
 
@@ -1256,8 +1348,11 @@ fn map_responses_usage(response: &ResponsesResult) -> AnthropicUsage {
     }
 }
 
-fn convert_tool_result_content(content: Option<&Value>) -> FunctionCallOutputContent {
-    match content {
+#[allow(clippy::result_large_err)]
+fn convert_tool_result_content(
+    content: Option<&Value>,
+) -> Result<FunctionCallOutputContent, AppError> {
+    Ok(match content {
         Some(Value::String(s)) => FunctionCallOutputContent::Text(s.clone()),
         Some(Value::Array(arr)) => {
             let mut result: Vec<ResponseInputContent> = Vec::new();
@@ -1265,10 +1360,10 @@ fn convert_tool_result_content(content: Option<&Value>) -> FunctionCallOutputCon
                 match block_type(block) {
                     Some("text") => result.push(create_text_content(text_field(block))),
                     Some("image") => {
-                        result.push(ResponseInputContent::Image(create_image_content(block)))
+                        result.push(ResponseInputContent::Image(create_image_content(block)?))
                     }
                     Some("document") => {
-                        result.push(ResponseInputContent::File(create_file_content(block)))
+                        result.push(ResponseInputContent::File(create_file_content(block)?))
                     }
                     Some("tool_reference") => {
                         let tool_name = block
@@ -1283,7 +1378,7 @@ fn convert_tool_result_content(content: Option<&Value>) -> FunctionCallOutputCon
             FunctionCallOutputContent::Blocks(result)
         }
         _ => FunctionCallOutputContent::Text(String::new()),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,6 +1425,127 @@ mod tests {
     }
 
     #[test]
+    fn image_content_url_source_passes_through() {
+        let block = json!({
+            "type": "image",
+            "source": { "type": "url", "url": "https://example.com/pic.png" },
+        });
+        let img = create_image_content(&block).unwrap();
+        assert_eq!(
+            img.image_url.as_deref(),
+            Some("https://example.com/pic.png")
+        );
+    }
+
+    #[test]
+    fn image_content_base64_source_builds_data_url() {
+        let block = json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" },
+        });
+        let img = create_image_content(&block).unwrap();
+        assert_eq!(img.image_url.as_deref(), Some("data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn image_content_file_source_is_rejected() {
+        let block = json!({
+            "type": "image",
+            "source": { "type": "file", "file_id": "file_123" },
+        });
+        let err = create_image_content(&block).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn image_content_base64_missing_fields_is_rejected() {
+        // Missing data, empty media_type, and blank url must all 400 rather than
+        // emit a corrupt `data:;base64,` / empty image reference upstream.
+        for block in [
+            json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png" } }),
+            json!({ "type": "image", "source": { "type": "base64", "media_type": "", "data": "AAAA" } }),
+            json!({ "type": "image", "source": { "type": "url", "url": "   " } }),
+        ] {
+            let err = create_image_content(&block).unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "block: {block}");
+        }
+    }
+
+    #[test]
+    fn file_content_base64_missing_fields_is_rejected() {
+        for block in [
+            json!({ "type": "document", "source": { "type": "base64", "data": "" } }),
+            json!({ "type": "document", "source": { "type": "url", "url": "" } }),
+        ] {
+            let err = create_file_content(&block).unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "block: {block}");
+        }
+    }
+
+    #[test]
+    fn file_content_file_source_is_rejected() {
+        let block = json!({
+            "type": "document",
+            "source": { "type": "file", "file_id": "file_456" },
+        });
+        let err = create_file_content(&block).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn url_image_propagates_through_full_translation() {
+        let payload: AnthropicMessagesPayload = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.4",
+                "max_tokens": 100,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "image", "source": { "type": "url", "url": "https://example.com/x.png" } }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let result = translate_anthropic_messages_to_responses_payload(&payload, None).unwrap();
+        let items = match result.input.expect("input") {
+            InputField::Items(items) => items,
+            InputField::Text(_) => panic!("expected items"),
+        };
+        let ResponseInputItem::Message(msg) = &items[0] else {
+            panic!("expected message item");
+        };
+        let Some(MessageContent::Blocks(blocks)) = &msg.content else {
+            panic!("expected block content");
+        };
+        let ResponseInputContent::Image(img) = &blocks[0] else {
+            panic!("expected image content");
+        };
+        assert_eq!(img.image_url.as_deref(), Some("https://example.com/x.png"));
+    }
+
+    #[test]
+    fn file_image_rejected_through_full_translation() {
+        let payload: AnthropicMessagesPayload = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.4",
+                "max_tokens": 100,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "image", "source": { "type": "file", "file_id": "file_1" } }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let err = translate_anthropic_messages_to_responses_payload(&payload, None).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
     fn basic_user_message_translation() {
         let payload: AnthropicMessagesPayload = serde_json::from_str(
             r#"{
@@ -1340,7 +1556,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = translate_anthropic_messages_to_responses_payload(&payload, None);
+        let result = translate_anthropic_messages_to_responses_payload(&payload, None).unwrap();
         assert_eq!(result.model, "gpt-5.4");
         assert_eq!(result.max_output_tokens, Some(12800));
         assert_eq!(result.temperature, Some(1.0));
@@ -1377,7 +1593,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = translate_anthropic_messages_to_responses_payload(&payload, None);
+        let result = translate_anthropic_messages_to_responses_payload(&payload, None).unwrap();
         assert_eq!(result.max_output_tokens, Some(20000));
         let items = match result.input.expect("input") {
             InputField::Items(items) => items,

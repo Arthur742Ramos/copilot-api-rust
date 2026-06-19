@@ -71,7 +71,7 @@ pub async fn handle_provider_count_tokens_for_provider(
         TranslateToOpenAiOptions::default()
     };
 
-    let openai_payload = translate_to_openai_with_options(&payload, &translation_options);
+    let openai_payload = translate_to_openai_with_options(&payload, &translation_options)?;
 
     let selected_model = create_fallback_model(&model_id);
 
