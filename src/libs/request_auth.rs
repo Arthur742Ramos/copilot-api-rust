@@ -19,6 +19,12 @@ use crate::libs::config::get_config;
 pub struct ApiKeyConfig {
     pub key: String,
     pub label: Option<String>,
+    /// Optional per-key daily token cap. When set and positive, requests
+    /// attributed to this key (by [`ApiKeyConfig::attribution`]) are rejected with
+    /// a 429 once the key's own recorded spend for the local day reaches it,
+    /// independently of the global `dailyTokenBudget`. `None` or `<= 0` disables
+    /// the per-key cap. Phase 2 of per-key multi-tenancy.
+    pub daily_token_budget: Option<i64>,
 }
 
 impl ApiKeyConfig {
@@ -54,6 +60,10 @@ enum ApiKeyEntry {
         key: String,
         #[serde(default)]
         label: Option<String>,
+        /// Per-key daily token cap (object form only). Renamed to match the
+        /// top-level `dailyTokenBudget` config key.
+        #[serde(default, rename = "dailyTokenBudget")]
+        daily_token_budget: Option<i64>,
     },
 }
 
@@ -77,9 +87,13 @@ pub fn normalize_api_keys(api_keys: Option<&Vec<Value>>) -> Vec<ApiKeyConfig> {
                 continue;
             }
         };
-        let (key, label) = match parsed {
-            ApiKeyEntry::Plain(s) => (s, None),
-            ApiKeyEntry::Labeled { key, label } => (key, label),
+        let (key, label, daily_token_budget) = match parsed {
+            ApiKeyEntry::Plain(s) => (s, None, None),
+            ApiKeyEntry::Labeled {
+                key,
+                label,
+                daily_token_budget,
+            } => (key, label, daily_token_budget),
         };
         let trimmed = key.trim();
         if trimmed.is_empty() {
@@ -89,10 +103,14 @@ pub fn normalize_api_keys(api_keys: Option<&Vec<Value>>) -> Vec<ApiKeyConfig> {
         let label = label
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty());
+        // A non-positive per-key cap is treated as "no cap", mirroring the
+        // global `dailyTokenBudget` semantics, so config can disable it inline.
+        let daily_token_budget = daily_token_budget.filter(|&b| b > 0);
         if seen.insert(trimmed.to_string()) {
             out.push(ApiKeyConfig {
                 key: trimmed.to_string(),
                 label,
+                daily_token_budget,
             });
         }
     }
@@ -129,9 +147,23 @@ pub fn get_configured_admin_api_keys() -> Vec<ApiKeyConfig> {
         Some(k) => vec![ApiKeyConfig {
             key: k,
             label: Some("admin".to_string()),
+            daily_token_budget: None,
         }],
         None => Vec::new(),
     }
+}
+
+/// Look up the configured per-key daily token budget for a given attribution
+/// token (the same `label`/fingerprint Phase 1 attributes usage under). Returns
+/// the first matching positive cap, or `None` when the label is unknown or has no
+/// per-key budget. Reuses [`ApiKeyConfig::attribution`] so the key used for the
+/// budget lookup is exactly the key used for usage attribution.
+pub fn get_api_key_daily_budget(attribution: &str) -> Option<i64> {
+    get_configured_api_keys()
+        .into_iter()
+        .find(|entry| entry.attribution() == attribution)
+        .and_then(|entry| entry.daily_token_budget)
+        .filter(|&b| b > 0)
 }
 
 /// Mirrors `extractRequestApiKey`: prefer `x-api-key`, else a Bearer token from
@@ -331,6 +363,21 @@ mod tests {
     }
 
     #[test]
+    fn normalize_parses_per_key_daily_budget() {
+        let parsed = keys(vec![
+            json!({ "key": "k1", "label": "team-a", "dailyTokenBudget": 1_000_000 }),
+            json!({ "key": "k2", "label": "team-b" }), // no budget -> None
+            json!({ "key": "k3", "label": "team-c", "dailyTokenBudget": 0 }), // non-positive -> disabled
+            json!("plain"),                                                   // string form -> None
+        ]);
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].daily_token_budget, Some(1_000_000));
+        assert_eq!(parsed[1].daily_token_budget, None);
+        assert_eq!(parsed[2].daily_token_budget, None);
+        assert_eq!(parsed[3].daily_token_budget, None);
+    }
+
+    #[test]
     fn normalize_trims_dedupes_and_drops_invalid() {
         let parsed = keys(vec![
             json!("  spaced  "),
@@ -349,12 +396,14 @@ mod tests {
         let labeled = ApiKeyConfig {
             key: "secret".to_string(),
             label: Some("frontend".to_string()),
+            daily_token_budget: None,
         };
         assert_eq!(labeled.attribution(), "frontend");
 
         let unlabeled = ApiKeyConfig {
             key: "secret".to_string(),
             label: None,
+            daily_token_budget: None,
         };
         let fp = unlabeled.attribution();
         assert!(fp.starts_with("key-"));
@@ -388,10 +437,12 @@ mod tests {
             ApiKeyConfig {
                 key: "key-one".to_string(),
                 label: Some("alice".to_string()),
+                daily_token_budget: None,
             },
             ApiKeyConfig {
                 key: "key-two".to_string(),
                 label: None,
+                daily_token_budget: None,
             },
         ]
     }
