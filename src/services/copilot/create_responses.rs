@@ -310,24 +310,45 @@ pub struct ResponseInputFile {
 // Result
 // ---------------------------------------------------------------------------
 
+/// Deserialize helper: coerce an explicit JSON `null` into `T::default()`.
+///
+/// `#[serde(default)]` alone only covers a *missing* key — an explicit `null`
+/// still routes to `T::deserialize` and fails for non-`Option` types with
+/// `invalid type: null, expected a string` (and the equivalent for other
+/// types). Copilot's Claude backend intermittently emits `null` for fields it
+/// usually sends as a string/array (observed: `output_text` on tool-use turns,
+/// and required strings on output items), which used to 500 the *entire*
+/// response in [`read_json_capped::<ResponsesResult>`]. Pairing this with
+/// `#[serde(default)]` makes both a missing key and an explicit `null` decode to
+/// the default, keeping the item correctly typed so downstream translation still
+/// emits the right Anthropic blocks (a blanket `Other(Value)` fallback would
+/// instead silently drop tool-use/thinking blocks — strictly worse).
+pub(crate) fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Mirrors the TS `ResponsesResult`. Fields default-lenient so embedded results
 /// inside stream events deserialize even when partial; unknown keys round-trip
 /// through `extra`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponsesResult {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub object: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub created_at: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub model: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub output: Vec<ResponseOutputItem>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub output_text: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ResponseUsage>,
@@ -345,7 +366,7 @@ pub struct ResponsesResult {
     pub temperature: Value,
     #[serde(default)]
     pub tool_choice: Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub tools: Vec<Value>,
     #[serde(default)]
     pub top_p: Value,
@@ -405,10 +426,13 @@ impl<'de> Deserialize<'de> for ResponseOutputItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseOutputMessage {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
     pub item_type: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub role: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ResponseOutputContentBlock>>,
@@ -416,8 +440,9 @@ pub struct ResponseOutputMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseOutputReasoning {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
     pub item_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<Vec<ResponseReasoningBlock>>,
@@ -429,7 +454,7 @@ pub struct ResponseOutputReasoning {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseReasoningBlock {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
     pub block_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -439,10 +464,13 @@ pub struct ResponseReasoningBlock {
 pub struct ResponseOutputFunctionCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
     pub item_type: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub call_id: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub name: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub arguments: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -454,8 +482,9 @@ pub struct ResponseOutputFunctionCall {
 pub struct ResponseOutputToolSearchCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
     pub item_type: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub call_id: String,
     pub arguments: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -468,9 +497,11 @@ pub struct ResponseOutputToolSearchCall {
 pub struct ResponseOutputToolSearchOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
     pub item_type: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub call_id: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub tools: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<String>,
@@ -480,9 +511,11 @@ pub struct ResponseOutputToolSearchOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseOutputCompaction {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
     pub item_type: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub encrypted_content: String,
 }
 
@@ -1105,5 +1138,111 @@ mod tests {
         );
         let t: ResponsesTransport = serde_json::from_str("\"http\"").unwrap();
         assert_eq!(t, ResponsesTransport::Http);
+    }
+
+    // Regression: Copilot's Claude backend intermittently emits `null` where the
+    // Responses schema declares a string. `#[serde(default)]` does NOT cover an
+    // explicit `null` (only a missing key), so before `null_to_default` these
+    // bodies failed the whole parse with `invalid type: null, expected a string`
+    // and the proxy returned HTTP 500 (observed 2026-06-18). Each case must now
+    // decode, stay correctly typed, and round-trip.
+
+    #[test]
+    fn null_output_text_does_not_500() {
+        // `output_text` is null on tool-use / structured turns — the field that
+        // sits right after the large `output` array (~57KB into the body).
+        let raw = r#"{
+            "id": "resp_1",
+            "object": "response",
+            "model": "claude-opus-4-8",
+            "status": "completed",
+            "output_text": null,
+            "output": []
+        }"#;
+        let result: ResponsesResult = serde_json::from_str(raw).expect("null output_text parses");
+        assert_eq!(result.output_text, "");
+        assert_eq!(result.id, "resp_1");
+    }
+
+    #[test]
+    fn null_function_call_arguments_stays_typed() {
+        // A no-arg tool call where the backend sends `arguments: null` instead of
+        // `"{}"`. Must remain a typed FunctionCall (NOT degrade to Other, which
+        // would silently drop the tool_use block downstream) with empty args.
+        let raw = r#"{
+            "id": "resp_2",
+            "object": "response",
+            "model": "claude-opus-4-8",
+            "status": "completed",
+            "output": [
+                {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "list_files",
+                    "arguments": null
+                }
+            ]
+        }"#;
+        let result: ResponsesResult = serde_json::from_str(raw).expect("null arguments parses");
+        match &result.output[0] {
+            ResponseOutputItem::FunctionCall(fc) => {
+                assert_eq!(fc.call_id, "call_1");
+                assert_eq!(fc.name, "list_files");
+                assert_eq!(fc.arguments, "");
+            }
+            other => panic!("expected typed function_call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_message_status_stays_typed() {
+        let raw = r#"{
+            "id": "resp_3",
+            "output": [
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": null,
+                    "content": [
+                        { "type": "output_text", "text": "hi", "annotations": [] }
+                    ]
+                }
+            ]
+        }"#;
+        let result: ResponsesResult = serde_json::from_str(raw).expect("null status parses");
+        match &result.output[0] {
+            ResponseOutputItem::Message(m) => {
+                assert_eq!(m.status, "");
+                assert_eq!(m.role, "assistant");
+            }
+            other => panic!("expected typed message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_to_default_helper_handles_string_array_and_int() {
+        // The helper is generic: null coerces to T::default() for every type it
+        // guards (string -> "", Vec -> [], i64 -> 0), while real values pass
+        // through unchanged.
+        #[derive(Deserialize)]
+        struct Probe {
+            #[serde(default, deserialize_with = "null_to_default")]
+            s: String,
+            #[serde(default, deserialize_with = "null_to_default")]
+            v: Vec<i64>,
+            #[serde(default, deserialize_with = "null_to_default")]
+            n: i64,
+        }
+        let nulls: Probe = serde_json::from_str(r#"{"s":null,"v":null,"n":null}"#).unwrap();
+        assert_eq!(nulls.s, "");
+        assert!(nulls.v.is_empty());
+        assert_eq!(nulls.n, 0);
+
+        let vals: Probe = serde_json::from_str(r#"{"s":"x","v":[1,2],"n":7}"#).unwrap();
+        assert_eq!(vals.s, "x");
+        assert_eq!(vals.v, vec![1, 2]);
+        assert_eq!(vals.n, 7);
     }
 }
