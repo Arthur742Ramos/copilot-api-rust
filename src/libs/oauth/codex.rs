@@ -266,7 +266,17 @@ async fn wait_for_authorization_code(state: &str) -> Option<String> {
     // favicon/preflight/non-matching hits).
     async fn accept_on(listener: tokio::net::TcpListener, state: &str) -> Option<String> {
         loop {
-            let (mut socket, _) = listener.accept().await.ok()?;
+            // A transient accept() error (ECONNABORTED, EMFILE, ...) must not end
+            // this branch: under the select! below, returning None would cancel
+            // the healthy peer listener and drop the whole callback to manual
+            // paste. Skip the error and keep listening instead.
+            let mut socket = match listener.accept().await {
+                Ok((socket, _)) => socket,
+                Err(e) => {
+                    tracing::debug!("OAuth callback accept error (continuing): {e}");
+                    continue;
+                }
+            };
             if let Some(code) = handle_conn(&mut socket, state).await {
                 return Some(code);
             }

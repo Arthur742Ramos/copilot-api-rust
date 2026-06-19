@@ -672,6 +672,27 @@ pub async fn handle_with_messages_api(
 /// Mirrors `prepareCopilotChatCompletionsPayload`.
 pub fn prepare_copilot_chat_completions_payload(payload: &mut ChatCompletionsPayload) {
     apply_copilot_context_cache(payload);
+    request_streaming_usage(payload);
+}
+
+/// For streaming requests, ask the OpenAI-compatible upstream to emit a terminal
+/// usage chunk via `stream_options.include_usage = true`. Without it the stream
+/// carries `usage: null` and the flow records zero tokens (mis-counting the
+/// per-API-key daily budget). Mirrors the provider chat-completions path.
+fn request_streaming_usage(payload: &mut ChatCompletionsPayload) {
+    if payload.stream != Some(true) {
+        return;
+    }
+    let mut stream_options = payload
+        .extra
+        .get("stream_options")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    stream_options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+    payload.extra.insert(
+        "stream_options".to_string(),
+        serde_json::Value::Object(stream_options),
+    );
 }
 
 /// Mirrors `applyCopilotContextCache`: stamp the ephemeral `copilot_cache_control`

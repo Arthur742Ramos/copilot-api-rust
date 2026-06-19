@@ -273,7 +273,8 @@ fn build_proxy_response_from_parts(
             HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            headers.insert(n, v);
+            // append, not insert: preserve repeated headers like set-cookie.
+            headers.append(n, v);
         }
     }
 

@@ -113,7 +113,11 @@ fn build_pool() -> UsagePool {
             let conn = Connection::open_in_memory()
                 .expect("failed to open in-memory token usage database");
             let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
-            let _ = crate::libs::token_usage::initialize_schema(&conn);
+            if let Err(e) = crate::libs::token_usage::initialize_schema(&conn) {
+                // A doubly-degraded node (in-memory fallback whose schema also
+                // failed) would otherwise error at every query with no clue why.
+                tracing::warn!("Failed to initialize in-memory token usage schema: {e}");
+            }
             UsagePool {
                 connections: vec![Mutex::new(conn)],
                 next: AtomicUsize::new(0),

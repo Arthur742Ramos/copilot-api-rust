@@ -18,7 +18,8 @@ pub async fn poll_access_token(device_code: &DeviceCodeResponse) -> Result<Strin
     let urls = get_oauth_urls();
 
     // Interval is seconds; +1 second of safety margin, then to milliseconds.
-    let sleep_duration = Duration::from_millis((device_code.interval + 1) * 1000);
+    // `mut` so a GitHub `slow_down` response can extend the backoff.
+    let mut sleep_duration = Duration::from_millis((device_code.interval + 1) * 1000);
     // GitHub's verification code expires after `expires_in` seconds; stop polling
     // once it elapses so we never wait on a code the user can no longer redeem.
     let deadline = Instant::now() + Duration::from_secs(device_code.expires_in);
@@ -83,6 +84,41 @@ pub async fn poll_access_token(device_code: &DeviceCodeResponse) -> Result<Strin
             }
         };
 
+        // GitHub's device-flow token endpoint reports progress and terminal
+        // outcomes via the OAuth `error` field (HTTP 200 body). Without handling
+        // it, a denied/expired authorization is indistinguishable from "still
+        // pending" and the loop spins until the local deadline.
+        if let Some(err) = json.error.as_deref() {
+            match err {
+                "authorization_pending" => {
+                    tracing::info!("Still waiting for GitHub authorization...");
+                    tokio::time::sleep(sleep_duration).await;
+                    continue;
+                }
+                "slow_down" => {
+                    // Per the device-flow spec, back off by an extra 5 seconds.
+                    sleep_duration += Duration::from_secs(5);
+                    tracing::info!("GitHub asked to slow down; backing off polling...");
+                    tokio::time::sleep(sleep_duration).await;
+                    continue;
+                }
+                terminal => {
+                    // access_denied, expired_token, unsupported_grant_type,
+                    // incorrect_client_credentials, ... — fail fast instead of
+                    // polling a code that can never succeed.
+                    return Err(HttpError::new(
+                        format!(
+                            "GitHub device authorization failed ({terminal}). \
+                             Re-run the command and complete the GitHub login prompt."
+                        ),
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        axum::http::HeaderMap::new(),
+                        String::new(),
+                    ));
+                }
+            }
+        }
+
         match json.access_token {
             Some(token) if !token.is_empty() => return Ok(token),
             _ => {
@@ -105,4 +141,9 @@ struct AccessTokenResponse {
     #[serde(default)]
     #[allow(dead_code)]
     scope: Option<String>,
+    /// OAuth error code (`authorization_pending`, `slow_down`, `access_denied`,
+    /// `expired_token`, ...). Present instead of `access_token` on every poll
+    /// that has not yet succeeded.
+    #[serde(default)]
+    error: Option<String>,
 }

@@ -543,6 +543,16 @@ fn merge_output_item_with_collected_text(
 
     for part in &collected {
         let idx = part.content_index as usize;
+        // `content_index` is upstream-controlled. Filling the array up to an
+        // arbitrary index (the gap-fill loop below) would let a malicious or
+        // buggy upstream drive unbounded allocation / OOM. A legitimate
+        // positional cite never lands past the existing content plus the number
+        // of collected parts, so anything beyond that is dropped. (A negative
+        // index wraps to a huge usize and is rejected here too.)
+        let max_idx = content.len() + collected.len();
+        if idx > max_idx {
+            continue;
+        }
         let existing = content.get(idx).cloned();
         let existing_annotations = existing.as_ref().and_then(|e| e.get("annotations"));
         let mut block = existing
