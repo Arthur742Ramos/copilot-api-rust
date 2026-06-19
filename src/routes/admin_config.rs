@@ -9,9 +9,10 @@ use serde_json::{json, Value};
 
 use crate::libs::config::{
     get_model_mappings, get_provider_config, get_raw_provider_config, is_reserved_provider_name,
-    reload_config, set_model_mappings, set_provider_config, ProviderConfig,
+    list_enabled_providers, reload_config, set_model_mappings, set_provider_config, ProviderConfig,
 };
 use crate::libs::paths::PATHS;
+use crate::services::providers::provider_proxy::{probe_provider_models, ProbeOutcome};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,6 +112,115 @@ pub async fn get_providers_route() -> Response {
         "providers": provider_summaries(),
     }))
     .into_response()
+}
+
+/// Map a probe outcome to the redacted per-provider JSON fields. The raw HTTP
+/// status is preserved (not collapsed to a boolean) so an operator can tell a
+/// bad apiKey (401/403) from a wrong baseUrl (404) from an unreachable host.
+fn probe_result_json(outcome: &ProbeOutcome, latency_ms: u128) -> Value {
+    match outcome {
+        // `reachable` means "we got an HTTP response", independent of whether the
+        // credentials were accepted. A 401 is reachable-but-unauthorized.
+        ProbeOutcome::Status(status) => json!({
+            "reachable": true,
+            "status": status,
+            "latencyMs": latency_ms,
+        }),
+        ProbeOutcome::Unreachable(reason) => json!({
+            "reachable": false,
+            "status": Value::Null,
+            "error": reason,
+            "latencyMs": latency_ms,
+        }),
+    }
+}
+
+/// Freshness summary for a builtin (copilot / codex) credential. These are
+/// probed by token expiry rather than an HTTP round-trip: the gateway already
+/// holds and refreshes them, so an HTTP call would just re-test our own warm
+/// token. Never echoes the token itself.
+fn builtin_summary(name: &str, present: bool, fresh: bool) -> Value {
+    json!({
+        "name": name,
+        "tokenPresent": present,
+        "tokenFresh": fresh,
+    })
+}
+
+/// GET /admin/providers/health — actively probe every ENABLED third-party
+/// provider so a bad apiKey / wrong baseUrl / unreachable host surfaces here
+/// instead of on the first real generation. Each provider gets a lightweight,
+/// timeout-bounded `GET {baseUrl}/v1/models` probe (issued concurrently) and is
+/// reported with name, `reachable`, the raw HTTP `status`, and `latencyMs`. The
+/// builtin copilot/codex credentials are reported by token freshness instead of
+/// an HTTP round-trip. No secrets (apiKeys, tokens) appear in the response.
+pub async fn get_providers_health_route() -> Response {
+    // Resolve each enabled provider to its full config up front. Disabled /
+    // misconfigured providers are intentionally skipped — `list_enabled_providers`
+    // already filters them, and there is nothing to probe.
+    let configs: Vec<_> = list_enabled_providers()
+        .into_iter()
+        .filter_map(|name| get_provider_config(&name))
+        .collect();
+
+    // Probe all providers concurrently; a single slow upstream must not serialize
+    // behind the others. Each probe is independently bounded by PROBE_TIMEOUT.
+    let probes = configs.iter().map(|cfg| async move {
+        let (outcome, latency_ms) = probe_provider_models(cfg).await;
+        let mut entry = probe_result_json(&outcome, latency_ms);
+        if let Value::Object(map) = &mut entry {
+            map.insert("name".to_string(), json!(cfg.name));
+            map.insert("type".to_string(), json!(cfg.provider_type));
+            map.insert("baseUrl".to_string(), json!(cfg.base_url));
+            map.insert("authType".to_string(), json!(cfg.auth_type));
+        }
+        entry
+    });
+    let providers: Vec<Value> = futures::future::join_all(probes).await;
+
+    Json(json!({
+        "configPath": config_path_string(),
+        "builtins": builtin_health(),
+        "providers": providers,
+    }))
+    .into_response()
+}
+
+/// Build the builtin (copilot / codex) freshness section. Reuses the same
+/// freshness predicates as `/readyz` (`copilot_token_is_fresh`) and the codex
+/// refresh loop (`is_codex_credentials_expired`).
+fn builtin_health() -> Vec<Value> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let now_millis = now_secs.saturating_mul(1000);
+
+    let (copilot_token, codex_token, codex_expires_at) = crate::libs::state::with_state(|s| {
+        (
+            s.copilot_token.clone(),
+            s.codex_access_token.clone(),
+            s.codex_expires_at,
+        )
+    });
+
+    let copilot_present = copilot_token.as_deref().is_some_and(|t| !t.is_empty());
+    let copilot_fresh = copilot_token
+        .as_deref()
+        .is_some_and(|t| crate::routes::token::copilot_token_is_fresh(t, now_secs));
+
+    let codex_present = codex_token.as_deref().is_some_and(|t| !t.is_empty());
+    // Fresh only when a token is held AND its expiry is not within the refresh
+    // buffer. A missing expiry (no token) is treated as not-fresh.
+    let codex_fresh = codex_present
+        && codex_expires_at.is_some_and(|exp| {
+            !crate::libs::oauth::codex::is_codex_credentials_expired(exp, Some(now_millis))
+        });
+
+    vec![
+        builtin_summary("copilot", copilot_present, copilot_fresh),
+        builtin_summary("codex", codex_present, codex_fresh),
+    ]
 }
 
 /// Strip a secret string key from a config object and report whether it held a
@@ -247,4 +357,48 @@ fn forwarded_error(message: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reachable_probe_preserves_raw_status() {
+        // A 401 means "reachable, but rejected our apiKey" — reachable must be
+        // true and the raw status preserved, NOT collapsed to a boolean.
+        let v = probe_result_json(&ProbeOutcome::Status(401), 12);
+        assert_eq!(v["reachable"], json!(true));
+        assert_eq!(v["status"], json!(401));
+        assert_eq!(v["latencyMs"], json!(12));
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn not_found_probe_is_reachable_with_404() {
+        // A wrong baseUrl typically yields 404 — still reachable, distinct from
+        // a connect failure.
+        let v = probe_result_json(&ProbeOutcome::Status(404), 5);
+        assert_eq!(v["reachable"], json!(true));
+        assert_eq!(v["status"], json!(404));
+    }
+
+    #[test]
+    fn unreachable_probe_reports_false_with_reason() {
+        let v = probe_result_json(&ProbeOutcome::Unreachable("connect".to_string()), 4000);
+        assert_eq!(v["reachable"], json!(false));
+        assert_eq!(v["status"], Value::Null);
+        assert_eq!(v["error"], json!("connect"));
+        assert_eq!(v["latencyMs"], json!(4000));
+    }
+
+    #[test]
+    fn builtin_summary_redacts_token_to_booleans() {
+        let v = builtin_summary("copilot", true, false);
+        assert_eq!(v["name"], json!("copilot"));
+        assert_eq!(v["tokenPresent"], json!(true));
+        assert_eq!(v["tokenFresh"], json!(false));
+        // The token value itself must never appear.
+        assert!(v.as_object().unwrap().len() == 3);
+    }
 }

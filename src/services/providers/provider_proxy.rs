@@ -3,7 +3,7 @@
 //! response back to the client unchanged.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -360,6 +360,87 @@ pub async fn forward_provider_models(
         .map_err(|e| HttpError::internal(format!("Failed to forward provider models: {e}")))
 }
 
+/// Maximum time a single health probe waits for the upstream to respond.
+///
+/// PROVIDER_CLIENT sets only connect + read (gap-between-reads) timeouts and
+/// deliberately omits an overall `.timeout(...)` so it never truncates a healthy
+/// long SSE stream. A health probe has no such constraint, so we MUST cap each
+/// probe with an explicit per-request timeout — otherwise a stalled-open
+/// upstream (accepts the connection, never replies) would hang the admin call.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Result of a lightweight provider health probe. Kept richer than a boolean so
+/// the admin endpoint can distinguish "reachable but rejected us" (401/403),
+/// "wrong path/base URL" (404), and "could not connect at all" (DNS/TCP/TLS/
+/// timeout) — each is a different operator action.
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    /// The upstream returned an HTTP response with this status code.
+    Status(u16),
+    /// No HTTP response was obtained. The string is a short, secret-free
+    /// category ("timeout", "connect", "request", "blocked"), never the raw
+    /// error (which could echo the configured URL).
+    Unreachable(String),
+}
+
+/// Issue a lightweight `GET {base_url}/v1/models` health probe using the
+/// provider's configured auth header, returning the outcome and the round-trip
+/// latency. Used by the `/admin/providers/health` endpoint so a bad apiKey /
+/// wrong baseUrl / unreachable host surfaces immediately instead of on the first
+/// real generation. Never returns the apiKey or raw transport error text.
+pub async fn probe_provider_models(cfg: &ResolvedProviderConfig) -> (ProbeOutcome, u128) {
+    let start = Instant::now();
+
+    // Reuse the same SSRF guard the real forwarding path applies, so a probe
+    // can't be turned into a port scanner against internal addresses.
+    if let Err(err) = validate_upstream_url(&cfg.base_url) {
+        // Keep the response field a stable category ("blocked") for clean
+        // monitoring/alerting; log the detailed reason separately for operators.
+        tracing::warn!(
+            provider = %cfg.name,
+            "provider health probe blocked by SSRF guard: {}",
+            err.message
+        );
+        return (
+            ProbeOutcome::Unreachable("blocked".to_string()),
+            start.elapsed().as_millis(),
+        );
+    }
+
+    let headers = build_provider_upstream_headers(cfg, &HeaderMap::new());
+    let result = provider_client()
+        .get(format!("{}/v1/models", cfg.base_url))
+        .headers(headers)
+        // See PROBE_TIMEOUT: PROVIDER_CLIENT has no overall request timeout.
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await;
+
+    let latency = start.elapsed().as_millis();
+    match result {
+        Ok(resp) => (ProbeOutcome::Status(resp.status().as_u16()), latency),
+        Err(err) => (
+            ProbeOutcome::Unreachable(classify_probe_error(&err)),
+            latency,
+        ),
+    }
+}
+
+/// Reduce a reqwest error to a short, secret-free category. We never surface the
+/// `Display` of the error because it can embed the request URL. The category set
+/// is intentionally small and stable ("timeout"/"connect"/"request" here, plus
+/// "blocked" from the SSRF guard) so the admin endpoint is easy to alert on;
+/// redirects fold into "request" (redirects are disabled on the client anyway).
+fn classify_probe_error(err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        "timeout".to_string()
+    } else if err.is_connect() {
+        "connect".to_string()
+    } else {
+        "request".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +581,24 @@ mod tests {
         assert!(validate_upstream_url("http://127.0.0.1:8080").is_ok());
         assert!(validate_upstream_url("http://localhost:11434").is_ok());
         std::env::remove_var(ALLOW_PRIVATE_PROVIDERS_ENV);
+    }
+
+    #[tokio::test]
+    async fn probe_blocked_base_url_is_unreachable_without_network() {
+        // A non-http(s) scheme is rejected by the SSRF guard regardless of the
+        // private-provider opt-out, so the probe reports Unreachable
+        // deterministically with no socket opened and no env-var coupling (hence
+        // no lock held across the await).
+        let mut c = cfg("openai-compatible", "authorization", "secret");
+        c.base_url = "ftp://example.com".to_string();
+        let (outcome, _latency) = probe_provider_models(&c).await;
+        match outcome {
+            ProbeOutcome::Unreachable(reason) => {
+                assert!(reason.starts_with("blocked"), "reason was: {reason}");
+                // The configured apiKey must never leak into the error string.
+                assert!(!reason.contains("secret"));
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
     }
 }
