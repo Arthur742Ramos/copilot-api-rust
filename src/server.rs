@@ -15,7 +15,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::{info_span, Instrument, Level};
 
-use crate::libs::request_auth::{check_auth, AuthOptions};
+use crate::libs::request_auth::{check_auth, AuthOptions, AuthOutcome};
 use crate::libs::request_context::{resolve_trace_id, run_with_context, RequestContext};
 
 use crate::libs::http::MAX_REQUEST_BODY_BYTES;
@@ -287,13 +287,13 @@ async fn trace_middleware(req: Request, next: Next) -> Response {
         .or_else(|| header_string(&req, "x-client-request-id"));
     let parent_session_id = header_string(&req, "x-parent-session-id");
 
-    let context = RequestContext {
-        trace_id: trace_id.clone(),
-        start_time: crate::libs::request_context::now_millis(),
+    let context = RequestContext::new(
+        trace_id.clone(),
+        crate::libs::request_context::now_millis(),
         user_agent,
         session_affinity,
         parent_session_id,
-    };
+    );
 
     // Correlation span: every log line emitted while handling the request carries
     // the trace id (also returned as `x-trace-id`), plus method/path. The
@@ -433,28 +433,39 @@ fn header_string(req: &Request, name: &str) -> Option<String> {
 
 async fn general_auth_middleware(req: Request, next: Next) -> Response {
     let options = AuthOptions::general();
-    if let Some(rejection) = check_auth(
+    match check_auth(
         &options,
         req.method(),
         req.uri().path(),
         req.headers(),
         false,
     ) {
-        return rejection;
+        AuthOutcome::Reject(rejection) => return rejection,
+        AuthOutcome::Allow(Some(label)) => {
+            // Record which named key served this request so token usage can be
+            // attributed per client. The trace layer installed the task-local
+            // context outermost, so this fills its (interior-mutable) cell.
+            crate::libs::request_context::set_request_api_key_label(label);
+        }
+        AuthOutcome::Allow(None) => {}
     }
     next.run(req).await
 }
 
 async fn admin_auth_middleware(req: Request, next: Next) -> Response {
     let options = AuthOptions::admin();
-    if let Some(rejection) = check_auth(
+    match check_auth(
         &options,
         req.method(),
         req.uri().path(),
         req.headers(),
         true,
     ) {
-        return rejection;
+        AuthOutcome::Reject(rejection) => return rejection,
+        AuthOutcome::Allow(Some(label)) => {
+            crate::libs::request_context::set_request_api_key_label(label);
+        }
+        AuthOutcome::Allow(None) => {}
     }
     next.run(req).await
 }

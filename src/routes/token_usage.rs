@@ -5,9 +5,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::libs::token_usage::{
-    create_empty_daily_summary, create_empty_events_page, create_empty_sessions,
-    create_empty_summary, get_token_usage_daily_summary, get_token_usage_events_page,
-    get_token_usage_sessions, get_token_usage_summary,
+    create_empty_clients, create_empty_daily_summary, create_empty_events_page,
+    create_empty_sessions, create_empty_summary, get_token_usage_clients,
+    get_token_usage_daily_summary, get_token_usage_events_page, get_token_usage_sessions,
+    get_token_usage_summary,
 };
 
 const DEFAULT_EVENTS_PAGE_SIZE: i64 = 20;
@@ -20,6 +21,7 @@ pub fn router() -> Router {
         .route("/daily", get(get_daily))
         .route("/events", get(get_events))
         .route("/sessions", get(get_sessions))
+        .route("/clients", get(get_clients))
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,5 +98,16 @@ async fn get_sessions(Query(query): Query<PeriodQuery>) -> Response {
     })
     .await
     .unwrap_or_else(|_| create_empty_sessions(&period));
+    Json(response).into_response()
+}
+
+async fn get_clients(Query(query): Query<PeriodQuery>) -> Response {
+    let period = parse_period(query.period.as_deref());
+    let response = tokio::task::spawn_blocking({
+        let period = period.clone();
+        move || get_token_usage_clients(&period)
+    })
+    .await
+    .unwrap_or_else(|_| create_empty_clients(&period));
     Json(response).into_response()
 }

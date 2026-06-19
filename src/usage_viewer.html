@@ -161,6 +161,11 @@
   </section>
 
   <section class="section">
+    <h2>By Client (API key)</h2>
+    <div id="clientWrap"></div>
+  </section>
+
+  <section class="section">
     <h2>Daily Usage (total tokens)</h2>
     <div id="chartWrap"></div>
   </section>
@@ -293,6 +298,27 @@ function renderModels(summary) {
   });
 }
 
+function renderClients(resp) {
+  const wrap = document.getElementById("clientWrap");
+  const rows = (resp.clients || []).slice();
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">No attributed client usage yet (set auth.apiKeys labels to see a breakdown).</div>';
+    return;
+  }
+  const head = ["Client", "Requests", "Input", "Output", "Cache read", "Cache create", "Total"]
+    .map(function (h) { return "<th>" + esc(h) + "</th>"; }).join("");
+  const body = rows.map(function (c) {
+    return "<tr><td>" + esc(c.api_key_label) + "</td>" +
+      "<td>" + fmt(c.request_count) + "</td>" +
+      "<td>" + fmt(c.input_tokens) + "</td>" +
+      "<td>" + fmt(c.output_tokens) + "</td>" +
+      "<td>" + fmt(c.cache_read_input_tokens) + "</td>" +
+      "<td>" + fmt(c.cache_creation_input_tokens) + "</td>" +
+      "<td>" + fmt(c.total_tokens) + "</td></tr>";
+  }).join("");
+  wrap.innerHTML = "<table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table>";
+}
+
 function renderChart(daily) {
   const wrap = document.getElementById("chartWrap");
   const days = daily.days || [];
@@ -324,7 +350,7 @@ function renderEvents(page) {
     pager.style.display = "none";
     return;
   }
-  const head = ["Time", "Model", "Endpoint", "Source", "Input", "Output", "Cache R", "Cache C", "Total"]
+  const head = ["Time", "Model", "Endpoint", "Source", "Client", "Input", "Output", "Cache R", "Cache C", "Total"]
     .map(function (h) { return "<th>" + esc(h) + "</th>"; }).join("");
   const body = items.map(function (e) {
     let when = e.created_at_utc || "";
@@ -334,6 +360,7 @@ function renderEvents(page) {
       "<td>" + esc(e.model) + "</td>" +
       "<td>" + esc(e.endpoint) + "</td>" +
       "<td>" + esc(e.source) + "</td>" +
+      "<td>" + esc(e.api_key_label || "") + "</td>" +
       "<td>" + fmt(e.input_tokens) + "</td>" +
       "<td>" + fmt(e.output_tokens) + "</td>" +
       "<td>" + fmt(e.cache_read_input_tokens) + "</td>" +
@@ -365,6 +392,8 @@ async function loadAll() {
     const summary = await api("/token-usage?period=" + p);
     renderTotals(summary);
     renderModels(summary);
+    const clients = await api("/token-usage/clients?period=" + p);
+    renderClients(clients);
     const daily = await api("/token-usage/daily?period=" + p);
     renderChart(daily);
     await loadEvents();
