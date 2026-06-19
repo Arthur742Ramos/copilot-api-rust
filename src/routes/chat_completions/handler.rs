@@ -110,6 +110,18 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     match result {
         ChatCompletionsResult::NonStreaming(response) => {
+            // Native non-streaming responses never pass through a StreamTimer, so
+            // record the flow/model/transport headline here. This lets the
+            // trace middleware's `has_flow` guard emit the single
+            // `request.completed` line for this request (streaming responses are
+            // covered by the StreamTimer drop instead — never both).
+            if let Some(ctx) = crate::libs::request_context::request_context_store() {
+                ctx.set_flow_transport_model_non_streaming(
+                    &payload.model,
+                    "chat_completions",
+                    crate::libs::stream_metrics::transport::NATIVE,
+                );
+            }
             recorder.record(normalize_openai_usage(response.get("usage")));
             Ok(Json(response).into_response())
         }

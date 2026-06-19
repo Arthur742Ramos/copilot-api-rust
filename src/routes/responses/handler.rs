@@ -165,6 +165,17 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
             Ok(stream_responses_sse(upstream, recorder))
         }
         CreateResponsesReturn::Result(result) => {
+            // Native non-streaming responses never pass through a StreamTimer, so
+            // record the flow/model/transport headline here so the trace
+            // middleware's `has_flow` guard emits the single `request.completed`
+            // line (streaming responses are covered by the StreamTimer drop).
+            if let Some(ctx) = crate::libs::request_context::request_context_store() {
+                ctx.set_flow_transport_model_non_streaming(
+                    &payload.model,
+                    "responses",
+                    crate::libs::stream_metrics::transport::NATIVE,
+                );
+            }
             let usage_value = result
                 .usage
                 .as_ref()

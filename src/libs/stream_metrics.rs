@@ -169,8 +169,18 @@ mod tests {
             }
         }
         fn record_str(&mut self, field: &Field, value: &str) {
-            self.fields
-                .insert(field.name().to_string(), value.to_string());
+            // Route the message identically to `record_debug` so the captured
+            // `message` lands in the same slot regardless of which visitor method
+            // tracing chooses for the event's format string. Otherwise a string
+            // message would silently land in `fields["message"]`, leaving
+            // `self.message` empty and letting a real emission slip past a
+            // `message`-only assertion (a false negative).
+            if field.name() == "message" {
+                self.message = Some(value.to_string());
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
         }
         fn record_u64(&mut self, field: &Field, value: u64) {
             self.fields
@@ -204,6 +214,7 @@ mod tests {
             user_agent: "test".to_string(),
             session_affinity: Some("sess-7".to_string()),
             parent_session_id: None,
+            api_key_label: std::sync::Arc::new(std::sync::OnceLock::new()),
             summary: Arc::new(Mutex::new(RequestSummary::default())),
         }
     }
@@ -285,9 +296,15 @@ mod tests {
             drop(timer);
         });
         let captured = captured.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(captured
-            .events
-            .iter()
-            .all(|e| e.message.as_deref() != Some("request.completed")));
+        // Assert on the structured `event` field (always recorded via
+        // `record_str`), not just the format-string `message`, so a stray
+        // emission can't slip past on account of how tracing renders the message.
+        assert!(
+            captured.events.iter().all(|e| {
+                e.fields.get("event").map(String::as_str) != Some("request.completed")
+                    && e.message.as_deref() != Some("request.completed")
+            }),
+            "a context-less timer must emit no request.completed event"
+        );
     }
 }

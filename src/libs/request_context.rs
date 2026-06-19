@@ -333,6 +333,7 @@ mod summary_tests {
             user_agent: "test-agent".to_string(),
             session_affinity: Some("session-1".to_string()),
             parent_session_id: Some("parent-9".to_string()),
+            api_key_label: Arc::new(OnceLock::new()),
             summary: Arc::new(Mutex::new(summary)),
         }
     }
@@ -391,5 +392,25 @@ mod summary_tests {
         // Second call is a no-op (flag already set); must not panic.
         emit_request_completed(&ctx);
         assert!(ctx.summary_lock().emitted);
+    }
+
+    #[test]
+    fn non_streaming_helper_records_headline_without_marking_streaming() {
+        // Native non-streaming handlers stamp flow/model/transport here so the
+        // trace middleware's `has_flow` guard emits a single request.completed.
+        let ctx = ctx_with_summary(RequestSummary::default());
+        ctx.set_flow_transport_model_non_streaming("gpt-4o", "chat_completions", "native");
+        {
+            let s = ctx.summary_lock();
+            assert_eq!(s.flow, Some("chat_completions"));
+            assert_eq!(s.transport, Some("native"));
+            assert_eq!(s.model.as_deref(), Some("gpt-4o"));
+            assert!(!s.streaming, "non-streaming path must not set streaming");
+        }
+        // First flow writer wins: an api_flows selection is not clobbered.
+        ctx.set_flow_transport_model_non_streaming("other", "responses", "native");
+        let s = ctx.summary_lock();
+        assert_eq!(s.flow, Some("chat_completions"));
+        assert_eq!(s.model.as_deref(), Some("gpt-4o"));
     }
 }
