@@ -1,3 +1,4 @@
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Mirrors src/lib/request-context.ts. The TS code uses Node's AsyncLocalStorage
@@ -10,6 +11,32 @@ pub struct RequestContext {
     pub user_agent: String,
     pub session_affinity: Option<String>,
     pub parent_session_id: Option<String>,
+    /// Interior-mutable attribution token for the matched API key (its label, or
+    /// a stable fingerprint when unlabeled — never the raw key). The context
+    /// itself is installed immutably by the trace layer before auth runs, so the
+    /// auth layer fills this `OnceLock` (shared across clones via the `Arc`) once
+    /// the key is matched. Read later by the token-usage recorder.
+    pub api_key_label: Arc<OnceLock<String>>,
+}
+
+impl RequestContext {
+    /// Construct a context with an empty (not-yet-filled) attribution cell.
+    pub fn new(
+        trace_id: String,
+        start_time: u128,
+        user_agent: String,
+        session_affinity: Option<String>,
+        parent_session_id: Option<String>,
+    ) -> Self {
+        RequestContext {
+            trace_id,
+            start_time,
+            user_agent,
+            session_affinity,
+            parent_session_id,
+            api_key_label: Arc::new(OnceLock::new()),
+        }
+    }
 }
 
 const TRACE_ID_MAX_LENGTH: usize = 64;
@@ -30,6 +57,25 @@ where
 /// context if one is installed for this task.
 pub fn request_context_store() -> Option<RequestContext> {
     REQUEST_CONTEXT.try_with(|ctx| ctx.clone()).ok()
+}
+
+/// Fill the current context's API-key attribution cell (label or fingerprint —
+/// never the raw key). Called by the auth layer, which runs inside the trace
+/// layer's task-local scope. First write wins; later writes are ignored.
+pub fn set_request_api_key_label(label: String) {
+    let _ = REQUEST_CONTEXT.try_with(|ctx| {
+        let _ = ctx.api_key_label.set(label);
+    });
+}
+
+/// Read the API-key attribution token filled by the auth layer for the current
+/// request, if any. Returns `None` when no context is installed or no key matched
+/// (e.g. unauthenticated requests when no keys are configured).
+pub fn request_api_key_label() -> Option<String> {
+    REQUEST_CONTEXT
+        .try_with(|ctx| ctx.api_key_label.get().cloned())
+        .ok()
+        .flatten()
 }
 
 pub fn now_millis() -> u128 {

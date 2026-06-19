@@ -4,7 +4,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::libs::request_context::{generate_trace_id, request_context_store};
+use crate::libs::request_context::{
+    generate_trace_id, request_api_key_label, request_context_store,
+};
 use crate::libs::sqlite::with_usage_conn;
 use crate::libs::state;
 
@@ -277,6 +279,10 @@ pub struct PersistedTokenUsageEvent {
     pub total_tokens: i64,
     pub trace_id: String,
     pub user_id: String,
+    /// Attribution token for the API key that served the request: its configured
+    /// label, or a stable fingerprint when unlabeled. Never the raw key. `None`
+    /// for unauthenticated traffic (no keys configured).
+    pub api_key_label: Option<String>,
 }
 
 /// Mirrors `TokenUsageEventRecord` (a persisted event plus its row id).
@@ -297,6 +303,7 @@ pub struct TokenUsageEventRecord {
     pub total_tokens: i64,
     pub trace_id: String,
     pub user_id: String,
+    pub api_key_label: Option<String>,
 }
 
 /// Mirrors `TokenUsageTotals`.
@@ -337,6 +344,27 @@ pub struct TokenUsageSessionsResponse {
     pub period: TokenUsagePeriod,
     pub range: TokenUsageRange,
     pub sessions: Vec<TokenUsageSessionSummary>,
+}
+
+/// Per-client (per-API-key-label) aggregated usage row. The attribution token is
+/// the key's label or a stable fingerprint — never the raw key. Forms the basis
+/// of per-key budgets in a later phase.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenUsageClientSummary {
+    pub api_key_label: String,
+    #[serde(flatten)]
+    pub totals: TokenUsageTotals,
+    pub first_request_ms: i64,
+    pub last_request_ms: i64,
+}
+
+/// Response shape for `/token-usage/clients`: the per-client rows plus the period
+/// label and resolved range.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenUsageClientsResponse {
+    pub clients: Vec<TokenUsageClientSummary>,
+    pub period: TokenUsagePeriod,
+    pub range: TokenUsageRange,
 }
 
 /// Mirrors the inline `range` object on the summary shapes.
@@ -439,6 +467,15 @@ fn resolve_user_id(source: TokenUsageSource, provider_name: Option<&str>) -> Str
     }
 }
 
+/// Resolve the API-key attribution token for the current request from the
+/// request context (filled by the auth layer). Trimmed; `None` when absent or
+/// empty. This is the per-key identity a budget lookup will reuse.
+fn resolve_api_key_label() -> Option<String> {
+    request_api_key_label()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+}
+
 /// Mirrors `toPersistedEvent`: returns `None` when the usage carries no tokens.
 #[allow(clippy::too_many_arguments)]
 pub fn to_persisted_event(
@@ -483,6 +520,7 @@ pub fn to_persisted_event(
         total_tokens: resolve_total_tokens(usage),
         trace_id: resolve_token_usage_trace_id(trace_id),
         user_id: resolve_user_id(source, provider_name.as_deref()),
+        api_key_label: resolve_api_key_label(),
     })
 }
 
@@ -507,12 +545,18 @@ pub fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
           output_tokens INTEGER NOT NULL DEFAULT 0,
           cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
           cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-          total_tokens INTEGER NOT NULL DEFAULT 0
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          api_key_label TEXT NOT NULL DEFAULT ''
         )
         "#,
     )?;
     ensure_column(conn, "user_id", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "total_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    // Per-key attribution column (added after the original schema shipped, so it
+    // goes through the same additive migration path). Stores the key's label or a
+    // stable fingerprint — never the raw key. Empty string for legacy/anonymous
+    // rows keeps the column NOT NULL without a backfill.
+    ensure_column(conn, "api_key_label", "TEXT NOT NULL DEFAULT ''")?;
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_token_usage_events_created_at_ms
@@ -525,6 +569,8 @@ pub fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
           ON token_usage_events(session_id);
         CREATE INDEX IF NOT EXISTS idx_token_usage_events_user_id
           ON token_usage_events(user_id);
+        CREATE INDEX IF NOT EXISTS idx_token_usage_events_api_key_label
+          ON token_usage_events(api_key_label);
         "#,
     )?;
     Ok(())
@@ -564,8 +610,9 @@ pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Re
           output_tokens,
           cache_read_input_tokens,
           cache_creation_input_tokens,
-          total_tokens
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          total_tokens,
+          api_key_label
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
             params![
                 event.created_at_ms,
@@ -582,6 +629,7 @@ pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Re
                 event.cache_read_input_tokens,
                 event.cache_creation_input_tokens,
                 event.total_tokens,
+                event.api_key_label.as_deref().unwrap_or(""),
             ],
         )?;
         Ok::<(), rusqlite::Error>(())
@@ -595,6 +643,17 @@ pub fn write_token_usage_event(event: &PersistedTokenUsageEvent) -> rusqlite::Re
         "endpoint" => event.endpoint,
     )
     .increment(1);
+    // Per-client request counter. The `client` label is the API-key attribution
+    // token (label or fingerprint), NEVER the raw key. Cardinality is bounded by
+    // the number of configured keys (operator-controlled), so this is safe to
+    // expose as a Prometheus label. Skipped for anonymous traffic.
+    if let Some(client) = event.api_key_label.as_deref().filter(|c| !c.is_empty()) {
+        metrics::counter!(
+            "token_usage_events_by_client_total",
+            "client" => client.to_string(),
+        )
+        .increment(1);
+    }
     // Per-token counters reusing the same bounded {source, endpoint} labels.
     // Summing these makes cache hit rate a PromQL one-liner, e.g.
     //   sum(rate(cache_read_input_tokens_total[5m]))
@@ -892,6 +951,52 @@ fn sum_model_totals(models: &[TokenUsageModelSummary]) -> TokenUsageTotals {
     totals
 }
 
+/// Aggregate usage grouped by API-key attribution label, newest activity first.
+/// Rows with an empty label (legacy/anonymous traffic) are excluded so the
+/// breakdown only shows attributable clients. Mirrors `get_session_rows`.
+fn get_client_rows(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+) -> rusqlite::Result<Vec<TokenUsageClientSummary>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+          api_key_label,
+          COUNT(*) AS request_count,
+          COALESCE(SUM(input_tokens), 0) AS input_tokens,
+          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+          COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+          COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+          COALESCE(SUM(total_tokens), 0) AS total_tokens,
+          MIN(created_at_ms) AS first_request_ms,
+          MAX(created_at_ms) AS last_request_ms
+        FROM token_usage_events
+        WHERE created_at_ms >= ? AND created_at_ms < ? AND api_key_label != ''
+        GROUP BY api_key_label
+        ORDER BY total_tokens DESC, api_key_label ASC
+        "#,
+    )?;
+    let rows = stmt
+        .query_map(params![start_ms, end_ms], |row| {
+            Ok(TokenUsageClientSummary {
+                api_key_label: row.get("api_key_label")?,
+                totals: TokenUsageTotals {
+                    cache_creation_input_tokens: row.get("cache_creation_input_tokens")?,
+                    cache_read_input_tokens: row.get("cache_read_input_tokens")?,
+                    input_tokens: row.get("input_tokens")?,
+                    output_tokens: row.get("output_tokens")?,
+                    request_count: row.get("request_count")?,
+                    total_tokens: row.get("total_tokens")?,
+                },
+                first_request_ms: row.get("first_request_ms")?,
+                last_request_ms: row.get("last_request_ms")?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 // --- Empty (well-formed) shapes for the DB-error / disabled paths ---
 
 pub(crate) fn create_empty_summary(period: &str) -> TokenUsageSummary {
@@ -950,6 +1055,15 @@ pub(crate) fn create_empty_sessions(period: &str) -> TokenUsageSessionsResponse 
         sessions: Vec::new(),
     }
 }
+
+pub(crate) fn create_empty_clients(period: &str) -> TokenUsageClientsResponse {
+    let (start_ms, end_ms) = get_period_range(period, Utc::now().timestamp_millis());
+    TokenUsageClientsResponse {
+        clients: Vec::new(),
+        period: period.to_string(),
+        range: range_payload(start_ms, end_ms),
+    }
+}
 // --- Public read API (mirrors the getTokenUsage* functions) ---
 
 pub fn get_token_usage_summary(period: &str) -> TokenUsageSummary {
@@ -1004,6 +1118,35 @@ fn sessions_inner(
             period: period.to_string(),
             range: range_payload(start_ms, end_ms),
             sessions,
+        })
+    })
+}
+
+pub fn get_token_usage_clients(period: &str) -> TokenUsageClientsResponse {
+    if !is_token_usage_storage_enabled() {
+        return create_empty_clients(period);
+    }
+    let (start_ms, end_ms) = get_period_range(period, Utc::now().timestamp_millis());
+    match clients_inner(period, start_ms, end_ms) {
+        Ok(response) => response,
+        Err(error) => {
+            warn!("Failed to read token usage clients: {error}");
+            create_empty_clients(period)
+        }
+    }
+}
+
+fn clients_inner(
+    period: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> rusqlite::Result<TokenUsageClientsResponse> {
+    with_usage_conn(|conn| {
+        let clients = get_client_rows(conn, start_ms, end_ms)?;
+        Ok(TokenUsageClientsResponse {
+            clients,
+            period: period.to_string(),
+            range: range_payload(start_ms, end_ms),
         })
     })
 }
@@ -1108,7 +1251,8 @@ fn events_page_inner(
           output_tokens,
           cache_read_input_tokens,
           cache_creation_input_tokens,
-          total_tokens
+          total_tokens,
+          api_key_label
         FROM token_usage_events
         WHERE created_at_ms >= ? AND created_at_ms < ?
         ORDER BY created_at_ms DESC, id DESC
@@ -1118,6 +1262,7 @@ fn events_page_inner(
         let items = stmt
             .query_map(params![start_ms, end_ms, page_size, offset], |row| {
                 let model: Option<String> = row.get("model")?;
+                let api_key_label: String = row.get("api_key_label")?;
                 Ok(TokenUsageEventRecord {
                     cache_creation_input_tokens: row.get("cache_creation_input_tokens")?,
                     cache_read_input_tokens: row.get("cache_read_input_tokens")?,
@@ -1136,6 +1281,7 @@ fn events_page_inner(
                     total_tokens: row.get("total_tokens")?,
                     trace_id: row.get("trace_id")?,
                     user_id: row.get("user_id")?,
+                    api_key_label: Some(api_key_label).filter(|l| !l.is_empty()),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1161,6 +1307,80 @@ fn events_page_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libs::request_context::{
+        run_with_context, set_request_api_key_label, RequestContext,
+    };
+
+    #[test]
+    fn migration_adds_api_key_label_column() {
+        // Simulate an OLD database created before this column existed: a table
+        // without api_key_label. initialize_schema must add it via ensure_column.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE token_usage_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at_ms INTEGER NOT NULL,
+              created_at_utc TEXT NOT NULL,
+              trace_id TEXT NOT NULL,
+              session_id TEXT NOT NULL DEFAULT '',
+              user_id TEXT NOT NULL DEFAULT '',
+              source TEXT NOT NULL,
+              endpoint TEXT NOT NULL,
+              provider_name TEXT,
+              model TEXT NOT NULL,
+              input_tokens INTEGER NOT NULL DEFAULT 0,
+              output_tokens INTEGER NOT NULL DEFAULT 0,
+              cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+              cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+              total_tokens INTEGER NOT NULL DEFAULT 0
+            );
+            "#,
+        )
+        .unwrap();
+
+        let has_col = |c: &Connection| -> bool {
+            let mut stmt = c.prepare("PRAGMA table_info(token_usage_events)").unwrap();
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap();
+            cols.iter().any(|name| name == "api_key_label")
+        };
+        assert!(!has_col(&conn), "column should be absent before migration");
+        initialize_schema(&conn).unwrap();
+        assert!(has_col(&conn), "migration must add api_key_label column");
+    }
+
+    #[test]
+    fn attribution_flows_into_persisted_event() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let context = RequestContext::new("trace-attr".to_string(), 0, String::new(), None, None);
+        let event = rt.block_on(run_with_context(context, async {
+            // The auth layer fills this cell inside the context scope.
+            set_request_api_key_label("team-a".to_string());
+            let usage = UsageTokens {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                ..Default::default()
+            };
+            to_persisted_event(
+                "chat_completions",
+                "copilot",
+                "attr-model",
+                None,
+                None,
+                None,
+                None,
+                &usage,
+            )
+        }));
+        let event = event.expect("event present");
+        assert_eq!(event.api_key_label.as_deref(), Some("team-a"));
+    }
 
     #[test]
     fn to_persisted_event_returns_none_without_tokens() {

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::libs::config::get_config;
@@ -10,7 +11,57 @@ use crate::libs::config::get_config;
 // Mirrors src/lib/request-auth.ts. Provides API-key extraction and the auth
 // decision used by the server middleware layers.
 
-pub fn normalize_api_keys(api_keys: Option<&Vec<Value>>) -> Vec<String> {
+/// A normalized API key plus its optional human-readable label. This is the unit
+/// of per-key identity: the label (never the raw key) is what gets attributed in
+/// usage records and, in a later phase, looked up for per-key budgets. Designed
+/// so a budget lookup can reuse the same `label`/`attribution` resolution.
+#[derive(Debug, Clone)]
+pub struct ApiKeyConfig {
+    pub key: String,
+    pub label: Option<String>,
+}
+
+impl ApiKeyConfig {
+    /// The stable attribution token for this key: its label when set, otherwise a
+    /// short, deterministic fingerprint of the key. Never the raw key — safe to
+    /// persist and surface as a bounded metric label.
+    pub fn attribution(&self) -> String {
+        match self.label.as_deref().map(str::trim) {
+            Some(label) if !label.is_empty() => label.to_string(),
+            _ => key_fingerprint(&self.key),
+        }
+    }
+}
+
+/// A short, stable fingerprint of a raw key used to distinguish unlabeled clients
+/// without ever persisting or logging the secret itself. `key-<first 12 hex of
+/// sha256>` is collision-resistant enough to separate a handful of keys while
+/// revealing nothing about the original value.
+pub fn key_fingerprint(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    format!("key-{}", &hex::encode(digest)[..12])
+}
+
+/// One configured `auth.apiKeys` entry: either a bare string or an object with a
+/// `key` and an optional `label`. Untagged so existing string-only config keeps
+/// parsing unchanged while the richer object form is also accepted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ApiKeyEntry {
+    Plain(String),
+    Labeled {
+        key: String,
+        #[serde(default)]
+        label: Option<String>,
+    },
+}
+
+/// Normalize raw `auth.apiKeys` values (each an arbitrary JSON `Value`, so the
+/// surrounding config round-trips unknown shapes) into deduplicated key->label
+/// pairs. Accepts either a plain string or `{ "key": ..., "label": ... }`; empty
+/// keys and unparseable entries are dropped with a warning.
+pub fn normalize_api_keys(api_keys: Option<&Vec<Value>>) -> Vec<ApiKeyConfig> {
     let api_keys = match api_keys {
         Some(v) => v,
         None => return Vec::new(),
@@ -18,28 +69,42 @@ pub fn normalize_api_keys(api_keys: Option<&Vec<Value>>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     let mut had_invalid = false;
-    for key in api_keys {
-        match key {
-            Value::String(s) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    had_invalid = true;
-                    continue;
-                }
-                if seen.insert(trimmed.to_string()) {
-                    out.push(trimmed.to_string());
-                }
+    for entry in api_keys {
+        let parsed = match serde_json::from_value::<ApiKeyEntry>(entry.clone()) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                had_invalid = true;
+                continue;
             }
-            _ => had_invalid = true,
+        };
+        let (key, label) = match parsed {
+            ApiKeyEntry::Plain(s) => (s, None),
+            ApiKeyEntry::Labeled { key, label } => (key, label),
+        };
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            had_invalid = true;
+            continue;
+        }
+        let label = label
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty());
+        if seen.insert(trimmed.to_string()) {
+            out.push(ApiKeyConfig {
+                key: trimmed.to_string(),
+                label,
+            });
         }
     }
     if had_invalid {
-        tracing::warn!("Invalid auth.apiKeys entries found. Only non-empty strings are allowed.");
+        tracing::warn!(
+            "Invalid auth.apiKeys entries found. Each entry must be a non-empty string or an object with a non-empty 'key'."
+        );
     }
     out
 }
 
-pub fn get_configured_api_keys() -> Vec<String> {
+pub fn get_configured_api_keys() -> Vec<ApiKeyConfig> {
     let config = get_config();
     normalize_api_keys(config.auth.as_ref().and_then(|a| a.api_keys.as_ref()))
 }
@@ -58,10 +123,13 @@ fn normalize_api_key(value: Option<&Value>) -> Option<String> {
     }
 }
 
-pub fn get_configured_admin_api_keys() -> Vec<String> {
+pub fn get_configured_admin_api_keys() -> Vec<ApiKeyConfig> {
     let config = get_config();
     match normalize_api_key(config.auth.as_ref().and_then(|a| a.admin_api_key.as_ref())) {
-        Some(k) => vec![k],
+        Some(k) => vec![ApiKeyConfig {
+            key: k,
+            label: Some("admin".to_string()),
+        }],
         None => Vec::new(),
     }
 }
@@ -109,7 +177,7 @@ fn unauthorized_response() -> Response {
 
 /// Options matching `AuthMiddlewareOptions`.
 pub struct AuthOptions {
-    pub get_api_keys: fn() -> Vec<String>,
+    pub get_api_keys: fn() -> Vec<ApiKeyConfig>,
     pub allow_unauthenticated_paths: &'static [&'static str],
     pub allow_options_bypass: bool,
     pub allow_when_no_api_keys: bool,
@@ -154,43 +222,69 @@ impl AuthOptions {
     }
 }
 
-/// Returns `Some(response)` when the request should be rejected, `None` when it
-/// is authorized to proceed. Mirrors `createAuthMiddleware`'s decision tree.
+/// The result of an auth check. `Reject` carries the 401 response; `Allow`
+/// carries the matched key's attribution token (its label, or a stable
+/// fingerprint when unlabeled) when a configured key matched, or `None` for
+/// unauthenticated-but-permitted requests (allowlisted paths, OPTIONS bypass, or
+/// no keys configured).
+pub enum AuthOutcome {
+    Reject(Response),
+    Allow(Option<String>),
+}
+
+/// Returns `Reject(response)` when the request should be rejected, `Allow(label)`
+/// when it is authorized to proceed. Mirrors `createAuthMiddleware`'s decision
+/// tree. On a successful key match the matched entry's attribution token is
+/// returned so the caller can attribute usage to the named key.
 pub fn check_auth(
     options: &AuthOptions,
     method: &Method,
     path: &str,
     headers: &HeaderMap,
     is_admin_layer: bool,
-) -> Option<Response> {
+) -> AuthOutcome {
     if options.allow_options_bypass && method == Method::OPTIONS {
-        return None;
+        return AuthOutcome::Allow(None);
     }
     // The general layer skips /admin/ paths so the admin layer can handle them.
     if options.skip_admin_prefix && path.starts_with("/admin/") {
-        return None;
+        return AuthOutcome::Allow(None);
     }
     // The admin layer only applies to /admin/* paths.
     if is_admin_layer && !path.starts_with("/admin/") {
-        return None;
+        return AuthOutcome::Allow(None);
     }
     if options.allow_unauthenticated_paths.contains(&path) {
-        return None;
+        return AuthOutcome::Allow(None);
     }
 
     let api_keys = (options.get_api_keys)();
     if api_keys.is_empty() {
         return if options.allow_when_no_api_keys {
-            None
+            AuthOutcome::Allow(None)
         } else {
-            Some(unauthorized_response())
+            AuthOutcome::Reject(unauthorized_response())
         };
     }
 
-    let request_api_key = extract_request_api_key(headers);
-    match request_api_key {
-        Some(key) if api_keys.iter().any(|valid| constant_time_eq(valid, &key)) => None,
-        _ => Some(unauthorized_response()),
+    let request_api_key = match extract_request_api_key(headers) {
+        Some(key) => key,
+        None => return AuthOutcome::Reject(unauthorized_response()),
+    };
+
+    // Compare against every configured key without short-circuiting, so neither
+    // the per-byte comparison (constant_time_eq) nor the loop reveals which key
+    // matched or how far a near-miss got. The matched entry's attribution token
+    // is captured for usage accounting.
+    let mut matched: Option<String> = None;
+    for entry in &api_keys {
+        if constant_time_eq(&entry.key, &request_api_key) {
+            matched = Some(entry.attribution());
+        }
+    }
+    match matched {
+        Some(attribution) => AuthOutcome::Allow(Some(attribution)),
+        None => AuthOutcome::Reject(unauthorized_response()),
     }
 }
 
@@ -208,4 +302,138 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use serde_json::json;
+
+    fn keys(values: Vec<Value>) -> Vec<ApiKeyConfig> {
+        normalize_api_keys(Some(&values))
+    }
+
+    #[test]
+    fn normalize_accepts_plain_string_and_labeled_object() {
+        let parsed = keys(vec![
+            json!("plain-key"),
+            json!({ "key": "labeled-key", "label": "team-a" }),
+            json!({ "key": "unlabeled-obj" }),
+        ]);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].key, "plain-key");
+        assert_eq!(parsed[0].label, None);
+        assert_eq!(parsed[1].key, "labeled-key");
+        assert_eq!(parsed[1].label.as_deref(), Some("team-a"));
+        assert_eq!(parsed[2].key, "unlabeled-obj");
+        assert_eq!(parsed[2].label, None);
+    }
+
+    #[test]
+    fn normalize_trims_dedupes_and_drops_invalid() {
+        let parsed = keys(vec![
+            json!("  spaced  "),
+            json!("spaced"),                      // duplicate after trim -> dropped
+            json!(""),                            // empty -> dropped
+            json!({ "key": "  ", "label": "x" }), // empty key -> dropped
+            json!(42),                            // wrong type -> dropped
+            json!({ "label": "no-key" }),         // missing key -> dropped
+        ]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].key, "spaced");
+    }
+
+    #[test]
+    fn attribution_prefers_label_then_fingerprint() {
+        let labeled = ApiKeyConfig {
+            key: "secret".to_string(),
+            label: Some("frontend".to_string()),
+        };
+        assert_eq!(labeled.attribution(), "frontend");
+
+        let unlabeled = ApiKeyConfig {
+            key: "secret".to_string(),
+            label: None,
+        };
+        let fp = unlabeled.attribution();
+        assert!(fp.starts_with("key-"));
+        // Deterministic and never the raw key.
+        assert_eq!(fp, key_fingerprint("secret"));
+        assert_ne!(fp, "secret");
+        assert!(!fp.contains("secret"));
+    }
+
+    fn options_for(keys: fn() -> Vec<ApiKeyConfig>) -> AuthOptions {
+        AuthOptions {
+            get_api_keys: keys,
+            allow_unauthenticated_paths: &[],
+            allow_options_bypass: true,
+            allow_when_no_api_keys: false,
+            skip_admin_prefix: false,
+        }
+    }
+
+    fn bearer(key: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {key}")).unwrap(),
+        );
+        headers
+    }
+
+    fn two_keys() -> Vec<ApiKeyConfig> {
+        vec![
+            ApiKeyConfig {
+                key: "key-one".to_string(),
+                label: Some("alice".to_string()),
+            },
+            ApiKeyConfig {
+                key: "key-two".to_string(),
+                label: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn check_auth_returns_matched_label() {
+        let options = options_for(two_keys);
+        match check_auth(
+            &options,
+            &Method::GET,
+            "/v1/models",
+            &bearer("key-one"),
+            false,
+        ) {
+            AuthOutcome::Allow(Some(label)) => assert_eq!(label, "alice"),
+            _ => panic!("expected Allow with label"),
+        }
+    }
+
+    #[test]
+    fn check_auth_unlabeled_match_returns_fingerprint() {
+        let options = options_for(two_keys);
+        match check_auth(
+            &options,
+            &Method::GET,
+            "/v1/models",
+            &bearer("key-two"),
+            false,
+        ) {
+            AuthOutcome::Allow(Some(label)) => {
+                assert_eq!(label, key_fingerprint("key-two"));
+            }
+            _ => panic!("expected Allow with fingerprint"),
+        }
+    }
+
+    #[test]
+    fn check_auth_rejects_unknown_key() {
+        let options = options_for(two_keys);
+        match check_auth(&options, &Method::GET, "/v1/models", &bearer("nope"), false) {
+            AuthOutcome::Reject(_) => {}
+            _ => panic!("expected Reject"),
+        }
+    }
 }
