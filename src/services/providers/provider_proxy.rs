@@ -378,8 +378,8 @@ pub enum ProbeOutcome {
     /// The upstream returned an HTTP response with this status code.
     Status(u16),
     /// No HTTP response was obtained. The string is a short, secret-free
-    /// category ("timeout", "connect", "request"), never the raw error (which
-    /// could echo the configured URL).
+    /// category ("timeout", "connect", "request", "blocked"), never the raw
+    /// error (which could echo the configured URL).
     Unreachable(String),
 }
 
@@ -394,8 +394,15 @@ pub async fn probe_provider_models(cfg: &ResolvedProviderConfig) -> (ProbeOutcom
     // Reuse the same SSRF guard the real forwarding path applies, so a probe
     // can't be turned into a port scanner against internal addresses.
     if let Err(err) = validate_upstream_url(&cfg.base_url) {
+        // Keep the response field a stable category ("blocked") for clean
+        // monitoring/alerting; log the detailed reason separately for operators.
+        tracing::warn!(
+            provider = %cfg.name,
+            "provider health probe blocked by SSRF guard: {}",
+            err.message
+        );
         return (
-            ProbeOutcome::Unreachable(format!("blocked: {}", err.message)),
+            ProbeOutcome::Unreachable("blocked".to_string()),
             start.elapsed().as_millis(),
         );
     }
@@ -420,14 +427,15 @@ pub async fn probe_provider_models(cfg: &ResolvedProviderConfig) -> (ProbeOutcom
 }
 
 /// Reduce a reqwest error to a short, secret-free category. We never surface the
-/// `Display` of the error because it can embed the request URL.
+/// `Display` of the error because it can embed the request URL. The category set
+/// is intentionally small and stable ("timeout"/"connect"/"request" here, plus
+/// "blocked" from the SSRF guard) so the admin endpoint is easy to alert on;
+/// redirects fold into "request" (redirects are disabled on the client anyway).
 fn classify_probe_error(err: &reqwest::Error) -> String {
     if err.is_timeout() {
         "timeout".to_string()
     } else if err.is_connect() {
         "connect".to_string()
-    } else if err.is_redirect() {
-        "redirect".to_string()
     } else {
         "request".to_string()
     }
