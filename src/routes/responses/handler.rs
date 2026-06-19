@@ -58,6 +58,7 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
 
     check_rate_limit().await?;
     crate::libs::token_budget::check_token_budget()?;
+    crate::libs::premium_interactions::check_premium_interactions()?;
 
     let subagent_marker = get_codex_responses_subagent_marker(&headers);
     if let Some(marker) = subagent_marker.as_ref() {

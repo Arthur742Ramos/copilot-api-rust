@@ -144,6 +144,25 @@ pub struct AppConfig {
     /// `gpt-image-2`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "imageModel")]
     pub image_model: Option<String>,
+    /// Reject requests with a 429 once the account's cached GitHub Copilot
+    /// premium-interaction quota falls strictly below this many remaining
+    /// interactions. `None` (or a value `<= 0`) disables the threshold check.
+    /// Coarse, account-wide, and slow-refreshing (see
+    /// [`crate::libs::premium_interactions`]); always a no-op on plans that
+    /// report the quota as unlimited.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "minPremiumInteractionsRemaining"
+    )]
+    pub min_premium_interactions_remaining: Option<f64>,
+    /// Reject requests with a 429 once the account has exhausted its
+    /// premium-interaction entitlement and is into overage. `None`/`false`
+    /// disables the check. Always a no-op on unlimited plans.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "blockOnPremiumOverage"
+    )]
+    pub block_on_premium_overage: Option<bool>,
     /// Preserve unknown top-level keys (e.g. desktop-only fields).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -736,6 +755,20 @@ pub fn get_claude_token_multiplier() -> f64 {
 /// (treated as disabled).
 pub fn get_daily_token_budget() -> Option<i64> {
     get_config().daily_token_budget.filter(|&b| b > 0)
+}
+
+/// Minimum remaining premium interactions before the admission gate rejects, or
+/// `None` when unset or non-positive (treated as disabled).
+pub fn get_min_premium_interactions_remaining() -> Option<f64> {
+    get_config()
+        .min_premium_interactions_remaining
+        .filter(|&v| v > 0.0)
+}
+
+/// Whether to reject requests once the account is into premium-interaction
+/// overage. Defaults to `false` (disabled).
+pub fn get_block_on_premium_overage() -> bool {
+    get_config().block_on_premium_overage.unwrap_or(false)
 }
 
 /// Top-level Responses model that drives Codex image generation. Defaults to

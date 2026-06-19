@@ -38,6 +38,7 @@ async fn handle(body: Value, headers: axum::http::HeaderMap) -> Result<Value, Ap
     // single request, so it must not bypass the spend guardrail.
     crate::libs::rate_limit::check_rate_limit().await?;
     crate::libs::token_budget::check_token_budget()?;
+    crate::libs::premium_interactions::check_premium_interactions()?;
 
     // Ensure the Codex OAuth token is loaded/refreshed into global state before
     // forwarding (no-op if the refresh loop already populated it). A missing

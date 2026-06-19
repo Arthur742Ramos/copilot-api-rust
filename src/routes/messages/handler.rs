@@ -123,6 +123,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     check_rate_limit().await?;
     crate::libs::token_budget::check_token_budget()?;
+    crate::libs::premium_interactions::check_premium_interactions()?;
 
     sanitize_ide_tools(&mut payload);
 
