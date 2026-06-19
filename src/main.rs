@@ -155,9 +155,16 @@ async fn main() {
     let verbose = matches!(&cli.command, Command::Start(a) if a.verbose)
         || matches!(&cli.command, Command::Auth(a) if a.verbose);
     // In MCP mode stdout is the JSON-RPC transport, so all logs must go to
-    // stderr to avoid corrupting the protocol stream.
+    // stderr to avoid corrupting the protocol stream. Likewise, subcommands that
+    // print a machine-readable JSON report to stdout (`doctor --json`,
+    // `debug --json`) must keep logs off stdout so a stray config warning can't
+    // interleave with and break the JSON.
     let mcp_mode = matches!(&cli.command, Command::Mcp);
-    init_tracing(verbose, mcp_mode);
+    let json_report_to_stdout = matches!(
+        &cli.command,
+        Command::Doctor { json: true } | Command::Debug { json: true }
+    );
+    init_tracing(verbose, mcp_mode || json_report_to_stdout);
 
     let result = match cli.command {
         Command::Start(args) => run_server(args).await,

@@ -107,20 +107,18 @@ async fn check_auth() -> Vec<Check> {
     // GitHub token: probe presence WITHOUT calling setup_github_token when the
     // token is absent, because setup_github_token would otherwise start the
     // interactive device-code flow (wrong for a non-interactive preflight).
-    let github_token = match crate::libs::credential_store::read_github_token().await {
-        Ok(token) => token.filter(|t| !t.trim().is_empty()),
+    // A single match records exactly ONE `auth.github` check per outcome (read
+    // error / missing / present-and-validated), so the report never double-counts.
+    let github_ok = match crate::libs::credential_store::read_github_token().await {
         Err(e) => {
             checks.push(Check::new(
                 "auth.github",
                 Status::Fail,
                 format!("Could not read GitHub token: {e}"),
             ));
-            None
+            false
         }
-    };
-
-    let github_ok = match github_token {
-        None => {
+        Ok(token) if token.as_ref().map(|t| t.trim().is_empty()).unwrap_or(true) => {
             checks.push(Check::new(
                 "auth.github",
                 Status::Fail,
@@ -128,7 +126,7 @@ async fn check_auth() -> Vec<Check> {
             ));
             false
         }
-        Some(_) => {
+        Ok(_) => {
             // Token present: validate it is actually usable (setup_github_token
             // with force=false reuses the on-disk token and calls log_user,
             // which hits the GitHub API and fails on a revoked/expired token).
