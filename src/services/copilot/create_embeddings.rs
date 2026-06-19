@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::libs::api_config::{copilot_base_url, copilot_headers};
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::{client, read_json_capped, retry_endpoint, send_with_retry, RetryPolicy};
+use crate::libs::http::{client, read_json_capped, retry_endpoint};
 use crate::libs::metrics::{record_upstream_request, UpstreamStatus};
 use crate::libs::state;
 
@@ -19,20 +19,28 @@ pub async fn create_embeddings(payload: &EmbeddingRequest) -> Result<Value, Http
     let base = copilot_base_url(&st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    let request = client()
-        .post(format!("{base}/embeddings"))
-        .headers(copilot_headers(&st, None, false))
-        .body(body);
-    let response = send_with_retry(request, retry_endpoint::EMBEDDINGS, RetryPolicy::from_env())
-        .await
-        .map_err(|e| {
-            record_upstream_request(
-                retry_endpoint::EMBEDDINGS,
-                UpstreamStatus::TransportError,
-                upstream_start.elapsed().as_secs_f64(),
-            );
-            HttpError::internal(format!("Failed to create embeddings: {e}"))
-        })?;
+    // Rebuild auth headers per attempt from the token the helper hands us so the
+    // 401-triggered replay carries the inline-refreshed token, against which the
+    // refresh decision is made (no read/build token-rotation window).
+    let build = |token: &str| {
+        let mut st = state::snapshot();
+        st.copilot_token = Some(token.to_string());
+        client()
+            .post(format!("{base}/embeddings"))
+            .headers(copilot_headers(&st, None, false))
+            .body(body.clone())
+    };
+    let response =
+        crate::libs::token::send_copilot_with_401_retry(retry_endpoint::EMBEDDINGS, build)
+            .await
+            .map_err(|e| {
+                record_upstream_request(
+                    retry_endpoint::EMBEDDINGS,
+                    UpstreamStatus::TransportError,
+                    upstream_start.elapsed().as_secs_f64(),
+                );
+                HttpError::internal(format!("Failed to create embeddings: {e}"))
+            })?;
     record_upstream_request(
         retry_endpoint::EMBEDDINGS,
         UpstreamStatus::from_code(response.status().as_u16()),
