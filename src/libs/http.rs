@@ -105,7 +105,7 @@ pub const RETRY_ENDPOINTS: [&str; 6] = [
 /// `status` is a retryable upstream HTTP status ({429, 502, 503, 504}) observed
 /// before any body streamed. Used at both the increment sites and the
 /// pre-registration so the two series always exist together.
-pub const RETRY_REASONS: [&str; 2] = [RETRY_REASON_CONNECT, RETRY_REASON_STATUS];
+const RETRY_REASONS: [&str; 2] = [RETRY_REASON_CONNECT, RETRY_REASON_STATUS];
 
 const RETRY_REASON_CONNECT: &str = "connect";
 const RETRY_REASON_STATUS: &str = "status";
@@ -202,14 +202,19 @@ fn is_retryable_status(status: u16) -> bool {
 }
 
 /// Resolve the effective retry count from the environment, clamped to
-/// [`MAX_UPSTREAM_MAX_RETRIES`]. Pure-ish (reads env) and factored so the parse
-/// fallbacks are covered without juggling process env in the hot path.
+/// [`MAX_UPSTREAM_MAX_RETRIES`]. The override is effectively static for a running
+/// process (like [`upstream_read_timeout`]), so it is parsed once and cached
+/// rather than re-read on every request in the hot path. The pure parse lives in
+/// [`parse_max_retries`] so the fallbacks stay testable without touching env.
 fn upstream_max_retries() -> u32 {
-    parse_max_retries(
-        std::env::var("COPILOT_API_UPSTREAM_MAX_RETRIES")
-            .ok()
-            .as_deref(),
-    )
+    static CACHED: Lazy<u32> = Lazy::new(|| {
+        parse_max_retries(
+            std::env::var("COPILOT_API_UPSTREAM_MAX_RETRIES")
+                .ok()
+                .as_deref(),
+        )
+    });
+    *CACHED
 }
 
 /// Parse the `COPILOT_API_UPSTREAM_MAX_RETRIES` override, falling back to
