@@ -1,6 +1,6 @@
 // The crate's modules live in the `copilot_api` library (src/lib.rs) so that
 // integration tests can link against them. The binary just drives the CLI.
-use copilot_api::{debug, libs, mcp, server, services};
+use copilot_api::{debug, doctor, libs, mcp, server, services};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -43,6 +43,12 @@ enum Command {
     /// Print environment, provider, and path diagnostics
     Debug {
         /// Emit diagnostics as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Run preflight checks on config, auth, and providers (exits non-zero on FAIL)
+    Doctor {
+        /// Emit the report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -149,9 +155,16 @@ async fn main() {
     let verbose = matches!(&cli.command, Command::Start(a) if a.verbose)
         || matches!(&cli.command, Command::Auth(a) if a.verbose);
     // In MCP mode stdout is the JSON-RPC transport, so all logs must go to
-    // stderr to avoid corrupting the protocol stream.
+    // stderr to avoid corrupting the protocol stream. Likewise, subcommands that
+    // print a machine-readable JSON report to stdout (`doctor --json`,
+    // `debug --json`) must keep logs off stdout so a stray config warning can't
+    // interleave with and break the JSON.
     let mcp_mode = matches!(&cli.command, Command::Mcp);
-    init_tracing(verbose, mcp_mode);
+    let json_report_to_stdout = matches!(
+        &cli.command,
+        Command::Doctor { json: true } | Command::Debug { json: true }
+    );
+    init_tracing(verbose, mcp_mode || json_report_to_stdout);
 
     let result = match cli.command {
         Command::Start(args) => run_server(args).await,
@@ -160,6 +173,13 @@ async fn main() {
         Command::Debug { json } => {
             debug::run_debug(json).await;
             Ok(())
+        }
+        Command::Doctor { json } => {
+            // The doctor command owns its own exit code (non-zero when any check
+            // FAILs) so it can gate a CI / preflight step. Exit directly rather
+            // than folding into the shared `result` path below.
+            let code = doctor::run_doctor(json).await;
+            std::process::exit(code);
         }
         Command::Mcp => mcp::run_mcp_server().await,
         Command::Update(args) => run_update(args).await,
