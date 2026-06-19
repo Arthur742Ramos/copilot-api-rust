@@ -1,6 +1,6 @@
 // The crate's modules live in the `copilot_api` library (src/lib.rs) so that
 // integration tests can link against them. The binary just drives the CLI.
-use copilot_api::{debug, libs, mcp, server, services};
+use copilot_api::{debug, doctor, libs, mcp, server, services};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -43,6 +43,12 @@ enum Command {
     /// Print environment, provider, and path diagnostics
     Debug {
         /// Emit diagnostics as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Run preflight checks on config, auth, and providers (exits non-zero on FAIL)
+    Doctor {
+        /// Emit the report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -160,6 +166,13 @@ async fn main() {
         Command::Debug { json } => {
             debug::run_debug(json).await;
             Ok(())
+        }
+        Command::Doctor { json } => {
+            // The doctor command owns its own exit code (non-zero when any check
+            // FAILs) so it can gate a CI / preflight step. Exit directly rather
+            // than folding into the shared `result` path below.
+            let code = doctor::run_doctor(json).await;
+            std::process::exit(code);
         }
         Command::Mcp => mcp::run_mcp_server().await,
         Command::Update(args) => run_update(args).await,

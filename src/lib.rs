@@ -10,4 +10,5 @@ pub mod server;
 pub mod services;
 
 pub mod debug;
+pub mod doctor;
 pub mod mcp;

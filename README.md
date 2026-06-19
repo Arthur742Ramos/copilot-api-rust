@@ -228,6 +228,7 @@ Global usage: `copilot-api [GLOBAL OPTIONS] <SUBCOMMAND>`
 | `auth`         | Run authentication flows without starting the server. |
 | `check-usage`  | Show current GitHub Copilot usage / quota information. |
 | `debug`        | Print environment, provider, and path diagnostics. Add `--json` for JSON output. |
+| `doctor`       | Run a one-shot preflight over auth, providers, and config; exits non-zero on any `FAIL`. Add `--json` for JSON output. |
 | `mcp`          | Start the MCP bridge server over stdio (`tool_search` + `generate_image` tools). |
 | `update`       | Update copilot-api in place to the latest GitHub release. |
 
@@ -264,6 +265,35 @@ These apply to every subcommand:
 | `--provider <NAME>` | `copilot` | Provider to log in with: `copilot` or `codex`. |
 | `--verbose` / `-v` | `false` | Enable verbose logging. |
 | `--show-token` | `false` | Show the provider access token on auth. |
+
+### `doctor` preflight
+
+`copilot-api doctor` runs a one-shot health check and exits non-zero when any
+check reports `FAIL`, so it can gate a CI step or a deployment script:
+
+```sh
+copilot-api doctor          # human-readable summary
+copilot-api doctor --json   # machine-readable report (checks, summary, exitCode)
+```
+
+Each check reports `OK | WARN | FAIL` with a short, secret-free message (tokens
+and apiKeys are never printed). Checks performed:
+
+- **Auth** — GitHub token present and usable; Copilot token obtained and fresh;
+  Codex credentials present and unexpired (only when a `codex` provider is
+  configured). A missing GitHub token `FAIL`s without starting the interactive
+  device-code login.
+- **Providers** — every enabled third-party provider is actively probed
+  (`GET {baseUrl}/v1/models`). `200`/`404` is `OK`; `401`/`403` is `FAIL` (bad
+  apiKey); an SSRF-blocked base URL or a connect/timeout failure is `FAIL`.
+- **Config model-id drift** — `smallModel`, `messageApiWebSearchModel`,
+  `imageChatModel`, and the model-keyed maps (`modelMappings` targets,
+  `modelReasoningEfforts`, `extraPrompts`) are cross-checked against the model
+  catalog they belong to. A dangling id silently no-ops at runtime, so it is
+  reported as a `WARN` (it never fails the preflight).
+
+The exit code is `0` when no check `FAIL`s (WARNs are advisory) and `1`
+otherwise.
 
 ## MCP bridge (image generation in Claude Code)
 
