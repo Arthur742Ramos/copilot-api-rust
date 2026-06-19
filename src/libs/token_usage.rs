@@ -470,7 +470,7 @@ fn resolve_user_id(source: TokenUsageSource, provider_name: Option<&str>) -> Str
 /// Resolve the API-key attribution token for the current request from the
 /// request context (filled by the auth layer). Trimmed; `None` when absent or
 /// empty. This is the per-key identity a budget lookup will reuse.
-fn resolve_api_key_label() -> Option<String> {
+pub(crate) fn resolve_api_key_label() -> Option<String> {
     request_api_key_label()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
@@ -1091,6 +1091,42 @@ fn summary_inner(period: &str, start_ms: i64, end_ms: i64) -> rusqlite::Result<T
             totals,
         })
     })
+}
+
+/// Total tokens recorded for a single attribution label over `period`. Reuses the
+/// same day-window the global budget uses, but scoped with `WHERE api_key_label =
+/// ?`, so the per-key budget gate counts exactly the spend Phase 1 attributed to
+/// that key. Returns 0 when storage is disabled or the read fails (fail-open,
+/// matching the global summary's error handling).
+pub fn get_token_usage_label_total(period: &str, label: &str) -> i64 {
+    if !is_token_usage_storage_enabled() {
+        return 0;
+    }
+    let (start_ms, end_ms) = get_period_range(period, Utc::now().timestamp_millis());
+    match with_usage_conn(|conn| get_label_total_row(conn, start_ms, end_ms, label)) {
+        Ok(total) => total,
+        Err(error) => {
+            warn!("Failed to read per-key token usage total: {error}");
+            0
+        }
+    }
+}
+
+fn get_label_total_row(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+    label: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        r#"
+        SELECT COALESCE(SUM(total_tokens), 0) AS total_tokens
+        FROM token_usage_events
+        WHERE created_at_ms >= ? AND created_at_ms < ? AND api_key_label = ?
+        "#,
+        params![start_ms, end_ms, label],
+        |row| row.get("total_tokens"),
+    )
 }
 
 pub fn get_token_usage_sessions(period: &str) -> TokenUsageSessionsResponse {
