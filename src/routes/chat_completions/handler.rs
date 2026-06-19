@@ -147,10 +147,10 @@ fn stream_sse(
     // here is a coarser first-non-empty-chunk approximation (transport=native).
     // The timer is held by the stream closure and drops (recording
     // stream-complete) when the stream ends or the client disconnects.
-    let timer_for_stream = Arc::new(Mutex::new(StreamTimer::new(
-        "chat_completions",
-        transport::NATIVE,
-    )));
+    let timer_for_stream = Arc::new(Mutex::new(
+        StreamTimer::new("chat_completions", transport::NATIVE)
+            .with_request_context(crate::libs::request_context::request_context_store()),
+    ));
 
     let byte_stream = upstream.bytes_stream();
     let mapped = byte_stream.map(move |chunk| {

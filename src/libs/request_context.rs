@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Mirrors src/lib/request-context.ts. The TS code uses Node's AsyncLocalStorage
@@ -17,10 +17,43 @@ pub struct RequestContext {
     /// auth layer fills this `OnceLock` (shared across clones via the `Arc`) once
     /// the key is matched. Read later by the token-usage recorder.
     pub api_key_label: Arc<OnceLock<String>>,
+    /// Shared, mutable per-request triage summary. Cloning a `RequestContext`
+    /// (e.g. `request_context_store()`) shares the SAME `Arc`, so every layer —
+    /// the api_flows flow selection, the `StreamTimer`, and the
+    /// `record_upstream_request` sites — writes into one summary that is emitted
+    /// exactly once as the `request.completed` event. Added last so existing
+    /// field-by-field construction stays a single additive line.
+    pub summary: Arc<Mutex<RequestSummary>>,
+}
+
+/// Per-request triage data that today only exists as aggregate Prometheus
+/// histograms. Collected across the request's layers and flushed once into the
+/// `request.completed` log line so per-request triage doesn't require
+/// `RUST_LOG=debug` + replay.
+#[derive(Debug, Clone, Default)]
+pub struct RequestSummary {
+    /// Concrete upstream model id (e.g. `gpt-4o`), once a flow has been selected.
+    pub model: Option<String>,
+    /// Dispatch flow: `chat_completions` | `responses` | `messages`.
+    pub flow: Option<&'static str>,
+    /// Transport: `translated` (per-event translation) | `native` (raw forward).
+    pub transport: Option<&'static str>,
+    /// Whether the response was an SSE stream.
+    pub streaming: bool,
+    /// Coarse upstream status class: `ok` | `client_error` | `server_error` |
+    /// `transport_error` (last upstream call wins, so retries reflect the final).
+    pub upstream_status: Option<&'static str>,
+    /// Time-to-first-token in milliseconds (streaming responses only).
+    pub ttft_ms: Option<u64>,
+    /// Terminal outcome: `ok` | `error`.
+    pub outcome: Option<&'static str>,
+    /// Guards against double-emission: the first emitter wins.
+    pub emitted: bool,
 }
 
 impl RequestContext {
-    /// Construct a context with an empty (not-yet-filled) attribution cell.
+    /// Construct a context with an empty (not-yet-filled) attribution cell and a
+    /// fresh, empty triage summary.
     pub fn new(
         trace_id: String,
         start_time: u128,
@@ -35,6 +68,81 @@ impl RequestContext {
             session_affinity,
             parent_session_id,
             api_key_label: Arc::new(OnceLock::new()),
+            summary: Arc::new(Mutex::new(RequestSummary::default())),
+        }
+    }
+
+    /// Lock the summary, recovering from a poisoned mutex (a panic while another
+    /// layer held the lock must not wedge the whole request).
+    fn summary_lock(&self) -> std::sync::MutexGuard<'_, RequestSummary> {
+        self.summary.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Record the selected dispatch flow + transport + concrete model. Called
+    /// once per request from the api_flows handlers (in-scope, before streaming).
+    pub fn set_flow(&self, model: &str, flow: &'static str, transport: &'static str) {
+        let mut s = self.summary_lock();
+        s.model = Some(model.to_string());
+        s.flow = Some(flow);
+        s.transport = Some(transport);
+    }
+
+    /// Mark the response streaming and stamp flow/transport without touching the
+    /// model. Used by the `StreamTimer` (which knows flow/transport but not the
+    /// model) so native streams without a flow handler still get a headline.
+    pub fn set_flow_transport_streaming(&self, flow: &'static str, transport: &'static str) {
+        let mut s = self.summary_lock();
+        s.streaming = true;
+        if s.flow.is_none() {
+            s.flow = Some(flow);
+        }
+        if s.transport.is_none() {
+            s.transport = Some(transport);
+        }
+    }
+
+    /// Record the selected flow/transport/model for a NON-streaming response
+    /// without touching the `streaming` flag. Used by native (non-translated)
+    /// handlers so non-streaming native requests still record a headline and
+    /// emit exactly one `request.completed`. First flow writer wins so a later,
+    /// less-specific label can't clobber an api_flows selection.
+    pub fn set_flow_transport_model_non_streaming(
+        &self,
+        model: &str,
+        flow: &'static str,
+        transport: &'static str,
+    ) {
+        let mut s = self.summary_lock();
+        if s.flow.is_none() {
+            s.flow = Some(flow);
+        }
+        if s.transport.is_none() {
+            s.transport = Some(transport);
+        }
+        if s.model.is_none() {
+            s.model = Some(model.to_string());
+        }
+    }
+
+    /// Record time-to-first-token (first content frame) unless already recorded.
+    pub fn set_ttft_ms(&self, ttft_ms: u64) {
+        let mut s = self.summary_lock();
+        if s.ttft_ms.is_none() {
+            s.ttft_ms = Some(ttft_ms);
+        }
+    }
+
+    /// Record the coarse upstream-status class. Last writer wins so that a
+    /// retried request reflects the status that actually produced the response.
+    pub fn set_upstream_status(&self, status: &'static str) {
+        self.summary_lock().upstream_status = Some(status);
+    }
+
+    /// Set the terminal outcome unless one was already recorded.
+    pub fn set_outcome_if_unset(&self, outcome: &'static str) {
+        let mut s = self.summary_lock();
+        if s.outcome.is_none() {
+            s.outcome = Some(outcome);
         }
     }
 }
@@ -130,4 +238,158 @@ pub fn resolve_trace_id(trace_id: Option<&str>) -> String {
         return generate_trace_id();
     }
     candidate.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// request.completed summary event
+// ---------------------------------------------------------------------------
+
+/// The assembled, flat field set of one `request.completed` event. Factored out
+/// of the emit path so the assembly is unit-testable without a live server: the
+/// pure [`RequestCompletedFields::assemble`] takes an explicit `now_ms`, and
+/// [`RequestCompletedFields::emit`] does the (side-effecting) tracing call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestCompletedFields {
+    pub trace_id: String,
+    pub session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub model: Option<String>,
+    pub flow: Option<&'static str>,
+    pub transport: Option<&'static str>,
+    pub streaming: bool,
+    pub upstream_status: Option<&'static str>,
+    pub ttft_ms: Option<u64>,
+    pub total_ms: u64,
+    pub outcome: &'static str,
+}
+
+impl RequestCompletedFields {
+    /// Build the flat field set from the request context + collected summary.
+    /// Pure given `now_ms` (millis since the epoch) so tests can pin the clock.
+    pub fn assemble(ctx: &RequestContext, summary: &RequestSummary, now_ms: u128) -> Self {
+        let total_ms = now_ms.saturating_sub(ctx.start_time) as u64;
+        Self {
+            trace_id: ctx.trace_id.clone(),
+            session_id: ctx.session_affinity.clone(),
+            parent_session_id: ctx.parent_session_id.clone(),
+            model: summary.model.clone(),
+            flow: summary.flow,
+            transport: summary.transport,
+            streaming: summary.streaming,
+            upstream_status: summary.upstream_status,
+            ttft_ms: summary.ttft_ms,
+            total_ms,
+            outcome: summary.outcome.unwrap_or("ok"),
+        }
+    }
+
+    /// Emit the single structured `request.completed` tracing event. Greppable
+    /// in both the human and `COPILOT_API_LOG_FORMAT=json` formatters: the
+    /// message and the `event` field are both the literal `request.completed`.
+    pub fn emit(&self) {
+        tracing::info!(
+            target: "request_completed",
+            event = "request.completed",
+            trace_id = %self.trace_id,
+            session_id = self.session_id.as_deref(),
+            parent_session_id = self.parent_session_id.as_deref(),
+            model = self.model.as_deref(),
+            flow = self.flow,
+            transport = self.transport,
+            streaming = self.streaming,
+            upstream_status = self.upstream_status,
+            ttft_ms = self.ttft_ms,
+            total_ms = self.total_ms,
+            outcome = self.outcome,
+            "request.completed"
+        );
+    }
+}
+
+/// Emit the `request.completed` event for `ctx` exactly once. The `emitted`
+/// flag in the shared summary makes this idempotent across the two call sites
+/// (the middleware for non-streaming responses, the `StreamTimer` drop for
+/// streams), so a misordered double-call can never double-log.
+pub fn emit_request_completed(ctx: &RequestContext) {
+    let fields = {
+        let mut s = ctx.summary_lock();
+        if s.emitted {
+            return;
+        }
+        s.emitted = true;
+        RequestCompletedFields::assemble(ctx, &s, now_millis())
+    };
+    fields.emit();
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    fn ctx_with_summary(summary: RequestSummary) -> RequestContext {
+        RequestContext {
+            trace_id: "trace-abc".to_string(),
+            start_time: 1_000,
+            user_agent: "test-agent".to_string(),
+            session_affinity: Some("session-1".to_string()),
+            parent_session_id: Some("parent-9".to_string()),
+            summary: Arc::new(Mutex::new(summary)),
+        }
+    }
+
+    #[test]
+    fn assemble_maps_every_field() {
+        let summary = RequestSummary {
+            model: Some("gpt-4o".to_string()),
+            flow: Some("chat_completions"),
+            transport: Some("translated"),
+            streaming: true,
+            upstream_status: Some("ok"),
+            ttft_ms: Some(42),
+            outcome: Some("ok"),
+            emitted: false,
+        };
+        let ctx = ctx_with_summary(summary.clone());
+        let fields = RequestCompletedFields::assemble(&ctx, &summary, 1_350);
+
+        assert_eq!(
+            fields,
+            RequestCompletedFields {
+                trace_id: "trace-abc".to_string(),
+                session_id: Some("session-1".to_string()),
+                parent_session_id: Some("parent-9".to_string()),
+                model: Some("gpt-4o".to_string()),
+                flow: Some("chat_completions"),
+                transport: Some("translated"),
+                streaming: true,
+                upstream_status: Some("ok"),
+                ttft_ms: Some(42),
+                total_ms: 350,
+                outcome: "ok",
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_defaults_to_ok_and_clock_never_underflows() {
+        let summary = RequestSummary::default();
+        let ctx = ctx_with_summary(summary.clone());
+        // now_ms earlier than start_time must not panic/underflow.
+        let fields = RequestCompletedFields::assemble(&ctx, &summary, 0);
+        assert_eq!(fields.total_ms, 0);
+        assert_eq!(fields.outcome, "ok");
+    }
+
+    #[test]
+    fn emit_request_completed_is_idempotent() {
+        let ctx = ctx_with_summary(RequestSummary {
+            flow: Some("messages"),
+            ..RequestSummary::default()
+        });
+        emit_request_completed(&ctx);
+        assert!(ctx.summary_lock().emitted);
+        // Second call is a no-op (flag already set); must not panic.
+        emit_request_completed(&ctx);
+        assert!(ctx.summary_lock().emitted);
+    }
 }

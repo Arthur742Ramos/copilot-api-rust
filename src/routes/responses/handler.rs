@@ -187,11 +187,17 @@ fn stream_responses_sse(
 
     let event_stream = upstream;
 
+    // Capture the request context while the task-local is still in scope; the
+    // stream body below is polled later (outside the scope), so it must be
+    // moved in for the timer's `request.completed` emission.
+    let req_ctx = crate::libs::request_context::request_context_store();
+
     let body = Body::from_stream(async_stream::stream! {
         // Cover the native /v1/responses stream with the same proxy_stream_*
         // dashboards as the messages flows (transport=native). The timer drops
         // at end-of-stream (or client disconnect), recording stream-complete.
-        let mut timer = StreamTimer::new("responses", transport::NATIVE);
+        let mut timer = StreamTimer::new("responses", transport::NATIVE)
+            .with_request_context(req_ctx);
         let mut tracker = StreamIdTracker::new();
         let mut usage: UsageTokens = UsageTokens::default();
         futures_util::pin_mut!(event_stream);

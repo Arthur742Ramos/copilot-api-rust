@@ -6,6 +6,8 @@
 
 use metrics::{gauge, histogram};
 
+use crate::libs::request_context::{emit_request_completed, RequestContext};
+
 /// How the stream's bytes were produced, so the two measurement methods are
 /// distinguishable on the same metric. `translated` = the messages flows that
 /// translate per-event (precise TTFT); `native` = the raw byte forwarders whose
@@ -40,6 +42,12 @@ pub struct StreamTimer {
     start: std::time::Instant,
     ttft_recorded: bool,
     errored: bool,
+    /// When attached, the timer also feeds the shared per-request summary
+    /// (TTFT/transport/outcome) and emits the single `request.completed` event
+    /// for this stream on drop. Captured eagerly by the caller (while the
+    /// task-local context is still in scope) so it survives into the
+    /// later-polled stream body. `None` leaves the timer metrics-only.
+    request_context: Option<RequestContext>,
 }
 
 impl StreamTimer {
@@ -56,7 +64,20 @@ impl StreamTimer {
             start: std::time::Instant::now(),
             ttft_recorded: false,
             errored: false,
+            request_context: None,
         }
+    }
+
+    /// Attach the captured request context so this stream contributes to, and
+    /// emits, the `request.completed` summary line. Stamps the flow/transport
+    /// onto the shared summary immediately so the headline is populated even if
+    /// no content frame ever arrives (e.g. a stream that errors at the head).
+    pub fn with_request_context(mut self, ctx: Option<RequestContext>) -> Self {
+        if let Some(ctx) = &ctx {
+            ctx.set_flow_transport_streaming(self.flow, self.transport);
+        }
+        self.request_context = ctx;
+        self
     }
 
     /// Call as each genuine **content** frame is about to be yielded; records
@@ -64,12 +85,16 @@ impl StreamTimer {
     pub fn on_content_frame(&mut self) {
         if !self.ttft_recorded {
             self.ttft_recorded = true;
+            let ttft = self.start.elapsed();
             histogram!(
                 "proxy_stream_ttft_seconds",
                 "flow" => self.flow,
                 "transport" => self.transport,
             )
-            .record(self.start.elapsed().as_secs_f64());
+            .record(ttft.as_secs_f64());
+            if let Some(ctx) = &self.request_context {
+                ctx.set_ttft_ms(ttft.as_millis() as u64);
+            }
         }
     }
 
@@ -95,5 +120,174 @@ impl Drop for StreamTimer {
             "outcome" => outcome,
         )
         .record(self.start.elapsed().as_secs_f64());
+
+        // Streaming responses return their HEAD to the middleware before TTFT /
+        // outcome are known, so the single `request.completed` line for a stream
+        // is emitted here — at the terminal step — rather than in the middleware.
+        if let Some(ctx) = self.request_context.take() {
+            ctx.set_outcome_if_unset(outcome);
+            emit_request_completed(&ctx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::libs::request_context::{RequestContext, RequestSummary};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Default)]
+    struct Captured {
+        events: Vec<CapturedEvent>,
+    }
+
+    struct CapturedEvent {
+        message: Option<String>,
+        fields: HashMap<String, String>,
+    }
+
+    struct CaptureLayer(Arc<Mutex<Captured>>);
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        message: Option<String>,
+        fields: HashMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = Some(rendered);
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .events
+                .push(CapturedEvent {
+                    message: visitor.message,
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    fn test_context() -> RequestContext {
+        RequestContext {
+            trace_id: "trace-stream".to_string(),
+            start_time: crate::libs::request_context::now_millis(),
+            user_agent: "test".to_string(),
+            session_affinity: Some("sess-7".to_string()),
+            parent_session_id: None,
+            summary: Arc::new(Mutex::new(RequestSummary::default())),
+        }
+    }
+
+    /// A streaming request must emit EXACTLY ONE `request.completed` event, with
+    /// the flow/transport/TTFT/upstream-status headline populated — driven purely
+    /// through the StreamTimer lifecycle, no live server required.
+    #[test]
+    fn streaming_request_emits_exactly_one_request_completed() {
+        let captured = Arc::new(Mutex::new(Captured::default()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let ctx = test_context();
+            // Upstream responded ok (recorded in-scope before the stream body).
+            ctx.set_upstream_status("ok");
+
+            let mut timer = StreamTimer::new("messages", transport::TRANSLATED)
+                .with_request_context(Some(ctx.clone()));
+            // First content frame -> TTFT recorded into the shared summary.
+            timer.on_content_frame();
+            // Terminal step: dropping the timer emits the single summary line.
+            drop(timer);
+
+            // Idempotency: the shared summary's `emitted` flag is now set.
+            assert!(ctx.summary.lock().unwrap().emitted);
+        });
+
+        let captured = captured.lock().unwrap_or_else(|p| p.into_inner());
+        let completed: Vec<&CapturedEvent> = captured
+            .events
+            .iter()
+            .filter(|e| {
+                e.message.as_deref() == Some("request.completed")
+                    || e.fields.get("event").map(String::as_str) == Some("request.completed")
+            })
+            .collect();
+
+        assert_eq!(
+            completed.len(),
+            1,
+            "expected exactly one request.completed event, got {}",
+            completed.len()
+        );
+        let e = completed[0];
+        assert_eq!(
+            e.fields.get("event").map(String::as_str),
+            Some("request.completed")
+        );
+        assert_eq!(e.fields.get("flow").map(String::as_str), Some("messages"));
+        assert_eq!(
+            e.fields.get("transport").map(String::as_str),
+            Some("translated")
+        );
+        assert_eq!(e.fields.get("streaming").map(String::as_str), Some("true"));
+        assert_eq!(
+            e.fields.get("upstream_status").map(String::as_str),
+            Some("ok")
+        );
+        assert_eq!(e.fields.get("outcome").map(String::as_str), Some("ok"));
+        assert!(
+            e.fields.contains_key("ttft_ms"),
+            "ttft_ms must be present on a streaming completion"
+        );
+        assert_eq!(
+            e.fields.get("trace_id").map(String::as_str),
+            Some("trace-stream")
+        );
+    }
+
+    /// A timer with no attached context stays metrics-only and emits no event.
+    #[test]
+    fn timer_without_context_emits_no_event() {
+        let captured = Arc::new(Mutex::new(Captured::default()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut timer = StreamTimer::new("messages", transport::TRANSLATED);
+            timer.on_content_frame();
+            drop(timer);
+        });
+        let captured = captured.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(captured
+            .events
+            .iter()
+            .all(|e| e.message.as_deref() != Some("request.completed")));
     }
 }
