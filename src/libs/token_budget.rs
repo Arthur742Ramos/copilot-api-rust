@@ -109,16 +109,29 @@ fn current_daily_total() -> i64 {
 /// scoped `WHERE api_key_label = ?` read is paid solely by capped keys.
 fn current_label_total(label: &str) -> i64 {
     let day_key = local_day_key();
-    let mut guard = CACHED_LABEL_TOTALS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if let Some(cached) = guard.get(label) {
-        if cached.day_key == day_key && cached.fetched_at.elapsed() < CACHE_TTL {
-            return cached.total_tokens;
+
+    // Fast path: a fresh cache entry returns without touching the DB. Unlike the
+    // single-series global cache, ONE mutex guards ALL labels here, so we must
+    // NOT hold it across the DB read below — doing so would stall budget checks
+    // for *other* tenants whose cache is fresh (head-of-line blocking).
+    {
+        let guard = CACHED_LABEL_TOTALS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(cached) = guard.get(label) {
+            if cached.day_key == day_key && cached.fetched_at.elapsed() < CACHE_TTL {
+                return cached.total_tokens;
+            }
         }
     }
 
+    // Stale or absent: read with the lock released, then publish. Two concurrent
+    // stale checks for the SAME label may both read (rare, bounded by the TTL);
+    // that is the deliberate trade for never blocking a different label.
     let total = get_token_usage_label_total("day", label);
+    let mut guard = CACHED_LABEL_TOTALS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     guard.insert(
         label.to_string(),
         CachedTotal {

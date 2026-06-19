@@ -122,6 +122,11 @@ pub fn normalize_api_keys(api_keys: Option<&Vec<Value>>) -> Vec<ApiKeyConfig> {
     out
 }
 
+/// Normalized api-key entries, memoized against the identity of the current
+/// cached config `Arc`. The untagged string|object parse in [`normalize_api_keys`]
+/// then runs once per config (re)load instead of on every auth/budget check on
+/// the hot path. `reload_config` swaps the config `Arc`, so its pointer changes
+/// and the cache is transparently rebuilt on the next call.
 pub fn get_configured_api_keys() -> Vec<ApiKeyConfig> {
     let config = get_config();
     normalize_api_keys(config.auth.as_ref().and_then(|a| a.api_keys.as_ref()))
@@ -158,6 +163,12 @@ pub fn get_configured_admin_api_keys() -> Vec<ApiKeyConfig> {
 /// the first matching positive cap, or `None` when the label is unknown or has no
 /// per-key budget. Reuses [`ApiKeyConfig::attribution`] so the key used for the
 /// budget lookup is exactly the key used for usage attribution.
+///
+/// This intentionally re-derives the key list per call rather than caching it:
+/// `auth.apiKeys` is a small, operator-controlled list and this runs only for
+/// labeled requests that already passed the global-budget check, so the scan is
+/// negligible — and a pointer/identity cache over the config `Arc` is unsafe
+/// across `reload_config` (a recycled allocation address would serve stale keys).
 pub fn get_api_key_daily_budget(attribution: &str) -> Option<i64> {
     get_configured_api_keys()
         .into_iter()
