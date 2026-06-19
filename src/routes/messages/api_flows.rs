@@ -181,6 +181,18 @@ pub async fn handle_with_chat_completions(
     let mut openai_payload = translate_to_openai(payload)?;
     prepare_copilot_chat_completions_payload(&mut openai_payload);
 
+    // Capture the request context while the task-local is in scope (the stream
+    // body is polled later, outside it) and record the dispatch flow for the
+    // `request.completed` summary line.
+    let req_ctx = crate::libs::request_context::request_context_store();
+    if let Some(ctx) = &req_ctx {
+        ctx.set_flow(
+            &openai_payload.model,
+            "chat_completions",
+            stream_transport::TRANSLATED,
+        );
+    }
+
     let recorder = build_recorder(
         "chat_completions",
         openai_payload.model.clone(),
@@ -207,7 +219,8 @@ pub async fn handle_with_chat_completions(
         }
         ChatCompletionsResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("chat_completions", stream_transport::TRANSLATED);
+                let mut timer = StreamTimer::new("chat_completions", stream_transport::TRANSLATED)
+                    .with_request_context(req_ctx);
                 let mut state = AnthropicStreamState::default();
                 let mut usage = UsageTokens::default();
 
@@ -325,6 +338,16 @@ pub async fn handle_with_responses_api(
     let mut responses_payload =
         translate_anthropic_messages_to_responses_payload(payload, subagent_agent_id)?;
 
+    // Capture context in-scope for the deferred stream body + summary line.
+    let req_ctx = crate::libs::request_context::request_context_store();
+    if let Some(ctx) = &req_ctx {
+        ctx.set_flow(
+            &responses_payload.model,
+            "responses",
+            stream_transport::TRANSLATED,
+        );
+    }
+
     let recorder = build_recorder(
         "responses",
         responses_payload.model.clone(),
@@ -383,7 +406,8 @@ pub async fn handle_with_responses_api(
     match result {
         CreateResponsesReturn::Stream(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("responses", stream_transport::TRANSLATED);
+                let mut timer = StreamTimer::new("responses", stream_transport::TRANSLATED)
+                    .with_request_context(req_ctx);
                 let mut state = ResponsesStreamState::new(Some(tool_search_name));
                 let mut usage = UsageTokens::default();
 
@@ -505,6 +529,12 @@ pub async fn handle_with_messages_api(
     prepare_messages_api_payload(&mut value, opts.selected_model.as_ref());
     *payload = serde_json::from_value(value)?;
 
+    // Capture context in-scope for the deferred stream body + summary line.
+    let req_ctx = crate::libs::request_context::request_context_store();
+    if let Some(ctx) = &req_ctx {
+        ctx.set_flow(&payload.model, "messages", stream_transport::TRANSLATED);
+    }
+
     let recorder = build_recorder(
         "messages",
         payload.model.clone(),
@@ -532,7 +562,8 @@ pub async fn handle_with_messages_api(
         }
         CreateMessagesResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
-                let mut timer = StreamTimer::new("messages", stream_transport::TRANSLATED);
+                let mut timer = StreamTimer::new("messages", stream_transport::TRANSLATED)
+                    .with_request_context(req_ctx);
                 let mut usage = UsageTokens::default();
                 // Track terminal framing so a passthrough upstream that ends
                 // without a `message_stop` (clean end / [DONE]) doesn't leave the

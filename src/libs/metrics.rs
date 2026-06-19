@@ -79,6 +79,13 @@ pub fn record_upstream_request(endpoint: &'static str, status: UpstreamStatus, e
         "status" => status.as_str(),
     )
     .record(elapsed_secs);
+    // Feed the per-request triage summary so `request.completed` can correlate
+    // the upstream-status class with flow/transport/TTFT. This runs in-scope
+    // (during the upstream `send().await`), so the task-local context is live;
+    // last writer wins so a retried request reflects its final status.
+    if let Some(ctx) = crate::libs::request_context::request_context_store() {
+        ctx.set_upstream_status(status.as_str());
+    }
 }
 
 /// Coarse outcome class for an upstream request (keeps the metric label set
@@ -92,7 +99,7 @@ pub enum UpstreamStatus {
 }
 
 impl UpstreamStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             UpstreamStatus::Ok => "ok",
             UpstreamStatus::ClientError => "client_error",

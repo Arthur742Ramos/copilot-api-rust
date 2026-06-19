@@ -110,6 +110,18 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     match result {
         ChatCompletionsResult::NonStreaming(response) => {
+            // Native non-streaming responses never pass through a StreamTimer, so
+            // record the flow/model/transport headline here. This lets the
+            // trace middleware's `has_flow` guard emit the single
+            // `request.completed` line for this request (streaming responses are
+            // covered by the StreamTimer drop instead — never both).
+            if let Some(ctx) = crate::libs::request_context::request_context_store() {
+                ctx.set_flow_transport_model_non_streaming(
+                    &payload.model,
+                    "chat_completions",
+                    crate::libs::stream_metrics::transport::NATIVE,
+                );
+            }
             recorder.record(normalize_openai_usage(response.get("usage")));
             Ok(Json(response).into_response())
         }
@@ -147,10 +159,10 @@ fn stream_sse(
     // here is a coarser first-non-empty-chunk approximation (transport=native).
     // The timer is held by the stream closure and drops (recording
     // stream-complete) when the stream ends or the client disconnects.
-    let timer_for_stream = Arc::new(Mutex::new(StreamTimer::new(
-        "chat_completions",
-        transport::NATIVE,
-    )));
+    let timer_for_stream = Arc::new(Mutex::new(
+        StreamTimer::new("chat_completions", transport::NATIVE)
+            .with_request_context(crate::libs::request_context::request_context_store()),
+    ));
 
     let byte_stream = upstream.bytes_stream();
     let mapped = byte_stream.map(move |chunk| {

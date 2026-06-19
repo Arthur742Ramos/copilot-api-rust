@@ -302,11 +302,44 @@ async fn trace_middleware(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_owned();
     let span = info_span!("request", trace_id = %trace_id, method = %method, path = %path);
 
-    let mut response = run_with_context(context, next.run(req).instrument(span)).await;
+    let mut response = run_with_context(context.clone(), next.run(req).instrument(span)).await;
     if let Ok(value) = HeaderValue::from_str(&trace_id) {
         response.headers_mut().insert("x-trace-id", value);
     }
+
+    // Emit the single `request.completed` summary line for NON-streaming model
+    // responses here, where TTFT/tokens/outcome are already known. Streaming
+    // responses (text/event-stream) return their HEAD before those are known, so
+    // their line is emitted from the StreamTimer drop instead — never both
+    // (the `emitted` flag also guards against a double-call). Requests that
+    // never reached a dispatch flow (no `flow` recorded) are skipped to keep the
+    // event scoped to actual model traffic.
+    if !is_event_stream_response(&response) {
+        let has_flow = context
+            .summary
+            .lock()
+            .map(|s| s.flow.is_some())
+            .unwrap_or_else(|p| p.into_inner().flow.is_some());
+        if has_flow {
+            context.set_outcome_if_unset(if response.status().is_success() {
+                "ok"
+            } else {
+                "error"
+            });
+            crate::libs::request_context::emit_request_completed(&context);
+        }
+    }
     response
+}
+
+/// Whether a response is an SSE (`text/event-stream`) body — the signal that its
+/// `request.completed` line is owned by the StreamTimer drop, not the middleware.
+fn is_event_stream_response(response: &Response) -> bool {
+    response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"))
 }
 
 /// Decrements the in-flight gauge on drop, so a panicking handler can't leak the
