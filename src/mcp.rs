@@ -237,6 +237,16 @@ async fn handle_generate_image_call(id: Value, params: Option<&Value>) -> Value 
             format!("Image generation blocked: {}", e.message),
         );
     }
+    // Same premium-interaction quota guardrail as the HTTP routes: reject when
+    // the account's billable premium-interaction entitlement is near/at
+    // exhaustion (no-op when unconfigured or on unlimited plans).
+    if let Err(e) = crate::libs::premium_interactions::check_premium_interactions() {
+        return error(
+            id,
+            -32603,
+            format!("Image generation blocked: {}", e.message),
+        );
+    }
 
     // Resolve Codex credentials (loads/refreshes the OAuth token from disk into
     // state). The MCP server has no inbound HTTP headers, so an empty HeaderMap

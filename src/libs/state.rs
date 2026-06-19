@@ -41,6 +41,13 @@ pub struct State {
 
     pub copilot_api_url: Option<String>,
     pub token_based_billing: Option<bool>,
+
+    /// Latest cached premium-interaction quota snapshot from the shared
+    /// `/copilot_internal/user` endpoint, refreshed by the background loop in
+    /// [`crate::libs::premium_interactions`]. `None` until the first successful
+    /// refresh (or when the plan reports no premium-interaction quota).
+    pub premium_interactions:
+        Option<crate::libs::premium_interactions::PremiumInteractionsSnapshot>,
 }
 
 impl State {

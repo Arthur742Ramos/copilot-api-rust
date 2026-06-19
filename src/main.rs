@@ -308,6 +308,8 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     let app = server::build_router();
     crate::libs::metrics::init_build_info();
     crate::libs::http::preregister_retry_metrics();
+    crate::libs::premium_interactions::preregister_premium_interactions_metrics();
+    crate::libs::premium_interactions::start_premium_interactions_refresh_loop();
     spawn_token_usage_retention();
     let addr = std::net::SocketAddr::new(ip, options.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
