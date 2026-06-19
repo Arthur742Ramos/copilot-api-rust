@@ -264,11 +264,12 @@ fn build_response_content(request_id: &str, extract: &WebSearchExtract) -> Vec<V
 /// `prepareWebSearchResponsesPayload`: switch to the GPT web-search model, drop
 /// the Anthropic server tool, translate to a Responses payload, and attach the
 /// Responses `web_search` tool.
+#[allow(clippy::result_large_err)]
 pub fn prepare_web_search_responses_payload(
     payload: &AnthropicMessagesPayload,
     model: Option<&str>,
     subagent_agent_id: Option<&str>,
-) -> ResponsesPayload {
+) -> Result<ResponsesPayload, AppError> {
     let config = extract_web_search_config(payload);
 
     let mut switched = payload.clone();
@@ -279,10 +280,10 @@ pub fn prepare_web_search_responses_payload(
     switched.stream = Some(true);
 
     let mut responses_payload =
-        translate_anthropic_messages_to_responses_payload(&switched, subagent_agent_id);
+        translate_anthropic_messages_to_responses_payload(&switched, subagent_agent_id)?;
     responses_payload.tools = Some(vec![build_responses_web_search_tool(&config)]);
     responses_payload.tool_choice = None;
-    responses_payload
+    Ok(responses_payload)
 }
 
 /// `reconstructWebSearchResponse`: extract + assemble the native Anthropic
@@ -777,7 +778,7 @@ pub async fn handle_web_search_via_responses(
             .subagent_marker
             .as_ref()
             .map(|m| m.agent_id.as_str()),
-    );
+    )?;
 
     let selected_model = find_endpoint_model(&options.web_search_model);
     let (vision, initiator) = get_responses_request_options(&responses_payload);
@@ -1313,7 +1314,7 @@ mod tests {
             "allowed_domains": ["a.com"]
         }]));
         let responses_payload =
-            prepare_web_search_responses_payload(&payload, Some("gpt-5-mini"), None);
+            prepare_web_search_responses_payload(&payload, Some("gpt-5-mini"), None).unwrap();
         assert_eq!(responses_payload.model, "gpt-5-mini");
         let tools = responses_payload.tools.expect("tools present");
         assert_eq!(tools.len(), 1);

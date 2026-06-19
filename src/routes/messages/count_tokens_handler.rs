@@ -130,7 +130,7 @@ pub async fn handle_count_tokens(body: Value, headers: HeaderMap) -> Result<Resp
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let openai_payload = translate_to_openai(&anthropic_payload);
+    let openai_payload = translate_to_openai(&anthropic_payload)?;
 
     let requested_model = anthropic_payload.model.clone();
     let resolve = resolve_count_tokens_model(&requested_model);

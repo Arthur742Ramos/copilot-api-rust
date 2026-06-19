@@ -216,7 +216,7 @@ async fn handle_openai_responses_provider_messages(
 ) -> Result<Response, AppError> {
     let max_prompt_tokens = codex_max_prompt_tokens(provider_config, &payload.model);
 
-    let mut responses_payload = translate_anthropic_messages_to_responses_payload(&payload, None);
+    let mut responses_payload = translate_anthropic_messages_to_responses_payload(&payload, None)?;
 
     apply_responses_api_context_management(
         &mut responses_payload,
@@ -286,7 +286,7 @@ async fn handle_openai_responses_provider_web_search_messages(
 
     // `prepare_web_search_responses_payload` keeps the original model (model =
     // None), drops the Anthropic server tool, and sets stream = true.
-    let mut responses_payload = prepare_web_search_responses_payload(&payload, None, None);
+    let mut responses_payload = prepare_web_search_responses_payload(&payload, None, None)?;
     responses_payload.stream = Some(true);
 
     apply_responses_api_context_management(
@@ -586,7 +586,7 @@ async fn handle_openai_compatible_provider_messages(
     model_config: Option<&ModelConfig>,
     headers: &HeaderMap,
 ) -> Result<Response, AppError> {
-    let openai_payload = create_openai_compatible_payload(&payload, model_config);
+    let openai_payload = create_openai_compatible_payload(&payload, model_config)?;
 
     let upstream_response =
         forward_provider_chat_completions(provider_config, &openai_payload, headers).await?;
@@ -618,10 +618,11 @@ async fn handle_openai_compatible_provider_messages(
 }
 
 /// Mirrors `createOpenAICompatiblePayload`.
+#[allow(clippy::result_large_err)]
 fn create_openai_compatible_payload(
     payload: &AnthropicMessagesPayload,
     model_config: Option<&ModelConfig>,
-) -> ChatCompletionsPayload {
+) -> Result<ChatCompletionsPayload, AppError> {
     // Thread the PDF / tool-content support flags from the provider model config
     // (TS passes `{ supportPdf, toolContentSupportType }` here).
     let translation_options = TranslateToOpenAiOptions {
@@ -630,7 +631,7 @@ fn create_openai_compatible_payload(
             .and_then(|m| m.tool_content_support_type.clone())
             .unwrap_or_default(),
     };
-    let mut openai_payload = translate_to_openai_with_options(payload, &translation_options);
+    let mut openai_payload = translate_to_openai_with_options(payload, &translation_options)?;
 
     apply_openai_compatible_thinking_budget(&mut openai_payload, payload);
 
@@ -665,7 +666,7 @@ fn create_openai_compatible_payload(
         apply_openai_compatible_context_cache(&mut openai_payload);
     }
 
-    openai_payload
+    Ok(openai_payload)
 }
 
 /// Mirrors `applyOpenAICompatibleThinkingBudget`.

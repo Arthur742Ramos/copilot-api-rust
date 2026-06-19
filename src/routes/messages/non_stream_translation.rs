@@ -12,6 +12,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::libs::error::AppError;
 use crate::libs::state::with_state;
 use crate::routes::messages::anthropic_types::{
     AnthropicMessagesPayload, AnthropicResponse, AnthropicThinkingConfig, AnthropicTool,
@@ -105,16 +106,20 @@ struct ToolResultMessages {
 /// Mirrors `translateToOpenAI`. The api-flows caller passes no options, so the
 /// default capabilities apply. Thin wrapper over
 /// [`translate_to_openai_with_options`].
-pub fn translate_to_openai(payload: &AnthropicMessagesPayload) -> ChatCompletionsPayload {
+#[allow(clippy::result_large_err)]
+pub fn translate_to_openai(
+    payload: &AnthropicMessagesPayload,
+) -> Result<ChatCompletionsPayload, AppError> {
     translate_to_openai_with_options(payload, &TranslateToOpenAiOptions::default())
 }
 
 /// Mirrors `translateToOpenAI(payload, options)`: honours `supportPdf` /
 /// `toolContentSupportType` from the provider model config.
+#[allow(clippy::result_large_err)]
 pub fn translate_to_openai_with_options(
     payload: &AnthropicMessagesPayload,
     options: &TranslateToOpenAiOptions,
-) -> ChatCompletionsPayload {
+) -> Result<ChatCompletionsPayload, AppError> {
     let model_id = payload.model.clone();
     let thinking_budget = get_thinking_budget(payload);
     let capabilities = TranslationCapabilities {
@@ -122,7 +127,7 @@ pub fn translate_to_openai_with_options(
         tool_content_support_type: options.tool_content_support_type.clone(),
     };
 
-    let messages = translate_anthropic_messages_to_openai(payload, &model_id, &capabilities);
+    let messages = translate_anthropic_messages_to_openai(payload, &model_id, &capabilities)?;
 
     // The Rust ChatCompletionsPayload keeps model/messages/max_tokens/stream
     // strongly typed; the remaining fields the TS sets go through `extra`,
@@ -152,13 +157,13 @@ pub fn translate_to_openai_with_options(
         extra.insert("thinking_budget".to_string(), json!(budget));
     }
 
-    ChatCompletionsPayload {
+    Ok(ChatCompletionsPayload {
         messages,
         model: model_id,
         max_tokens: payload.max_tokens,
         stream: payload.stream,
         extra,
-    }
+    })
 }
 
 /// Mirrors `getThinkingBudget`, reading `state.models` to find the model by id.
@@ -206,24 +211,25 @@ fn thinking_budget_from_model(
 
 /// Mirrors `translateAnthropicMessagesToOpenAI`: system messages first, then the
 /// user/assistant messages flat-mapped.
+#[allow(clippy::result_large_err)]
 fn translate_anthropic_messages_to_openai(
     payload: &AnthropicMessagesPayload,
     model_id: &str,
     capabilities: &TranslationCapabilities,
-) -> Vec<Message> {
+) -> Result<Vec<Message>, AppError> {
     let mut out = handle_system_prompt(payload.system.as_ref());
     for message in &payload.messages {
         if message.role == "user" {
-            out.extend(handle_user_message(&message.content, capabilities));
+            out.extend(handle_user_message(&message.content, capabilities)?);
         } else {
             out.extend(handle_assistant_message(
                 &message.content,
                 model_id,
                 capabilities,
-            ));
+            )?);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Mirrors `handleSystemPrompt`.
@@ -261,7 +267,11 @@ fn handle_system_prompt(system: Option<&Value>) -> Vec<Message> {
 
 /// Mirrors `handleUserMessage`. Tool results MUST come first to maintain the
 /// protocol ordering: tool_use -> tool_result -> user.
-fn handle_user_message(content: &Value, capabilities: &TranslationCapabilities) -> Vec<Message> {
+#[allow(clippy::result_large_err)]
+fn handle_user_message(
+    content: &Value,
+    capabilities: &TranslationCapabilities,
+) -> Result<Vec<Message>, AppError> {
     let mut new_messages: Vec<Message> = Vec::new();
 
     if let Value::Array(blocks) = content {
@@ -277,7 +287,7 @@ fn handle_user_message(content: &Value, capabilities: &TranslationCapabilities) 
 
         let mut moved_tool_result_user_messages: Vec<Message> = Vec::new();
         for block in tool_result_blocks {
-            let result = handle_tool_result_block(block, capabilities);
+            let result = handle_tool_result_block(block, capabilities)?;
             new_messages.push(result.tool_message);
             if let Some(moved) = result.moved_user_message {
                 moved_tool_result_user_messages.push(moved);
@@ -286,7 +296,7 @@ fn handle_user_message(content: &Value, capabilities: &TranslationCapabilities) 
         new_messages.extend(moved_tool_result_user_messages);
 
         if !other_blocks.is_empty() {
-            let mapped = map_content(&Value::Array(other_blocks), capabilities.support_pdf);
+            let mapped = map_content(&Value::Array(other_blocks), capabilities.support_pdf)?;
             new_messages.push(Message {
                 role: "user".to_string(),
                 content: mapped,
@@ -296,19 +306,20 @@ fn handle_user_message(content: &Value, capabilities: &TranslationCapabilities) 
     } else {
         new_messages.push(Message {
             role: "user".to_string(),
-            content: map_content(content, false),
+            content: map_content(content, false)?,
             extra: Map::new(),
         });
     }
 
-    new_messages
+    Ok(new_messages)
 }
 
 /// Mirrors `handleToolResultBlock`.
+#[allow(clippy::result_large_err)]
 fn handle_tool_result_block(
     block: &Value,
     capabilities: &TranslationCapabilities,
-) -> ToolResultMessages {
+) -> Result<ToolResultMessages, AppError> {
     let tool_use_id = block
         .get("tool_use_id")
         .and_then(|v| v.as_str())
@@ -318,27 +329,27 @@ fn handle_tool_result_block(
 
     // String content -> straight tool message.
     if let Some(Value::String(s)) = content {
-        return ToolResultMessages {
+        return Ok(ToolResultMessages {
             moved_user_message: None,
             tool_message: create_tool_message(&tool_use_id, Some(Value::String(s.clone()))),
-        };
+        });
     }
 
     // Non-array (and non-string) content -> empty tool message.
     let blocks = match content {
         Some(Value::Array(a)) => a,
         _ => {
-            return ToolResultMessages {
+            return Ok(ToolResultMessages {
                 moved_user_message: None,
                 tool_message: create_tool_message(&tool_use_id, Some(Value::String(String::new()))),
-            };
+            });
         }
     };
 
     let support = get_tool_content_support(capabilities);
     let has_image = blocks.iter().any(|b| block_type(b) == Some("image"));
     let has_document = blocks.iter().any(|b| block_type(b) == Some("document"));
-    let content_value = map_content(&Value::Array(blocks.clone()), capabilities.support_pdf);
+    let content_value = map_content(&Value::Array(blocks.clone()), capabilities.support_pdf)?;
 
     let has_pdf_file = has_document && capabilities.support_pdf;
     let should_move_image_to_user_message = has_image && !support.image;
@@ -351,30 +362,30 @@ fn handle_tool_result_block(
         } else {
             text
         };
-        return ToolResultMessages {
+        return Ok(ToolResultMessages {
             moved_user_message: Some(create_tool_result_user_message(
                 block,
                 capabilities.support_pdf,
-            )),
+            )?),
             tool_message: create_tool_message(&tool_use_id, Some(Value::String(tool_text))),
-        };
+        });
     }
 
     let has_rich_content = has_image || has_pdf_file;
     if support.array || has_rich_content {
-        return ToolResultMessages {
+        return Ok(ToolResultMessages {
             moved_user_message: None,
             tool_message: create_tool_message(&tool_use_id, content_value),
-        };
+        });
     }
 
-    ToolResultMessages {
+    Ok(ToolResultMessages {
         moved_user_message: None,
         tool_message: create_tool_message(
             &tool_use_id,
             Some(Value::String(get_text_tool_content(&content_value))),
         ),
-    }
+    })
 }
 
 /// Mirrors `getTextToolContent`.
@@ -426,7 +437,8 @@ fn create_tool_message(tool_call_id: &str, content: Option<Value>) -> Message {
 }
 
 /// Mirrors `createToolResultUserMessage`.
-fn create_tool_result_user_message(block: &Value, support_pdf: bool) -> Message {
+#[allow(clippy::result_large_err)]
+fn create_tool_result_user_message(block: &Value, support_pdf: bool) -> Result<Message, AppError> {
     let tool_use_id = block
         .get("tool_use_id")
         .and_then(|v| v.as_str())
@@ -435,7 +447,7 @@ fn create_tool_result_user_message(block: &Value, support_pdf: bool) -> Message 
         "type": "text",
         "text": format!("Tool result for {tool_use_id}:"),
     });
-    let content = map_content(block.get("content").unwrap_or(&Value::Null), support_pdf);
+    let content = map_content(block.get("content").unwrap_or(&Value::Null), support_pdf)?;
 
     let parts = match content {
         Some(Value::Array(mut arr)) => {
@@ -450,27 +462,28 @@ fn create_tool_result_user_message(block: &Value, support_pdf: bool) -> Message 
         _ => vec![prefix, json!({ "type": "text", "text": "" })],
     };
 
-    Message {
+    Ok(Message {
         role: "user".to_string(),
         content: Some(Value::Array(parts)),
         extra: Map::new(),
-    }
+    })
 }
 
 /// Mirrors `handleAssistantMessage`.
+#[allow(clippy::result_large_err)]
 fn handle_assistant_message(
     content: &Value,
     model_id: &str,
     capabilities: &TranslationCapabilities,
-) -> Vec<Message> {
+) -> Result<Vec<Message>, AppError> {
     let blocks = match content {
         Value::Array(a) => a,
         _ => {
-            return vec![Message {
+            return Ok(vec![Message {
                 role: "assistant".to_string(),
-                content: map_content(content, false),
+                content: map_content(content, false)?,
                 extra: Map::new(),
-            }];
+            }]);
         }
     };
 
@@ -551,22 +564,23 @@ fn handle_assistant_message(
         extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
 
-    vec![Message {
+    Ok(vec![Message {
         role: "assistant".to_string(),
-        content: map_content(content, capabilities.support_pdf),
+        content: map_content(content, capabilities.support_pdf)?,
         extra,
-    }]
+    }])
 }
 
 /// Mirrors `mapContent`. Returns `Some(string)` / `Some(array)` / `None`,
 /// matching the TS `string | Array<ContentPart> | null`.
-fn map_content(content: &Value, support_pdf: bool) -> Option<Value> {
+#[allow(clippy::result_large_err)]
+fn map_content(content: &Value, support_pdf: bool) -> Result<Option<Value>, AppError> {
     if let Value::String(s) = content {
-        return Some(Value::String(s.clone()));
+        return Ok(Some(Value::String(s.clone())));
     }
     let blocks = match content {
         Value::Array(a) => a,
-        _ => return None,
+        _ => return Ok(None),
     };
 
     let mut content_parts: Vec<Value> = Vec::new();
@@ -579,20 +593,10 @@ fn map_content(content: &Value, support_pdf: bool) -> Option<Value> {
                 }));
             }
             Some("image") => {
-                let media_type = block
-                    .get("source")
-                    .and_then(|s| s.get("media_type"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("");
-                let data = block
-                    .get("source")
-                    .and_then(|s| s.get("data"))
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
                 content_parts.push(json!({
                     "type": "image_url",
                     "image_url": {
-                        "url": format!("data:{media_type};base64,{data}"),
+                        "url": image_url_from_source(block.get("source"))?,
                     },
                 }));
             }
@@ -619,9 +623,53 @@ fn map_content(content: &Value, support_pdf: bool) -> Option<Value> {
     }
 
     if content_parts.is_empty() {
-        return Some(Value::String(String::new()));
+        return Ok(Some(Value::String(String::new())));
     }
-    Some(Value::Array(content_parts))
+    Ok(Some(Value::Array(content_parts)))
+}
+
+/// Resolves an Anthropic image `source` object into the `image_url.url` string
+/// expected by Chat Completions.
+///
+/// Anthropic image sources are tagged by `source.type`:
+/// - `base64` builds a `data:` URL from `media_type` + `data`.
+/// - `url` passes the remote URL straight through.
+/// - `file` references a Files-API id, which this Chat Completions upstream
+///   cannot resolve; surface a 400 instead of emitting a blank `data:` URL.
+#[allow(clippy::result_large_err)]
+fn image_url_from_source(source: Option<&Value>) -> Result<String, AppError> {
+    let source_type = source
+        .and_then(|s| s.get("type"))
+        .and_then(|t| t.as_str())
+        // Anthropic historically omitted `type` for base64 sources; default to it.
+        .unwrap_or("base64");
+
+    match source_type {
+        "url" => source
+            .and_then(|s| s.get("url"))
+            .and_then(|u| u.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                AppError::BadRequest("Image source of type \"url\" is missing \"url\"".to_string())
+            }),
+        "file" => Err(AppError::BadRequest(
+            "Image source of type \"file\" (Files API ids) is not supported".to_string(),
+        )),
+        "base64" => {
+            let media_type = source
+                .and_then(|s| s.get("media_type"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            let data = source
+                .and_then(|s| s.get("data"))
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            Ok(format!("data:{media_type};base64,{data}"))
+        }
+        other => Err(AppError::BadRequest(format!(
+            "Unsupported image source type \"{other}\""
+        ))),
+    }
 }
 
 /// Mirrors `createDocumentTextPart`.
@@ -973,7 +1021,7 @@ mod tests {
             ..Default::default()
         };
 
-        let out = translate_to_openai(&payload);
+        let out = translate_to_openai(&payload).unwrap();
         assert_eq!(out.messages.len(), 2);
         assert_eq!(out.messages[0].role, "tool");
         assert_eq!(
@@ -1007,7 +1055,7 @@ mod tests {
             ],
         });
 
-        let result = handle_tool_result_block(&block, &caps);
+        let result = handle_tool_result_block(&block, &caps).unwrap();
         assert!(result.moved_user_message.is_some());
         // No text in the original content -> placeholder text used.
         assert_eq!(
@@ -1027,6 +1075,69 @@ mod tests {
         } else {
             panic!("expected array content");
         }
+    }
+
+    #[test]
+    fn image_url_source_passes_through_unchanged() {
+        // A {"type":"image","source":{"type":"url",...}} block must keep the
+        // remote URL verbatim, NOT be wrapped in a blank "data:;base64," URL.
+        let payload = AnthropicMessagesPayload {
+            model: "gpt-4o".to_string(),
+            messages: vec![user_message(json!([
+                {
+                    "type": "image",
+                    "source": { "type": "url", "url": "https://example.com/cat.png" },
+                },
+            ]))],
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+
+        let out = translate_to_openai(&payload).unwrap();
+        let parts = out.messages[0].content.as_ref().unwrap();
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[0]["image_url"]["url"], "https://example.com/cat.png");
+    }
+
+    #[test]
+    fn image_base64_source_still_builds_data_url() {
+        // Regression guard: the base64 path must keep building the data: URL.
+        let payload = AnthropicMessagesPayload {
+            model: "gpt-4o".to_string(),
+            messages: vec![user_message(json!([
+                {
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" },
+                },
+            ]))],
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+
+        let out = translate_to_openai(&payload).unwrap();
+        let parts = out.messages[0].content.as_ref().unwrap();
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn image_file_source_is_rejected_with_bad_request() {
+        // Files-API ids can't be resolved by the Chat Completions upstream, so
+        // they must surface a 400 instead of a corrupt blank image.
+        let payload = AnthropicMessagesPayload {
+            model: "gpt-4o".to_string(),
+            messages: vec![user_message(json!([
+                {
+                    "type": "image",
+                    "source": { "type": "file", "file_id": "file_abc123" },
+                },
+            ]))],
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+
+        let err = translate_to_openai(&payload).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[test]
@@ -1240,7 +1351,8 @@ mod tests {
 
         // Default options: PDF unsupported -> text placeholder.
         let default_out =
-            translate_to_openai_with_options(&payload, &TranslateToOpenAiOptions::default());
+            translate_to_openai_with_options(&payload, &TranslateToOpenAiOptions::default())
+                .unwrap();
         let default_parts = default_out.messages[0].content.as_ref().unwrap();
         assert_eq!(default_parts[0]["type"], "text");
 
@@ -1251,7 +1363,8 @@ mod tests {
                 support_pdf: true,
                 tool_content_support_type: vec!["array".to_string(), "image".to_string()],
             },
-        );
+        )
+        .unwrap();
         let pdf_parts = pdf_out.messages[0].content.as_ref().unwrap();
         assert_eq!(pdf_parts[0]["type"], "file");
     }
