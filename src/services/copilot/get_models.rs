@@ -12,10 +12,12 @@ pub async fn get_models() -> Result<ModelsResponse, HttpError> {
     let base = copilot_base_url(&st);
     tracing::info!("Fetching models from {base}/models");
     let upstream_start = std::time::Instant::now();
-    // Rebuild auth headers from current state per attempt so a 401-triggered
-    // inline token refresh is picked up on the single replay.
-    let build = || {
-        let st = state::snapshot();
+    // Rebuild auth headers per attempt from the token the helper hands us so the
+    // 401-triggered replay carries the inline-refreshed token, against which the
+    // refresh decision is made (no read/build token-rotation window).
+    let build = |token: &str| {
+        let mut st = state::snapshot();
+        st.copilot_token = Some(token.to_string());
         client()
             .get(format!("{base}/models"))
             .headers(copilot_models_headers(&st))

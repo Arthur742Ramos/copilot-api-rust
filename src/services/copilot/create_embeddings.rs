@@ -19,10 +19,12 @@ pub async fn create_embeddings(payload: &EmbeddingRequest) -> Result<Value, Http
     let base = copilot_base_url(&st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    // Rebuild auth headers from current state per attempt so a 401-triggered
-    // inline token refresh is picked up on the single replay.
-    let build = || {
-        let st = state::snapshot();
+    // Rebuild auth headers per attempt from the token the helper hands us so the
+    // 401-triggered replay carries the inline-refreshed token, against which the
+    // refresh decision is made (no read/build token-rotation window).
+    let build = |token: &str| {
+        let mut st = state::snapshot();
+        st.copilot_token = Some(token.to_string());
         client()
             .post(format!("{base}/embeddings"))
             .headers(copilot_headers(&st, None, false))

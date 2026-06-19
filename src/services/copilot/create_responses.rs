@@ -926,8 +926,12 @@ async fn create_http_responses(
     let base = copilot_base_url(st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    let build = || {
-        let st = state::snapshot();
+    // Auth headers are rebuilt per attempt from the token the helper hands us so
+    // the 401-triggered replay carries the inline-refreshed token, against which
+    // the refresh decision is made (no read/build token-rotation window).
+    let build = |token: &str| {
+        let mut st = state::snapshot();
+        st.copilot_token = Some(token.to_string());
         let mut headers: HeaderMap = copilot_headers(&st, Some(options.request_id), options.vision);
         set_header(&mut headers, "x-initiator", options.initiator);
         prepare_interaction_headers(

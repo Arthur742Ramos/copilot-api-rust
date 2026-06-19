@@ -411,25 +411,37 @@ pub async fn force_refresh_codex_token(stale: &str) -> Result<(), anyhow::Error>
 /// is surfaced unchanged. `refresh` returns `true` when a usable new token is in
 /// place (replay worthwhile) and `false` otherwise (surface the original 401).
 ///
-/// `build` is `Fn` so it can be called twice; it must read the current token
-/// from state each time so the replay picks up the refreshed credential.
-async fn send_with_401_retry_inner<B, R, Fut>(
+/// TOCTOU-free token identity: the token is read ONCE here via `read_token` and
+/// threaded INTO `build`, so the request provably carries the exact token that
+/// `refresh` then force-refreshes against. If `build` instead re-snapshotted the
+/// token from global state, a background-loop rotation between the read and the
+/// snapshot could make the failing request use a *different* token than the one
+/// handed to `refresh` — the coalescing check would then see "already rotated"
+/// and skip, leaving the single replay to reuse the same bad token (a silent
+/// no-op). Threading the value removes that window entirely. The replay re-reads
+/// `read_token` so it picks up the freshly-installed credential.
+async fn send_with_401_retry_inner<Read, B, R, Fut>(
     endpoint: &'static str,
+    read_token: Read,
     build: B,
     refresh: R,
 ) -> reqwest::Result<reqwest::Response>
 where
-    B: Fn() -> reqwest::RequestBuilder,
-    R: FnOnce() -> Fut,
+    Read: Fn() -> String,
+    B: Fn(&str) -> reqwest::RequestBuilder,
+    R: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let response = send_with_retry(build(), endpoint, RetryPolicy::from_env()).await?;
+    let stale = read_token();
+    let response = send_with_retry(build(&stale), endpoint, RetryPolicy::from_env()).await?;
     if !is_unauthorized(response.status().as_u16()) {
         return Ok(response);
     }
 
     tracing::warn!("upstream 401 ({endpoint}); attempting inline token refresh + single replay");
-    if !refresh().await {
+    // Refresh against the EXACT token the failing request carried, not a fresh
+    // re-read of state that may already have rotated under us.
+    if !refresh(stale).await {
         // Refresh failed / not possible: surface the original 401 unchanged.
         return Ok(response);
     }
@@ -437,23 +449,28 @@ where
     metrics::counter!("copilot_token_401_replay_total", "endpoint" => endpoint).increment(1);
     // Replay EXACTLY once with the freshly-installed token; surface whatever it
     // returns (including another 401) without further retries.
-    send_with_retry(build(), endpoint, RetryPolicy::from_env()).await
+    let fresh = read_token();
+    send_with_retry(build(&fresh), endpoint, RetryPolicy::from_env()).await
 }
 
 /// Inline-401 wrapper for the Copilot HTTP call sites: force-refreshes the
-/// Copilot token (coalesced) and replays once. `build` must rebuild the request
-/// (including auth headers) from current state on each call.
+/// Copilot token (coalesced) and replays once. `build` receives the exact token
+/// the helper read from state and MUST stamp it into the request's auth header
+/// (rather than re-snapshotting the token itself) so the refresh decision is made
+/// against the token the request actually carried.
 pub async fn send_copilot_with_401_retry<B>(
     endpoint: &'static str,
     build: B,
 ) -> reqwest::Result<reqwest::Response>
 where
-    B: Fn() -> reqwest::RequestBuilder,
+    B: Fn(&str) -> reqwest::RequestBuilder,
 {
-    let stale = state::with_state(|s| s.copilot_token.clone()).unwrap_or_default();
-    send_with_401_retry_inner(endpoint, build, || async move {
-        force_refresh_copilot_token(&stale).await.is_ok()
-    })
+    send_with_401_retry_inner(
+        endpoint,
+        || state::with_state(|s| s.copilot_token.clone()).unwrap_or_default(),
+        build,
+        |stale| async move { force_refresh_copilot_token(&stale).await.is_ok() },
+    )
     .await
 }
 
@@ -680,19 +697,20 @@ mod tests {
     async fn replays_once_after_successful_refresh() {
         // 401 then 200: a successful refresh drives exactly one replay -> 200.
         let (url, count) = spawn_status_server(|n| if n == 0 { 401 } else { 200 }).await;
-        let build = || {
+        let build = |_token: &str| {
             crate::libs::http::client()
                 .post(&url)
                 .body(Vec::<u8>::new())
         };
         let refreshed = Arc::new(AtomicBool::new(false));
         let refreshed_clone = refreshed.clone();
-        let response = send_with_401_retry_inner("chat", build, move || async move {
-            refreshed_clone.store(true, Ordering::SeqCst);
-            true
-        })
-        .await
-        .unwrap();
+        let response =
+            send_with_401_retry_inner("chat", String::new, build, move |_stale| async move {
+                refreshed_clone.store(true, Ordering::SeqCst);
+                true
+            })
+            .await
+            .unwrap();
         assert_eq!(response.status().as_u16(), 200);
         assert!(refreshed.load(Ordering::SeqCst), "refresh runs on a 401");
         assert_eq!(count.load(Ordering::SeqCst), 2, "exactly one replay");
@@ -702,14 +720,15 @@ mod tests {
     async fn no_replay_when_refresh_fails() {
         // 401 first: a failed refresh surfaces the original 401 with no replay.
         let (url, count) = spawn_status_server(|n| if n == 0 { 401 } else { 200 }).await;
-        let build = || {
+        let build = |_token: &str| {
             crate::libs::http::client()
                 .post(&url)
                 .body(Vec::<u8>::new())
         };
-        let response = send_with_401_retry_inner("chat", build, || async { false })
-            .await
-            .unwrap();
+        let response =
+            send_with_401_retry_inner("chat", String::new, build, |_stale| async { false })
+                .await
+                .unwrap();
         assert_eq!(response.status().as_u16(), 401);
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -723,14 +742,15 @@ mod tests {
         // Always 401: refresh succeeds but the single replay also 401s, which is
         // surfaced unchanged — the replay never repeats.
         let (url, count) = spawn_status_server(|_| 401).await;
-        let build = || {
+        let build = |_token: &str| {
             crate::libs::http::client()
                 .post(&url)
                 .body(Vec::<u8>::new())
         };
-        let response = send_with_401_retry_inner("chat", build, || async { true })
-            .await
-            .unwrap();
+        let response =
+            send_with_401_retry_inner("chat", String::new, build, |_stale| async { true })
+                .await
+                .unwrap();
         assert_eq!(response.status().as_u16(), 401);
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -743,21 +763,80 @@ mod tests {
     async fn no_refresh_on_initial_success() {
         // A 200 first response never triggers a refresh or replay.
         let (url, count) = spawn_status_server(|_| 200).await;
-        let build = || {
+        let build = |_token: &str| {
             crate::libs::http::client()
                 .post(&url)
                 .body(Vec::<u8>::new())
         };
         let refreshed = Arc::new(AtomicBool::new(false));
         let refreshed_clone = refreshed.clone();
-        let response = send_with_401_retry_inner("chat", build, move || async move {
-            refreshed_clone.store(true, Ordering::SeqCst);
-            true
-        })
-        .await
-        .unwrap();
+        let response =
+            send_with_401_retry_inner("chat", String::new, build, move |_stale| async move {
+                refreshed_clone.store(true, Ordering::SeqCst);
+                true
+            })
+            .await
+            .unwrap();
         assert_eq!(response.status().as_u16(), 200);
         assert!(!refreshed.load(Ordering::SeqCst), "no refresh on success");
         assert_eq!(count.load(Ordering::SeqCst), 1, "no replay on success");
+    }
+
+    #[tokio::test]
+    async fn refresh_decides_against_token_request_carried() {
+        // TOCTOU regression guard. Even if the global token rotates between the
+        // helper's read and the request build, the value `build` stamps into the
+        // first request is the SAME value handed to `refresh` — so the refresh
+        // decision can never be made against a token the request didn't carry.
+        // The replay then re-reads state and picks up the rotated/refreshed token.
+        let (url, count) = spawn_status_server(|n| if n == 0 { 401 } else { 200 }).await;
+
+        // read_token yields "tok-a" first (first request), "tok-b" on the replay
+        // re-read — simulating a rotation that landed before the replay.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_clone = reads.clone();
+        let read_token = move || {
+            if reads_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                "tok-a".to_string()
+            } else {
+                "tok-b".to_string()
+            }
+        };
+
+        // Record every token `build` is asked to stamp into the request.
+        let built_with: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let built_with_clone = built_with.clone();
+        let build = move |token: &str| {
+            built_with_clone.lock().unwrap().push(token.to_string());
+            crate::libs::http::client()
+                .post(&url)
+                .body(Vec::<u8>::new())
+        };
+
+        // Record the token the refresh decision was made against.
+        let refreshed_with: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let refreshed_with_clone = refreshed_with.clone();
+        let refresh = move |stale: String| async move {
+            *refreshed_with_clone.lock().unwrap() = Some(stale);
+            true
+        };
+
+        let response = send_with_401_retry_inner("chat", read_token, build, refresh)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(count.load(Ordering::SeqCst), 2, "exactly one replay");
+        // The first request carried "tok-a"; the replay carried the re-read "tok-b".
+        assert_eq!(
+            built_with.lock().unwrap().as_slice(),
+            ["tok-a".to_string(), "tok-b".to_string()],
+        );
+        // Crucially: refresh was decided against the exact token request #1 used.
+        assert_eq!(
+            refreshed_with.lock().unwrap().as_deref(),
+            Some("tok-a"),
+            "refresh must target the token the failing request actually carried",
+        );
     }
 }

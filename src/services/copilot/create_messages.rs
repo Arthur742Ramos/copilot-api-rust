@@ -165,10 +165,12 @@ pub async fn create_messages(
     let base = copilot_base_url(&st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    // Auth headers are rebuilt from current state per attempt so the single
-    // 401-triggered replay carries the inline-refreshed token.
-    let build = || {
-        let st = state::snapshot();
+    // Auth headers are rebuilt per attempt from the token the helper hands us, so
+    // the single 401-triggered replay carries the inline-refreshed token and the
+    // request provably uses the exact token the refresh decision is made against.
+    let build = |token: &str| {
+        let mut st = state::snapshot();
+        st.copilot_token = Some(token.to_string());
         let mut headers: HeaderMap = copilot_headers(&st, Some(options.request_id), enable_vision);
         set_header(
             &mut headers,

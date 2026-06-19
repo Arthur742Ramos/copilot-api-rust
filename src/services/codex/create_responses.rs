@@ -47,22 +47,19 @@ const STRIPPED_CODEX_REQUEST_HEADERS: &[&str] = &[
     "x-forwarded-proto",
 ];
 
-/// Mirrors the TS `requireCodexAuthContext`: pulls the Codex access token and
-/// account id from global state, erroring (TS throws) when either is missing.
+/// Mirrors the TS `requireCodexAuthContext`'s account-id half: pulls the Codex
+/// account id from global state, erroring (TS throws) when it is missing. The
+/// access token is threaded in explicitly by the caller (see
+/// [`build_codex_responses_headers`]) so the 401-replay path can stamp the exact
+/// token its refresh decision is made against, rather than re-snapshotting state.
 // HttpError is the crate-wide service error; the small Ok payload here makes
 // clippy flag the large Err, but boxing would diverge from every other service.
 #[allow(clippy::result_large_err)]
-fn require_codex_auth_context() -> Result<(String, String), HttpError> {
-    let st = state::snapshot();
-    let access_token = st
-        .codex_access_token
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| HttpError::internal("Codex access token is not loaded"))?;
-    let account_id = st
+fn require_codex_account_id() -> Result<String, HttpError> {
+    state::snapshot()
         .codex_account_id
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| HttpError::internal("Codex account id is not loaded"))?;
-    Ok((access_token, account_id))
+        .ok_or_else(|| HttpError::internal("Codex account id is not loaded"))
 }
 
 /// Mirrors the TS `resolveCodexResponsesUrl`.
@@ -93,6 +90,10 @@ fn set_req_header(map: &mut reqwest::header::HeaderMap, name: &str, value: &str)
 /// request headers minus the strip-set / `*trace*` / `cf-*` rules, then layers
 /// the Codex auth + defaults and the opencode originator override.
 ///
+/// `access_token` is threaded in by the caller (rather than re-read from state)
+/// so the 401-replay path stamps the exact token its refresh decision is made
+/// against; an empty token is rejected, matching the old state-loaded check.
+///
 /// NOTE: the TS port takes no provider config — Codex auth comes from global
 /// state (oauth2), so this intentionally omits the `ResolvedProviderConfig`
 /// parameter the orchestrator sketched.
@@ -100,8 +101,12 @@ fn set_req_header(map: &mut reqwest::header::HeaderMap, name: &str, value: &str)
 pub fn build_codex_responses_headers(
     request_headers: &axum::http::HeaderMap,
     stream: Option<bool>,
+    access_token: &str,
 ) -> Result<reqwest::header::HeaderMap, HttpError> {
-    let (access_token, account_id) = require_codex_auth_context()?;
+    if access_token.is_empty() {
+        return Err(HttpError::internal("Codex access token is not loaded"));
+    }
+    let account_id = require_codex_account_id()?;
     let mut headers = reqwest::header::HeaderMap::new();
 
     for (name, value) in request_headers.iter() {
@@ -338,9 +343,11 @@ pub async fn forward_codex_responses(
     // request that hit it. Codex auth is a DISTINCT path from the Copilot token
     // (oauth2 access token), so it force-refreshes the Codex credential. The 401
     // is read off the status line before any body streams, so replaying once is
-    // safe (no partial, already-billed generation is dropped). Unlike the HTTP
-    // call sites we build headers inline here because the auth-context lookup is
-    // fallible (`?`); the replay rebuilds them so it carries the fresh token.
+    // safe (no partial, already-billed generation is dropped). The access token is
+    // read ONCE here and threaded into the header builder so the failing request
+    // provably carries the exact token `force_refresh_codex_token` is told is
+    // stale — a background-loop rotation between this read and header construction
+    // can no longer make the refresh decision skip and replay a still-bad token.
     let stale = state::with_state(|s| s.codex_access_token.clone()).unwrap_or_default();
     let send = |headers: reqwest::header::HeaderMap| {
         let request = client().post(&url).headers(headers).body(body.clone());
@@ -351,7 +358,7 @@ pub async fn forward_codex_responses(
         )
     };
 
-    let headers = build_codex_responses_headers(request_headers, payload.stream)?;
+    let headers = build_codex_responses_headers(request_headers, payload.stream, &stale)?;
     let response = send(headers)
         .await
         .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
@@ -361,6 +368,7 @@ pub async fn forward_codex_responses(
     }
 
     tracing::warn!("codex upstream 401; attempting inline credential refresh + single replay");
+    // Refresh against the EXACT token the failing request carried.
     if crate::libs::token::force_refresh_codex_token(&stale)
         .await
         .is_err()
@@ -371,7 +379,9 @@ pub async fn forward_codex_responses(
 
     metrics::counter!("copilot_token_401_replay_total", "endpoint" => crate::libs::http::retry_endpoint::CODEX)
         .increment(1);
-    let headers = build_codex_responses_headers(request_headers, payload.stream)?;
+    // Replay once with the freshly-installed token re-read from state.
+    let fresh = state::with_state(|s| s.codex_access_token.clone()).unwrap_or_default();
+    let headers = build_codex_responses_headers(request_headers, payload.stream, &fresh)?;
     let response = send(headers)
         .await
         .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
@@ -482,9 +492,9 @@ mod tests {
 
     #[test]
     fn build_headers_applies_strip_set_and_auth() {
-        // Seed Codex auth context in global state.
+        // Seed the Codex account id in global state; the access token is threaded
+        // in explicitly (mirroring the 401-replay call site) rather than read here.
         state::with_state_mut(|s| {
-            s.codex_access_token = Some("tok-abc".to_string());
             s.codex_account_id = Some("acct-123".to_string());
         });
 
@@ -505,8 +515,8 @@ mod tests {
         // Kept through.
         insert(&mut request_headers, "x-custom", "keep-me");
 
-        let headers =
-            build_codex_responses_headers(&request_headers, Some(true)).expect("build headers");
+        let headers = build_codex_responses_headers(&request_headers, Some(true), "tok-abc")
+            .expect("build headers");
 
         // Strip-set / trace / cf- removed.
         assert!(!headers.contains_key("host"));
@@ -515,7 +525,7 @@ mod tests {
         assert!(!headers.contains_key("cf-ray"));
         // Passthrough kept.
         assert_eq!(headers.get("x-custom").unwrap(), "keep-me");
-        // Auth overrides the inbound authorization header.
+        // Auth overrides the inbound authorization header with the threaded token.
         assert_eq!(headers.get("authorization").unwrap(), "Bearer tok-abc");
         assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct-123");
         // Stream -> SSE accept; defaults layered on.
@@ -527,5 +537,16 @@ mod tests {
         );
         assert_eq!(headers.get("originator").unwrap(), "copilot-api");
         assert_eq!(headers.get("user-agent").unwrap(), "copilot-api");
+    }
+
+    #[test]
+    fn build_headers_rejects_empty_access_token() {
+        state::with_state_mut(|s| {
+            s.codex_account_id = Some("acct-123".to_string());
+        });
+        let request_headers = axum::http::HeaderMap::new();
+        // An empty threaded token is rejected, matching the old "token not loaded"
+        // guard now that the access token no longer comes from state here.
+        assert!(build_codex_responses_headers(&request_headers, Some(false), "").is_err());
     }
 }

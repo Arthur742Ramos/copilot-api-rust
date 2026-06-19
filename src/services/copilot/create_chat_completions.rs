@@ -55,11 +55,13 @@ pub async fn create_chat_completions(
     let base = copilot_base_url(&st);
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
-    // The request (auth headers in particular) is rebuilt from current state on
-    // every attempt so a 401-triggered inline token refresh is picked up on the
-    // single replay. Non-auth header inputs are captured by reference.
-    let build = || {
-        let st = state::snapshot();
+    // The request (auth headers in particular) is rebuilt per attempt from the
+    // token the helper hands us, so the 401-triggered replay carries the
+    // inline-refreshed token and the request provably uses the exact token the
+    // refresh decision is made against. Non-auth header inputs are by reference.
+    let build = |token: &str| {
+        let mut st = state::snapshot();
+        st.copilot_token = Some(token.to_string());
         let mut headers: HeaderMap = copilot_headers(&st, Some(&options.request_id), enable_vision);
         set_header(
             &mut headers,
