@@ -21,7 +21,9 @@ use crate::libs::compact::{
     COMPACT_REQUEST, COMPACT_SUMMARY_PROMPT_START, COMPACT_SYSTEM_PROMPT_STARTS,
     COMPACT_TEXT_ONLY_GUARD,
 };
-use crate::libs::config::get_reasoning_effort_for_model;
+use crate::libs::config::{
+    get_configured_reasoning_effort_for_model, get_reasoning_effort_for_model,
+};
 use crate::libs::models::normalize_sdk_model_id;
 use crate::routes::messages::anthropic_types::{
     CLAUDE_CODE_BILLING_HEADER_PREFIX, IDE_EXECUTE_CODE_TOOL, IDE_GET_DIAGNOSTICS_DESCRIPTION,
@@ -1125,11 +1127,19 @@ pub fn prepare_messages_api_payload(payload: &mut Value, selected_model: Option<
     }
     payload["thinking"] = thinking;
 
-    let mut effort = payload
+    // Effort precedence: an explicit `modelReasoningEfforts` entry in config wins
+    // over the client-supplied `output_config.effort`, which in turn wins over the
+    // built-in default. This lets an operator force e.g. `max` for a model even
+    // when the client hardcodes a lower effort (the Copilot CLI always sends
+    // `effort: "high"`). Models without a configured override still honor the
+    // client's choice.
+    let client_effort = payload
         .get("output_config")
         .and_then(|oc| oc.get("effort"))
         .and_then(|e| e.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+    let mut effort = get_configured_reasoning_effort_for_model(&model)
+        .or(client_effort)
         .unwrap_or_else(|| get_reasoning_effort_for_model(&model));
 
     if effort == "none" || effort == "minimal" {
@@ -1318,5 +1328,36 @@ mod tests {
         });
         prepare_messages_api_payload(&mut payload, Some(&model));
         assert_eq!(payload["output_config"]["effort"].as_str(), Some("medium"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prepare_messages_api_payload_config_effort_overrides_client() {
+        use crate::libs::config::{
+            get_config, reset_cached_config_for_test, set_cached_config_for_test,
+        };
+        use std::collections::BTreeMap;
+
+        // Force `max` for this model via operator config, preserving all other
+        // config fields so the process-global cache stays well-formed.
+        let mut cfg = (*get_config()).clone();
+        let mut efforts = BTreeMap::new();
+        efforts.insert("claude-opus-4.8".to_string(), "max".to_string());
+        cfg.model_reasoning_efforts = Some(efforts);
+        set_cached_config_for_test(cfg);
+
+        let model = model_with_adaptive(Some(vec!["low", "medium", "high", "xhigh", "max"]));
+        let mut payload = json!({
+            "model": "claude-opus-4.8",
+            "messages": [{ "role": "user", "content": "hi" }],
+            // Client hardcodes a lower effort, as the Copilot CLI does.
+            "output_config": { "effort": "high" }
+        });
+        prepare_messages_api_payload(&mut payload, Some(&model));
+
+        // The configured `max` overrides the client-supplied `high`.
+        assert_eq!(payload["output_config"]["effort"].as_str(), Some("max"));
+
+        reset_cached_config_for_test();
     }
 }

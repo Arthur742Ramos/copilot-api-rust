@@ -199,6 +199,7 @@ fn default_config() -> AppConfig {
     efforts.insert("gpt-5.4-mini".to_string(), "xhigh".to_string());
     efforts.insert("gpt-5.4".to_string(), "xhigh".to_string());
     efforts.insert("gpt-5.5".to_string(), "xhigh".to_string());
+    efforts.insert("claude-opus-4.8".to_string(), "max".to_string());
 
     AppConfig {
         auth: Some(AuthConfig {
@@ -550,12 +551,26 @@ pub fn get_model_responses_api_compact_threshold(model: &str) -> Option<f64> {
     Some(threshold)
 }
 
-pub fn get_reasoning_effort_for_model(model: &str) -> String {
+/// Built-in fallback reasoning effort used when neither the client nor the
+/// operator's `modelReasoningEfforts` config specify one for a model.
+pub const DEFAULT_REASONING_EFFORT: &str = "high";
+
+/// Returns the explicitly-configured reasoning effort for a model from
+/// `modelReasoningEfforts`, if one is present. Unlike
+/// [`get_reasoning_effort_for_model`], this returns `None` (rather than the
+/// built-in default) when the model has no configured override, so callers can
+/// distinguish "operator forced an effort" from "fall back to default" and give
+/// the configured value precedence over a client-supplied effort.
+pub fn get_configured_reasoning_effort_for_model(model: &str) -> Option<String> {
     get_config()
         .model_reasoning_efforts
         .as_ref()
         .and_then(|m| m.get(model).cloned())
-        .unwrap_or_else(|| "high".to_string())
+}
+
+pub fn get_reasoning_effort_for_model(model: &str) -> String {
+    get_configured_reasoning_effort_for_model(model)
+        .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string())
 }
 
 pub fn normalize_provider_base_url(url: &str) -> String {
