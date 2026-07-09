@@ -178,27 +178,47 @@ fn default_config() -> AppConfig {
         "gpt-5-mini".to_string(),
         GPT5_EXPLORATION_PROMPT.to_string(),
     );
-    extra_prompts.insert(
-        "gpt-5.3-codex".to_string(),
-        GPT5_COMMENTARY_PROMPT.to_string(),
-    );
-    extra_prompts.insert(
-        "gpt-5.4-mini".to_string(),
-        GPT5_COMMENTARY_PROMPT.to_string(),
-    );
-    extra_prompts.insert("gpt-5.4".to_string(), GPT5_COMMENTARY_PROMPT.to_string());
-    extra_prompts.insert("gpt-5.5".to_string(), GPT5_COMMENTARY_PROMPT.to_string());
+    for model in [
+        "gpt-5.2",
+        "gpt-5.3-codex",
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+    ] {
+        extra_prompts.insert(model.to_string(), GPT5_COMMENTARY_PROMPT.to_string());
+    }
 
     let mut thresholds = BTreeMap::new();
-    thresholds.insert("gpt-5.4".to_string(), 272_000.0 * 0.8);
-    thresholds.insert("gpt-5.5".to_string(), 272_000.0 * 0.8);
+    for model in ["gpt-5.2", "gpt-5.4-mini"] {
+        thresholds.insert(model.to_string(), 272_000.0 * 0.8);
+    }
+    for model in [
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+    ] {
+        thresholds.insert(model.to_string(), 922_000.0 * 0.8);
+    }
 
     let mut efforts = BTreeMap::new();
     efforts.insert("gpt-5-mini".to_string(), "low".to_string());
-    efforts.insert("gpt-5.3-codex".to_string(), "xhigh".to_string());
-    efforts.insert("gpt-5.4-mini".to_string(), "xhigh".to_string());
-    efforts.insert("gpt-5.4".to_string(), "xhigh".to_string());
-    efforts.insert("gpt-5.5".to_string(), "xhigh".to_string());
+    for model in [
+        "gpt-5.2",
+        "gpt-5.3-codex",
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "gpt-5.5",
+    ] {
+        efforts.insert(model.to_string(), "xhigh".to_string());
+    }
+    for model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+        efforts.insert(model.to_string(), "max".to_string());
+    }
     efforts.insert("claude-opus-4.8".to_string(), "max".to_string());
 
     AppConfig {
@@ -804,4 +824,33 @@ pub fn get_image_model() -> String {
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "gpt-image-2".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_context_models_compact_against_the_1m_prompt_budget() {
+        let thresholds = default_config()
+            .model_responses_api_compact_thresholds
+            .expect("default compact thresholds");
+
+        assert_eq!(thresholds.get("gpt-5.6-sol"), Some(&(922_000.0 * 0.8)));
+        assert_eq!(thresholds.get("gpt-5.6-terra"), Some(&(922_000.0 * 0.8)));
+        assert_eq!(thresholds.get("gpt-5.6-luna"), Some(&(922_000.0 * 0.8)));
+        assert_eq!(thresholds.get("gpt-5.4-mini"), Some(&(272_000.0 * 0.8)));
+    }
+
+    #[test]
+    fn max_capable_codex_models_default_to_max_reasoning() {
+        let efforts = default_config()
+            .model_reasoning_efforts
+            .expect("default reasoning efforts");
+
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(efforts.get(model).map(String::as_str), Some("max"));
+        }
+        assert_eq!(efforts.get("gpt-5.5").map(String::as_str), Some("xhigh"));
+    }
 }

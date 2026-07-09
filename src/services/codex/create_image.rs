@@ -107,6 +107,7 @@ fn build_image_payload(req: &ImageGenerationRequest) -> ResponsesPayload {
         content: Some(MessageContent::Text(req.prompt.clone())),
         status: None,
         phase: None,
+        extra: Default::default(),
     })]);
 
     ResponsesPayload {

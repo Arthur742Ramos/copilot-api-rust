@@ -169,6 +169,8 @@ pub struct ResponseInputMessage {
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// A message `content` is either bare text or an array of content blocks.
@@ -190,6 +192,8 @@ pub struct ResponseFunctionToolCallItem {
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +204,8 @@ pub struct ResponseFunctionCallOutputItem {
     pub output: FunctionCallOutputContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// `output` is either a bare string or an array of input content blocks.
@@ -220,6 +226,8 @@ pub struct ResponseToolSearchCallItem {
     pub execution: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +240,8 @@ pub struct ResponseToolSearchOutputItem {
     pub execution: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +252,8 @@ pub struct ResponseInputReasoning {
     pub item_type: String,
     pub summary: Vec<ReasoningSummaryText>,
     pub encrypted_content: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +261,8 @@ pub struct ReasoningSummaryText {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,12 +271,16 @@ pub struct ResponseInputCompaction {
     #[serde(rename = "type")]
     pub item_type: String,
     pub encrypted_content: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseInputCompactionTrigger {
     #[serde(rename = "type")]
     pub item_type: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Mirrors the TS `ResponseInputContent` union.
@@ -281,6 +299,8 @@ pub struct ResponseInputText {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +312,8 @@ pub struct ResponseInputImage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
     pub detail: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +326,8 @@ pub struct ResponseInputFile {
     pub file_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +460,8 @@ pub struct ResponseOutputMessage {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ResponseOutputContentBlock>>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +476,8 @@ pub struct ResponseOutputReasoning {
     pub encrypted_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,6 +486,8 @@ pub struct ResponseReasoningBlock {
     pub block_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +506,8 @@ pub struct ResponseOutputFunctionCall {
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +523,8 @@ pub struct ResponseOutputToolSearchCall {
     pub execution: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,6 +541,8 @@ pub struct ResponseOutputToolSearchOutput {
     pub execution: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +553,8 @@ pub struct ResponseOutputCompaction {
     pub item_type: String,
     #[serde(default, deserialize_with = "null_to_default")]
     pub encrypted_content: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Mirrors the TS `ResponseOutputContentBlock` union.
@@ -534,6 +572,8 @@ pub struct ResponseOutputText {
     pub block_type: String,
     pub text: String,
     pub annotations: Vec<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,6 +581,8 @@ pub struct ResponseOutputRefusal {
     #[serde(rename = "type")]
     pub block_type: String,
     pub refusal: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -559,18 +601,24 @@ pub struct ResponseUsage {
     pub input_tokens_details: Option<ResponseUsageInputDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<ResponseUsageOutputDetails>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseUsageInputDetails {
     #[serde(default, deserialize_with = "null_to_default")]
     pub cached_tokens: i64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseUsageOutputDetails {
     #[serde(default, deserialize_with = "null_to_default")]
     pub reasoning_tokens: i64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,9 +1156,22 @@ mod tests {
                     "call_id": "call_1",
                     "name": "do_thing",
                     "arguments": "{}",
-                    "status": "completed"
+                    "status": "completed",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "turn_123"
+                    }
                 }
             ],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+                "input_tokens_details": {
+                    "cached_tokens": 2,
+                    "cache_creation_tokens": 1
+                },
+                "future_usage_field": 9
+            },
             "parallel_tool_calls": true,
             "custom_passthrough": { "keep": "me" }
         }"#;
@@ -1132,6 +1193,70 @@ mod tests {
 
         let reser = serde_json::to_value(&result).expect("serialize");
         assert_eq!(reser["custom_passthrough"]["keep"], "me");
+        assert_eq!(
+            reser["output"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "turn_123"
+        );
+        assert_eq!(
+            reser["usage"]["input_tokens_details"]["cache_creation_tokens"],
+            1
+        );
+        assert_eq!(reser["usage"]["future_usage_field"], 9);
+    }
+
+    #[test]
+    fn roundtrips_unknown_fields_on_known_input_items() {
+        let raw = r#"{
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "turn_456"
+                    },
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "hello",
+                            "annotations": [],
+                            "future_content_field": true
+                        }
+                    ]
+                },
+                {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "do_thing",
+                    "arguments": "{}",
+                    "status": "completed",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "turn_456"
+                    }
+                }
+            ]
+        }"#;
+
+        let payload: ResponsesPayload = serde_json::from_str(raw).expect("parse payload");
+        let reserialized = serde_json::to_value(payload).expect("serialize payload");
+
+        assert_eq!(reserialized["input"][0]["id"], "msg_1");
+        assert_eq!(
+            reserialized["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "turn_456"
+        );
+        assert_eq!(
+            reserialized["input"][0]["content"][0]["future_content_field"],
+            true
+        );
+        assert_eq!(reserialized["input"][1]["id"], "fc_1");
+        assert_eq!(
+            reserialized["input"][1]["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "turn_456"
+        );
     }
 
     #[test]

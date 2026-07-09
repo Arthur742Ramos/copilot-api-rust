@@ -455,6 +455,7 @@ fn create_message(role: &str, content: MessageContent, phase: Option<String>) ->
         content: Some(content),
         status: None,
         phase,
+        extra: Default::default(),
     })
 }
 
@@ -489,6 +490,7 @@ fn create_text_content(text: String) -> ResponseInputContent {
     ResponseInputContent::Text(ResponseInputText {
         block_type: "input_text".to_string(),
         text,
+        extra: Default::default(),
     })
 }
 
@@ -496,6 +498,7 @@ fn create_output_text_content(text: String) -> ResponseInputContent {
     ResponseInputContent::Text(ResponseInputText {
         block_type: "output_text".to_string(),
         text,
+        extra: Default::default(),
     })
 }
 
@@ -528,6 +531,7 @@ fn create_image_content(block: &Value) -> Result<ResponseInputImage, AppError> {
         image_url: Some(image_url),
         file_id: None,
         detail: "auto".to_string(),
+        extra: Default::default(),
     })
 }
 
@@ -564,6 +568,7 @@ fn create_file_content(block: &Value) -> Result<ResponseInputFile, AppError> {
         file_data: Some(file_data),
         file_id: None,
         filename: Some(filename),
+        extra: Default::default(),
     })
 }
 
@@ -629,6 +634,7 @@ fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
         vec![ReasoningSummaryText {
             block_type: "summary_text".to_string(),
             text: thinking.to_string(),
+            extra: Default::default(),
         }]
     };
     ResponseInputReasoning {
@@ -636,6 +642,7 @@ fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
         item_type: "reasoning".to_string(),
         summary,
         encrypted_content,
+        extra: Default::default(),
     }
 }
 
@@ -645,6 +652,7 @@ fn create_compaction_content(signature: &str) -> Option<ResponseInputCompaction>
         id: compaction.id,
         item_type: "compaction".to_string(),
         encrypted_content: compaction.encrypted_content,
+        extra: Default::default(),
     })
 }
 
@@ -675,6 +683,7 @@ fn create_function_tool_call(
         arguments,
         status: Some("completed".to_string()),
         namespace,
+        extra: Default::default(),
     }
 }
 
@@ -687,6 +696,7 @@ fn create_tool_search_call(block: &Value) -> ResponseToolSearchCallItem {
         arguments: normalize_tool_search_bridge_arguments(&input),
         execution: Some("client".to_string()),
         status: Some("completed".to_string()),
+        extra: Default::default(),
     }
 }
 
@@ -717,6 +727,7 @@ fn create_function_call_output(block: &Value) -> Result<ResponseFunctionCallOutp
         call_id: call_id.to_string(),
         output: convert_tool_result_content(block.get("content"))?,
         status: Some(if is_error { "incomplete" } else { "completed" }.to_string()),
+        extra: Default::default(),
     })
 }
 
@@ -774,6 +785,7 @@ fn create_tool_search_output(
         tools,
         execution: Some("client".to_string()),
         status: Some(if is_error { "incomplete" } else { "completed" }.to_string()),
+        extra: Default::default(),
     }
 }
 
@@ -1675,9 +1687,11 @@ mod tests {
                     summary: Some(vec![ResponseReasoningBlock {
                         block_type: "summary_text".to_string(),
                         text: Some("pondering".to_string()),
+                        extra: Default::default(),
                     }]),
                     encrypted_content: Some("ENC".to_string()),
                     status: None,
+                    extra: Default::default(),
                 }),
                 ResponseOutputItem::Message(ResponseOutputMessage {
                     id: "msg_1".to_string(),
@@ -1689,8 +1703,10 @@ mod tests {
                             block_type: "output_text".to_string(),
                             text: "the answer".to_string(),
                             annotations: vec![],
+                            extra: Default::default(),
                         },
                     )]),
+                    extra: Default::default(),
                 }),
             ],
             ..Default::default()
@@ -1737,6 +1753,7 @@ mod tests {
                     arguments: "{}".to_string(),
                     status: None,
                     namespace: None,
+                    extra: Default::default(),
                 },
             )],
             ..Default::default()
@@ -1769,6 +1786,7 @@ mod tests {
                     arguments: "{}".to_string(),
                     status: None,
                     namespace: None,
+                    extra: Default::default(),
                 },
             )],
             ..Default::default()
@@ -1797,6 +1815,7 @@ mod tests {
                 summary: None,
                 encrypted_content: Some("E".to_string()),
                 status: None,
+                extra: Default::default(),
             })],
             ..Default::default()
         };
