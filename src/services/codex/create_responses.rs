@@ -424,8 +424,13 @@ mod tests {
             "input": [
                 { "type": "message", "role": "system",
                   "content": [ { "type": "input_text", "text": "be helpful" } ] },
-                { "type": "message", "role": "user",
-                  "content": [ { "type": "input_text", "text": "hello" } ] }
+                { "id": "msg_1", "type": "message", "role": "user",
+                  "content": [
+                    { "type": "input_text", "text": "hello", "future_content_field": true }
+                  ],
+                  "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn_1"
+                  } }
             ]
         }"#;
         let mut payload: ResponsesPayload = serde_json::from_str(raw).expect("parse payload");
@@ -439,7 +444,7 @@ mod tests {
         assert!(payload.metadata.is_none());
         assert_eq!(payload.instructions.as_deref(), Some("be helpful"));
 
-        match payload.input {
+        match &payload.input {
             Some(InputField::Items(ref items)) => {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
@@ -449,6 +454,17 @@ mod tests {
             }
             other => panic!("expected remaining input items, got {other:?}"),
         }
+
+        let normalized = serde_json::to_value(&payload).expect("serialize normalized payload");
+        assert_eq!(normalized["input"][0]["id"], "msg_1");
+        assert_eq!(
+            normalized["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "turn_1"
+        );
+        assert_eq!(
+            normalized["input"][0]["content"][0]["future_content_field"],
+            true
+        );
     }
 
     #[test]
