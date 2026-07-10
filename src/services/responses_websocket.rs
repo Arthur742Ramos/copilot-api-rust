@@ -801,7 +801,15 @@ mod tests {
 
         server.await.expect("websocket server task");
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!WEBSOCKET_POOL.lock().unwrap().contains_key(&pool_key));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !WEBSOCKET_POOL.lock().unwrap().contains_key(&pool_key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("idle-close task should evict the completed socket");
     }
 }
