@@ -32,7 +32,9 @@ async fn handle(body: Value) -> Result<Value, AppError> {
     // arrays (of strings or token-id arrays) pass through untouched.
     normalize_embedding_input(&mut payload.input);
 
-    crate::libs::admission::check_shared_admission().await?;
+    crate::libs::admission::check_shared_admission()
+        .await
+        .map_err(AppError::Http)?;
 
     let response = create_embeddings(&payload).await?;
 

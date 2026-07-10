@@ -104,6 +104,10 @@ pub struct FlowOptions {
     pub compact_type: Option<i32>,
     pub selected_model: Option<Model>,
     pub anthropic_beta_header: Option<String>,
+    /// In-flight concurrency permit acquired during admission. Held for the
+    /// lifetime of the streaming response so the slot is freed on completion
+    /// or client disconnect, not when the handler function returns.
+    pub permit: crate::libs::admission::InFlightPermit,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +224,8 @@ pub async fn handle_with_chat_completions(
         ChatCompletionsResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
                 let mut timer = StreamTimer::new("chat_completions", stream_transport::TRANSLATED)
-                    .with_request_context(req_ctx);
+                    .with_request_context(req_ctx)
+                    .with_in_flight_permit(opts.permit);
                 let mut state = AnthropicStreamState::default();
                 let mut usage = UsageTokens::default();
 
@@ -264,6 +269,7 @@ pub async fn handle_with_chat_completions(
                     };
 
                     if raw_event.data == "[DONE]" {
+                        timer.mark_finished();
                         break;
                     }
                     if raw_event.data.is_empty() {
@@ -407,7 +413,8 @@ pub async fn handle_with_responses_api(
         CreateResponsesReturn::Stream(upstream) => {
             let stream = async_stream::stream! {
                 let mut timer = StreamTimer::new("responses", stream_transport::TRANSLATED)
-                    .with_request_context(req_ctx);
+                    .with_request_context(req_ctx)
+                    .with_in_flight_permit(opts.permit);
                 let mut state = ResponsesStreamState::new(Some(tool_search_name));
                 let mut usage = UsageTokens::default();
 
@@ -480,6 +487,7 @@ pub async fn handle_with_responses_api(
                     }
 
                     if state.message_completed {
+                        timer.mark_finished();
                         break;
                     }
                 }
@@ -563,7 +571,8 @@ pub async fn handle_with_messages_api(
         CreateMessagesResult::Streaming(upstream) => {
             let stream = async_stream::stream! {
                 let mut timer = StreamTimer::new("messages", stream_transport::TRANSLATED)
-                    .with_request_context(req_ctx);
+                    .with_request_context(req_ctx)
+                    .with_in_flight_permit(opts.permit);
                 let mut usage = UsageTokens::default();
                 // Track terminal framing so a passthrough upstream that ends
                 // without a `message_stop` (clean end / [DONE]) doesn't leave the
@@ -611,6 +620,7 @@ pub async fn handle_with_messages_api(
                     let event_name = event.event.clone();
                     let data = event.data;
                     if data == "[DONE]" {
+                        timer.mark_finished();
                         break;
                     }
                     if data.is_empty() {

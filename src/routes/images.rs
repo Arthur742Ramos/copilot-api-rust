@@ -36,7 +36,9 @@ async fn handle(body: Value, headers: axum::http::HeaderMap) -> Result<Value, Ap
     // Admission gates, matching the chat/responses/messages routes: rate limit
     // first, then the daily token budget. Image generation is the most expensive
     // single request, so it must not bypass the spend guardrail.
-    crate::libs::admission::check_shared_admission().await?;
+    crate::libs::admission::check_shared_admission()
+        .await
+        .map_err(AppError::Http)?;
     crate::libs::premium_interactions::check_premium_interactions()?;
 
     // Ensure the Codex OAuth token is loaded/refreshed into global state before

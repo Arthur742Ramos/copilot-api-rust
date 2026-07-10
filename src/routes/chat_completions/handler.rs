@@ -38,7 +38,9 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     // Provider aliases return early, so apply policies shared by every
     // billable upstream before resolving the concrete transport.
-    crate::libs::admission::check_shared_admission().await?;
+    let in_flight_permit = crate::libs::admission::check_shared_admission()
+        .await
+        .map_err(AppError::Http)?;
 
     if let Some(alias) = parse_provider_model_alias(&payload.model) {
         payload.model = alias.model.clone();
@@ -111,6 +113,10 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     match result {
         ChatCompletionsResult::NonStreaming(response) => {
+            // Non-streaming response: permit can drop immediately (the request
+            // is already complete). Bind explicitly to silence unused-variable
+            // lint while still observing the RAII drop at this point.
+            drop(in_flight_permit);
             // Native non-streaming responses never pass through a StreamTimer, so
             // record the flow/model/transport headline here. This lets the
             // trace middleware's `has_flow` guard emit the single
@@ -128,7 +134,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         }
         ChatCompletionsResult::Streaming(upstream) => {
             let _ = is_stream;
-            Ok(stream_sse(upstream, recorder).into_response())
+            Ok(stream_sse(upstream, recorder, in_flight_permit).into_response())
         }
     }
 }
@@ -146,6 +152,7 @@ fn messages_as_values(payload: &ChatCompletionsPayload) -> Vec<Value> {
 fn stream_sse(
     upstream: reqwest::Response,
     recorder: crate::libs::token_usage::TokenUsageRecorder,
+    permit: crate::libs::admission::InFlightPermit,
 ) -> Response {
     use crate::libs::stream_metrics::{transport, StreamTimer};
     use crate::libs::token_usage::UsageTokens;
@@ -162,8 +169,13 @@ fn stream_sse(
     // stream-complete) when the stream ends or the client disconnects.
     let timer_for_stream = Arc::new(Mutex::new(
         StreamTimer::new("chat_completions", transport::NATIVE)
-            .with_request_context(crate::libs::request_context::request_context_store()),
+            .with_request_context(crate::libs::request_context::request_context_store())
+            .with_in_flight_permit(permit),
     ));
+    // Clone for the finalizing `once` future so `mark_finished` can be called
+    // when the byte stream is fully exhausted (vs client disconnect, which drops
+    // the stream and this clone simultaneously without the `once` ever running).
+    let timer_for_finalizing = timer_for_stream.clone();
 
     let byte_stream = upstream.bytes_stream();
     let mapped = byte_stream.map(move |chunk| {
@@ -200,6 +212,12 @@ fn stream_sse(
     let recorder_final = recorder.clone();
     let usage_final = usage_acc.clone();
     let finalizing = mapped.chain(futures_util::stream::once(async move {
+        // Stream was fully exhausted (client received all bytes) — mark as
+        // finished so the Drop outcome is "ok" rather than "cancelled".
+        timer_for_finalizing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .mark_finished();
         let usage = std::mem::take(
             &mut *usage_final
                 .lock()

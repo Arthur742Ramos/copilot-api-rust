@@ -110,6 +110,20 @@ struct StartArgs {
     /// Initialize proxy from environment variables
     #[arg(long = "proxy-env", default_value_t = false)]
     proxy_env: bool,
+    /// Allow binding to a non-loopback address when no API keys are configured.
+    /// Without this flag, binding to a non-loopback interface with no keys is
+    /// a fatal error — an unauthenticated proxy reachable from the network is
+    /// almost certainly a misconfiguration.
+    #[arg(
+        long = "allow-remote-no-key",
+        default_value_t = false,
+        env = "COPILOT_API_ALLOW_REMOTE_NO_KEY"
+    )]
+    allow_remote_no_key: bool,
+    /// Run in provider-only mode, bypassing GitHub/Copilot authentication and
+    /// forwarding all requests directly to the named provider.
+    #[arg(long = "provider-only", env = "COPILOT_API_PROVIDER_ONLY")]
+    provider_only: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -234,6 +248,7 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
         s.rate_limit_seconds = options.rate_limit;
         s.rate_limit_wait = options.wait;
         s.show_token = options.show_token;
+        s.provider_only = options.provider_only.clone();
     });
 
     if options.verbose {
@@ -249,7 +264,28 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     cache_vscode_session_id();
     cache_vscode_device_id().await;
 
-    if let Some(token) = options.github_token {
+    if let Some(ref provider_name) = options.provider_only {
+        // Provider-only mode: validate the named provider exists in config, then
+        // skip GitHub auth, Copilot token exchange, and model caching.
+        let providers = crate::libs::config::list_enabled_providers();
+        if !providers.iter().any(|p| p == provider_name) {
+            let known = providers.join(", ");
+            anyhow::bail!(
+                "Provider '{}' not found in config (enabled providers: {}). \
+                 Check your config file and ensure the provider is configured and enabled.",
+                provider_name,
+                if known.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    known
+                }
+            );
+        }
+        tracing::info!(
+            "Provider-only mode: forwarding to '{}' — GitHub/Copilot auth skipped.",
+            provider_name
+        );
+    } else if let Some(token) = options.github_token {
         state::with_state_mut(|s| s.github_token = Some(token));
         tracing::info!("Using provided GitHub token");
         log_user().await?;
@@ -257,25 +293,30 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
         setup_github_token(false).await?;
     }
 
-    setup_copilot_token().await?;
-    cache_models().await?;
+    if options.provider_only.is_none() {
+        setup_copilot_token().await?;
+        cache_models().await?;
+    }
 
-    let model_list = state::with_state(|s| {
-        s.models
-            .as_ref()
-            .map(|m| {
-                m.data
-                    .iter()
-                    .map(|model| format!("- {}", model.id))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default()
-    });
-    let model_count = state::with_state(|s| s.models.as_ref().map(|m| m.data.len()).unwrap_or(0));
-    // Full list at debug so it doesn't bury the ready banner; a count at info.
-    tracing::info!("Loaded {model_count} models (run with -v to list them).");
-    tracing::debug!("Available models: \n{model_list}");
+    if options.provider_only.is_none() {
+        let model_list = state::with_state(|s| {
+            s.models
+                .as_ref()
+                .map(|m| {
+                    m.data
+                        .iter()
+                        .map(|model| format!("- {}", model.id))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        });
+        let model_count =
+            state::with_state(|s| s.models.as_ref().map(|m| m.data.len()).unwrap_or(0));
+        // Full list at debug so it doesn't bury the ready banner; a count at info.
+        tracing::info!("Loaded {model_count} models (run with -v to list them).");
+        tracing::debug!("Available models: \n{model_list}");
+    }
 
     // Resolve the bind host once into an IpAddr (single source of truth for both
     // the advertised URL and the listen SocketAddr below). Accepts an IP literal
@@ -334,10 +375,34 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     let addr = std::net::SocketAddr::new(ip, options.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     if !ip.is_loopback() {
-        tracing::warn!(
-            "Binding to non-loopback host {ip}: the gateway is reachable from other machines. \
-             Configure auth.apiKeys so /token, /metrics and the proxy routes require a key."
-        );
+        // Fail-closed: binding on a network interface without API keys means any
+        // host on the LAN can use the proxy without any credential. Refuse unless
+        // the operator explicitly opts in with --allow-remote-no-key.
+        let api_keys = crate::libs::config::get_config()
+            .auth
+            .as_ref()
+            .and_then(|a| a.api_keys.as_ref())
+            .map(|keys| keys.len())
+            .unwrap_or(0);
+        let no_keys = api_keys == 0;
+        if no_keys && !options.allow_remote_no_key {
+            anyhow::bail!(
+                "Binding to non-loopback host {ip} with no API keys configured is a \
+                 security risk: any network client can use the proxy without credentials. \
+                 Configure auth.apiKeys, or pass --allow-remote-no-key to suppress this check."
+            );
+        }
+        if no_keys {
+            tracing::warn!(
+                "Binding to non-loopback host {ip} with no API keys (--allow-remote-no-key is set). \
+                 The proxy is reachable from other machines without any credential."
+            );
+        } else {
+            tracing::info!(
+                "Binding to non-loopback host {ip}: API keys are configured — \
+                 /token, /metrics and proxy routes require a key."
+            );
+        }
     }
     tracing::info!("Listening on {addr} ({server_url})");
 

@@ -244,12 +244,19 @@ impl IntoResponse for AppError {
                 (StatusCode::BAD_REQUEST, body).into_response()
             }
             AppError::Other(e) => {
-                tracing::error!("Error occurred: {}", e);
+                let trace_id = crate::libs::request_context::request_context_store()
+                    .map(|ctx| ctx.trace_id.clone())
+                    .unwrap_or_else(crate::libs::request_context::generate_trace_id);
+                tracing::error!(
+                    trace_id = %trace_id,
+                    error = ?e,
+                    "internal error"
+                );
                 let body = Json(json!({
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": e.to_string(),
+                        "message": format!("An internal error occurred. Reference: {trace_id}"),
                     }
                 }));
                 (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
@@ -398,7 +405,17 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "api_error");
-        assert_eq!(body["error"]["message"], "something broke internally");
+        // The raw error message must NOT leak to the client; a sanitized
+        // "An internal error occurred. Reference: <trace_id>" is expected.
+        let msg = body["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.starts_with("An internal error occurred. Reference:"),
+            "expected sanitized message, got: {msg}"
+        );
+        assert!(
+            !msg.contains("something broke internally"),
+            "raw error must not appear in client response, got: {msg}"
+        );
     }
 
     #[tokio::test]
