@@ -9,7 +9,6 @@ use crate::libs::approval::await_approval;
 use crate::libs::config::resolve_mapped_model;
 use crate::libs::error::AppError;
 use crate::libs::provider_model::parse_provider_model_alias;
-use crate::libs::rate_limit::check_rate_limit;
 use crate::libs::state;
 use crate::libs::token_usage::{create_copilot_token_usage_recorder, normalize_openai_usage};
 use crate::libs::utils::{generate_request_id_from_payload, get_uuid};
@@ -37,6 +36,10 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         );
     }
 
+    // Provider aliases return early, so apply policies shared by every
+    // billable upstream before resolving the concrete transport.
+    crate::libs::admission::check_shared_admission().await?;
+
     if let Some(alias) = parse_provider_model_alias(&payload.model) {
         payload.model = alias.model.clone();
         return crate::routes::provider::chat_completions::handle_provider_chat_completions(
@@ -47,8 +50,6 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         .await;
     }
 
-    check_rate_limit().await?;
-    crate::libs::token_budget::check_token_budget()?;
     crate::libs::premium_interactions::check_premium_interactions()?;
 
     // Find the selected model from the cache.

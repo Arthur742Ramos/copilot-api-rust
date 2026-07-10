@@ -101,11 +101,13 @@ pub async fn handle_provider_chat_completions(
     // forward it back to the client with the proxy header policy.
     let status = upstream_response.status();
     let resp_headers = upstream_response.headers().clone();
-    let bytes = upstream_response.bytes().await.map_err(|e| {
-        AppError::Other(anyhow::anyhow!(
-            "Failed to read provider response body: {e}"
-        ))
-    })?;
+    let bytes = crate::libs::http::read_bytes_capped(upstream_response)
+        .await
+        .map_err(|e| {
+            AppError::Other(anyhow::anyhow!(
+                "Failed to read provider response body: {e}"
+            ))
+        })?;
 
     if let Ok(body_value) = serde_json::from_slice::<Value>(&bytes) {
         recorder.record(normalize_openai_usage(body_value.get("usage")));

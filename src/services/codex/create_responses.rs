@@ -328,16 +328,19 @@ pub async fn forward_codex_responses(
     normalize_codex_responses_payload(&mut payload);
 
     let url = resolve_codex_responses_url(base_url);
+    let custom_base_url = !base_url.trim().is_empty();
     // SSRF: when the operator has configured a custom Codex base URL it is
     // runtime-settable and therefore untrusted; validate it before forwarding.
     // An empty `base_url` falls back to the fixed CODEX_API_BASE_URL (ChatGPT's
     // own endpoint), which we trust and skip.
-    if !base_url.trim().is_empty() {
+    if custom_base_url {
         crate::services::providers::provider_proxy::validate_upstream_url(&url)?;
     }
+    let stream = payload.stream;
     let body = serde_json::to_vec(&payload).map_err(|e| {
         HttpError::internal(format!("Failed to serialize codex responses payload: {e}"))
     })?;
+    drop(payload);
 
     // Inline 401 recovery: a stale/revoked Codex oauth token self-heals on the
     // request that hit it. Codex auth is a DISTINCT path from the Copilot token
@@ -349,8 +352,18 @@ pub async fn forward_codex_responses(
     // stale — a background-loop rotation between this read and header construction
     // can no longer make the refresh decision skip and replay a still-bad token.
     let stale = state::with_state(|s| s.codex_access_token.clone()).unwrap_or_default();
+    let upstream_client = if custom_base_url {
+        // User-controlled targets must neither follow redirects nor connect to
+        // private DNS answers; both protections live on the restricted client.
+        crate::services::providers::provider_proxy::restricted_upstream_client()
+    } else {
+        client()
+    };
     let send = |headers: reqwest::header::HeaderMap| {
-        let request = client().post(&url).headers(headers).body(body.clone());
+        let request = upstream_client
+            .post(&url)
+            .headers(headers)
+            .body(body.clone());
         crate::libs::http::send_with_retry(
             request,
             crate::libs::http::retry_endpoint::CODEX,
@@ -358,7 +371,7 @@ pub async fn forward_codex_responses(
         )
     };
 
-    let headers = build_codex_responses_headers(request_headers, payload.stream, &stale)?;
+    let headers = build_codex_responses_headers(request_headers, stream, &stale)?;
     let response = send(headers)
         .await
         .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;
@@ -381,7 +394,7 @@ pub async fn forward_codex_responses(
         .increment(1);
     // Replay once with the freshly-installed token re-read from state.
     let fresh = state::with_state(|s| s.codex_access_token.clone()).unwrap_or_default();
-    let headers = build_codex_responses_headers(request_headers, payload.stream, &fresh)?;
+    let headers = build_codex_responses_headers(request_headers, stream, &fresh)?;
     let response = send(headers)
         .await
         .map_err(|e| HttpError::internal(format!("Failed to create codex responses: {e}")))?;

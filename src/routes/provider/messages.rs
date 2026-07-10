@@ -86,6 +86,12 @@ pub async fn post_provider_messages(
                 .into_response()
         }
     };
+    // Internal provider dispatches (model aliases / web search) already pass
+    // through the public route's shared gate. This direct provider endpoint does
+    // not, so gate it here before resolving or contacting the provider.
+    if let Err(error) = crate::libs::admission::check_shared_admission().await {
+        return AppError::Http(error).into_response();
+    }
     match handle_provider_messages_for_provider(payload, provider, headers).await {
         Ok(r) => r,
         Err(e) => AppError::into_response(e),
@@ -521,16 +527,13 @@ fn anthropic_tools_as_slice(payload: &AnthropicMessagesPayload) -> Option<Vec<Va
 /// Read a Responses-API body into a typed [`ResponsesResult`].
 #[allow(clippy::result_large_err)]
 async fn read_responses_result(response: reqwest::Response) -> Result<ResponsesResult, AppError> {
-    let bytes = response.bytes().await.map_err(|e| {
-        AppError::Other(anyhow::anyhow!(
-            "Failed to read provider responses body: {e}"
-        ))
-    })?;
-    serde_json::from_slice(&bytes).map_err(|e| {
-        AppError::Other(anyhow::anyhow!(
-            "Failed to parse provider responses body: {e}"
-        ))
-    })
+    crate::libs::http::read_json_capped(response)
+        .await
+        .map_err(|e| {
+            AppError::Other(anyhow::anyhow!(
+                "Failed to read or parse provider responses body: {e}"
+            ))
+        })
 }
 
 /// The `usage` from a [`ResponsesResult`] as a `Value`, for `normalize_responses_usage`.
@@ -1168,16 +1171,13 @@ fn response_content_type(response: &reqwest::Response) -> String {
 }
 
 async fn read_json(response: reqwest::Response) -> Result<Value, AppError> {
-    let bytes = response.bytes().await.map_err(|e| {
-        AppError::Other(anyhow::anyhow!(
-            "Failed to read provider response body: {e}"
-        ))
-    })?;
-    serde_json::from_slice(&bytes).map_err(|e| {
-        AppError::Other(anyhow::anyhow!(
-            "Failed to parse provider response body: {e}"
-        ))
-    })
+    crate::libs::http::read_json_capped(response)
+        .await
+        .map_err(|e| {
+            AppError::Other(anyhow::anyhow!(
+                "Failed to read or parse provider response body: {e}"
+            ))
+        })
 }
 
 /// Render one translated Anthropic event as an SSE frame (`event: {type}\ndata:

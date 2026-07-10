@@ -32,6 +32,8 @@ async fn handle(body: Value) -> Result<Value, AppError> {
     // arrays (of strings or token-id arrays) pass through untouched.
     normalize_embedding_input(&mut payload.input);
 
+    crate::libs::admission::check_shared_admission().await?;
+
     let response = create_embeddings(&payload).await?;
 
     let prompt_tokens = response

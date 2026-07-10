@@ -76,14 +76,33 @@ pub fn get_responses_transport_for_model(
     let supported_endpoints = selected_model
         .and_then(|m| m.supported_endpoints.as_ref())
         .unwrap_or(&empty);
-    let use_web_socket = configured_responses_api_web_socket_enabled();
+    select_responses_transport(
+        supported_endpoints,
+        compact_type,
+        configured_responses_api_web_socket_enabled(),
+        crate::libs::http::proxy_from_env_enabled(),
+    )
+}
 
-    if compact_type != Some(COMPACT_REQUEST)
-        && use_web_socket
-        && supported_endpoints
-            .iter()
-            .any(|e| e == RESPONSES_WS_ENDPOINT)
-    {
+fn select_responses_transport(
+    supported_endpoints: &[String],
+    compact_type: Option<i32>,
+    use_web_socket: bool,
+    proxy_from_env: bool,
+) -> Option<ResponsesTransport> {
+    let web_socket_supported = supported_endpoints
+        .iter()
+        .any(|endpoint| endpoint == RESPONSES_WS_ENDPOINT);
+
+    if compact_type != Some(COMPACT_REQUEST) && use_web_socket && web_socket_supported {
+        // tokio-tungstenite does not consume reqwest's HTTP(S)_PROXY setup. Use
+        // the equivalent HTTP Responses transport when proxy-from-env is
+        // enabled so corporate/proxied deployments do not silently bypass the
+        // configured proxy. The service also falls back to HTTP when a direct
+        // WebSocket handshake fails before sending a request frame.
+        if proxy_from_env {
+            return Some(ResponsesTransport::Http);
+        }
         return Some(ResponsesTransport::Websocket);
     }
 
@@ -464,6 +483,19 @@ mod tests {
     fn agent_initiator_false_for_empty_input() {
         let payload = payload_with_input(json!([]));
         assert!(!has_agent_initiator(&payload));
+    }
+
+    #[test]
+    fn proxy_env_forces_http_instead_of_websocket() {
+        let endpoints = vec![RESPONSES_WS_ENDPOINT.to_string()];
+        assert_eq!(
+            select_responses_transport(&endpoints, None, true, false),
+            Some(ResponsesTransport::Websocket)
+        );
+        assert_eq!(
+            select_responses_transport(&endpoints, None, true, true),
+            Some(ResponsesTransport::Http)
+        );
     }
 
     #[test]

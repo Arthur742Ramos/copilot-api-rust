@@ -77,7 +77,7 @@ pub async fn handle_provider_responses_for_provider(
 
     if provider_config.name == "codex" {
         let upstream_response =
-            forward_codex_responses(payload.clone(), &headers, &provider_config.base_url).await?;
+            forward_codex_responses(payload, &headers, &provider_config.base_url).await?;
 
         // forward_codex_responses only special-cases 401 (refresh + retry) and
         // otherwise hands back the live response verbatim, so a 4xx/5xx error
@@ -124,11 +124,13 @@ pub async fn handle_provider_responses_for_provider(
     // Non-streaming: buffer, record usage, forward unchanged.
     let status = upstream_response.status();
     let resp_headers = upstream_response.headers().clone();
-    let bytes = upstream_response.bytes().await.map_err(|e| {
-        AppError::Other(anyhow::anyhow!(
-            "Failed to read provider response body: {e}"
-        ))
-    })?;
+    let bytes = crate::libs::http::read_bytes_capped(upstream_response)
+        .await
+        .map_err(|e| {
+            AppError::Other(anyhow::anyhow!(
+                "Failed to read provider response body: {e}"
+            ))
+        })?;
 
     if let Ok(body_value) = serde_json::from_slice::<Value>(&bytes) {
         recorder.record(normalize_responses_usage(body_value.get("usage")));

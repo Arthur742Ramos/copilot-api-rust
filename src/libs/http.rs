@@ -28,6 +28,9 @@ pub fn proxy_from_env_enabled() -> bool {
 /// without capping a healthy long stream.
 pub const DEFAULT_UPSTREAM_READ_TIMEOUT_SECS: u64 = 120;
 
+/// Connection-establishment deadline shared by HTTP and WebSocket transports.
+pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The upstream read-timeout, overridable via `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS`.
 ///
 /// `read_timeout` bounds the gap between successive reads, NOT the total request
@@ -51,7 +54,7 @@ pub fn upstream_read_timeout() -> Option<Duration> {
 /// client configured with native roots and no global timeout (streaming).
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         // read_timeout bounds the gap between successive reads, NOT the total
         // request duration. A healthy SSE stream that keeps producing bytes
         // (including slow model "thinking" gaps under the timeout) is unaffected,
@@ -124,6 +127,9 @@ pub fn preregister_retry_metrics() {
                 .increment(0);
         }
     }
+    // The WebSocket path falls back to HTTP only before an application frame is
+    // sent. Keep this transport-resilience series visible at zero too.
+    metrics::counter!("copilot_responses_websocket_fallback_total").increment(0);
 }
 
 /// Send a request, retrying ONCE on a genuine connection failure.
@@ -389,19 +395,15 @@ pub const MAX_UPSTREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// exceed the same advertised per-request bound.
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Read a non-streaming upstream response body into memory with a hard byte cap,
-/// then deserialize it as `T`. Mirrors `response.json::<T>()` but bounds the
-/// buffer: `reqwest`'s own `.json()`/`.bytes()` read the entire body regardless
-/// of size. Returns `Err(message)` on a transport error, an oversize body, or a
-/// JSON parse failure — the caller wraps it into the appropriate `HttpError`.
-pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-) -> Result<T, String> {
+/// Read a non-streaming upstream response body into memory with a hard byte cap.
+/// Unlike `reqwest::Response::bytes`, this cannot allocate without bound when a
+/// compromised or misconfigured provider returns an enormous body.
+pub async fn read_bytes_capped(response: reqwest::Response) -> Result<bytes::Bytes, String> {
     use futures_util::StreamExt;
 
     // Fast-fail on an advertised Content-Length over the cap before reading.
     if let Some(len) = response.content_length() {
-        if len as usize > MAX_UPSTREAM_RESPONSE_BYTES {
+        if len > MAX_UPSTREAM_RESPONSE_BYTES as u64 {
             return Err(format!(
                 "upstream response too large: {len} bytes > {MAX_UPSTREAM_RESPONSE_BYTES} cap"
             ));
@@ -412,7 +414,7 @@ pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("error reading upstream response: {e}"))?;
-        if buf.len() + chunk.len() > MAX_UPSTREAM_RESPONSE_BYTES {
+        if chunk.len() > MAX_UPSTREAM_RESPONSE_BYTES.saturating_sub(buf.len()) {
             return Err(format!(
                 "upstream response exceeded {MAX_UPSTREAM_RESPONSE_BYTES} byte cap"
             ));
@@ -420,7 +422,15 @@ pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
         buf.extend_from_slice(&chunk);
     }
 
-    serde_json::from_slice(&buf).map_err(|e| format!("failed to parse upstream response: {e}"))
+    Ok(bytes::Bytes::from(buf))
+}
+
+/// Read a capped non-streaming body and deserialize it as `T`.
+pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, String> {
+    let bytes = read_bytes_capped(response).await?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("failed to parse upstream response: {e}"))
 }
 
 /// Max bytes buffered from a non-2xx upstream *error* body (1 MiB). Error bodies
@@ -496,6 +506,40 @@ mod tests {
         assert_eq!(buf, b"abcdef");
     }
 
+    #[tokio::test]
+    async fn read_bytes_capped_rejects_oversized_content_length_before_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_UPSTREAM_RESPONSE_BYTES + 1
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let response = client()
+            .get(format!("http://{addr}/oversized"))
+            .send()
+            .await
+            .expect("response headers");
+        let error = read_bytes_capped(response)
+            .await
+            .expect_err("oversized response must fail");
+        assert!(error.contains("too large"));
+        server.await.expect("test server task");
+    }
+
     #[test]
     fn owned_body_requests_are_cloneable_for_retry() {
         // send_with_connect_retry depends on try_clone() succeeding so it can
@@ -535,6 +579,7 @@ mod tests {
                 );
             }
         }
+        assert!(out.contains("copilot_responses_websocket_fallback_total 0"));
     }
 
     #[test]

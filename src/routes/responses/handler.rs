@@ -10,13 +10,13 @@ use crate::libs::approval::await_approval;
 use crate::libs::config::{is_responses_api_web_search_enabled, resolve_mapped_model};
 use crate::libs::error::AppError;
 use crate::libs::provider_model::parse_provider_model_alias;
-use crate::libs::rate_limit::check_rate_limit;
 use crate::libs::state;
 use crate::libs::subagent::SubagentMarker;
 use crate::libs::token_usage::{create_copilot_token_usage_recorder, normalize_responses_usage};
 use crate::libs::utils::{generate_request_id_from_payload, get_uuid};
 use crate::services::copilot::create_responses::{
-    create_responses, CreateResponsesReturn, InputField, ResponsesPayload, ResponsesRequestOptions,
+    create_responses, CreateResponsesReturn, InputField, MessageContent, ResponseInputItem,
+    ResponsesPayload, ResponsesRequestOptions,
 };
 
 use crate::routes::responses::stream_id_sync::{fix_stream_ids, StreamIdTracker};
@@ -46,6 +46,10 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
         );
     }
 
+    // Provider aliases return early, so shared admission belongs before the
+    // dispatch split rather than only in the Copilot arm.
+    crate::libs::admission::check_shared_admission().await?;
+
     if let Some(alias) = parse_provider_model_alias(&payload.model) {
         payload.model = alias.model.clone();
         return crate::routes::provider::responses::handle_provider_responses_for_provider(
@@ -56,8 +60,6 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
         .await;
     }
 
-    check_rate_limit().await?;
-    crate::libs::token_budget::check_token_budget()?;
     crate::libs::premium_interactions::check_premium_interactions()?;
 
     let subagent_marker = get_codex_responses_subagent_marker(&headers);
@@ -142,10 +144,10 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
         await_approval().await?;
     }
 
-    let is_stream = payload.stream.unwrap_or(false);
+    let response_model = payload.model.clone();
 
     let response = create_responses(
-        &payload,
+        payload,
         ResponsesRequestOptions {
             vision,
             initiator,
@@ -160,7 +162,6 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
 
     match response {
         CreateResponsesReturn::Stream(upstream) => {
-            let _ = is_stream;
             tracing::debug!("Forwarding native Responses stream");
             Ok(stream_responses_sse(upstream, recorder))
         }
@@ -171,7 +172,7 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
             // line (streaming responses are covered by the StreamTimer drop).
             if let Some(ctx) = crate::libs::request_context::request_context_store() {
                 ctx.set_flow_transport_model_non_streaming(
-                    &payload.model,
+                    &response_model,
                     "responses",
                     crate::libs::stream_metrics::transport::NATIVE,
                 );
@@ -331,14 +332,64 @@ fn responses_request_id(payload: &ResponsesPayload, session_id: Option<&str>) ->
             get_uuid(&format!("{}{}{}", session_id.unwrap_or(""), mac, text))
         }
         Some(InputField::Items(items)) => {
-            let values: Vec<Value> = items
-                .iter()
-                .map(|item| serde_json::to_value(item).unwrap_or(Value::Null))
-                .collect();
-            generate_request_id_from_payload(&values, session_id)
+            let content = responses_last_user_content(items);
+            crate::libs::utils::generate_request_id_from_user_content(
+                content.as_deref(),
+                session_id,
+            )
         }
         _ => generate_request_id_from_payload(&[], session_id),
     }
+}
+
+/// Typed equivalent of `find_last_user_content` that walks backward and only
+/// serializes the chosen user's content blocks. The previous implementation
+/// materialized every Responses input item as JSON merely to inspect the last
+/// user message, temporarily duplicating a potentially 1M-token conversation.
+fn responses_last_user_content(items: &[ResponseInputItem]) -> Option<String> {
+    for item in items.iter().rev() {
+        match item {
+            ResponseInputItem::Message(message) if message.role == "user" => {
+                let Some(content) = message.content.as_ref() else {
+                    continue;
+                };
+                match content {
+                    MessageContent::Text(text) if !text.is_empty() => return Some(text.clone()),
+                    MessageContent::Text(_) => continue,
+                    MessageContent::Blocks(blocks) => {
+                        let filtered: Vec<Value> = blocks
+                            .iter()
+                            .filter_map(|block| {
+                                let mut value = serde_json::to_value(block).ok()?;
+                                if value.get("type").and_then(Value::as_str) == Some("tool_result")
+                                {
+                                    return None;
+                                }
+                                if let Some(object) = value.as_object_mut() {
+                                    object.insert("cache_control".to_string(), Value::Null);
+                                }
+                                Some(value)
+                            })
+                            .collect();
+                        if !filtered.is_empty() {
+                            return serde_json::to_string(&filtered).ok();
+                        }
+                    }
+                }
+            }
+            // Preserve unknown message-like input shapes by running the generic
+            // probe over this one item, without retaining a full input clone.
+            ResponseInputItem::Other(value) => {
+                if let Some(content) =
+                    crate::libs::utils::find_last_user_content(std::slice::from_ref(value))
+                {
+                    return Some(content);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 const COPILOT_UNSUPPORTED_TOOL_TYPES: &[&str] = &["image_generation"];
@@ -501,6 +552,43 @@ mod tests {
         let mut value = json!({ "model": "gpt-5" });
         value["tools"] = tools;
         serde_json::from_value(value).expect("payload")
+    }
+
+    #[test]
+    fn typed_request_id_probe_matches_generic_user_content_semantics() {
+        let payload: ResponsesPayload = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "input": [
+                { "type": "message", "role": "user", "content": "older" },
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "t1", "content": "skip" },
+                        { "type": "input_text", "text": "newest", "cache_control": { "type": "ephemeral" } }
+                    ]
+                }
+            ]
+        }))
+        .expect("responses payload");
+        let InputField::Items(items) = payload.input.expect("items") else {
+            panic!("expected input items");
+        };
+
+        let generic_values: Vec<Value> = items
+            .iter()
+            .map(|item| serde_json::to_value(item).expect("serialize item"))
+            .collect();
+        let generic = crate::libs::utils::find_last_user_content(&generic_values);
+        let typed = responses_last_user_content(&items);
+        assert_eq!(typed, generic);
+        assert!(typed
+            .as_deref()
+            .is_some_and(|value| value.contains("newest")));
+        assert!(typed
+            .as_deref()
+            .is_some_and(|value| !value.contains("skip")));
     }
 
     #[test]

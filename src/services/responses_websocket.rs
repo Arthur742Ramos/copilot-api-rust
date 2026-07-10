@@ -20,8 +20,10 @@
 //!   create a socket instead of sharing one; the survivor is pooled for reuse.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use once_cell::sync::Lazy;
@@ -38,16 +40,6 @@ pub type SseChunk = crate::libs::sse::SseEvent;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 60_000;
-
-/// Per-operation deadline for the pooled WebSocket transport: it bounds the
-/// initial request-frame send and each subsequent awaited frame independently
-/// (the timer resets on every frame received, including control frames). Mirrors
-/// the 120s reqwest `read_timeout` on the shared HTTP path — it caps the gap
-/// between successive operations, not the total stream duration. Without it a
-/// silent upstream would hang the request forever: the pooled idle-close only
-/// fires once `request_count` hits 0, which never happens while a request is
-/// in-flight.
-const DEFAULT_WEBSOCKET_READ_TIMEOUT_MS: u64 = 120_000;
 
 /// A single pooled request description. Mirrors `PooledWebSocketRequest<TPayload>`.
 #[derive(Debug, Clone)]
@@ -70,11 +62,13 @@ pub struct PooledWebSocketStreamOptions {
     pub create_chunk: fn(String) -> SseChunk,
     /// Idle window before a pooled socket is closed. Defaults to 60s when `None`.
     pub idle_timeout_ms: Option<u64>,
-    /// Per-operation deadline (in ms) bounding the initial request-frame send
-    /// and each subsequently awaited frame independently; resets on every frame
-    /// received. Defaults to 120s when `None`, matching the HTTP path's
-    /// read timeout. It caps the gap between operations, not total duration.
-    pub read_timeout_ms: Option<u64>,
+    /// Deadline for opening the TCP/TLS/WebSocket connection.
+    pub connect_timeout: Duration,
+    /// Per-operation deadline bounding the initial request-frame send and each
+    /// subsequently awaited frame independently; resets on every frame. `None`
+    /// disables it, matching `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS=0` on the
+    /// HTTP path.
+    pub read_timeout: Option<Duration>,
     /// Returns true once a chunk signals the end of the response.
     pub is_terminal_chunk: fn(&SseChunk) -> bool,
     /// Error text if the socket fails to open.
@@ -91,6 +85,8 @@ impl std::fmt::Debug for PooledWebSocketStreamOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PooledWebSocketStreamOptions")
             .field("idle_timeout_ms", &self.idle_timeout_ms)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("read_timeout", &self.read_timeout)
             .field("open_error_message", &self.open_error_message)
             .field("stream_error_message", &self.stream_error_message)
             .field(
@@ -201,6 +197,16 @@ struct RequestHandle {
     pooled: bool,
     idle_timeout_ms: u64,
     released: bool,
+    /// Set only after the terminal application frame has been consumed. A
+    /// client-cancelled stream may leave response frames queued on the socket,
+    /// so its connection must never return to the pool.
+    reusable: bool,
+}
+
+impl RequestHandle {
+    fn mark_reusable(&mut self) {
+        self.reusable = true;
+    }
 }
 
 impl Drop for RequestHandle {
@@ -211,6 +217,11 @@ impl Drop for RequestHandle {
         self.released = true;
 
         decrement_active_request_count(&self.pool_key);
+
+        if self.pooled && !self.reusable {
+            remove_pooled_entry(&self.pool_key, self.id);
+            return;
+        }
 
         if !self.pooled {
             // Non-pooled socket: nothing mapped; closes when the Arc drops.
@@ -316,19 +327,24 @@ async fn acquire(
             pooled: true,
             idle_timeout_ms,
             released: false,
+            reusable: false,
         }),
         Decision::NewPooled => {
             // active count already incremented before this await.
-            let ws =
-                match open_web_socket(&request.url, &request.headers, &options.open_error_message)
-                    .await
-                {
-                    Ok(ws) => ws,
-                    Err(e) => {
-                        decrement_active_request_count(&request.pool_key);
-                        return Err(e);
-                    }
-                };
+            let ws = match open_web_socket(
+                &request.url,
+                &request.headers,
+                &options.open_error_message,
+                options.connect_timeout,
+            )
+            .await
+            {
+                Ok(ws) => ws,
+                Err(e) => {
+                    decrement_active_request_count(&request.pool_key);
+                    return Err(e);
+                }
+            };
             let conn = Arc::new(Conn {
                 ws: tokio::sync::Mutex::new(ws),
             });
@@ -353,20 +369,25 @@ async fn acquire(
                 pooled: true,
                 idle_timeout_ms,
                 released: false,
+                reusable: false,
             })
         }
         Decision::NewUnpooled => {
             // active count already incremented before this await.
-            let ws =
-                match open_web_socket(&request.url, &request.headers, &options.open_error_message)
-                    .await
-                {
-                    Ok(ws) => ws,
-                    Err(e) => {
-                        decrement_active_request_count(&request.pool_key);
-                        return Err(e);
-                    }
-                };
+            let ws = match open_web_socket(
+                &request.url,
+                &request.headers,
+                &options.open_error_message,
+                options.connect_timeout,
+            )
+            .await
+            {
+                Ok(ws) => ws,
+                Err(e) => {
+                    decrement_active_request_count(&request.pool_key);
+                    return Err(e);
+                }
+            };
             let conn = Arc::new(Conn {
                 ws: tokio::sync::Mutex::new(ws),
             });
@@ -377,6 +398,7 @@ async fn acquire(
                 pooled: false,
                 idle_timeout_ms,
                 released: false,
+                reusable: false,
             })
         }
     }
@@ -387,6 +409,7 @@ async fn open_web_socket(
     url: &str,
     headers: &[(String, String)],
     open_error_message: &str,
+    connect_timeout: Duration,
 ) -> Result<WsStream, std::io::Error> {
     // Build a properly-formed handshake request (Host / Sec-WebSocket-Key / ...)
     // then layer the caller's custom headers on top.
@@ -405,10 +428,29 @@ async fn open_web_socket(
         }
     }
 
-    let (ws, _resp) = connect_async(req)
+    let (ws, _resp) = tokio::time::timeout(connect_timeout, connect_async(req))
         .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{open_error_message}: connection timed out after {}ms",
+                    connect_timeout.as_millis()
+                ),
+            )
+        })?
         .map_err(|e| std::io::Error::other(format!("{open_error_message}: {e}")))?;
     Ok(ws)
+}
+
+async fn await_optional_timeout<F, T>(timeout: Option<Duration>, future: F) -> Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| ()),
+        None => Ok(future.await),
+    }
 }
 
 /// Normalize a WebSocket frame into the SSE text payload, or `None` for control
@@ -432,20 +474,18 @@ fn normalize_message(message: Message) -> Option<String> {
 /// The returned stream yields `Ok(chunk)` per message until (and including) the
 /// terminal chunk, then ends. If the socket closes before a terminal chunk, or
 /// errors mid-stream, it yields a single `Err` and the pooled entry is dropped.
-pub fn create_pooled_web_socket_stream(
+pub async fn create_pooled_web_socket_stream(
     request: PooledWebSocketRequest,
     options: PooledWebSocketStreamOptions,
-) -> impl Stream<Item = Result<SseChunk, std::io::Error>> {
-    async_stream::stream! {
-        // Acquire (connect/reuse + bookkeeping). On failure, surface one error.
-        let handle = match acquire(&request, &options).await {
-            Ok(handle) => handle,
-            Err(err) => {
-                yield Err(err);
-                return;
-            }
-        };
+) -> Result<impl Stream<Item = Result<SseChunk, std::io::Error>>, std::io::Error> {
+    // Complete the handshake before returning a stream. The caller can safely
+    // fall back to HTTP on this error because no application request frame has
+    // been sent yet.
+    let handle = acquire(&request, &options).await?;
+
+    Ok(async_stream::stream! {
         // `handle` is held for the whole stream; its Drop runs the release path.
+        let mut handle = handle;
         let pool_key = handle.pool_key.clone();
         let id = handle.id;
         let pooled = handle.pooled;
@@ -465,15 +505,12 @@ pub fn create_pooled_web_socket_stream(
         };
 
         // The live socket is serialized behind this async mutex for the request.
-        let mut ws = handle.conn.ws.lock().await;
+        let conn = handle.conn.clone();
+        let mut ws = conn.ws.lock().await;
 
-        let read_timeout = std::time::Duration::from_millis(
-            options
-                .read_timeout_ms
-                .unwrap_or(DEFAULT_WEBSOCKET_READ_TIMEOUT_MS),
-        );
+        let read_timeout = options.read_timeout;
 
-        match tokio::time::timeout(read_timeout, ws.send(Message::Text(payload))).await {
+        match await_optional_timeout(read_timeout, ws.send(Message::Text(payload))).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 if pooled {
@@ -492,14 +529,14 @@ pub fn create_pooled_web_socket_stream(
                 yield Err(std::io::Error::other(format!(
                     "{}: timed out sending request frame after {}ms",
                     options.stream_error_message,
-                    read_timeout.as_millis()
+                    read_timeout.map(|value| value.as_millis()).unwrap_or_default()
                 )));
                 return;
             }
         }
 
         loop {
-            let next = match tokio::time::timeout(read_timeout, ws.next()).await {
+            let next = match await_optional_timeout(read_timeout, ws.next()).await {
                 Ok(next) => next,
                 Err(_elapsed) => {
                     // No frame (data or control) within the deadline: treat the
@@ -511,7 +548,7 @@ pub fn create_pooled_web_socket_stream(
                     yield Err(std::io::Error::other(format!(
                         "{}: no data within {}ms",
                         options.stream_error_message,
-                        read_timeout.as_millis()
+                        read_timeout.map(|value| value.as_millis()).unwrap_or_default()
                     )));
                     return;
                 }
@@ -524,6 +561,12 @@ pub fn create_pooled_web_socket_stream(
                     };
                     let chunk = (options.create_chunk)(data);
                     let terminal = (options.is_terminal_chunk)(&chunk);
+                    if terminal {
+                        // Mark clean before yielding: a downstream consumer may
+                        // drop immediately after this frame without polling us
+                        // again to execute the code below the yield.
+                        handle.mark_reusable();
+                    }
                     yield Ok(chunk);
                     if terminal {
                         // Normal completion: keep the pooled socket for reuse;
@@ -553,12 +596,46 @@ pub fn create_pooled_web_socket_stream(
                 }
             }
         }
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_chunk(data: String) -> SseChunk {
+        let event = serde_json::from_str::<serde_json::Value>(&data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            });
+        SseChunk {
+            id: None,
+            event,
+            data,
+        }
+    }
+
+    fn test_terminal(chunk: &SseChunk) -> bool {
+        chunk.event.as_deref() == Some("response.completed")
+    }
+
+    fn test_options() -> PooledWebSocketStreamOptions {
+        PooledWebSocketStreamOptions {
+            create_chunk: test_chunk,
+            idle_timeout_ms: Some(5),
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Some(Duration::from_secs(2)),
+            is_terminal_chunk: test_terminal,
+            open_error_message: "open failed".to_string(),
+            stream_error_message: "stream failed".to_string(),
+            terminal_chunk_missing_message: "terminal missing".to_string(),
+            unavailable_error_message: None,
+        }
+    }
 
     #[test]
     fn create_web_socket_url_upgrades_https() {
@@ -605,5 +682,134 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key("test-key-never-inserted-unique"));
+    }
+
+    #[tokio::test]
+    async fn handshake_failure_is_returned_before_a_stream_is_created() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind handshake test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept connection");
+            drop(socket); // EOF before the WebSocket handshake completes
+        });
+
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type": "response.create"}),
+            pool_key: format!("failed-handshake-{}", next_entry_id()),
+            url: format!("ws://{addr}"),
+        };
+        assert!(
+            create_pooled_web_socket_stream(request, test_options())
+                .await
+                .is_err(),
+            "connect failure must be observable while HTTP fallback is still safe"
+        );
+        server.await.expect("handshake server task");
+    }
+
+    #[tokio::test]
+    async fn client_cancellation_evicts_socket_instead_of_reusing_queued_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+
+        let server = tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for connection_index in 0..2 {
+                let (tcp, _) = listener.accept().await.expect("accept websocket");
+                accepted_server.fetch_add(1, Ordering::SeqCst);
+                handlers.push(tokio::spawn(async move {
+                    let mut ws = accept_async(tcp).await.expect("websocket handshake");
+                    let request = ws
+                        .next()
+                        .await
+                        .expect("request frame")
+                        .expect("valid request frame");
+                    assert!(matches!(request, Message::Text(_)));
+                    ws.send(Message::Text(
+                        r#"{"type":"response.output_text.delta","delta":"old"}"#.to_string(),
+                    ))
+                    .await
+                    .expect("send delta");
+
+                    if connection_index == 0 {
+                        // A cancelled client must close this connection. If the
+                        // pool incorrectly reuses it, this receives the second
+                        // request frame and that request consumes stale output.
+                        let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+                    } else {
+                        ws.send(Message::Text(
+                            r#"{"type":"response.completed"}"#.to_string(),
+                        ))
+                        .await
+                        .expect("send terminal frame");
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.await.expect("websocket handler task");
+            }
+        });
+
+        let pool_key = format!("cancel-test-{}", next_entry_id());
+        let request = || PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type": "response.create"}),
+            pool_key: pool_key.clone(),
+            url: format!("ws://{addr}"),
+        };
+
+        let mut first = Box::pin(
+            create_pooled_web_socket_stream(request(), test_options())
+                .await
+                .expect("first websocket stream"),
+        );
+        let first_chunk = first
+            .next()
+            .await
+            .expect("first chunk")
+            .expect("valid first chunk");
+        assert!(!test_terminal(&first_chunk));
+        drop(first); // cancellation before response.completed
+
+        let mut second = Box::pin(
+            create_pooled_web_socket_stream(request(), test_options())
+                .await
+                .expect("second websocket stream"),
+        );
+        let _delta = second
+            .next()
+            .await
+            .expect("second delta")
+            .expect("valid second delta");
+        let terminal = second
+            .next()
+            .await
+            .expect("second terminal")
+            .expect("valid terminal");
+        assert!(test_terminal(&terminal));
+        drop(second);
+
+        server.await.expect("websocket server task");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !WEBSOCKET_POOL.lock().unwrap().contains_key(&pool_key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("idle-close task should evict the completed socket");
     }
 }

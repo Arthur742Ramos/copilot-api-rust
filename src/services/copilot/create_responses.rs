@@ -1,8 +1,7 @@
 //! Data model for the Copilot `/responses` API.
 //!
-//! Ported from services/copilot/create-responses.ts (type/interface
-//! declarations). This module is TYPES ONLY: the network/transport
-//! implementation (HTTP + pooled websocket streaming) lands in a later phase.
+//! Ported from services/copilot/create-responses.ts, including the HTTP and
+//! pooled WebSocket transports.
 //!
 //! Conventions match the rest of the crate:
 //! - serde_json has `preserve_order`, so unknown keys captured via
@@ -822,10 +821,11 @@ pub struct ResponsesRequestOptions<'a> {
 
 /// Mirrors `createResponses` in services/copilot/create-responses.ts.
 ///
-/// HTTP transport only. The websocket transport is Phase 5; where the TS code
-/// branches to a pooled websocket stream we fall back to HTTP (see below).
+/// Streaming requests use the selected HTTP or pooled WebSocket transport. A
+/// WebSocket handshake failure falls back to HTTP before any request frame is
+/// sent; compact requests always use HTTP.
 pub async fn create_responses(
-    payload: &ResponsesPayload,
+    mut payload: ResponsesPayload,
     options: ResponsesRequestOptions<'_>,
 ) -> Result<CreateResponsesReturn, HttpError> {
     let st = state::snapshot();
@@ -845,7 +845,6 @@ pub async fn create_responses(
     prepare_for_compact(&mut headers, options.compact_type);
 
     // service_tier is not supported by github copilot: strip it before sending.
-    let mut payload = payload.clone();
     payload.service_tier = None;
     payload.extra.remove("service_tier");
 
@@ -858,28 +857,35 @@ pub async fn create_responses(
     };
 
     if payload.stream == Some(true) && effective_transport == ResponsesTransport::Websocket {
-        return create_web_socket_responses(&payload, &st, &headers, &options);
+        match create_web_socket_responses(&payload, &st, &headers, &options).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                // The pooled engine completes its handshake before returning a
+                // stream, so this failure happened before any response.create
+                // frame was sent. Falling back to HTTP cannot duplicate work.
+                metrics::counter!("copilot_responses_websocket_fallback_total").increment(1);
+                tracing::warn!(
+                    "responses websocket unavailable before request send; falling back to HTTP: {error}"
+                );
+            }
+        }
     }
 
     let stream = payload.stream.unwrap_or(false);
-    create_http_responses(&payload, &st, &options, stream).await
+    create_http_responses(payload, &st, &options, stream).await
 }
 
 /// Build and drive the pooled websocket `/responses` transport, returning a
 /// decoded SSE event stream identical in shape to the HTTP path. Mirrors
 /// `prepareResponsesWebSocketRequest` + `createPooledResponsesWebSocketStream`.
 ///
-/// INLINE 401 RECOVERY LIMITATION: unlike the HTTP call sites, this path does
-/// NOT perform an inline refresh-and-replay on a 401. The pooled websocket
-/// transport is not a simple idempotent HTTP resend — a handshake/auth failure
-/// surfaces as an opaque stream `io::Error` (not an observable HTTP status), the
-/// socket is shared across requests via the pool, and a frame may already have
-/// been written, so a transparent replay could double-charge or corrupt pool
-/// state. The background refresh loop still keeps the token fresh, and the
-/// 60s `EARLY_REFRESH_BUFFER` makes expiry-driven 401s rare here; a websocket
-/// auth failure is surfaced to the client to retry rather than auto-replayed.
+/// Once the response.create frame has been written, this path cannot safely
+/// replay an auth/transport failure: output may already have been generated.
+/// Handshake failures happen before that boundary and are returned to
+/// `create_responses`, which safely falls back to the HTTP path (including its
+/// inline 401 refresh support).
 #[allow(clippy::result_large_err)]
-fn create_web_socket_responses(
+async fn create_web_socket_responses(
     payload: &ResponsesPayload,
     st: &state::State,
     headers: &HeaderMap,
@@ -953,7 +959,8 @@ fn create_web_socket_responses(
         PooledWebSocketStreamOptions {
             create_chunk: ws_chunk_from_data,
             idle_timeout_ms: None,
-            read_timeout_ms: None,
+            connect_timeout: crate::libs::http::UPSTREAM_CONNECT_TIMEOUT,
+            read_timeout: crate::libs::http::upstream_read_timeout(),
             is_terminal_chunk: is_terminal_ws_chunk,
             open_error_message: "Failed to create responses websocket".to_string(),
             stream_error_message: "Responses websocket stream error".to_string(),
@@ -961,7 +968,9 @@ fn create_web_socket_responses(
                 .to_string(),
             unavailable_error_message: None,
         },
-    );
+    )
+    .await
+    .map_err(|error| HttpError::internal(error.to_string()))?;
 
     Ok(CreateResponsesReturn::Stream(Box::pin(stream)))
 }
@@ -1003,13 +1012,16 @@ fn is_terminal_ws_chunk(chunk: &crate::libs::sse::SseEvent) -> bool {
 /// `build` closure) so the single 401-triggered inline-refresh replay carries
 /// the freshly-rotated Copilot token.
 async fn create_http_responses(
-    payload: &ResponsesPayload,
+    payload: ResponsesPayload,
     st: &state::State,
     options: &ResponsesRequestOptions<'_>,
     stream: bool,
 ) -> Result<CreateResponsesReturn, HttpError> {
     let base = copilot_base_url(st);
-    let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    let body = serde_json::to_vec(&payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    // The owned request tree can be very large; once serialized, release it
+    // before waiting on the upstream response rather than retaining both forms.
+    drop(payload);
     let upstream_start = std::time::Instant::now();
     // Auth headers are rebuilt per attempt from the token the helper hands us so
     // the 401-triggered replay carries the inline-refreshed token, against which

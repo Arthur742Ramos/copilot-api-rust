@@ -390,7 +390,7 @@ pub async fn handle_with_responses_api(
     let tool_search_name = resolve_bridge_tool_search_name(tool_slice);
 
     let result = create_responses(
-        &responses_payload,
+        responses_payload,
         ResponsesRequestOptions {
             vision,
             initiator,

@@ -2,7 +2,8 @@
 //! OpenAI-compatible requests to a configured upstream provider and proxies the
 //! response back to the client unchanged.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -29,7 +30,7 @@ const ALLOW_PRIVATE_PROVIDERS_ENV: &str = "COPILOT_API_ALLOW_PRIVATE_PROVIDERS";
 /// rustls native roots via Cargo features, proxy-from-env gating).
 static PROVIDER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
+        .connect_timeout(crate::libs::http::UPSTREAM_CONNECT_TIMEOUT)
         // read_timeout bounds the gap between successive reads, NOT the total
         // request duration, so it never caps a healthy long SSE stream that
         // keeps producing bytes but does rescue a stalled-open upstream
@@ -42,16 +43,62 @@ static PROVIDER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         builder = builder.read_timeout(read_timeout);
     }
     if !proxy_from_env_enabled() {
-        builder = builder.no_proxy();
+        builder = builder
+            .no_proxy()
+            // Resolve and validate in the connector itself. The exact checked
+            // SocketAddrs are handed to hyper, closing the DNS-rebinding/TOCTOU
+            // gap between a separate validation lookup and the actual connect.
+            .dns_resolver(Arc::new(PublicDnsResolver));
     }
     builder
         .build()
         .expect("failed to build provider reqwest client")
 });
 
-/// The provider-forwarding HTTP client (redirects disabled).
-fn provider_client() -> &'static reqwest::Client {
+/// The restricted upstream client: redirects disabled and, for direct
+/// connections, DNS answers checked before the connector receives them.
+/// Custom Codex base URLs use this too; the fixed ChatGPT URL may keep using the
+/// shared trusted-upstream client.
+pub(crate) fn restricted_upstream_client() -> &'static reqwest::Client {
     &PROVIDER_CLIENT
+}
+
+#[derive(Debug)]
+struct PublicDnsResolver;
+
+impl reqwest::dns::Resolve for PublicDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect();
+            validate_resolved_addresses(&host, &addresses, allow_private_providers())
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn validate_resolved_addresses(
+    host: &str,
+    addresses: &[SocketAddr],
+    allow_private: bool,
+) -> std::io::Result<()> {
+    if addresses.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("provider host '{host}' returned no DNS addresses"),
+        ));
+    }
+    if !allow_private && addresses.iter().any(|address| is_blocked_ip(address.ip())) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("provider host '{host}' resolved to a blocked address"),
+        ));
+    }
+    Ok(())
 }
 
 fn allow_private_providers() -> bool {
@@ -122,12 +169,10 @@ fn is_blocked_hostname(host: &str) -> bool {
 /// link-local (cloud metadata), or private ranges — unless the
 /// `COPILOT_API_ALLOW_PRIVATE_PROVIDERS=1` opt-out is set.
 ///
-/// NOTE: for hostnames (not IP literals) this is a best-effort name-based check.
-/// We do not perform DNS resolution here, so a name that resolves to an internal
-/// IP can still pass. Full resolution + re-check is the ideal but suffers a
-/// known TOCTOU gap (DNS can change between the check and the actual connect),
-/// so we deliberately keep this to a name + IP-literal check. Redirect-following
-/// is disabled on the provider client to close the most common bypass.
+/// Hostnames receive a cheap name check here; for direct connections the
+/// restricted client's DNS resolver also rejects blocked DNS answers
+/// and passes those exact checked addresses to the connector, avoiding a DNS
+/// rebinding/TOCTOU gap. Redirect-following is disabled as a second boundary.
 #[allow(clippy::result_large_err)]
 pub fn validate_upstream_url(url: &str) -> Result<(), HttpError> {
     let reject = |msg: &str| {
@@ -297,7 +342,7 @@ pub async fn forward_provider_messages(
     tracing::info!("<-- model: {}", payload.model);
     validate_upstream_url(&cfg.base_url)?;
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
-    provider_client()
+    restricted_upstream_client()
         .post(format!("{}/v1/messages", cfg.base_url))
         .headers(build_provider_upstream_headers(cfg, request_headers))
         .body(body)
@@ -316,7 +361,7 @@ pub async fn forward_provider_chat_completions(
     tracing::info!("<-- model: {}", payload.model);
     validate_upstream_url(&cfg.base_url)?;
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
-    provider_client()
+    restricted_upstream_client()
         .post(format!("{}/v1/chat/completions", cfg.base_url))
         .headers(build_provider_upstream_headers(cfg, request_headers))
         .body(body)
@@ -336,7 +381,7 @@ pub async fn forward_provider_responses(
     tracing::info!("<-- model: {}", payload.model);
     validate_upstream_url(&cfg.base_url)?;
     let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
-    provider_client()
+    restricted_upstream_client()
         .post(format!("{}/v1/responses", cfg.base_url))
         .headers(build_provider_upstream_headers(cfg, request_headers))
         .body(body)
@@ -352,7 +397,7 @@ pub async fn forward_provider_models(
     request_headers: &HeaderMap,
 ) -> Result<reqwest::Response, HttpError> {
     validate_upstream_url(&cfg.base_url)?;
-    provider_client()
+    restricted_upstream_client()
         .get(format!("{}/v1/models", cfg.base_url))
         .headers(build_provider_upstream_headers(cfg, request_headers))
         .send()
@@ -408,7 +453,7 @@ pub async fn probe_provider_models(cfg: &ResolvedProviderConfig) -> (ProbeOutcom
     }
 
     let headers = build_provider_upstream_headers(cfg, &HeaderMap::new());
-    let result = provider_client()
+    let result = restricted_upstream_client()
         .get(format!("{}/v1/models", cfg.base_url))
         .headers(headers)
         // See PROBE_TIMEOUT: PROVIDER_CLIENT has no overall request timeout.
@@ -581,6 +626,49 @@ mod tests {
         assert!(validate_upstream_url("http://127.0.0.1:8080").is_ok());
         assert!(validate_upstream_url("http://localhost:11434").is_ok());
         std::env::remove_var(ALLOW_PRIVATE_PROVIDERS_ENV);
+    }
+
+    #[test]
+    fn resolved_dns_answers_reject_any_private_destination() {
+        let public = SocketAddr::from(([93, 184, 216, 34], 0));
+        let private = SocketAddr::from(([10, 0, 0, 1], 0));
+
+        assert!(validate_resolved_addresses("provider.example", &[public], false).is_ok());
+        assert!(
+            validate_resolved_addresses("provider.example", &[public, private], false).is_err()
+        );
+        assert!(validate_resolved_addresses("provider.example", &[private], true).is_ok());
+        assert!(validate_resolved_addresses("provider.example", &[], false).is_err());
+    }
+
+    #[tokio::test]
+    async fn restricted_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect server");
+        let addr = listener.local_addr().expect("redirect server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/internal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write redirect");
+        });
+
+        let response = restricted_upstream_client()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect("redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.expect("redirect server task");
     }
 
     #[tokio::test]
