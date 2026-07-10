@@ -195,16 +195,19 @@ const RETRY_BACKOFF_JITTER_MS: u64 = 250;
 /// minutes, so we clamp to something a user will still wait through.
 const MAX_RETRY_AFTER_SECS: u64 = 5;
 
-/// Upstream HTTP statuses worth retrying: transient gateway / overload signals
-/// returned BEFORE any model output streamed. 429 (rate limited), 502/503/504
-/// (bad gateway / unavailable / gateway timeout). A bare 500 is excluded — it
-/// often reflects a deterministic request-shape error a retry won't fix and
-/// could double-bill.
-const RETRYABLE_STATUSES: [u16; 4] = [429, 502, 503, 504];
-
-/// Whether `status` is in the retryable set. Pure so it is unit-testable.
-fn is_retryable_status(status: u16) -> bool {
-    RETRYABLE_STATUSES.contains(&status)
+/// Whether `status` is retryable under `policy`. 429 (rate-limit) is always
+/// retried. 502/503/504 (transient gateway errors) are retried only when
+/// `policy.retry_on_transient_5xx` is set — opt-in to avoid double-billing
+/// on billable generation endpoints. A bare 500 is never retried (often
+/// deterministic / double-bill risk).
+fn is_retryable_status(status: u16, policy: &RetryPolicy) -> bool {
+    if status == 429 {
+        return true;
+    }
+    if matches!(status, 502..=504) {
+        return policy.retry_on_transient_5xx;
+    }
+    false
 }
 
 /// Resolve the effective retry count from the environment, clamped to
@@ -267,14 +270,38 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 pub struct RetryPolicy {
     /// Extra attempts beyond the first send.
     pub max_retries: u32,
+    /// When `true`, 502/503/504 transient errors are retried in addition to
+    /// 429 (rate-limit), which is always retried.
+    /// Default is `false` (opt-in) because retrying billable generation
+    /// endpoints risks double-billing on partially-processed requests.
+    pub retry_on_transient_5xx: bool,
 }
 
 impl RetryPolicy {
-    /// Policy derived from the environment (`COPILOT_API_UPSTREAM_MAX_RETRIES`),
-    /// the standard policy for the retryable upstream call sites.
+    /// Policy derived from the environment (`COPILOT_API_UPSTREAM_MAX_RETRIES`
+    /// and `COPILOT_API_UPSTREAM_RETRY_5XX`), the standard policy for the
+    /// retryable upstream call sites.
     pub fn from_env() -> Self {
+        let retry_5xx = std::env::var("COPILOT_API_UPSTREAM_RETRY_5XX")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false);
         Self {
             max_retries: upstream_max_retries(),
+            retry_on_transient_5xx: retry_5xx,
+        }
+    }
+
+    /// Conservative policy for billable generation endpoints: never retry
+    /// transient 5xx errors to avoid potential double-billing. 429 is still
+    /// retried (it indicates rate-limiting, not a completed charge).
+    pub fn billable_generation() -> Self {
+        Self {
+            max_retries: upstream_max_retries(),
+            retry_on_transient_5xx: false,
         }
     }
 }
@@ -336,7 +363,9 @@ pub async fn send_with_retry(
         // byte has flowed.
         let reason: Option<&'static str> = match &result {
             Err(e) if e.is_connect() => Some(RETRY_REASON_CONNECT),
-            Ok(resp) if is_retryable_status(resp.status().as_u16()) => Some(RETRY_REASON_STATUS),
+            Ok(resp) if is_retryable_status(resp.status().as_u16(), &policy) => {
+                Some(RETRY_REASON_STATUS)
+            }
             _ => None,
         };
 
@@ -399,13 +428,23 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Unlike `reqwest::Response::bytes`, this cannot allocate without bound when a
 /// compromised or misconfigured provider returns an enormous body.
 pub async fn read_bytes_capped(response: reqwest::Response) -> Result<bytes::Bytes, String> {
+    read_bytes_capped_with_max(response, MAX_UPSTREAM_RESPONSE_BYTES).await
+}
+
+/// Read a response body with a caller-supplied byte cap. Use [`read_bytes_capped`]
+/// for standard upstream API responses; use this directly when a different limit
+/// applies (e.g. binary self-update downloads).
+pub async fn read_bytes_capped_with_max(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<bytes::Bytes, String> {
     use futures_util::StreamExt;
 
     // Fast-fail on an advertised Content-Length over the cap before reading.
     if let Some(len) = response.content_length() {
-        if len > MAX_UPSTREAM_RESPONSE_BYTES as u64 {
+        if len > max_bytes as u64 {
             return Err(format!(
-                "upstream response too large: {len} bytes > {MAX_UPSTREAM_RESPONSE_BYTES} cap"
+                "upstream response too large: {len} bytes > {max_bytes} cap"
             ));
         }
     }
@@ -414,10 +453,8 @@ pub async fn read_bytes_capped(response: reqwest::Response) -> Result<bytes::Byt
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("error reading upstream response: {e}"))?;
-        if chunk.len() > MAX_UPSTREAM_RESPONSE_BYTES.saturating_sub(buf.len()) {
-            return Err(format!(
-                "upstream response exceeded {MAX_UPSTREAM_RESPONSE_BYTES} byte cap"
-            ));
+        if chunk.len() > max_bytes.saturating_sub(buf.len()) {
+            return Err(format!("upstream response exceeded {max_bytes} byte cap"));
         }
         buf.extend_from_slice(&chunk);
     }
@@ -584,13 +621,42 @@ mod tests {
 
     #[test]
     fn only_known_transient_statuses_are_retryable() {
-        for code in [429, 502, 503, 504] {
-            assert!(is_retryable_status(code), "{code} should be retryable");
+        let permissive = RetryPolicy {
+            max_retries: 3,
+            retry_on_transient_5xx: true,
+        };
+        let strict = RetryPolicy {
+            max_retries: 3,
+            retry_on_transient_5xx: false,
+        };
+
+        // 429 is always retried regardless of policy.
+        assert!(is_retryable_status(429, &permissive));
+        assert!(is_retryable_status(429, &strict));
+
+        // With 5xx opt-in, 502/503/504 are retried.
+        for code in [502, 503, 504] {
+            assert!(
+                is_retryable_status(code, &permissive),
+                "{code} should be retryable with retry_on_transient_5xx=true"
+            );
         }
+
+        // Without 5xx opt-in, 502/503/504 are NOT retried.
+        for code in [502, 503, 504] {
+            assert!(
+                !is_retryable_status(code, &strict),
+                "{code} should not be retried without retry_on_transient_5xx"
+            );
+        }
+
         // 500 is deliberately excluded (often deterministic / double-bill risk),
-        // and success / 4xx-other are not retried.
+        // and success / 4xx-other are not retried regardless of policy.
         for code in [200, 400, 401, 403, 404, 418, 500, 501] {
-            assert!(!is_retryable_status(code), "{code} should not be retryable");
+            assert!(
+                !is_retryable_status(code, &permissive),
+                "{code} should not be retryable"
+            );
         }
     }
 

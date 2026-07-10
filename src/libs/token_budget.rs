@@ -81,25 +81,33 @@ fn should_block(used: i64, budget: Option<i64>) -> bool {
 
 /// Read today's total tokens, using the short-TTL cache when fresh. Only called
 /// when a budget is configured, so the SQLite read cost is paid solely by
-/// budget-enabled deployments. Holds the cache lock across the refresh so that
-/// concurrent callers finding the cache stale collapse into one DB read.
-fn current_daily_total() -> i64 {
+/// budget-enabled deployments. The cache lock is NOT held across the DB read so
+/// the Tokio thread pool is never starved by a blocking SQLite call; a
+/// double-checked update on re-acquire means at most one extra read per refresh
+/// cycle in the rare concurrent-stale case.
+async fn current_daily_total() -> i64 {
     let day_key = local_day_key();
-    let mut guard = CACHED_DAILY_TOTAL.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(cached) = guard.as_ref() {
-        if cached.day_key == day_key && cached.fetched_at.elapsed() < CACHE_TTL {
-            return cached.total_tokens;
+    {
+        let guard = CACHED_DAILY_TOTAL.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cached) = guard.as_ref() {
+            if cached.day_key == day_key && cached.fetched_at.elapsed() < CACHE_TTL {
+                return cached.total_tokens;
+            }
         }
     }
 
-    // Stale or absent: refresh under the lock. The DB read is held off the hot
-    // path by the TTL, and serializing the refresh avoids a thundering herd.
-    let total = get_token_usage_summary("day").totals.total_tokens;
-    *guard = Some(CachedTotal {
-        day_key,
-        total_tokens: total,
-        fetched_at: Instant::now(),
-    });
+    // Lock released; run the blocking SQLite read off the Tokio thread pool.
+    let total = tokio::task::spawn_blocking(|| get_token_usage_summary("day").totals.total_tokens)
+        .await
+        .unwrap_or(0);
+    {
+        let mut guard = CACHED_DAILY_TOTAL.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(CachedTotal {
+            day_key,
+            total_tokens: total,
+            fetched_at: Instant::now(),
+        });
+    }
     total
 }
 
@@ -107,7 +115,7 @@ fn current_daily_total() -> i64 {
 /// single attribution label, cached with the same short TTL. Only invoked when
 /// that label has a configured per-key budget, so the map stays small and the
 /// scoped `WHERE api_key_label = ?` read is paid solely by capped keys.
-fn current_label_total(label: &str) -> i64 {
+async fn current_label_total(label: &str) -> i64 {
     let day_key = local_day_key();
 
     // Fast path: a fresh cache entry returns without touching the DB. Unlike the
@@ -125,21 +133,28 @@ fn current_label_total(label: &str) -> i64 {
         }
     }
 
-    // Stale or absent: read with the lock released, then publish. Two concurrent
-    // stale checks for the SAME label may both read (rare, bounded by the TTL);
-    // that is the deliberate trade for never blocking a different label.
-    let total = get_token_usage_label_total("day", label);
-    let mut guard = CACHED_LABEL_TOTALS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    guard.insert(
-        label.to_string(),
-        CachedTotal {
-            day_key,
-            total_tokens: total,
-            fetched_at: Instant::now(),
-        },
-    );
+    // Stale or absent: read off the Tokio thread pool with the lock released,
+    // then publish. Two concurrent stale checks for the SAME label may both read
+    // (rare, bounded by the TTL); that is the deliberate trade for never blocking
+    // a different label.
+    let label_owned = label.to_string();
+    let total =
+        tokio::task::spawn_blocking(move || get_token_usage_label_total("day", &label_owned))
+            .await
+            .unwrap_or(0);
+    {
+        let mut guard = CACHED_LABEL_TOTALS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.insert(
+            label.to_string(),
+            CachedTotal {
+                day_key,
+                total_tokens: total,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
     total
 }
 
@@ -149,10 +164,10 @@ fn current_label_total(label: &str) -> i64 {
 /// Mirrors the rate-limit admission shape so the Anthropic/OpenAI clients treat it
 /// as a retryable 429.
 #[allow(clippy::result_large_err)]
-pub fn check_token_budget() -> Result<(), HttpError> {
+pub async fn check_token_budget() -> Result<(), HttpError> {
     // Global cap: gates on the whole day's recorded spend across all keys.
     if let Some(budget) = get_daily_token_budget() {
-        let used = current_daily_total();
+        let used = current_daily_total().await;
         // Export the spend-vs-cap so operators can chart "approaching daily
         // budget" and alert before clients start getting 429'd. Both are
         // single-series gauges (no labels), set on each check.
@@ -171,7 +186,7 @@ pub fn check_token_budget() -> Result<(), HttpError> {
     // resolve to `None` and only ever hit the global cap above.
     if let Some(label) = resolve_api_key_label() {
         if let Some(budget) = get_api_key_daily_budget(&label) {
-            let used = current_label_total(&label);
+            let used = current_label_total(&label).await;
             if should_block(used, Some(budget)) {
                 metrics::counter!("token_budget_per_key_rejections_total").increment(1);
                 tracing::warn!(
@@ -261,32 +276,32 @@ mod tests {
         assert!(key > 10_000_000, "expected YYYYMMDD-shaped key, got {key}");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn no_budget_configured_is_a_noop() {
+    async fn no_budget_configured_is_a_noop() {
         // With no dailyTokenBudget set, admission always passes and never reads
         // the usage store.
         set_cached_config_for_test(AppConfig::default());
-        assert!(check_token_budget().is_ok());
+        assert!(check_token_budget().await.is_ok());
         reset_cached_config_for_test();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn non_positive_budget_is_disabled() {
+    async fn non_positive_budget_is_disabled() {
         let cfg = AppConfig {
             daily_token_budget: Some(0),
             ..Default::default()
         };
         set_cached_config_for_test(cfg);
         // A zero/negative budget is treated as "no budget", not "block everything".
-        assert!(check_token_budget().is_ok());
+        assert!(check_token_budget().await.is_ok());
         reset_cached_config_for_test();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn rejects_once_at_or_over_budget() {
+    async fn rejects_once_at_or_over_budget() {
         let cfg = AppConfig {
             daily_token_budget: Some(1000),
             ..Default::default()
@@ -295,24 +310,26 @@ mod tests {
 
         // Under budget: passes.
         seed_cache(999);
-        assert!(check_token_budget().is_ok());
+        assert!(check_token_budget().await.is_ok());
 
         // At the cap: rejected with a 429.
         seed_cache(1000);
-        let err = check_token_budget().expect_err("should reject at the cap");
+        let err = check_token_budget()
+            .await
+            .expect_err("should reject at the cap");
         assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
 
         // Over the cap: also rejected.
         seed_cache(5000);
-        assert!(check_token_budget().is_err());
+        assert!(check_token_budget().await.is_err());
 
         clear_cache();
         reset_cached_config_for_test();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn exports_budget_metrics() {
+    async fn exports_budget_metrics() {
         crate::libs::metrics::init_build_info(); // installs the recorder
         let cfg = AppConfig {
             daily_token_budget: Some(1000),
@@ -322,7 +339,7 @@ mod tests {
 
         // Over the cap -> rejection counter + usage/limit gauges are emitted.
         seed_cache(2000);
-        assert!(check_token_budget().is_err());
+        assert!(check_token_budget().await.is_err());
 
         let out = crate::libs::metrics::render();
         assert!(
@@ -356,13 +373,13 @@ mod tests {
         assert!(should_block(5000, Some(1000)));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn current_label_total_uses_seeded_cache() {
+    async fn current_label_total_uses_seeded_cache() {
         // A fresh seeded entry is returned without hitting SQLite.
         clear_label_cache();
         seed_label_cache("team-a", 4242);
-        assert_eq!(current_label_total("team-a"), 4242);
+        assert_eq!(current_label_total("team-a").await, 4242);
         clear_label_cache();
     }
 
@@ -382,9 +399,9 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn anonymous_request_only_hits_global_cap() {
+    async fn anonymous_request_only_hits_global_cap() {
         // A per-key budget is configured and its label is already over cap, but
         // an anonymous request (no attribution label in context) must NOT be
         // gated by it — only the global cap applies, and here there is none.
@@ -395,7 +412,7 @@ mod tests {
 
         // resolve_api_key_label() is None outside a request context, so the
         // per-key branch is skipped and admission passes.
-        assert!(check_token_budget().is_ok());
+        assert!(check_token_budget().await.is_ok());
 
         clear_label_cache();
         reset_cached_config_for_test();
@@ -416,7 +433,7 @@ mod tests {
         let ctx = RequestContext::new("trace".to_string(), 0, "test".to_string(), None, None);
         let result = run_with_context(ctx, async {
             set_request_api_key_label("team-a".to_string());
-            check_token_budget()
+            check_token_budget().await
         })
         .await;
 
@@ -427,7 +444,7 @@ mod tests {
         let ctx2 = RequestContext::new("trace2".to_string(), 0, "test".to_string(), None, None);
         let ok = run_with_context(ctx2, async {
             set_request_api_key_label("other".to_string());
-            check_token_budget()
+            check_token_budget().await
         })
         .await;
         assert!(ok.is_ok());

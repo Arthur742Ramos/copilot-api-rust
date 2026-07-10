@@ -400,12 +400,26 @@ async fn metrics_handler() -> Response {
 /// already past its expiry, and the model list has been cached. Distinct from
 /// `/` (liveness), which is always 200.
 ///
+/// In provider-only mode the Copilot token and model cache are not used, so
+/// readiness is declared immediately: the proxy is ready to forward traffic to
+/// the configured provider as soon as it binds.
+///
 /// Asserting freshness (not just presence) avoids a false-green during a refresh
 /// outage: the refresh loop retries with backoff while continuing to hold the
 /// now-expired token, so a presence-only check would keep reporting "ready" even
 /// though every upstream call is failing with 401. Tokens without a parseable
 /// `exp=` fall back to presence-based readiness.
 async fn readyz() -> Response {
+    // In provider-only mode there is no Copilot token — readiness is immediate.
+    let provider_only = crate::libs::state::with_state(|s| s.provider_only.clone());
+    if let Some(provider) = provider_only {
+        return (
+            StatusCode::OK,
+            Json(json!({"status": "ready", "mode": "provider_only", "provider": provider})),
+        )
+            .into_response();
+    }
+
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

@@ -76,7 +76,9 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     // Shared admission must precede every early dispatch below. In particular,
     // fulfilled web-search requests and provider aliases return directly and
     // would otherwise bypass rate limits and daily/per-key token budgets.
-    crate::libs::admission::check_shared_admission().await?;
+    let in_flight_permit = crate::libs::admission::check_shared_admission()
+        .await
+        .map_err(AppError::Http)?;
 
     // 2. Web-search server-tool short-circuit. Mirrors `tryHandleWebSearch`.
     //
@@ -234,6 +236,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         request_id,
         session_id,
         compact_type: Some(compact_type),
+        permit: in_flight_permit,
     };
 
     if should_use_messages_api(selected_model.as_ref()) {

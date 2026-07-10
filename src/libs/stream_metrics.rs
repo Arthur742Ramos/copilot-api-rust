@@ -23,7 +23,7 @@ pub mod transport {
 ///   do NOT count, so this reflects time-to-first-token, not first-byte.
 /// - `proxy_stream_complete_seconds` — total stream duration, recorded on drop
 ///   so it fires on every exit (clean end, upstream error, or client disconnect),
-///   labelled `outcome` = ok | error.
+///   labelled `outcome` = ok | error | cancelled.
 ///
 /// Both histograms carry a bounded `flow` (chat_completions | responses |
 /// messages) and `transport` (translated | native) label.
@@ -36,18 +36,30 @@ pub mod transport {
 /// ends). A gauge that rises without falling is therefore the signal that
 /// streams are stuck or leaking — which the drop-recorded completion histogram
 /// cannot surface on its own.
+///
+/// The timer also optionally holds an in-flight permit (AC2): if a semaphore
+/// is configured, the permit MUST live until the stream body is fully drained
+/// so the active-stream count stays accurate. Attach it via
+/// [`with_in_flight_permit`].
 pub struct StreamTimer {
     flow: &'static str,
     transport: &'static str,
     start: std::time::Instant,
     ttft_recorded: bool,
     errored: bool,
+    /// Set by [`mark_finished`] when the stream reaches its terminal frame.
+    /// Drives the "ok" vs "cancelled" outcome on drop.
+    finished: bool,
     /// When attached, the timer also feeds the shared per-request summary
     /// (TTFT/transport/outcome) and emits the single `request.completed` event
     /// for this stream on drop. Captured eagerly by the caller (while the
     /// task-local context is still in scope) so it survives into the
     /// later-polled stream body. `None` leaves the timer metrics-only.
     request_context: Option<RequestContext>,
+    /// Optional in-flight semaphore permit. Held here so it is released only
+    /// when the stream body drops (i.e. after the last byte is flushed to the
+    /// client), not when the handler function returns.
+    _permit: Option<crate::libs::admission::InFlightPermit>,
 }
 
 impl StreamTimer {
@@ -64,7 +76,9 @@ impl StreamTimer {
             start: std::time::Instant::now(),
             ttft_recorded: false,
             errored: false,
+            finished: false,
             request_context: None,
+            _permit: None,
         }
     }
 
@@ -77,6 +91,13 @@ impl StreamTimer {
             ctx.set_flow_transport_streaming(self.flow, self.transport);
         }
         self.request_context = ctx;
+        self
+    }
+
+    /// Attach an in-flight semaphore permit so it is released when the stream
+    /// body drops (not when the handler function returns).
+    pub fn with_in_flight_permit(mut self, permit: crate::libs::admission::InFlightPermit) -> Self {
+        self._permit = Some(permit);
         self
     }
 
@@ -102,6 +123,13 @@ impl StreamTimer {
     pub fn mark_error(&mut self) {
         self.errored = true;
     }
+
+    /// Call at the `[DONE]` / terminal frame to mark the stream as cleanly
+    /// completed. If this is never called the stream is treated as `cancelled`
+    /// (client disconnected before the final frame was flushed).
+    pub fn mark_finished(&mut self) {
+        self.finished = true;
+    }
 }
 
 impl Drop for StreamTimer {
@@ -112,7 +140,13 @@ impl Drop for StreamTimer {
             "transport" => self.transport,
         )
         .decrement(1.0);
-        let outcome = if self.errored { "error" } else { "ok" };
+        let outcome = if self.errored {
+            "error"
+        } else if self.finished {
+            "ok"
+        } else {
+            "cancelled"
+        };
         histogram!(
             "proxy_stream_complete_seconds",
             "flow" => self.flow,
@@ -236,6 +270,8 @@ mod tests {
                 .with_request_context(Some(ctx.clone()));
             // First content frame -> TTFT recorded into the shared summary.
             timer.on_content_frame();
+            // Mark stream as cleanly finished so outcome is "ok".
+            timer.mark_finished();
             // Terminal step: dropping the timer emits the single summary line.
             drop(timer);
 
@@ -305,6 +341,43 @@ mod tests {
                     && e.message.as_deref() != Some("request.completed")
             }),
             "a context-less timer must emit no request.completed event"
+        );
+    }
+
+    /// A stream dropped without `mark_finished()` records outcome = "cancelled"
+    /// — models a client disconnect before the `[DONE]` frame arrived.
+    #[test]
+    fn stream_cancelled_emits_cancelled_outcome() {
+        let captured = Arc::new(Mutex::new(Captured::default()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let ctx = test_context();
+            ctx.set_upstream_status("ok");
+
+            let mut timer =
+                StreamTimer::new("messages", transport::TRANSLATED).with_request_context(Some(ctx));
+            // Deliver some content frames...
+            timer.on_content_frame();
+            // ...but never call mark_finished() — simulating client disconnect.
+            drop(timer);
+        });
+
+        let captured = captured.lock().unwrap_or_else(|p| p.into_inner());
+        let completed: Vec<&CapturedEvent> = captured
+            .events
+            .iter()
+            .filter(|e| {
+                e.message.as_deref() == Some("request.completed")
+                    || e.fields.get("event").map(String::as_str) == Some("request.completed")
+            })
+            .collect();
+
+        assert_eq!(completed.len(), 1, "expected exactly one request.completed");
+        assert_eq!(
+            completed[0].fields.get("outcome").map(String::as_str),
+            Some("cancelled"),
+            "outcome must be 'cancelled' when mark_finished was never called"
         );
     }
 }

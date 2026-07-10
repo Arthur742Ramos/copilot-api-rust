@@ -187,10 +187,11 @@ async fn download(url: &str) -> anyhow::Result<Vec<u8>> {
         );
     }
 
-    let bytes = response
-        .bytes()
+    // Cap binary download at 256 MiB so a compromised CDN can't exhaust memory.
+    const MAX_BINARY_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+    let bytes = crate::libs::http::read_bytes_capped_with_max(response, MAX_BINARY_DOWNLOAD_BYTES)
         .await
-        .context("reading the downloaded release asset")?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(bytes.to_vec())
 }
 

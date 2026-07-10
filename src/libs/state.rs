@@ -48,6 +48,11 @@ pub struct State {
     /// refresh (or when the plan reports no premium-interaction quota).
     pub premium_interactions:
         Option<crate::libs::premium_interactions::PremiumInteractionsSnapshot>,
+
+    /// When set, the proxy operates in provider-only mode: GitHub/Copilot
+    /// authentication is skipped and all traffic is forwarded to this named
+    /// provider. The value is the provider name as it appears in config.
+    pub provider_only: Option<String>,
 }
 
 impl State {

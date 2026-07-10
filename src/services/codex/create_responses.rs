@@ -367,7 +367,7 @@ pub async fn forward_codex_responses(
         crate::libs::http::send_with_retry(
             request,
             crate::libs::http::retry_endpoint::CODEX,
-            crate::libs::http::RetryPolicy::from_env(),
+            crate::libs::http::RetryPolicy::billable_generation(),
         )
     };
 

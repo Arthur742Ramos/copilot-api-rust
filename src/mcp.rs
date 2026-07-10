@@ -230,7 +230,7 @@ async fn handle_generate_image_call(id: Value, params: Option<&Value>) -> Value 
     // unmetered hole. (Rate limit is intentionally omitted here: it is a coarse
     // time-since-last-request gate tied to the HTTP server's process state, and
     // the MCP server runs as a separate stdio process where it has no meaning.)
-    if let Err(e) = crate::libs::token_budget::check_token_budget() {
+    if let Err(e) = crate::libs::token_budget::check_token_budget().await {
         return error(
             id,
             -32603,

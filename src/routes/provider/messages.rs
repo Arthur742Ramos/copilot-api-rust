@@ -89,9 +89,10 @@ pub async fn post_provider_messages(
     // Internal provider dispatches (model aliases / web search) already pass
     // through the public route's shared gate. This direct provider endpoint does
     // not, so gate it here before resolving or contacting the provider.
-    if let Err(error) = crate::libs::admission::check_shared_admission().await {
-        return AppError::Http(error).into_response();
-    }
+    let _permit = match crate::libs::admission::check_shared_admission().await {
+        Ok(p) => p,
+        Err(error) => return AppError::Http(error).into_response(),
+    };
     match handle_provider_messages_for_provider(payload, provider, headers).await {
         Ok(r) => r,
         Err(e) => AppError::into_response(e),
@@ -387,6 +388,9 @@ fn stream_responses_provider_messages(
     let event_stream = crate::libs::sse::events(upstream);
 
     let body = Body::from_stream(async_stream::stream! {
+        use crate::libs::stream_metrics::{transport, StreamTimer};
+        let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)
+            .with_request_context(crate::libs::request_context::request_context_store());
         let mut usage = UsageTokens::default();
         let mut state = ResponsesStreamState::new(Some(tool_search_name));
         futures_util::pin_mut!(event_stream);
@@ -395,6 +399,7 @@ fn stream_responses_provider_messages(
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {
+                    timer.mark_error();
                     yield Err(err);
                     return;
                 }
@@ -437,6 +442,7 @@ fn stream_responses_provider_messages(
 
             for event in translate_responses_stream_event(&parsed, &mut state) {
                 if let Some(frame) = emit_event(&event) {
+                    timer.on_content_frame();
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
             }
@@ -450,6 +456,7 @@ fn stream_responses_provider_messages(
             }
         }
 
+        timer.mark_finished();
         recorder.record(usage);
     });
 
@@ -924,6 +931,9 @@ fn stream_provider_messages(
     let event_stream = crate::libs::sse::events(upstream);
 
     let body = Body::from_stream(async_stream::stream! {
+        use crate::libs::stream_metrics::{transport, StreamTimer};
+        let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)
+            .with_request_context(crate::libs::request_context::request_context_store());
         let mut usage = UsageTokens::default();
         futures_util::pin_mut!(event_stream);
 
@@ -931,6 +941,7 @@ fn stream_provider_messages(
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {
+                    timer.mark_error();
                     yield Err(err);
                     return;
                 }
@@ -961,9 +972,11 @@ fn stream_provider_messages(
                 Some(name) => format!("event: {name}\ndata: {data}\n\n"),
                 None => format!("data: {data}\n\n"),
             };
+            timer.on_content_frame();
             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
         }
 
+        timer.mark_finished();
         recorder.record(usage);
     });
 
@@ -1022,6 +1035,9 @@ fn stream_openai_compatible_provider_messages(
     let event_stream = crate::libs::sse::events(upstream);
 
     let body = Body::from_stream(async_stream::stream! {
+        use crate::libs::stream_metrics::{transport, StreamTimer};
+        let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)
+            .with_request_context(crate::libs::request_context::request_context_store());
         let mut usage = UsageTokens::default();
         let mut state = AnthropicStreamState::default();
         futures_util::pin_mut!(event_stream);
@@ -1030,6 +1046,7 @@ fn stream_openai_compatible_provider_messages(
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {
+                    timer.mark_error();
                     yield Err(err);
                     return;
                 }
@@ -1062,6 +1079,7 @@ fn stream_openai_compatible_provider_messages(
 
             for event in translate_chunk_to_anthropic_events(&parsed, &mut state) {
                 if let Some(frame) = emit_event(&event) {
+                    timer.on_content_frame();
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
             }
@@ -1073,6 +1091,7 @@ fn stream_openai_compatible_provider_messages(
             }
         }
 
+        timer.mark_finished();
         recorder.record(usage);
     });
 
