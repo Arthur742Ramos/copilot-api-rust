@@ -734,6 +734,13 @@ where
             Some(forward_to_provider(payload.clone(), alias.provider).await)
         }
         WebSearchRoute::Responses { model } => {
+            // This early-return branch invokes Copilot's native Responses API,
+            // so it must honor the Copilot-specific premium-interaction gate.
+            // Provider-routed web search above intentionally does not consume
+            // the Copilot account's quota.
+            if let Err(error) = crate::libs::premium_interactions::check_premium_interactions() {
+                return Some(Err(error.into()));
+            }
             let subagent_marker = parse_subagent_marker_from_first_user(&payload_value);
             let mut session_id = get_root_session_id(&payload_value, headers);
             let messages = payload_value
@@ -811,7 +818,7 @@ pub async fn handle_web_search_via_responses(
     );
 
     let upstream = create_responses(
-        &responses_payload,
+        responses_payload,
         ResponsesRequestOptions {
             vision,
             initiator,

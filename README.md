@@ -192,7 +192,7 @@ containers (the `start` flags below have matching `COPILOT_API_*` variables):
 | `COPILOT_API_ENTERPRISE_URL` | `--enterprise-url` | Enterprise URL for GitHub. |
 | `COPILOT_API_LOG_FORMAT` | _(env only)_ | Set to `json` for structured JSON logs; defaults to the human-readable format. |
 | `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS` | _(env only)_ | Days of `token_usage_events` to retain before pruning (default `45`; `<= 0` disables pruning). |
-| `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | _(env only)_ | Max seconds of silence on an upstream stream before the connection is treated as stalled and dropped (default `120`; `0` disables the read timeout). Raise it if legitimately slow generations are being cut off mid-stream. |
+| `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | _(env only)_ | Max seconds of silence on an upstream HTTP or WebSocket stream before the connection is treated as stalled and dropped (default `120`; `0` disables the read timeout). Raise it if legitimately slow generations are being cut off mid-stream. |
 | `COPILOT_API_SSE_HEARTBEAT_SECS` | _(env only)_ | Idle window (seconds) after which the proxy injects a keep-alive frame into a streaming response so long "thinking" gaps survive intermediaries (nginx/ALB) with sub-120s idle timeouts (default `15`; `0` disables heartbeats). A heartbeat is a no-op ping (Anthropic `event: ping` on `/v1/messages`, an SSE comment on `/responses`) and never affects token-usage or latency metrics. |
 
 Example:
@@ -256,7 +256,7 @@ These apply to every subcommand:
 | `--github-token <TOKEN>` | `-g` | (none) | Provide a GitHub token directly (non-interactive). Env: `COPILOT_API_GITHUB_TOKEN`. |
 | `--claude-code` | `-c` | `false` | Generate a clipboard command to launch Claude Code against the gateway. |
 | `--show-token` | | `false` | Show GitHub and Copilot tokens on fetch and refresh. |
-| `--proxy-env` | | `false` | Initialize the HTTP proxy from environment variables. |
+| `--proxy-env` | | `false` | Initialize the HTTP proxy from environment variables. Responses requests use HTTP instead of WebSocket so they also traverse the proxy. |
 
 ### `auth` flags
 

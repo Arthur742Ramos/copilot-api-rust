@@ -17,7 +17,7 @@ pub async fn sleep(ms: u64) {
 /// Mirrors `findLastUserContent`: scans messages from the end for the last
 /// user message with content, returning its text (stringifying array content
 /// with `tool_result` parts removed and `cache_control` stripped).
-fn find_last_user_content(messages: &[serde_json::Value]) -> Option<String> {
+pub(crate) fn find_last_user_content(messages: &[serde_json::Value]) -> Option<String> {
     for msg in messages.iter().rev() {
         if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
             continue;
@@ -60,6 +60,16 @@ pub fn generate_request_id_from_payload(
     session_id: Option<&str>,
 ) -> String {
     let last_user_content = find_last_user_content(messages);
+    generate_request_id_from_user_content(last_user_content.as_deref(), session_id)
+}
+
+/// Build the same deterministic request id when a typed caller has already
+/// found the last user content without serializing its entire conversation to
+/// an intermediate `Vec<Value>`.
+pub fn generate_request_id_from_user_content(
+    last_user_content: Option<&str>,
+    session_id: Option<&str>,
+) -> String {
     if let Some(content) = last_user_content {
         let mac = state::with_state(|s| s.mac_machine_id.clone().unwrap_or_default());
         let seed = format!("{}{}{}", session_id.unwrap_or(""), mac, content);

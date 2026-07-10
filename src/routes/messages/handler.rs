@@ -14,7 +14,6 @@ use crate::libs::config::{get_small_model, is_messages_api_enabled, resolve_mapp
 use crate::libs::error::AppError;
 use crate::libs::models::{find_endpoint_model, is_context_1m_model};
 use crate::libs::provider_model::parse_provider_model_alias;
-use crate::libs::rate_limit::check_rate_limit;
 use crate::libs::state;
 use crate::libs::subagent::parse_subagent_marker_from_first_user;
 use crate::libs::utils::{generate_request_id_from_payload, get_root_session_id, get_uuid};
@@ -74,6 +73,11 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         tracing::debug!("Resolved model mapping: {requested_model} -> {mapped_model}");
     }
 
+    // Shared admission must precede every early dispatch below. In particular,
+    // fulfilled web-search requests and provider aliases return directly and
+    // would otherwise bypass rate limits and daily/per-key token budgets.
+    crate::libs::admission::check_shared_admission().await?;
+
     // 2. Web-search server-tool short-circuit. Mirrors `tryHandleWebSearch`.
     //
     // Runs BEFORE the provider-alias step because a web-search request may
@@ -121,8 +125,6 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     // 4. Anthropic preprocessing.
     normalize_system_messages(&mut payload);
 
-    check_rate_limit().await?;
-    crate::libs::token_budget::check_token_budget()?;
     crate::libs::premium_interactions::check_premium_interactions()?;
 
     sanitize_ide_tools(&mut payload);
