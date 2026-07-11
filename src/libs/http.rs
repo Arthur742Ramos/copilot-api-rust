@@ -31,6 +31,11 @@ pub const DEFAULT_UPSTREAM_READ_TIMEOUT_SECS: u64 = 120;
 /// Connection-establishment deadline shared by HTTP and WebSocket transports.
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound retained idle sockets for any one upstream host. Active streaming
+/// connections are unaffected; this only prevents burst-created keep-alives from
+/// consuming desktop file-descriptor headroom after the burst drains.
+pub const UPSTREAM_POOL_MAX_IDLE_PER_HOST: usize = 8;
+
 /// The upstream read-timeout, overridable via `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS`.
 ///
 /// `read_timeout` bounds the gap between successive reads, NOT the total request
@@ -63,7 +68,8 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         // cap long legitimate streams, so we deliberately do not use one here.
         // The window is configurable via COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS
         // (default 120; 0 disables it).
-        .pool_idle_timeout(Duration::from_secs(90));
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(UPSTREAM_POOL_MAX_IDLE_PER_HOST);
     if let Some(read_timeout) = upstream_read_timeout() {
         builder = builder.read_timeout(read_timeout);
     }

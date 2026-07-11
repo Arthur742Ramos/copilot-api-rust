@@ -48,7 +48,7 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
 
     // Provider aliases return early, so shared admission belongs before the
     // dispatch split rather than only in the Copilot arm.
-    let in_flight_permit = crate::libs::admission::check_shared_admission()
+    crate::libs::admission::check_shared_admission()
         .await
         .map_err(AppError::Http)?;
 
@@ -165,11 +165,9 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
     match response {
         CreateResponsesReturn::Stream(upstream) => {
             tracing::debug!("Forwarding native Responses stream");
-            Ok(stream_responses_sse(upstream, recorder, in_flight_permit))
+            Ok(stream_responses_sse(upstream, recorder))
         }
         CreateResponsesReturn::Result(result) => {
-            // Non-streaming: permit can drop immediately (request is done).
-            drop(in_flight_permit);
             // Native non-streaming responses never pass through a StreamTimer, so
             // record the flow/model/transport headline here so the trace
             // middleware's `has_flow` guard emits the single `request.completed`
@@ -197,7 +195,6 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
 fn stream_responses_sse(
     upstream: crate::services::copilot::create_responses::ResponsesEventStream,
     recorder: crate::libs::token_usage::TokenUsageRecorder,
-    permit: crate::libs::admission::InFlightPermit,
 ) -> Response {
     use crate::libs::stream_metrics::{transport, StreamTimer};
     use crate::libs::token_usage::UsageTokens;
@@ -214,8 +211,7 @@ fn stream_responses_sse(
         // dashboards as the messages flows (transport=native). The timer drops
         // at end-of-stream (or client disconnect), recording stream-complete.
         let mut timer = StreamTimer::new("responses", transport::NATIVE)
-            .with_request_context(req_ctx)
-            .with_in_flight_permit(permit);
+            .with_request_context(req_ctx);
         let mut tracker = StreamIdTracker::new();
         let mut usage: UsageTokens = UsageTokens::default();
         futures_util::pin_mut!(event_stream);
@@ -533,7 +529,7 @@ mod tests {
             "m".to_string(),
             None,
         );
-        let response = stream_responses_sse(upstream, recorder, Default::default());
+        let response = stream_responses_sse(upstream, recorder);
         std::env::remove_var("COPILOT_API_SSE_HEARTBEAT_SECS");
 
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

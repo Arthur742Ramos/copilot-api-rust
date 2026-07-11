@@ -2,9 +2,9 @@
 //! CORS, body limits, and panic handling into the application `Router`.
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
-use axum::http::{HeaderValue, StatusCode};
-use axum::middleware::{from_fn, Next};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::{HeaderValue, Method, StatusCode};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -23,6 +23,15 @@ use crate::libs::http::MAX_REQUEST_BODY_BYTES;
 /// Build the axum application, mirroring src/server.ts route table and
 /// middleware stack (trace -> cors -> general auth -> admin auth).
 pub fn build_router() -> Router {
+    build_router_with_admission(crate::libs::admission::AdmissionController::default())
+}
+
+/// Build the production router with an explicit admission controller. Keeping
+/// the controller injectable lets embedders and integration tests use a low
+/// deterministic limit without mutating process-global environment variables.
+pub fn build_router_with_admission(
+    admission: crate::libs::admission::AdmissionController,
+) -> Router {
     Router::new()
         .route("/", get(|| async { "Server running" }))
         .route("/readyz", get(readyz))
@@ -124,6 +133,11 @@ pub fn build_router() -> Router {
         .layer(from_fn(
             crate::libs::zstd_request::zstd_decompression_middleware,
         ))
+        // Fail fast before decompression/handler work when an upstream-facing
+        // route has no available concurrency slot. The middleware attaches its
+        // permit to the response body, so returning a streaming HEAD does not
+        // release capacity early. Control-plane routes bypass this layer.
+        .layer(from_fn_with_state(admission, upstream_admission_middleware))
         .layer(from_fn(admin_auth_middleware))
         .layer(from_fn(general_auth_middleware))
         .layer(cors_layer())
@@ -162,6 +176,47 @@ pub fn build_router() -> Router {
         // access logs) and handler runs within the span. Must remain the last
         // `.layer()` call.
         .layer(from_fn(trace_middleware))
+}
+
+/// Select the route families that can consume upstream connections. Exact
+/// matched templates keep this list bounded and prevent user-controlled path
+/// values from becoming metric/log labels.
+fn is_upstream_proxy_route(method: &Method, route: &str) -> bool {
+    match route {
+        "/chat/completions"
+        | "/v1/chat/completions"
+        | "/embeddings"
+        | "/v1/embeddings"
+        | "/images/generations"
+        | "/v1/images/generations"
+        | "/responses"
+        | "/v1/responses"
+        | "/v1/messages"
+        | "/v1/messages/count_tokens"
+        | "/:provider/v1/messages"
+        | "/:provider/v1/messages/count_tokens" => method == Method::POST,
+        "/models" | "/v1/models" | "/models/:id" | "/v1/models/:id" | "/:provider/v1/models" => {
+            method == Method::GET || method == Method::HEAD
+        }
+        _ => false,
+    }
+}
+
+async fn upstream_admission_middleware(
+    State(admission): State<crate::libs::admission::AdmissionController>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("");
+    if !is_upstream_proxy_route(request.method(), route) {
+        return next.run(request).await;
+    }
+
+    crate::libs::admission::admit_request(admission, request, next).await
 }
 
 /// CORS policy for the API.

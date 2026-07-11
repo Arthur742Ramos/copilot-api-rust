@@ -38,6 +38,7 @@ static PROVIDER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         // streams, so it is intentionally absent. Shares the shared client's
         // COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS knob (default 120; 0 disables).
         .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(crate::libs::http::UPSTREAM_POOL_MAX_IDLE_PER_HOST)
         .redirect(reqwest::redirect::Policy::none());
     if let Some(read_timeout) = crate::libs::http::upstream_read_timeout() {
         builder = builder.read_timeout(read_timeout);

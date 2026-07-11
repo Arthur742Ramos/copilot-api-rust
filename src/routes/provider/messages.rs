@@ -89,10 +89,10 @@ pub async fn post_provider_messages(
     // Internal provider dispatches (model aliases / web search) already pass
     // through the public route's shared gate. This direct provider endpoint does
     // not, so gate it here before resolving or contacting the provider.
-    let _permit = match crate::libs::admission::check_shared_admission().await {
-        Ok(p) => p,
+    match crate::libs::admission::check_shared_admission().await {
+        Ok(()) => {}
         Err(error) => return AppError::Http(error).into_response(),
-    };
+    }
     match handle_provider_messages_for_provider(payload, provider, headers).await {
         Ok(r) => r,
         Err(e) => AppError::into_response(e),

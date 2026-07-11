@@ -3,6 +3,7 @@
 use copilot_api::{debug, doctor, libs, mcp, server, services};
 
 use clap::{Args, Parser, Subcommand};
+use std::num::NonZeroUsize;
 
 use crate::libs::config::merge_config_with_defaults;
 use crate::libs::opencode::init_opencode_version;
@@ -90,6 +91,13 @@ struct StartArgs {
     /// Rate limit in seconds between requests
     #[arg(short = 'r', long = "rate-limit", env = "COPILOT_API_RATE_LIMIT")]
     rate_limit: Option<u64>,
+    /// Optional cap on concurrent upstream-facing proxy requests. Excess work
+    /// gets 503 instead of queuing. Unset is unlimited; desktop recommendation: 64.
+    #[arg(
+        long = "max-concurrent-requests",
+        env = "COPILOT_API_MAX_CONCURRENT_REQUESTS"
+    )]
+    max_concurrent_requests: Option<NonZeroUsize>,
     /// Wait instead of error when rate limit is hit
     #[arg(
         short = 'w',
@@ -234,6 +242,8 @@ fn init_tracing(verbose: bool, to_stderr: bool) {
 }
 
 async fn run_server(options: StartArgs) -> anyhow::Result<()> {
+    let max_concurrent_requests = resolve_max_concurrent_requests(options.max_concurrent_requests)?;
+    raise_server_nofile_limit();
     crate::libs::http::set_proxy_from_env(options.proxy_env);
     if options.proxy_env {
         tracing::debug!("HTTP proxy configured from environment (per-URL)");
@@ -366,10 +376,24 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
         );
     }
 
-    let app = server::build_router();
     crate::libs::metrics::init_build_info();
     crate::libs::http::preregister_retry_metrics();
     crate::libs::premium_interactions::preregister_premium_interactions_metrics();
+    let admission = crate::libs::admission::AdmissionController::new(max_concurrent_requests);
+    if let Some(limit) = admission.limit() {
+        tracing::info!(
+            max_concurrent_requests = limit,
+            "Upstream concurrency admission enabled"
+        );
+    } else {
+        tracing::warn!(
+            recommended_max_concurrent_requests =
+                crate::libs::admission::RECOMMENDED_MAX_CONCURRENT_REQUESTS,
+            "Upstream concurrency is unlimited; configure --max-concurrent-requests to enable load shedding"
+        );
+    }
+
+    let app = server::build_router_with_admission(admission);
     crate::libs::premium_interactions::start_premium_interactions_refresh_loop();
     spawn_token_usage_retention();
     let addr = std::net::SocketAddr::new(ip, options.port);
@@ -584,6 +608,57 @@ async fn run_update(args: UpdateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn resolve_max_concurrent_requests(
+    configured: Option<NonZeroUsize>,
+) -> anyhow::Result<Option<NonZeroUsize>> {
+    if configured.is_some() {
+        return Ok(configured);
+    }
+
+    let Some(raw) = std::env::var("COPILOT_API_MAX_IN_FLIGHT").ok() else {
+        return Ok(None);
+    };
+    let value = raw.trim().parse::<usize>().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid COPILOT_API_MAX_IN_FLIGHT value '{raw}': expected a non-negative integer"
+        )
+    })?;
+    let legacy = NonZeroUsize::new(value);
+    tracing::warn!(
+        "COPILOT_API_MAX_IN_FLIGHT is deprecated; use COPILOT_API_MAX_CONCURRENT_REQUESTS"
+    );
+    Ok(legacy)
+}
+
+fn raise_server_nofile_limit() {
+    let target = crate::libs::resource_limits::TARGET_NOFILE_SOFT_LIMIT;
+    match crate::libs::resource_limits::raise_nofile_soft_limit(target) {
+        Ok(Some(limit)) if limit.raised() => tracing::info!(
+            previous_soft_limit = limit.before,
+            soft_limit = limit.after,
+            hard_limit = ?limit.hard,
+            "Raised process file-descriptor limit"
+        ),
+        Ok(Some(limit)) if limit.after < target => tracing::warn!(
+            soft_limit = limit.after,
+            hard_limit = ?limit.hard,
+            target,
+            "Process file-descriptor hard limit prevents the requested soft-limit increase"
+        ),
+        Ok(Some(limit)) => tracing::debug!(
+            soft_limit = limit.after,
+            hard_limit = ?limit.hard,
+            "Process file-descriptor limit already sufficient"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            target,
+            "Failed to raise process file-descriptor soft limit"
+        ),
+    }
+}
+
 async fn run_auth(options: AuthArgs) -> anyhow::Result<()> {
     state::with_state_mut(|s| s.show_token = options.show_token);
     ensure_paths().await?;
@@ -795,5 +870,28 @@ fn default_quota_detail() -> crate::services::github::get_copilot_usage::QuotaDe
         remaining: 0.0,
         unlimited: false,
         extra: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn max_concurrent_requests_flag_accepts_positive_values() {
+        let cli = Cli::try_parse_from(["copilot-api", "start", "--max-concurrent-requests", "7"])
+            .expect("positive limit should parse");
+        let Command::Start(args) = cli.command else {
+            panic!("expected start command");
+        };
+        assert_eq!(args.max_concurrent_requests.map(NonZeroUsize::get), Some(7));
+    }
+
+    #[test]
+    fn max_concurrent_requests_flag_rejects_zero() {
+        assert!(
+            Cli::try_parse_from(["copilot-api", "start", "--max-concurrent-requests", "0",])
+                .is_err()
+        );
     }
 }
