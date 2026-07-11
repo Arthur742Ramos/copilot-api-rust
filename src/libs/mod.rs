@@ -24,6 +24,7 @@ pub mod provider_resolver;
 pub mod rate_limit;
 pub mod request_auth;
 pub mod request_context;
+pub mod resource_limits;
 pub mod shell;
 pub mod sqlite;
 pub mod sse;

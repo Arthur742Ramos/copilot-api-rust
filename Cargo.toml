@@ -26,6 +26,7 @@ axum = { version = "0.7", features = ["json", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic", "limit"] }
 hyper = { version = "1", features = ["full"] }
+http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -56,6 +57,7 @@ chrono = "0.4"
 ruzstd = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 indexmap = { version = "2", features = ["serde"] }
+libc = "0.2"
 # Used by the pooled websocket responses transport (later in this stacked
 # series); declared here so the dependency set is stable across the stack.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
@@ -65,7 +67,6 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 [dev-dependencies]
 serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 # `start_paused` virtual-time tests (SSE heartbeat) need tokio's test-util,
 # which the `full` feature does not pull in.
 tokio = { version = "1", features = ["test-util"] }

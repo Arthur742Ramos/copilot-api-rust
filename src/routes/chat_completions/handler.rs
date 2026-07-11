@@ -38,7 +38,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     // Provider aliases return early, so apply policies shared by every
     // billable upstream before resolving the concrete transport.
-    let in_flight_permit = crate::libs::admission::check_shared_admission()
+    crate::libs::admission::check_shared_admission()
         .await
         .map_err(AppError::Http)?;
 
@@ -113,10 +113,6 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 
     match result {
         ChatCompletionsResult::NonStreaming(response) => {
-            // Non-streaming response: permit can drop immediately (the request
-            // is already complete). Bind explicitly to silence unused-variable
-            // lint while still observing the RAII drop at this point.
-            drop(in_flight_permit);
             // Native non-streaming responses never pass through a StreamTimer, so
             // record the flow/model/transport headline here. This lets the
             // trace middleware's `has_flow` guard emit the single
@@ -134,7 +130,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         }
         ChatCompletionsResult::Streaming(upstream) => {
             let _ = is_stream;
-            Ok(stream_sse(upstream, recorder, in_flight_permit).into_response())
+            Ok(stream_sse(upstream, recorder).into_response())
         }
     }
 }
@@ -152,7 +148,6 @@ fn messages_as_values(payload: &ChatCompletionsPayload) -> Vec<Value> {
 fn stream_sse(
     upstream: reqwest::Response,
     recorder: crate::libs::token_usage::TokenUsageRecorder,
-    permit: crate::libs::admission::InFlightPermit,
 ) -> Response {
     use crate::libs::stream_metrics::{transport, StreamTimer};
     use crate::libs::token_usage::UsageTokens;
@@ -169,8 +164,7 @@ fn stream_sse(
     // stream-complete) when the stream ends or the client disconnects.
     let timer_for_stream = Arc::new(Mutex::new(
         StreamTimer::new("chat_completions", transport::NATIVE)
-            .with_request_context(crate::libs::request_context::request_context_store())
-            .with_in_flight_permit(permit),
+            .with_request_context(crate::libs::request_context::request_context_store()),
     ));
     // Clone for the finalizing `once` future so `mark_finished` can be called
     // when the byte stream is fully exhausted (vs client disconnect, which drops

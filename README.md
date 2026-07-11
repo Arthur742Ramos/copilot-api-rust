@@ -194,7 +194,7 @@ containers (the `start` flags below have matching `COPILOT_API_*` variables):
 | `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS` | _(env only)_ | Days of `token_usage_events` to retain before pruning (default `45`; `<= 0` disables pruning). |
 | `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | _(env only)_ | Max seconds of silence on an upstream HTTP or WebSocket stream before the connection is treated as stalled and dropped (default `120`; `0` disables the read timeout). Raise it if legitimately slow generations are being cut off mid-stream. |
 | `COPILOT_API_SSE_HEARTBEAT_SECS` | _(env only)_ | Idle window (seconds) after which the proxy injects a keep-alive frame into a streaming response so long "thinking" gaps survive intermediaries (nginx/ALB) with sub-120s idle timeouts (default `15`; `0` disables heartbeats). A heartbeat is a no-op ping (Anthropic `event: ping` on `/v1/messages`, an SSE comment on `/responses`) and never affects token-usage or latency metrics. |
-| `COPILOT_API_MAX_IN_FLIGHT` | `_(env only)_` | Maximum number of requests allowed to be in-flight simultaneously across all routes. New requests beyond this limit receive `503 Service Unavailable`. Unset (default) means unlimited. |
+| `COPILOT_API_MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | Optional fail-fast cap on concurrent upstream-facing proxy requests. Unset (default) means unlimited; `64` is recommended for a desktop process with a 256-FD soft limit. When configured, excess requests receive a retryable `503 Service Unavailable` with `Retry-After: 1`. |
 | `COPILOT_API_RATE_LIMIT_MAX_WAITERS` | _(env only)_ | In rate-limit wait mode, the maximum number of requests allowed to be queued (sleeping) at once. When the queue is full, new arrivals are rejected with `429 Too Many Requests` rather than enqueued. Unset (default) means unlimited. |
 | `COPILOT_API_RATE_LIMIT_MAX_WAIT_SECS` | _(env only)_ | In rate-limit wait mode, the maximum number of seconds a request is allowed to wait in the queue. Requests whose projected wait would exceed this limit are rejected with `429 Too Many Requests`. Unset (default) means no limit. |
 | `COPILOT_API_UPSTREAM_RETRY_5XX` | _(env only)_ | Set to `true` to retry transient upstream 5xx errors on **non-billable** routes (e.g. model list, version checks). Billable generation routes (`/v1/messages`, `/v1/responses`, `/v1/chat/completions`) always use a no-retry policy regardless of this setting to avoid double-billing. Default `false`. |
@@ -207,8 +207,52 @@ Example:
 docker run --rm -p 8080:8080 \
   -e COPILOT_API_PORT=8080 \
   -e COPILOT_API_GITHUB_TOKEN=<github-token> \
+  -e COPILOT_API_MAX_CONCURRENT_REQUESTS=64 \
   -v copilot-api-data:/data copilot-api
 ```
+
+### Concurrency and file-descriptor headroom
+
+Concurrency is unlimited by default. For long-running desktop services, set
+`COPILOT_API_MAX_CONCURRENT_REQUESTS=64` (or
+`--max-concurrent-requests 64`) so a client burst cannot consume every process
+file descriptor. The admission check is fail-fast: it never queues excess
+inbound requests, never terminates an already-admitted stream, and holds each
+slot until the complete response body reaches EOF or is dropped because of an
+upstream error or client disconnect. Liveness, readiness, version, metrics,
+usage, and admin/control routes remain outside the cap.
+The former `COPILOT_API_MAX_IN_FLIGHT` variable is still accepted as a
+deprecated fallback.
+
+The shared HTTP clients also retain at most eight idle connections per upstream
+host. On Unix, server startup makes a best-effort attempt to raise the process
+soft file-descriptor limit to `4096`, never exceeding the inherited hard limit.
+If launchd/systemd supplies a lower hard limit, configure
+`NumberOfFiles`/`LimitNOFILE` in the deployment that owns the service. OS limits
+provide secondary headroom; they do not replace application-level admission.
+This repository does not generate launchd service files.
+
+For a macOS LaunchAgent, add resource limits such as:
+
+```xml
+<key>SoftResourceLimits</key>
+<dict>
+  <key>NumberOfFiles</key>
+  <integer>4096</integer>
+</dict>
+<key>HardResourceLimits</key>
+<dict>
+  <key>NumberOfFiles</key>
+  <integer>8192</integer>
+</dict>
+```
+
+Reload the launchd job after editing its plist; changing `ulimit -n` in an
+interactive shell does not update an already-running service.
+
+Prometheus exports `proxy_upstream_concurrency_limit` (`0` means unlimited),
+`proxy_upstream_requests_active`, and
+`proxy_upstream_overload_rejections_total`.
 
 ## Logging
 
@@ -258,6 +302,7 @@ These apply to every subcommand:
 | `--account-type <TYPE>` | `-a` | `individual` | Account type: `individual`, `business`, or `enterprise`. Env: `COPILOT_API_ACCOUNT_TYPE`. |
 | `--manual` | | `false` | Enable manual request approval. |
 | `--rate-limit <SECONDS>` | `-r` | (none) | Minimum seconds between requests. |
+| `--max-concurrent-requests <COUNT>` | | (unlimited) | Fail-fast cap for upstream-facing requests. Slots are held for the complete response-body/stream lifetime. Env: `COPILOT_API_MAX_CONCURRENT_REQUESTS`. |
 | `--wait` | `-w` | `false` | Wait instead of erroring when the rate limit is hit. |
 | `--github-token <TOKEN>` | `-g` | (none) | Provide a GitHub token directly (non-interactive). Env: `COPILOT_API_GITHUB_TOKEN`. |
 | `--claude-code` | `-c` | `false` | Generate a clipboard command to launch Claude Code against the gateway. |

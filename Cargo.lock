@@ -428,6 +428,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "indexmap",
+ "libc",
  "mac_address",
  "metrics",
  "metrics-exporter-prometheus",

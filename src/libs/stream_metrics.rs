@@ -37,10 +37,6 @@ pub mod transport {
 /// streams are stuck or leaking — which the drop-recorded completion histogram
 /// cannot surface on its own.
 ///
-/// The timer also optionally holds an in-flight permit (AC2): if a semaphore
-/// is configured, the permit MUST live until the stream body is fully drained
-/// so the active-stream count stays accurate. Attach it via
-/// [`with_in_flight_permit`].
 pub struct StreamTimer {
     flow: &'static str,
     transport: &'static str,
@@ -56,10 +52,6 @@ pub struct StreamTimer {
     /// task-local context is still in scope) so it survives into the
     /// later-polled stream body. `None` leaves the timer metrics-only.
     request_context: Option<RequestContext>,
-    /// Optional in-flight semaphore permit. Held here so it is released only
-    /// when the stream body drops (i.e. after the last byte is flushed to the
-    /// client), not when the handler function returns.
-    _permit: Option<crate::libs::admission::InFlightPermit>,
 }
 
 impl StreamTimer {
@@ -78,7 +70,6 @@ impl StreamTimer {
             errored: false,
             finished: false,
             request_context: None,
-            _permit: None,
         }
     }
 
@@ -91,13 +82,6 @@ impl StreamTimer {
             ctx.set_flow_transport_streaming(self.flow, self.transport);
         }
         self.request_context = ctx;
-        self
-    }
-
-    /// Attach an in-flight semaphore permit so it is released when the stream
-    /// body drops (not when the handler function returns).
-    pub fn with_in_flight_permit(mut self, permit: crate::libs::admission::InFlightPermit) -> Self {
-        self._permit = Some(permit);
         self
     }
 
