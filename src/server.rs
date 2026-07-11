@@ -196,7 +196,7 @@ fn is_upstream_proxy_route(method: &Method, route: &str) -> bool {
         | "/:provider/v1/messages"
         | "/:provider/v1/messages/count_tokens" => method == Method::POST,
         "/models" | "/v1/models" | "/models/:id" | "/v1/models/:id" | "/:provider/v1/models" => {
-            method == Method::GET
+            method == Method::GET || method == Method::HEAD
         }
         _ => false,
     }

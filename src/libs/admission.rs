@@ -201,9 +201,10 @@ fn overload_response() -> Response {
         })),
     )
         .into_response();
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from(OVERLOAD_RETRY_AFTER_SECS),
+    );
     response
 }
 

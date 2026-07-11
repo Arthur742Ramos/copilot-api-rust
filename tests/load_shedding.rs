@@ -33,7 +33,7 @@ fn request(method: Method, path: &str) -> Request<Body> {
         .expect("valid request")
 }
 
-async fn assert_overloaded(response: Response<Body>) {
+async fn assert_overloaded(response: Response<Body>, expect_body: bool) {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers().get("retry-after").unwrap(), "1");
     let body = response
@@ -42,6 +42,10 @@ async fn assert_overloaded(response: Response<Body>) {
         .await
         .expect("overload body")
         .to_bytes();
+    if !expect_body {
+        assert!(body.is_empty(), "HEAD responses must not include a body");
+        return;
+    }
     let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON overload body");
     assert_eq!(value["type"], "error");
     assert_eq!(value["error"]["type"], "overloaded_error");
@@ -80,6 +84,10 @@ async fn configured_overload_covers_upstream_routes_but_not_control_plane() {
         (Method::GET, "/v1/models"),
         (Method::GET, "/models/test"),
         (Method::GET, "/v1/models/test"),
+        (Method::HEAD, "/models"),
+        (Method::HEAD, "/v1/models"),
+        (Method::HEAD, "/models/test"),
+        (Method::HEAD, "/v1/models/test"),
         (Method::POST, "/embeddings"),
         (Method::POST, "/v1/embeddings"),
         (Method::POST, "/images/generations"),
@@ -91,14 +99,16 @@ async fn configured_overload_covers_upstream_routes_but_not_control_plane() {
         (Method::POST, "/test-provider/v1/messages"),
         (Method::POST, "/test-provider/v1/messages/count_tokens"),
         (Method::GET, "/test-provider/v1/models"),
+        (Method::HEAD, "/test-provider/v1/models"),
     ];
     for (method, path) in guarded_routes {
+        let expect_body = method != Method::HEAD;
         let response = app
             .clone()
             .oneshot(request(method, path))
             .await
             .expect("router response");
-        assert_overloaded(response).await;
+        assert_overloaded(response, expect_body).await;
     }
 
     for path in ["/", "/version", "/readyz", "/admin/config"] {
@@ -194,7 +204,7 @@ async fn streaming_permit_is_held_until_body_completion() {
         .oneshot(request(Method::GET, "/work"))
         .await
         .expect("overload response");
-    assert_overloaded(excess).await;
+    assert_overloaded(excess, true).await;
 
     release.add_permits(1);
     let last = body
