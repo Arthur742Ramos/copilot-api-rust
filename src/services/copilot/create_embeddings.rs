@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::libs::api_config::{copilot_base_url, copilot_headers};
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::{client, read_json_capped, retry_endpoint};
+use crate::libs::http::{client, read_json_capped, retry_endpoint, serialize_json_body};
 use crate::libs::metrics::{record_upstream_request, UpstreamStatus};
 use crate::libs::state;
 
@@ -17,7 +17,7 @@ pub async fn create_embeddings(payload: &EmbeddingRequest) -> Result<Value, Http
     }
 
     let base = copilot_base_url(&st);
-    let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    let body = serialize_json_body(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
     // Rebuild auth headers per attempt from the token the helper hands us so the
     // 401-triggered replay carries the inline-refreshed token, against which the

@@ -12,7 +12,7 @@
 use serde_json::Value;
 
 use crate::libs::error::HttpError;
-use crate::libs::http::client;
+use crate::libs::http::{client, serialize_json_body};
 use crate::libs::request_context::request_context_store;
 use crate::libs::state;
 use crate::services::copilot::create_responses::{
@@ -337,7 +337,7 @@ pub async fn forward_codex_responses(
         crate::services::providers::provider_proxy::validate_upstream_url(&url)?;
     }
     let stream = payload.stream;
-    let body = serde_json::to_vec(&payload).map_err(|e| {
+    let body = serialize_json_body(&payload).map_err(|e| {
         HttpError::internal(format!("Failed to serialize codex responses payload: {e}"))
     })?;
     drop(payload);

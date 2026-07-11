@@ -7,7 +7,7 @@ use crate::libs::api_config::{
 };
 use crate::libs::copilot_rate_limit::log_copilot_rate_limits;
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::client;
+use crate::libs::http::{client, serialize_json_body};
 use crate::libs::state;
 use crate::libs::subagent::SubagentMarker;
 
@@ -53,7 +53,7 @@ pub async fn create_chat_completions(
     tracing::info!("<-- model: {}", payload.model);
 
     let base = copilot_base_url(&st);
-    let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    let body = serialize_json_body(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     let upstream_start = std::time::Instant::now();
     // The request (auth headers in particular) is rebuilt per attempt from the
     // token the helper hands us, so the 401-triggered replay carries the

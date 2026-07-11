@@ -448,6 +448,10 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     // returns Ok (graceful shutdown) or Err — otherwise a serve error would skip
     // the checkpoint exactly when something went wrong.
     let serve_result = axum::serve(listener, app)
+        // Streaming responses consist of tiny token frames. Disable Nagle on
+        // accepted client sockets so those frames are written immediately rather
+        // than waiting to coalesce behind delayed ACKs.
+        .tcp_nodelay(true)
         .with_graceful_shutdown(shutdown_signal())
         .await;
 

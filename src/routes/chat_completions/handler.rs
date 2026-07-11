@@ -11,9 +11,12 @@ use crate::libs::error::AppError;
 use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::state;
 use crate::libs::token_usage::{create_copilot_token_usage_recorder, normalize_openai_usage};
-use crate::libs::utils::{generate_request_id_from_payload, get_uuid};
+use crate::libs::utils::{
+    generate_request_id_from_user_content, get_uuid, request_id_user_content,
+};
 use crate::services::copilot::create_chat_completions::{
     create_chat_completions, ChatCompletionsOptions, ChatCompletionsPayload, ChatCompletionsResult,
+    Message,
 };
 
 /// Mirrors routes/chat-completions/handler.ts `handleCompletion`.
@@ -87,7 +90,8 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
             .and_then(|m| m.capabilities.limits.max_output_tokens);
     }
 
-    let request_id = generate_request_id_from_payload(&messages_as_values(&payload), None);
+    let last_user_content = last_user_content(&payload.messages);
+    let request_id = generate_request_id_from_user_content(last_user_content.as_deref(), None);
     tracing::debug!("Generated request ID: {request_id}");
 
     let session_id = get_uuid(&request_id);
@@ -99,7 +103,6 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         Some(session_id.clone()),
     );
 
-    let is_stream = payload.stream.unwrap_or(false);
     let result = create_chat_completions(
         &payload,
         ChatCompletionsOptions {
@@ -129,18 +132,18 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
             Ok(Json(response).into_response())
         }
         ChatCompletionsResult::Streaming(upstream) => {
-            let _ = is_stream;
             Ok(stream_sse(upstream, recorder).into_response())
         }
     }
 }
 
-fn messages_as_values(payload: &ChatCompletionsPayload) -> Vec<Value> {
-    payload
-        .messages
+fn last_user_content(messages: &[Message]) -> Option<String> {
+    messages
         .iter()
-        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
-        .collect()
+        .rev()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| message.content.as_ref())
+        .find_map(request_id_user_content)
 }
 
 /// Forward the upstream SSE byte stream to the client unchanged, while sniffing
@@ -151,77 +154,43 @@ fn stream_sse(
 ) -> Response {
     use crate::libs::stream_metrics::{transport, StreamTimer};
     use crate::libs::token_usage::UsageTokens;
-    use std::sync::{Arc, Mutex};
 
-    let usage_acc: Arc<Mutex<UsageTokens>> = Arc::new(Mutex::new(UsageTokens::default()));
-    let usage_for_stream = usage_acc.clone();
-    let recorder = Arc::new(recorder);
-
-    // Time the native (raw byte-forwarded) stream so /v1/chat/completions is
-    // covered by the same proxy_stream_* dashboards as the messages flows. TTFT
-    // here is a coarser first-non-empty-chunk approximation (transport=native).
-    // The timer is held by the stream closure and drops (recording
-    // stream-complete) when the stream ends or the client disconnects.
-    let timer_for_stream = Arc::new(Mutex::new(
-        StreamTimer::new("chat_completions", transport::NATIVE)
-            .with_request_context(crate::libs::request_context::request_context_store()),
-    ));
-    // Clone for the finalizing `once` future so `mark_finished` can be called
-    // when the byte stream is fully exhausted (vs client disconnect, which drops
-    // the stream and this clone simultaneously without the `once` ever running).
-    let timer_for_finalizing = timer_for_stream.clone();
-
+    let req_ctx = crate::libs::request_context::request_context_store();
     let byte_stream = upstream.bytes_stream();
-    let mapped = byte_stream.map(move |chunk| {
-        match &chunk {
-            Ok(bytes) => {
-                if chunk_has_content(bytes) {
-                    timer_for_stream
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .on_content_frame();
+    let stream = async_stream::stream! {
+        // Keep the timer and usage accumulator inside the stream task. The old
+        // map/chain shape shared both through Arc<Mutex<_>>, taking a synchronous
+        // mutex on every token chunk even though the stream has only one poller.
+        let mut timer = StreamTimer::new("chat_completions", transport::NATIVE)
+            .with_request_context(req_ctx);
+        let mut usage = UsageTokens::default();
+        futures_util::pin_mut!(byte_stream);
+
+        while let Some(chunk) = byte_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if chunk_has_content(&bytes) {
+                        timer.on_content_frame();
+                    }
+                    if let Some(captured) = sniff_usage(&bytes) {
+                        usage = captured;
+                    }
+                    yield Ok::<bytes::Bytes, std::io::Error>(bytes);
                 }
-                if let Some(usage) = sniff_usage(bytes) {
-                    *usage_for_stream
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = usage;
+                Err(error) => {
+                    timer.mark_error();
+                    recorder.record(usage);
+                    yield Err(std::io::Error::other(error));
+                    return;
                 }
-            }
-            Err(_) => {
-                // Upstream read failure: record the stream as errored so
-                // proxy_stream_complete_seconds is labelled outcome="error".
-                timer_for_stream
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .mark_error();
             }
         }
-        chunk.map_err(std::io::Error::other)
-    });
 
-    // Record usage when the stream completes. The StreamTimer is captured by the
-    // `map` closure above (via `timer_for_stream`), so it drops — recording
-    // stream-complete — when the whole stream is dropped/exhausted, not in this
-    // terminal future. This `once` only flushes the accumulated usage.
-    let recorder_final = recorder.clone();
-    let usage_final = usage_acc.clone();
-    let finalizing = mapped.chain(futures_util::stream::once(async move {
-        // Stream was fully exhausted (client received all bytes) — mark as
-        // finished so the Drop outcome is "ok" rather than "cancelled".
-        timer_for_finalizing
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .mark_finished();
-        let usage = std::mem::take(
-            &mut *usage_final
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        recorder_final.record(usage);
-        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::new())
-    }));
+        timer.mark_finished();
+        recorder.record(usage);
+    };
 
-    let body = Body::from_stream(finalizing);
+    let body = Body::from_stream(stream);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -247,6 +216,14 @@ fn chunk_has_content(bytes: &[u8]) -> bool {
 /// Parse `data: {json}` lines out of an SSE chunk and return normalized usage
 /// if a chunk carries a `usage` object.
 fn sniff_usage(bytes: &[u8]) -> Option<crate::libs::token_usage::UsageTokens> {
+    // Usage only appears in the terminal chunk. Skip UTF-8 line walking and JSON
+    // parsing for ordinary token deltas on this otherwise byte-for-byte path.
+    if !bytes
+        .windows(b"\"usage\"".len())
+        .any(|window| window == b"\"usage\"")
+    {
+        return None;
+    }
     let text = std::str::from_utf8(bytes).ok()?;
     let mut found = None;
     for line in text.lines() {
@@ -261,4 +238,59 @@ fn sniff_usage(bytes: &[u8]) -> Option<crate::libs::token_usage::UsageTokens> {
         }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message(role: &str, content: Option<Value>) -> Message {
+        Message {
+            role: role.to_string(),
+            content,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn request_id_content_scans_typed_messages_without_a_full_value_round_trip() {
+        let messages = vec![
+            message("user", Some(json!("older"))),
+            message("assistant", Some(json!("answer"))),
+            message(
+                "user",
+                Some(json!([
+                    {"type": "tool_result", "content": "ignored"},
+                    {"type": "text", "text": "latest", "cache_control": {"type": "ephemeral"}}
+                ])),
+            ),
+        ];
+
+        assert_eq!(
+            last_user_content(&messages).as_deref(),
+            Some(r#"[{"type":"text","text":"latest","cache_control":null}]"#)
+        );
+    }
+
+    #[test]
+    fn request_id_content_skips_empty_newer_user_messages() {
+        let messages = vec![
+            message("user", Some(json!("usable"))),
+            message("user", Some(json!(""))),
+            message("user", None),
+        ];
+
+        assert_eq!(last_user_content(&messages).as_deref(), Some("usable"));
+    }
+
+    #[test]
+    fn usage_sniffer_skips_non_terminal_token_chunks() {
+        assert!(sniff_usage(
+            br#"data: {"choices":[{"delta":{"content":"hello"}}]}
+
+"#
+        )
+        .is_none());
+    }
 }

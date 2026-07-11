@@ -23,8 +23,8 @@ use crate::routes::messages::api_flows::{
 };
 use crate::routes::messages::preprocess::{
     apply_last_message_cache_control, get_compact_type, get_last_message_content_cache_control,
-    merge_tool_result_for_claude, normalize_system_messages, sanitize_ide_tools,
-    strip_tool_reference_turn_boundary,
+    merge_tool_result_for_claude, normalize_system_messages, prepare_messages_api_payload,
+    sanitize_ide_tools, strip_tool_reference_turn_boundary,
 };
 use crate::routes::responses::utils::get_responses_transport_for_model;
 use crate::services::copilot::create_messages::CONTEXT_1M_BETA;
@@ -225,10 +225,18 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         set_model(&mut payload, &model.id);
     }
 
+    // Apply native-Messages-only preprocessing while the payload is still a
+    // Value. Doing it here avoids a typed -> Value -> typed round trip over the
+    // complete conversation inside `handle_with_messages_api`.
+    let use_messages_api = should_use_messages_api(selected_model.as_ref());
+    if use_messages_api {
+        prepare_messages_api_payload(&mut payload, selected_model.as_ref());
+    }
+
     // 8. Dispatch. Deserialize the fully-preprocessed payload for the flows.
     // `payload` is not read after this point, so consume it (`from_value` takes
     // the `Value` by value) rather than cloning a potentially multi-MB body.
-    let mut typed = deserialize_payload_owned(payload)?;
+    let typed = deserialize_payload_owned(payload)?;
     let options = FlowOptions {
         subagent_marker,
         selected_model: selected_model.clone(),
@@ -238,8 +246,8 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         compact_type: Some(compact_type),
     };
 
-    if should_use_messages_api(selected_model.as_ref()) {
-        return handle_with_messages_api(&mut typed, options).await;
+    if use_messages_api {
+        return handle_with_messages_api(&typed, options).await;
     }
 
     if should_use_responses_api(selected_model.as_ref(), compact_type) {
