@@ -83,6 +83,17 @@ pub fn client() -> &'static reqwest::Client {
     &CLIENT
 }
 
+/// Serialize a JSON request into a reference-counted body.
+///
+/// Upstream retry and inline-auth-replay closures must clone the body before
+/// each send. `Bytes::clone` is O(1), unlike cloning the serialized `Vec<u8>`,
+/// which copied the complete conversation even on the first attempt.
+pub fn serialize_json_body<T: serde::Serialize + ?Sized>(
+    value: &T,
+) -> Result<bytes::Bytes, serde_json::Error> {
+    serde_json::to_vec(value).map(bytes::Bytes::from)
+}
+
 /// The `endpoint` label values for upstream calls that route through
 /// [`send_with_connect_retry`]. Defined as named constants and used at BOTH the
 /// call sites and the pre-registration below, so a new/renamed endpoint can't
@@ -153,8 +164,9 @@ pub fn preregister_retry_metrics() {
 /// transient-connect failures seen under concurrency.
 ///
 /// `endpoint` is a bounded label (messages | chat | responses | embeddings |
-/// models | codex) used only for the retry counter metric. The builder must be cloneable (our bodies are owned
-/// `Vec<u8>`, so `try_clone` always succeeds); if it somehow isn't, we send once.
+/// models | codex) used only for the retry counter metric. The builder must be
+/// cloneable (our bodies are owned `Bytes`, so `try_clone` always succeeds); if
+/// it somehow isn't, we send once.
 pub async fn send_with_connect_retry(
     builder: reqwest::RequestBuilder,
     endpoint: &'static str,
@@ -346,9 +358,9 @@ fn next_retry_delay(
 ///
 /// Backoff is small and jittered (~250ms base, see [`RETRY_BACKOFF_BASE_MS`]); a
 /// `Retry-After` header on a retryable status is honored and capped. `endpoint`
-/// is a bounded label used only for the retry counter. Bodies are owned
-/// `Vec<u8>`, so `try_clone` always succeeds; if it somehow doesn't, the request
-/// is sent once with no retry.
+/// is a bounded label used only for the retry counter. Bodies are owned `Bytes`,
+/// so `try_clone` always succeeds; if it somehow doesn't, the request is sent
+/// once with no retry.
 pub async fn send_with_retry(
     builder: reqwest::RequestBuilder,
     endpoint: &'static str,
@@ -588,15 +600,20 @@ mod tests {
         // send_with_connect_retry depends on try_clone() succeeding so it can
         // replay the request after a connect failure. A request built with an
         // owned byte body (as all our upstream calls are) must be cloneable;
-        // streaming bodies would not be, which is why we only use owned Vec<u8>.
+        // streaming bodies would not be.
+        let body = serialize_json_body(&serde_json::json!({"messages": ["hello"]})).unwrap();
+        let cloned = body.clone();
+        assert_eq!(
+            body.as_ptr(),
+            cloned.as_ptr(),
+            "retry-body clones must share the serialized allocation"
+        );
         let req = client()
             .post("http://127.0.0.1:0/v1/messages")
-            .body(vec![1u8, 2, 3])
+            .body(body)
             .build()
             .unwrap();
-        let rebuilt = client()
-            .post("http://127.0.0.1:0/v1/messages")
-            .body(vec![1u8, 2, 3]);
+        let rebuilt = client().post("http://127.0.0.1:0/v1/messages").body(cloned);
         assert!(
             rebuilt.try_clone().is_some(),
             "owned-body requests must be cloneable so the retry can replay them"

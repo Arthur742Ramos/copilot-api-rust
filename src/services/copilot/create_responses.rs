@@ -24,7 +24,7 @@ use crate::libs::api_config::{
 use crate::libs::compact::COMPACT_REQUEST;
 use crate::libs::copilot_rate_limit::log_copilot_rate_limits;
 use crate::libs::error::{http_error_from_response, HttpError};
-use crate::libs::http::client;
+use crate::libs::http::{client, serialize_json_body};
 use crate::libs::state;
 use crate::libs::subagent::SubagentMarker;
 
@@ -1018,7 +1018,7 @@ async fn create_http_responses(
     stream: bool,
 ) -> Result<CreateResponsesReturn, HttpError> {
     let base = copilot_base_url(st);
-    let body = serde_json::to_vec(&payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    let body = serialize_json_body(&payload).map_err(|e| HttpError::internal(format!("{e}")))?;
     // The owned request tree can be very large; once serialized, release it
     // before waiting on the upstream response rather than retaining both forms.
     drop(payload);

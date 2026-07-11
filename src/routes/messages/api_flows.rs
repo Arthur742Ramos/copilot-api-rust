@@ -42,7 +42,6 @@ use crate::routes::messages::anthropic_types::{
 use crate::routes::messages::non_stream_translation::{
     translate_to_anthropic, translate_to_openai,
 };
-use crate::routes::messages::preprocess::prepare_messages_api_payload;
 use crate::routes::messages::responses_stream_translation::{
     build_error_event, translate_responses_stream_event, ResponsesStreamState,
 };
@@ -110,12 +109,18 @@ pub struct FlowOptions {
 // SSE helpers
 // ---------------------------------------------------------------------------
 
-/// Render one translated Anthropic event as an SSE frame
-/// (`event: {type}\ndata: {json}\n\n`). Returns `None` if the event cannot be
-/// serialized (never happens for the wire types here).
-fn emit_event(event: &AnthropicStreamEventData) -> Option<String> {
-    let data = serde_json::to_string(event).ok()?;
-    Some(format!("event: {}\ndata: {data}\n\n", event.event_name()))
+/// Render one translated Anthropic event directly into its final SSE bytes.
+/// Serializing into the frame buffer avoids the previous intermediate JSON
+/// `String` plus a second allocation/copy for every streamed token event.
+fn emit_event(event: &AnthropicStreamEventData) -> Option<Bytes> {
+    let event_name = event.event_name();
+    let mut frame = Vec::with_capacity(event_name.len() + 128);
+    frame.extend_from_slice(b"event: ");
+    frame.extend_from_slice(event_name.as_bytes());
+    frame.extend_from_slice(b"\ndata: ");
+    serde_json::to_writer(&mut frame, event).ok()?;
+    frame.extend_from_slice(b"\n\n");
+    Some(Bytes::from(frame))
 }
 
 /// Count an upstream SSE chunk we could not JSON-parse, so a flaky upstream
@@ -254,7 +259,7 @@ pub async fn handle_with_chat_completions(
                             if let Some(frame) =
                                 emit_event(&translate_error_to_anthropic_error_event(Some(&e)))
                             {
-                                yield Ok(Bytes::from(frame));
+                                yield Ok(frame);
                             }
                             // Record whatever usage was sniffed before the error so
                             // partial-stream accounting isn't silently dropped.
@@ -287,7 +292,7 @@ pub async fn handle_with_chat_completions(
                     for event in translate_chunk_to_anthropic_events(&chunk, &mut state) {
                         if let Some(frame) = emit_event(&event) {
                             timer.on_content_frame();
-                            yield Ok(Bytes::from(frame));
+                            yield Ok(frame);
                         }
                     }
                 }
@@ -315,7 +320,7 @@ pub async fn handle_with_chat_completions(
                 for event in flush_pending_anthropic_stream_events(&mut state) {
                     if let Some(frame) = emit_event(&event) {
                         timer.on_content_frame();
-                        yield Ok(Bytes::from(frame));
+                        yield Ok(frame);
                     }
                 }
 
@@ -439,7 +444,7 @@ pub async fn handle_with_responses_api(
                             let error_event =
                                 build_error_event("An unexpected error occurred during streaming.");
                             if let Some(frame) = emit_event(&error_event) {
-                                yield Ok(Bytes::from(frame));
+                                yield Ok(frame);
                             }
                             recorder.record(usage);
                             return;
@@ -476,7 +481,7 @@ pub async fn handle_with_responses_api(
                     for event in translate_responses_stream_event(&response_event, &mut state) {
                         if let Some(frame) = emit_event(&event) {
                             timer.on_content_frame();
-                            yield Ok(Bytes::from(frame));
+                            yield Ok(frame);
                         }
                     }
 
@@ -494,7 +499,7 @@ pub async fn handle_with_responses_api(
                     let error_event =
                         build_error_event("Responses stream ended without completion");
                     if let Some(frame) = emit_event(&error_event) {
-                        yield Ok(Bytes::from(frame));
+                        yield Ok(frame);
                     }
                 }
 
@@ -521,16 +526,9 @@ pub async fn handle_with_responses_api(
 
 /// Mirrors `handleWithMessagesApi`.
 pub async fn handle_with_messages_api(
-    payload: &mut AnthropicMessagesPayload,
+    payload: &AnthropicMessagesPayload,
     opts: FlowOptions,
 ) -> Result<Response, AppError> {
-    // `prepareMessagesApiPayload(anthropicPayload, selectedModel)` mutates the
-    // payload in place; our preprocess works on a `Value`, so round-trip through
-    // one (unknown keys flow through `extra`).
-    let mut value = serde_json::to_value(&*payload)?;
-    prepare_messages_api_payload(&mut value, opts.selected_model.as_ref());
-    *payload = serde_json::from_value(value)?;
-
     // Capture context in-scope for the deferred stream body + summary line.
     let req_ctx = crate::libs::request_context::request_context_store();
     if let Some(ctx) = &req_ctx {
@@ -601,7 +599,7 @@ pub async fn handle_with_messages_api(
                             if let Some(frame) =
                                 emit_event(&translate_error_to_anthropic_error_event(Some(&e)))
                             {
-                                yield Ok(Bytes::from(frame));
+                                yield Ok(frame);
                             }
                             // Record sniffed usage (message_start input tokens are
                             // captured early here) before bailing on the error.
@@ -620,34 +618,33 @@ pub async fn handle_with_messages_api(
                         continue;
                     }
 
-                    // Sniff usage from message_start / message_delta without
-                    // disturbing the raw-forwarded bytes.
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-                        match parsed.get("type").and_then(Value::as_str) {
-                            Some("message_start") => {
-                                message_started = true;
-                                let next = normalize_anthropic_usage(
-                                    parsed.get("message").and_then(|m| m.get("usage")),
-                                );
-                                usage = merge_anthropic_usage(usage, next);
+                    // Only message_start/message_delta/message_stop can affect
+                    // accounting or terminal state. Avoid a JSON parse for the
+                    // overwhelmingly common content-block token deltas.
+                    if native_message_event_needs_inspection(event_name.as_deref(), &data) {
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                            match parsed.get("type").and_then(Value::as_str) {
+                                Some("message_start") => {
+                                    message_started = true;
+                                    let next = normalize_anthropic_usage(
+                                        parsed.get("message").and_then(|m| m.get("usage")),
+                                    );
+                                    usage = merge_anthropic_usage(usage, next);
+                                }
+                                Some("message_delta") => {
+                                    let next = normalize_anthropic_usage(parsed.get("usage"));
+                                    usage = merge_anthropic_usage(usage, next);
+                                }
+                                Some("message_stop") => {
+                                    message_stopped = true;
+                                }
+                                _ => {}
                             }
-                            Some("message_delta") => {
-                                let next = normalize_anthropic_usage(parsed.get("usage"));
-                                usage = merge_anthropic_usage(usage, next);
-                            }
-                            Some("message_stop") => {
-                                message_stopped = true;
-                            }
-                            _ => {}
                         }
                     }
 
-                    let frame = match event_name {
-                        Some(name) => format!("event: {name}\ndata: {data}\n\n"),
-                        None => format!("data: {data}\n\n"),
-                    };
                     timer.on_content_frame();
-                    yield Ok(Bytes::from(frame));
+                    yield Ok(native_message_frame(event_name.as_deref(), &data));
                 }
 
                 // Upstream ended without terminating a started message: synthesize
@@ -657,7 +654,7 @@ pub async fn handle_with_messages_api(
                         "messages stream ended without message_stop; synthesizing terminal event"
                     );
                     if let Some(frame) = emit_event(&AnthropicStreamEventData::MessageStop) {
-                        yield Ok(Bytes::from(frame));
+                        yield Ok(frame);
                     }
                 }
 
@@ -666,6 +663,29 @@ pub async fn handle_with_messages_api(
             Ok(sse_response(stream))
         }
     }
+}
+
+fn native_message_event_needs_inspection(event_name: Option<&str>, data: &str) -> bool {
+    matches!(
+        event_name,
+        Some("message_start" | "message_delta" | "message_stop")
+    ) || ["\"message_start\"", "\"message_delta\"", "\"message_stop\""]
+        .iter()
+        .any(|kind| data.contains(kind))
+}
+
+fn native_message_frame(event_name: Option<&str>, data: &str) -> Bytes {
+    let event_len = event_name.map_or(0, str::len);
+    let mut frame = Vec::with_capacity(event_len + data.len() + 16);
+    if let Some(event_name) = event_name {
+        frame.extend_from_slice(b"event: ");
+        frame.extend_from_slice(event_name.as_bytes());
+        frame.push(b'\n');
+    }
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(data.as_bytes());
+    frame.extend_from_slice(b"\n\n");
+    Bytes::from(frame)
 }
 
 // ---------------------------------------------------------------------------
@@ -848,8 +868,8 @@ mod tests {
     fn emit_event_frame_format() {
         let frame = emit_event(&AnthropicStreamEventData::MessageStop).unwrap();
         assert_eq!(
-            frame,
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            frame.as_ref(),
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
         );
     }
 
@@ -859,6 +879,7 @@ mod tests {
         // complete Anthropic `error` SSE event so Claude Code can retry instead of
         // hanging on a truncated body.
         let frame = emit_event(&translate_error_to_anthropic_error_event(None)).unwrap();
+        let frame = std::str::from_utf8(&frame).unwrap();
         assert!(frame.starts_with("event: error\ndata: "));
         assert!(frame.ends_with("\n\n"));
 
@@ -876,6 +897,30 @@ mod tests {
                     "message": "An unexpected error occurred during streaming."
                 }
             })
+        );
+    }
+
+    #[test]
+    fn native_message_inspection_skips_token_deltas() {
+        assert!(!native_message_event_needs_inspection(
+            Some("content_block_delta"),
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}"#
+        ));
+        assert!(native_message_event_needs_inspection(
+            Some("message_delta"),
+            r#"{"type":"message_delta","usage":{"output_tokens":1}}"#
+        ));
+    }
+
+    #[test]
+    fn native_message_frame_preserves_existing_wire_format() {
+        assert_eq!(
+            native_message_frame(Some("content_block_delta"), r#"{"type":"delta"}"#).as_ref(),
+            b"event: content_block_delta\ndata: {\"type\":\"delta\"}\n\n"
+        );
+        assert_eq!(
+            native_message_frame(None, "[DONE]").as_ref(),
+            b"data: [DONE]\n\n"
         );
     }
 }

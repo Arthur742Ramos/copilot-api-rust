@@ -22,34 +22,38 @@ pub(crate) fn find_last_user_content(messages: &[serde_json::Value]) -> Option<S
         if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
             continue;
         }
-        let content = match msg.get("content") {
-            Some(c) if !c.is_null() => c,
-            _ => continue,
-        };
-        if let Some(s) = content.as_str() {
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-            continue;
-        }
-        if let Some(arr) = content.as_array() {
-            let filtered: Vec<serde_json::Value> = arr
-                .iter()
-                .filter(|n| n.get("type").and_then(|t| t.as_str()) != Some("tool_result"))
-                .map(|n| {
-                    let mut cloned = n.clone();
-                    if let Some(obj) = cloned.as_object_mut() {
-                        obj.insert("cache_control".to_string(), serde_json::Value::Null);
-                    }
-                    cloned
-                })
-                .collect();
-            if !filtered.is_empty() {
-                return serde_json::to_string(&filtered).ok();
-            }
+        if let Some(content) = msg.get("content").and_then(request_id_user_content) {
+            return Some(content);
         }
     }
     None
+}
+
+/// Normalize one user-message `content` value for deterministic request IDs.
+/// Typed request handlers can call this directly and avoid serializing every
+/// message in the conversation into an intermediate `Vec<Value>`.
+pub(crate) fn request_id_user_content(content: &serde_json::Value) -> Option<String> {
+    if content.is_null() {
+        return None;
+    }
+    if let Some(s) = content.as_str() {
+        return (!s.is_empty()).then(|| s.to_string());
+    }
+    let arr = content.as_array()?;
+    let filtered: Vec<serde_json::Value> = arr
+        .iter()
+        .filter(|n| n.get("type").and_then(|t| t.as_str()) != Some("tool_result"))
+        .map(|n| {
+            let mut cloned = n.clone();
+            if let Some(obj) = cloned.as_object_mut() {
+                obj.insert("cache_control".to_string(), serde_json::Value::Null);
+            }
+            cloned
+        })
+        .collect();
+    (!filtered.is_empty())
+        .then(|| serde_json::to_string(&filtered).ok())
+        .flatten()
 }
 
 /// Mirrors `generateRequestIdFromPayload`. Derives a deterministic request id
