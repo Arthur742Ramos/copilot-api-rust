@@ -59,6 +59,29 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// Render a locally generated failure in the complete Anthropic error envelope.
+///
+/// Use this helper for local route and middleware failures that do not have an
+/// upstream response to normalize. Anthropic SDKs require the top-level
+/// `type: "error"` discriminator in addition to the nested error type.
+pub fn anthropic_error_response(
+    status: StatusCode,
+    error_type: impl Into<String>,
+    message: impl Into<String>,
+) -> Response {
+    (
+        status,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": error_type.into(),
+                "message": message.into(),
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// Build an HttpError from a non-OK reqwest response, consuming its body.
 pub async fn http_error_from_response(
     message: impl Into<String>,
@@ -284,14 +307,7 @@ impl IntoResponse for AppError {
             }
             AppError::BadRequest(message) => {
                 tracing::warn!("Bad request: {message}");
-                let body = Json(json!({
-                    "type": "error",
-                    "error": {
-                        "message": message,
-                        "type": "invalid_request_error",
-                    }
-                }));
-                (StatusCode::BAD_REQUEST, body).into_response()
+                anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
             }
             AppError::Other(e) => {
                 let message = internal_reference_message();
@@ -299,14 +315,7 @@ impl IntoResponse for AppError {
                     error = ?e,
                     "internal error"
                 );
-                let body = Json(json!({
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": message,
-                    }
-                }));
-                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+                anthropic_error_response(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message)
             }
         }
     }

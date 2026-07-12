@@ -210,6 +210,7 @@ fn unauthorized_response() -> Response {
         axum::http::HeaderValue::from_static("Bearer realm=\"copilot-api\""),
     );
     let body = Json(json!({
+        "type": "error",
         "error": {
             "message": "Unauthorized",
             "type": "authentication_error",

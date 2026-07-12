@@ -163,5 +163,7 @@ async fn oversize_body_returns_json_shaped_413() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     let json: serde_json::Value =
         serde_json::from_slice(&body).expect("413 body must be JSON, not plain text");
-    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "request_too_large");
+    assert_eq!(json["error"]["message"], "Request body is too large.");
 }

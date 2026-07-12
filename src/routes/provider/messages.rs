@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::libs::config::{ModelConfig, ResolvedProviderConfig};
-use crate::libs::error::{http_error_from_response, AppError};
+use crate::libs::error::{anthropic_error_response, http_error_from_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{
     create_provider_token_usage_recorder, merge_anthropic_usage, normalize_anthropic_usage,
@@ -119,17 +119,11 @@ pub async fn handle_provider_messages_for_provider(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let Some(provider_config) = resolve_provider_config(&provider).await else {
-        return Ok((
+        return Ok(anthropic_error_response(
             StatusCode::NOT_FOUND,
-            Json(json!({
-                "type": "error",
-                "error": {
-                    "message": format!("Provider '{provider}' not found or disabled"),
-                    "type": "invalid_request_error",
-                }
-            })),
-        )
-            .into_response());
+            "invalid_request_error",
+            format!("Provider '{provider}' not found or disabled"),
+        ));
     };
 
     let model_config = provider_config

@@ -8,9 +8,7 @@ use axum::extract::Request;
 use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
 use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::json;
+use axum::response::Response;
 
 const ZSTD_CONTENT_ENCODING: &str = "zstd";
 
@@ -90,34 +88,26 @@ fn decompress_zstd(input: &[u8]) -> Result<Vec<u8>, DecompressError> {
 }
 
 fn invalid_body() -> Response {
-    (
+    crate::libs::error::anthropic_error_response(
         StatusCode::BAD_REQUEST,
-        Json(json!({
-            "error": {
-                "message": "Failed to decompress zstd request body.",
-                "type": "invalid_request_error",
-            }
-        })),
+        "invalid_request_error",
+        "Failed to decompress zstd request body.",
     )
-        .into_response()
 }
 
 fn payload_too_large() -> Response {
-    (
+    crate::libs::error::anthropic_error_response(
         StatusCode::PAYLOAD_TOO_LARGE,
-        Json(json!({
-            "error": {
-                "message": "Request body is too large.",
-                "type": "invalid_request_error",
-            }
-        })),
+        "request_too_large",
+        "Request body is too large.",
     )
-        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::decompress_zstd;
+    use super::{decompress_zstd, invalid_body, payload_too_large};
+    use axum::http::StatusCode;
+    use http_body_util::BodyExt;
 
     // zstd frame for the bytes "hello zstd world" (produced by the zstd CLI).
     const HELLO_FRAME: &[u8] = &[
@@ -134,5 +124,43 @@ mod tests {
     #[test]
     fn rejects_non_zstd_input() {
         assert!(decompress_zstd(b"not a zstd frame at all").is_err());
+    }
+
+    async fn assert_complete_error(
+        response: axum::response::Response,
+        status: StatusCode,
+        error_type: &str,
+        message: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect error body")
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error response is JSON");
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], error_type);
+        assert_eq!(body["error"]["message"], message);
+    }
+
+    #[tokio::test]
+    async fn zstd_failures_use_complete_anthropic_envelopes() {
+        assert_complete_error(
+            invalid_body(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Failed to decompress zstd request body.",
+        )
+        .await;
+        assert_complete_error(
+            payload_too_large(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "Request body is too large.",
+        )
+        .await;
     }
 }
