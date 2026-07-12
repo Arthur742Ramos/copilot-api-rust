@@ -1778,31 +1778,74 @@ fn handle_output_text_done(
     events
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesTerminalKind {
+    Completed,
+    Incomplete,
+}
+
+impl ResponsesTerminalKind {
+    fn from_event(event: &Value) -> Option<Self> {
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => Some(Self::Completed),
+            Some("response.incomplete") => Some(Self::Incomplete),
+            _ => None,
+        }
+    }
+
+    fn expected_status(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
 fn handle_response_completed(
     event: &Value,
     state: &mut ResponsesStreamState,
 ) -> Vec<AnthropicStreamEventData> {
-    let Some(response) = event
-        .get("response")
-        .filter(|response| response.is_object())
-    else {
+    let Some(terminal_kind) = ResponsesTerminalKind::from_event(event) else {
         return terminate_responses_stream_with_error(
             state,
-            build_error_event("A terminal Responses event was missing its response object."),
+            build_error_event("An unrecognized Responses event reached terminal handling."),
         );
     };
-    let expected_status =
-        if event.get("type").and_then(Value::as_str) == Some("response.incomplete") {
-            "incomplete"
-        } else {
-            "completed"
-        };
-    if response.get("status").and_then(Value::as_str) != Some(expected_status) {
+
+    let empty_response = json!({});
+    let response = match event.get("response") {
+        Some(response) if response.is_object() => response,
+        None if terminal_kind == ResponsesTerminalKind::Incomplete => &empty_response,
+        _ => {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event(
+                    "A terminal Responses event contained an invalid response object.",
+                ),
+            )
+        }
+    };
+
+    if terminal_kind == ResponsesTerminalKind::Completed
+        && response.get("id").and_then(Value::as_str).is_none()
+    {
         return terminate_responses_stream_with_error(
             state,
-            build_error_event("A terminal Responses event had an inconsistent response status."),
+            build_error_event("A response.completed event was missing its response id."),
         );
     }
+
+    if let Some(status) = response.get("status") {
+        if status.as_str() != Some(terminal_kind.expected_status()) {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event(
+                    "A terminal Responses event had an inconsistent response status.",
+                ),
+            );
+        }
+    }
+
     let mut events = Vec::new();
 
     let pending_output_item = state.output_items_by_index.values().any(|item| !item.done);
@@ -1831,16 +1874,22 @@ fn handle_response_completed(
         return terminate_responses_stream_with_error(
             state,
             build_error_event(
-                "The Responses stream completed before all output items emitted response.output_item.done.",
+                "The Responses stream terminated before all output items emitted response.output_item.done.",
             ),
         );
     }
 
+    let stop_reason = match map_responses_stop_reason(response, state.has_tool_call, terminal_kind)
+    {
+        Ok(stop_reason) => stop_reason,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
+    let usage = map_responses_usage_delta(response);
+
     finish_all_function_calls(state, &mut events);
     close_all_open_blocks(state, &mut events);
-
-    let stop_reason = map_responses_stop_reason(response, state.has_tool_call);
-    let usage = map_responses_usage_delta(response);
 
     events.push(AnthropicStreamEventData::MessageDelta {
         delta: AnthropicMessageDeltaBody {
@@ -1903,32 +1952,36 @@ fn handle_function_call_arguments_validation_error(
 // Result mapping (inlined from responses-translation.ts so this compiles alone)
 // ---------------------------------------------------------------------------
 
-/// Mirrors `mapResponsesStopReason`.
-fn map_responses_stop_reason(response: &Value, has_tool_call: bool) -> Option<String> {
-    let status = response.get("status").and_then(Value::as_str);
-
-    if status == Some("completed") {
+/// Maps the terminal event discriminator to Anthropic stop semantics. Codex
+/// 0.144.1 does not model `response.status` on `ResponseCompleted`, so the SSE
+/// event type is authoritative and status is only a consistency check.
+fn map_responses_stop_reason(
+    response: &Value,
+    has_tool_call: bool,
+    terminal_kind: ResponsesTerminalKind,
+) -> Result<Option<String>, &'static str> {
+    if terminal_kind == ResponsesTerminalKind::Completed {
         let output = response.get("output").and_then(Value::as_array);
         match output {
             None => {
-                return Some(
+                return Ok(Some(
                     if has_tool_call {
                         "tool_use"
                     } else {
                         "end_turn"
                     }
                     .to_string(),
-                );
+                ));
             }
             Some(items) if items.is_empty() => {
-                return Some(
+                return Ok(Some(
                     if has_tool_call {
                         "tool_use"
                     } else {
                         "end_turn"
                     }
                     .to_string(),
-                );
+                ));
             }
             Some(items) => {
                 let has_call = items.iter().any(|item| {
@@ -1937,25 +1990,24 @@ fn map_responses_stop_reason(response: &Value, has_tool_call: bool) -> Option<St
                         Some("function_call") | Some("tool_search_call")
                     )
                 });
-                return Some(if has_call { "tool_use" } else { "end_turn" }.to_string());
+                return Ok(Some(
+                    if has_call { "tool_use" } else { "end_turn" }.to_string(),
+                ));
             }
         }
     }
 
-    if status == Some("incomplete") {
-        let reason = response
-            .get("incomplete_details")
-            .and_then(|d| d.get("reason"))
-            .and_then(Value::as_str);
-        if reason == Some("max_output_tokens") {
-            return Some("max_tokens".to_string());
-        }
-        if reason == Some("content_filter") {
-            return Some("refusal".to_string());
+    let reason = response
+        .get("incomplete_details")
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str);
+    match reason {
+        Some("max_output_tokens") => Ok(Some("max_tokens".to_string())),
+        Some("content_filter") => Ok(Some("refusal".to_string())),
+        Some(_) | None => {
+            Err("The Responses stream ended incomplete without a supported truncation reason.")
         }
     }
-
-    None
 }
 
 /// Mirrors `mapResponsesUsage`, shaped for the streaming `message_delta`.
@@ -2167,6 +2219,7 @@ mod tests {
         let completed = json!({
             "type": "response.completed",
             "response": {
+                "id": "resp_1",
                 "status": "completed",
                 "output": [{
                     "type":"message",
@@ -2378,6 +2431,7 @@ mod tests {
             json!({
                 "type": "response.completed",
                 "response": {
+                    "id": "resp_test",
                     "status": "completed",
                     "output": [
                         {
@@ -2799,6 +2853,7 @@ mod tests {
             &json!({
                 "type":"response.completed",
                 "response":{
+                    "id":"resp_test",
                     "status":"completed",
                     "output":[{
                         "type":"reasoning",

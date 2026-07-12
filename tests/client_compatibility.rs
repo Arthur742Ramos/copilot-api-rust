@@ -342,6 +342,239 @@ fn reasoning_summary_fixture_item(model: &str) -> Option<Value> {
     })
 }
 
+fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
+    let created = (
+        "response.created",
+        json!({
+            "type":"response.created",
+            "sequence_number":0,
+            "response":{
+                "id":"resp_terminal_fixture",
+                "object":"response",
+                "model":model
+            }
+        }),
+    );
+    let usage = json!({
+        "input_tokens":11,
+        "input_tokens_details":{"cached_tokens":3},
+        "output_tokens":7,
+        "output_tokens_details":{"reasoning_tokens":2},
+        "total_tokens":18
+    });
+    let completed_no_status_usage = (
+        "response.completed",
+        json!({
+            "type":"response.completed",
+            "sequence_number":1,
+            "response":{"id":"resp_terminal_fixture","usage":usage.clone()}
+        }),
+    );
+    let completed_no_status_no_usage = (
+        "response.completed",
+        json!({
+            "type":"response.completed",
+            "sequence_number":1,
+            "response":{"id":"resp_terminal_fixture"}
+        }),
+    );
+    let incomplete_no_status_usage = (
+        "response.incomplete",
+        json!({
+            "type":"response.incomplete",
+            "sequence_number":1,
+            "response":{
+                "id":"resp_terminal_fixture",
+                "incomplete_details":{"reason":"max_output_tokens"},
+                "usage":usage
+            }
+        }),
+    );
+    let incomplete_no_status_no_usage = (
+        "response.incomplete",
+        json!({
+            "type":"response.incomplete",
+            "sequence_number":1,
+            "response":{"incomplete_details":{"reason":"content_filter"}}
+        }),
+    );
+    let pending_item = (
+        "response.output_item.added",
+        json!({
+            "type":"response.output_item.added",
+            "sequence_number":1,
+            "output_index":0,
+            "item":{"type":"reasoning","id":"pending-terminal","summary":[]}
+        }),
+    );
+    let failed = (
+        "response.failed",
+        json!({
+            "type":"response.failed",
+            "sequence_number":2,
+            "response":{
+                "id":"resp_terminal_fixture",
+                "error":{"code":"server_error","message":"canonical fixture failure"}
+            }
+        }),
+    );
+    let error = (
+        "error",
+        json!({
+            "type":"error",
+            "sequence_number":3,
+            "code":"stream_error",
+            "message":"canonical top-level error"
+        }),
+    );
+
+    let events = match model {
+        "gpt-terminal-completed-no-status-usage" => {
+            vec![created, completed_no_status_usage]
+        }
+        "gpt-terminal-completed-no-status-no-usage" => {
+            vec![created, completed_no_status_no_usage]
+        }
+        "gpt-terminal-completed-matching-status" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_terminal_fixture","status":"completed"}
+                }),
+            ),
+        ],
+        "gpt-terminal-completed-mismatched-status" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_terminal_fixture","status":"incomplete"}
+                }),
+            ),
+        ],
+        "gpt-terminal-incomplete-no-status-usage" => {
+            vec![created, incomplete_no_status_usage]
+        }
+        "gpt-terminal-incomplete-no-status-no-usage" => {
+            vec![created, incomplete_no_status_no_usage]
+        }
+        "gpt-terminal-incomplete-matching-status" => vec![
+            created,
+            (
+                "response.incomplete",
+                json!({
+                    "type":"response.incomplete",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_terminal_fixture",
+                        "status":"incomplete",
+                        "incomplete_details":{"reason":"max_output_tokens"}
+                    }
+                }),
+            ),
+        ],
+        "gpt-terminal-incomplete-mismatched-status" => vec![
+            created,
+            (
+                "response.incomplete",
+                json!({
+                    "type":"response.incomplete",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_terminal_fixture",
+                        "status":"completed",
+                        "incomplete_details":{"reason":"max_output_tokens"}
+                    }
+                }),
+            ),
+        ],
+        "gpt-terminal-completed-pending-item" => vec![
+            created,
+            pending_item,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":2,
+                    "response":{"id":"resp_terminal_fixture"}
+                }),
+            ),
+            error,
+        ],
+        "gpt-terminal-incomplete-pending-item" => vec![
+            created,
+            pending_item,
+            (
+                "response.incomplete",
+                json!({
+                    "type":"response.incomplete",
+                    "sequence_number":2,
+                    "response":{"incomplete_details":{"reason":"max_output_tokens"}}
+                }),
+            ),
+            error,
+        ],
+        "gpt-terminal-completed-repeated-later" => vec![
+            created,
+            completed_no_status_usage.clone(),
+            completed_no_status_usage,
+            incomplete_no_status_no_usage,
+            failed,
+            error,
+        ],
+        "gpt-terminal-incomplete-repeated-later" => vec![
+            created,
+            incomplete_no_status_usage.clone(),
+            incomplete_no_status_usage,
+            completed_no_status_no_usage,
+            failed,
+            error,
+        ],
+        "gpt-terminal-failed-later" => vec![created, failed, completed_no_status_no_usage, error],
+        "gpt-terminal-error-later" => vec![created, error, failed, completed_no_status_no_usage],
+        "gpt-terminal-incomplete-unknown-reason" => vec![
+            created,
+            (
+                "response.incomplete",
+                json!({
+                    "type":"response.incomplete",
+                    "sequence_number":1,
+                    "response":{"incomplete_details":{"reason":"unknown_fixture_reason"}}
+                }),
+            ),
+            completed_no_status_no_usage,
+        ],
+        "gpt-terminal-incomplete-missing-response" => vec![
+            created,
+            (
+                "response.incomplete",
+                json!({"type":"response.incomplete","sequence_number":1}),
+            ),
+            completed_no_status_no_usage,
+        ],
+        "gpt-terminal-completed-missing-id" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{}
+                }),
+            ),
+            error,
+        ],
+        _ => return None,
+    };
+
+    Some(sse_response(render_sse(&events)))
+}
+
 fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
     let created = (
         "response.created",
@@ -389,7 +622,6 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
                 "id":"resp_lifecycle_fixture",
                 "object":"response",
                 "created_at":1,
-                "status":"completed",
                 "model":model,
                 "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
             }
@@ -1404,6 +1636,9 @@ fn responses_fixture(body: &Value) -> Response {
     }
 
     if body["stream"] == true {
+        if let Some(response) = terminal_contract_stream_fixture(model) {
+            return response;
+        }
         if let Some(response) = reasoning_lifecycle_stream_fixture(model) {
             return response;
         }
@@ -2024,6 +2259,23 @@ fn configure(fixture: &Fixture) {
         "gpt-premature-eof",
         "gpt-incomplete",
         "gpt-cli-smoke",
+        "gpt-terminal-completed-no-status-usage",
+        "gpt-terminal-completed-no-status-no-usage",
+        "gpt-terminal-completed-matching-status",
+        "gpt-terminal-completed-mismatched-status",
+        "gpt-terminal-incomplete-no-status-usage",
+        "gpt-terminal-incomplete-no-status-no-usage",
+        "gpt-terminal-incomplete-matching-status",
+        "gpt-terminal-incomplete-mismatched-status",
+        "gpt-terminal-completed-pending-item",
+        "gpt-terminal-incomplete-pending-item",
+        "gpt-terminal-completed-repeated-later",
+        "gpt-terminal-incomplete-repeated-later",
+        "gpt-terminal-failed-later",
+        "gpt-terminal-error-later",
+        "gpt-terminal-incomplete-unknown-reason",
+        "gpt-terminal-incomplete-missing-response",
+        "gpt-terminal-completed-missing-id",
         "gpt-reasoning-absent-both",
         "gpt-reasoning-empty-array-id",
         "gpt-reasoning-empty-text-both",
@@ -3134,6 +3386,297 @@ async fn claude_incomplete_or_out_of_order_response_items_fail_once_without_succ
             "{model}: malformed lifecycle duplicated a carrier"
         );
     }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_completed_terminals_follow_codex_event_discriminator() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, input_tokens, output_tokens, cached_tokens) in [
+        (
+            "gpt-terminal-completed-no-status-usage",
+            8_i64,
+            7_i64,
+            Some(3_i64),
+        ),
+        ("gpt-terminal-completed-no-status-no-usage", 0, 0, None),
+        ("gpt-terminal-completed-matching-status", 0, 0, None),
+        ("gpt-terminal-completed-repeated-later", 8, 7, Some(3)),
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"complete"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            0,
+            "{model}: {events:#?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_delta")
+                .count(),
+            1,
+            "{model}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("message_stop"),
+            "{model}"
+        );
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("completed terminal emits message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn", "{model}");
+        assert_eq!(delta["usage"]["input_tokens"], input_tokens, "{model}");
+        assert_eq!(delta["usage"]["output_tokens"], output_tokens, "{model}");
+        assert_eq!(
+            delta["usage"]
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_i64),
+            cached_tokens,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_incomplete_terminals_preserve_truncation_semantics_without_status() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, stop_reason, input_tokens, output_tokens, cached_tokens) in [
+        (
+            "gpt-terminal-incomplete-no-status-usage",
+            "max_tokens",
+            8_i64,
+            7_i64,
+            Some(3_i64),
+        ),
+        (
+            "gpt-terminal-incomplete-no-status-no-usage",
+            "refusal",
+            0,
+            0,
+            None,
+        ),
+        (
+            "gpt-terminal-incomplete-matching-status",
+            "max_tokens",
+            0,
+            0,
+            None,
+        ),
+        (
+            "gpt-terminal-incomplete-repeated-later",
+            "max_tokens",
+            8,
+            7,
+            Some(3),
+        ),
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"truncate"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            0,
+            "{model}: {events:#?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("incomplete terminal emits truncation delta");
+        assert_eq!(delta["delta"]["stop_reason"], stop_reason, "{model}");
+        assert_eq!(delta["usage"]["input_tokens"], input_tokens, "{model}");
+        assert_eq!(delta["usage"]["output_tokens"], output_tokens, "{model}");
+        assert_eq!(
+            delta["usage"]
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_i64),
+            cached_tokens,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_terminal_contradictions_and_pending_state_fail_once() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for model in [
+        "gpt-terminal-completed-mismatched-status",
+        "gpt-terminal-incomplete-mismatched-status",
+        "gpt-terminal-completed-pending-item",
+        "gpt-terminal-incomplete-pending-item",
+        "gpt-terminal-incomplete-unknown-reason",
+        "gpt-terminal-incomplete-missing-response",
+        "gpt-terminal-completed-missing-id",
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"terminal error"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}: {events:#?}"
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["type"].as_str(),
+                Some("message_delta" | "message_stop")
+            )),
+            "{model}: contradictory terminal fabricated success"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_failed_and_error_terminals_suppress_all_later_terminals() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, expected_message) in [
+        ("gpt-terminal-failed-later", "canonical fixture failure"),
+        ("gpt-terminal-error-later", "canonical top-level error"),
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"fail"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        let errors: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 1, "{model}: {events:#?}");
+        assert_eq!(errors[0]["error"]["message"], expected_message, "{model}");
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["type"].as_str(),
+                Some("message_delta" | "message_stop")
+            )),
+            "{model}: failure terminal fabricated success"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn native_responses_forwards_statusless_codex_terminal_unchanged() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let (status, body) = send(post_json(
+        "/v1/responses",
+        codex_request("gpt-terminal-completed-no-status-usage", true),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let completed: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.completed")
+        .collect();
+    assert_eq!(completed.len(), 1, "{events:#?}");
+    assert_eq!(completed[0]["response"]["id"], "resp_terminal_fixture");
+    assert!(completed[0]["response"].get("status").is_none());
+    assert_eq!(completed[0]["response"]["usage"]["input_tokens"], 11);
+    assert!(
+        !events.iter().any(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("message_delta" | "message_stop")
+            )
+        }),
+        "native Responses events were translated into Anthropic events"
+    );
 }
 
 #[tokio::test]

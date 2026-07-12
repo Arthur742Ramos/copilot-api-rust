@@ -197,6 +197,17 @@ at `output_item.done` from its final non-empty arrays or the ordered buffers.
 This prevents duplicate separators when deltas and complete values both carry
 the same text while retaining content-only delta streams.
 
+The terminal contract is also source-backed. Codex's
+[`ResponseCompleted`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/sse/responses.rs#L112-L120)
+requires only `id`; `usage` and `end_turn` are optional, and it does not model
+`status`. Its checked-in
+[`ev_completed`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/core/tests/common/responses.rs#L643-L656)
+fixture therefore contains `id` and usage but no status. The parser handles
+`response.incomplete` directly from the event discriminator and optional
+`incomplete_details.reason`, while `response.failed` becomes an error from its
+nested error payload
+([source](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/sse/responses.rs#L386-L449)).
+
 Every incrementally streamed item must first have an active
 `response.output_item.added` at its non-negative output index. Optional item IDs
 may first appear on a later event and are then reconciled to that index; a
@@ -220,8 +231,19 @@ that was never completed through the item lifecycle is likewise rejected rather
 than silently discarded. When a terminal `output` array is supplied, its length,
 order, IDs, and complete item payloads must match the recorded
 `output_item.done` items; explicit omission or conflicts fail closed.
-Terminal events also require a response object whose status matches
-`response.completed` or `response.incomplete`.
+
+The SSE event type—not `response.status`—is the terminal discriminator:
+
+- `response.completed` requires the Codex-required response `id`. Optional
+  status is accepted only when it is `completed`; usage is optional and maps to
+  zero when absent.
+- `response.incomplete` accepts absent status and maps
+  `max_output_tokens` to Anthropic `max_tokens` and `content_filter` to
+  `refusal`. Unknown or missing truncation reasons terminate with one
+  Anthropic error rather than fabricating success. If status is present it must
+  be `incomplete`.
+- `response.failed` and top-level `error` terminate with one Anthropic error.
+  Any repeated or later terminal event is ignored.
 
 Lifecycle state is bounded: at most 4,096 output items, 4,096 reasoning parts,
 and 4,096 text parts are tracked. Stored item JSON, reasoning/text
@@ -237,6 +259,9 @@ evidence is in
 `claude_reasoning_content_deltas_cross_public_stream_losslessly`,
 `claude_reasoning_lifecycle_replays_and_adjacent_variants_are_deterministic`,
 `claude_standalone_done_items_render_complete_text_and_function_calls`,
+`claude_completed_terminals_follow_codex_event_discriminator`,
+`claude_incomplete_terminals_preserve_truncation_semantics_without_status`,
+`claude_failed_and_error_terminals_suppress_all_later_terminals`,
 and
 `claude_incomplete_or_out_of_order_response_items_fail_once_without_success`,
 in addition to the JSON/SSE framing regressions.
@@ -281,7 +306,7 @@ Status means deterministic, credential-free evidence exists.
 | Model routing | aliases, `[1m]`, provider models | aliases and `provider/model` | model helpers and provider boundary tests |
 | Unknown fields | retained in known top-level/items | retained in typed items; uninspected variants raw-preserved | captured extension sentinels and complete `ResponseItem` audit |
 | Cancellation | response-body drop releases admission/upstream resources | same | load-shedding and WebSocket cancellation tests |
-| Truncation | incomplete upstream becomes Anthropic error/stop semantics | `response.incomplete` remains terminal, never completed | failure boundary test |
+| Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
 | Chat Completions | translation fallback retained | not Codex 0.144.1's wire API | existing Chat Completions suite |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
@@ -304,7 +329,9 @@ authentication, body limits, admission, and JSON parsing:
 | malformed stream frame | one terminal Anthropic `error`; no `message_stop` | one terminal OpenAI `error` or `response.failed`; no completion |
 | premature EOF/transport reset | one retryable terminal error | one terminal OpenAI error; no completion |
 | incomplete/conflicting output-item lifecycle | one terminal Anthropic `error`; open blocks close; later events ignored | native Responses stream is forwarded unchanged |
-| `response.incomplete` | translated truncation semantics | forwarded once as terminal incomplete |
+| statusless `response.completed` | one `end_turn`/`tool_use` terminal; usage optional | forwarded unchanged |
+| `response.incomplete` | known truncation reason becomes one Anthropic terminal; unknown reason errors once | forwarded once as terminal incomplete |
+| `response.failed` / `error` | one Anthropic error; later terminals ignored | forwarded in native Responses shape |
 
 Correlation headers are allowlisted, and every router response also carries the
 gateway `x-trace-id`. Arbitrary upstream `x-*` headers and internal diagnostics
