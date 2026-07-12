@@ -163,16 +163,20 @@ content field is present (including an explicitly empty string); carrier-free
 aggregate-empty reasoning emits no fabricated
 Anthropic thinking/signature data.
 
-### Reasoning summary framing policy
+### Reasoning framing and stream lifecycle policy
 
 One policy is shared by JSON and SSE translations:
 
-1. Summary parts stay in ascending `summary_index`/array order.
-2. Each part's text is preserved byte-for-byte, including leading/trailing
-   whitespace and empty elements.
-3. Distinct parts are joined with exactly `U+2063` followed by one blank line
-   (`"\u2063\n\n"`), including boundaries adjacent to empty parts.
-4. Whitespace is inspected only to classify the whole summary as
+1. Summary parts stay in ascending `summary_index`/array order, followed by
+   reasoning-content parts in ascending `content_index`/array order.
+2. Every part's text is preserved byte-for-byte, including leading/trailing
+   whitespace and empty elements. `response.reasoning_text.delta` fragments are
+   accumulated at their `content_index`; an explicit empty delta still records
+   its part boundary.
+3. Distinct summary/content parts are joined with exactly `U+2063` followed by
+   one blank line (`"\u2063\n\n"`), including boundaries adjacent to empty
+   parts.
+4. Whitespace is inspected only to classify the whole reasoning item as
    aggregate-empty. An aggregate-empty item with an `id` or
    `encrypted_content` field emits `Thinking...` plus its exact carrier; a
    carrier-free aggregate-empty item emits no thinking block or signature.
@@ -183,14 +187,59 @@ Codex 0.144.1
 [`process_responses_event`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/sse/responses.rs#L326-L465)
 parses `response.reasoning_summary_part.added`,
 `response.reasoning_summary_text.delta`, and
-`response.reasoning_summary_text.done`, followed by the authoritative
-`response.output_item.done`. The stream bridge buffers those fragments by
-`output_index`/`summary_index`, assigns rather than appends the complete `done`
-text, and renders once from the final item (or the ordered buffer if the final
-summary is absent). This prevents duplicate separators when a part event is
-repeated or when deltas and done events both carry the text. Exact public
-evidence is in `claude_reasoning_content_framing_nonstream_is_lossless` and
-`claude_reasoning_content_framing_stream_matches_nonstream_exactly`.
+`response.reasoning_summary_text.done`,
+`response.reasoning_text.delta`, `response.output_item.added`, and the
+authoritative `response.output_item.done`. It has no paired
+`response.reasoning_text.done` mapping in this version. The stream bridge
+therefore buffers summary/content fragments by output and part index, assigns
+rather than appends authoritative summary `text.done` values, and renders once
+at `output_item.done` from its final non-empty arrays or the ordered buffers.
+This prevents duplicate separators when deltas and complete values both carry
+the same text while retaining content-only delta streams.
+
+Every incrementally streamed item must first have an active
+`response.output_item.added` at its non-negative output index. Optional item IDs
+may first appear on a later event and are then reconciled to that index; a
+non-empty ID cannot move between indices. Structurally identical replayed
+`added` and `done` items are safely ignored. Conflicting replays, deltas after
+summary/item completion, wrong item/call IDs or function names, missing
+reasoning `delta`/`text` payloads, and missing/negative indices produce one
+terminal Anthropic `error`. A complete item with no incremental
+events may still arrive as a standalone `output_item.done`; complete message
+text and function-call arguments are rendered from that item exactly once.
+Streamed message text and function arguments are reconciled with their complete
+`done` values: a verified missing suffix is emitted, while a conflicting value
+terminates with an error rather than returning truncated text or JSON.
+
+When provider events include OpenAI `sequence_number`, it must increase
+monotonically; an immediately replayed identical frame is ignored, while reused
+or decreasing numbers fail closed. Summary and reasoning-content part indices
+must be contiguous from zero at item completion, so a sparse stream cannot
+silently erase an empty boundary. A terminal response containing an output item
+that was never completed through the item lifecycle is likewise rejected rather
+than silently discarded. When a terminal `output` array is supplied, its length,
+order, IDs, and complete item payloads must match the recorded
+`output_item.done` items; explicit omission or conflicts fail closed.
+Terminal events also require a response object whose status matches
+`response.completed` or `response.incomplete`.
+
+Lifecycle state is bounded: at most 4,096 output items, 4,096 reasoning parts,
+and 4,096 text parts are tracked. Stored item JSON, reasoning/text
+reconciliation data, and queued function arguments share the existing 16 MiB
+upstream-response budget. Exceeding a bound uses the same one-error terminal
+cleanup instead of allowing an unfinished stream to grow memory without limit.
+
+`response.completed` and `response.incomplete` cannot produce Anthropic success
+while an added output item, function call, or reasoning buffer is unfinished.
+The bridge closes open blocks, clears lifecycle state, emits exactly one native
+Anthropic terminal error, and ignores all later provider events. Exact public
+evidence is in
+`claude_reasoning_content_deltas_cross_public_stream_losslessly`,
+`claude_reasoning_lifecycle_replays_and_adjacent_variants_are_deterministic`,
+`claude_standalone_done_items_render_complete_text_and_function_calls`,
+and
+`claude_incomplete_or_out_of_order_response_items_fail_once_without_success`,
+in addition to the JSON/SSE framing regressions.
 
 The `U+2063` boundary follows the
 [audited TypeScript reference](https://github.com/caozhiyuan/copilot-api/blob/cd8207cb70ede07771bf37a04accfbf2af76d980/src/routes/messages/responses-translation.ts#L70-L75).
@@ -227,7 +276,7 @@ Status means deterministic, credential-free evidence exists.
 | Tool definitions/results | tool use/result, multi-turn | function/custom/tool-search calls and outputs, including optional IDs | optional-item boundary audit |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
 | Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
-| Thinking/reasoning | exact optional carriers; lossless whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders | reasoning items with every optional ID/encrypted-content combination | public request-carrier, framing, and empty-summary regressions in both modes |
+| Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
 | Usage | Anthropic cache/input/output fields | OpenAI cached/reasoning token details | native response assertions |
 | Model routing | aliases, `[1m]`, provider models | aliases and `provider/model` | model helpers and provider boundary tests |
 | Unknown fields | retained in known top-level/items | retained in typed items; uninspected variants raw-preserved | captured extension sentinels and complete `ResponseItem` audit |
@@ -254,6 +303,7 @@ authentication, body limits, admission, and JSON parsing:
 | upstream 4xx/5xx | status preserved, sanitized native envelope | status preserved, sanitized native envelope |
 | malformed stream frame | one terminal Anthropic `error`; no `message_stop` | one terminal OpenAI `error` or `response.failed`; no completion |
 | premature EOF/transport reset | one retryable terminal error | one terminal OpenAI error; no completion |
+| incomplete/conflicting output-item lifecycle | one terminal Anthropic `error`; open blocks close; later events ignored | native Responses stream is forwarded unchanged |
 | `response.incomplete` | translated truncation semantics | forwarded once as terminal incomplete |
 
 Correlation headers are allowlisted, and every router response also carries the

@@ -328,8 +328,989 @@ fn reasoning_summary_fixture_item(model: &str) -> Option<Value> {
                 {"type":"summary_text","text":""}
             ]
         }),
+        "gpt-reasoning-summary-content" => json!({
+            "type":"reasoning",
+            "id":"reasoning-content",
+            "encrypted_content":"encrypted-content",
+            "summary":[{"type":"summary_text","text":" summary "}],
+            "content":[
+                {"type":"reasoning_text","text":" raw content "},
+                {"type":"reasoning_text","text":"second"}
+            ]
+        }),
         _ => return None,
     })
+}
+
+fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
+    let created = (
+        "response.created",
+        json!({
+            "type":"response.created",
+            "sequence_number":0,
+            "response":{
+                "id":"resp_lifecycle_fixture",
+                "object":"response",
+                "created_at":1,
+                "status":"in_progress",
+                "model":model,
+                "output":[]
+            }
+        }),
+    );
+    let added = (
+        "response.output_item.added",
+        json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"reasoning","id":"reasoning-life","summary":[]}
+        }),
+    );
+    let done_item = json!({
+        "type":"reasoning",
+        "id":"reasoning-life",
+        "encrypted_content":"encrypted-life",
+        "summary":[{"type":"summary_text","text":"once"}]
+    });
+    let done = (
+        "response.output_item.done",
+        json!({
+            "type":"response.output_item.done",
+            "output_index":0,
+            "item":done_item
+        }),
+    );
+    let completed = (
+        "response.completed",
+        json!({
+            "type":"response.completed",
+            "sequence_number":99,
+            "response":{
+                "id":"resp_lifecycle_fixture",
+                "object":"response",
+                "created_at":1,
+                "status":"completed",
+                "model":model,
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+            }
+        }),
+    );
+
+    let events = match model {
+        "gpt-reasoning-summary-content" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"reasoning-content","summary":[]}
+                }),
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                json!({
+                    "type":"response.reasoning_summary_part.added",
+                    "output_index":0,
+                    "summary_index":0
+                }),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "item_id":"reasoning-content",
+                    "output_index":0,
+                    "summary_index":0,
+                    "delta":" summary "
+                }),
+            ),
+            (
+                "response.reasoning_summary_text.done",
+                json!({
+                    "type":"response.reasoning_summary_text.done",
+                    "item_id":"reasoning-content",
+                    "output_index":0,
+                    "summary_index":0,
+                    "text":" summary "
+                }),
+            ),
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":" raw"
+                }),
+            ),
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":" content "
+                }),
+            ),
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "output_index":0,
+                    "content_index":1,
+                    "delta":"second"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-content",
+                        "encrypted_content":"encrypted-content",
+                        "summary":[{"type":"summary_text","text":" summary "}]
+                    }
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-missing-reasoning-done" => vec![
+            created,
+            added,
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"unfinished"
+                }),
+            ),
+            completed,
+            done,
+        ],
+        "gpt-lifecycle-duplicate-reasoning-done" => {
+            vec![created, added.clone(), done.clone(), done, completed]
+        }
+        "gpt-lifecycle-conflicting-reasoning-done" => vec![
+            created,
+            added,
+            done,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-life",
+                        "encrypted_content":"encrypted-life",
+                        "summary":[{"type":"summary_text","text":"different"}]
+                    }
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-summary-before-added" => vec![
+            created,
+            (
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "output_index":0,
+                    "summary_index":0,
+                    "delta":"early"
+                }),
+            ),
+            added,
+            done,
+            completed,
+        ],
+        "gpt-lifecycle-summary-after-done" => vec![
+            created,
+            added,
+            done,
+            (
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "item_id":"reasoning-life",
+                    "output_index":0,
+                    "summary_index":0,
+                    "delta":"late"
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-summary-delta-after-text-done" => vec![
+            created,
+            added,
+            (
+                "response.reasoning_summary_text.done",
+                json!({
+                    "type":"response.reasoning_summary_text.done",
+                    "item_id":"reasoning-life",
+                    "output_index":0,
+                    "summary_index":0,
+                    "text":"done"
+                }),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "item_id":"reasoning-life",
+                    "output_index":0,
+                    "summary_index":0,
+                    "delta":"late"
+                }),
+            ),
+            done,
+            completed,
+        ],
+        "gpt-lifecycle-duplicate-added" => {
+            vec![created, added.clone(), added, done, completed]
+        }
+        "gpt-lifecycle-summary-done-without-part" => vec![
+            created,
+            added,
+            (
+                "response.reasoning_summary_text.done",
+                json!({
+                    "type":"response.reasoning_summary_text.done",
+                    "item_id":"reasoning-life",
+                    "output_index":0,
+                    "summary_index":0,
+                    "text":"buffered-authoritative"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-life",
+                        "encrypted_content":"encrypted-life"
+                    }
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-late-reasoning-id" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[]}
+                }),
+            ),
+            (
+                "response.reasoning_summary_text.done",
+                json!({
+                    "type":"response.reasoning_summary_text.done",
+                    "item_id":"reasoning-late",
+                    "output_index":0,
+                    "summary_index":0,
+                    "text":"late-id"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-late",
+                        "encrypted_content":"encrypted-late"
+                    }
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-duplicate-delta-sequence" => {
+            let delta = (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"sequence-once"
+                }),
+            );
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":{"type":"reasoning","id":"reasoning-life","summary":[]}
+                    }),
+                ),
+                delta.clone(),
+                delta,
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":3,
+                        "output_index":0,
+                        "item":{
+                            "type":"reasoning",
+                            "id":"reasoning-life",
+                            "encrypted_content":"encrypted-life"
+                        }
+                    }),
+                ),
+                completed,
+            ]
+        }
+        "gpt-lifecycle-empty-content-part" => vec![
+            created,
+            added,
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":""
+                }),
+            ),
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "output_index":0,
+                    "content_index":1,
+                    "delta":"second"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-life",
+                        "encrypted_content":"encrypted-life"
+                    }
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-conflicting-delta-sequence" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"reasoning-life","summary":[]}
+                }),
+            ),
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"first"
+                }),
+            ),
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"conflict"
+                }),
+            ),
+            done,
+            completed,
+        ],
+        "gpt-lifecycle-out-of-order-sequence" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"reasoning-life","summary":[]}
+                }),
+            ),
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"newer"
+                }),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "summary_index":0,
+                    "delta":"older"
+                }),
+            ),
+            done,
+            completed,
+        ],
+        "gpt-lifecycle-reused-reasoning-id" => vec![
+            created,
+            added,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":1,
+                    "item":{"type":"reasoning","id":"reasoning-life","summary":[]}
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-sparse-summary-index" => vec![
+            created,
+            added,
+            (
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "output_index":0,
+                    "summary_index":1,
+                    "delta":"missing zero"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-life",
+                        "encrypted_content":"encrypted-life"
+                    }
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-sparse-content-index" => vec![
+            created,
+            added,
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "output_index":0,
+                    "content_index":1,
+                    "delta":"missing zero"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-life",
+                        "encrypted_content":"encrypted-life"
+                    }
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-terminal-untracked-output" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_lifecycle_fixture",
+                        "status":"completed",
+                        "model":model,
+                        "output":[{
+                            "type":"reasoning",
+                            "id":"untracked",
+                            "encrypted_content":"opaque",
+                            "summary":[{"type":"summary_text","text":"lost"}]
+                        }],
+                        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                    }
+                }),
+            ),
+        ],
+        "gpt-lifecycle-terminal-omitted-output" => vec![
+            created,
+            added,
+            done,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":99,
+                    "response":{
+                        "id":"resp_lifecycle_fixture",
+                        "status":"completed",
+                        "model":model,
+                        "output":[],
+                        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                    }
+                }),
+            ),
+        ],
+        "gpt-lifecycle-terminal-mismatched-output" => vec![
+            created,
+            added,
+            done,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":99,
+                    "response":{
+                        "id":"resp_lifecycle_fixture",
+                        "status":"completed",
+                        "model":model,
+                        "output":[{
+                            "type":"reasoning",
+                            "id":"reasoning-life",
+                            "encrypted_content":"encrypted-life",
+                            "summary":[{"type":"summary_text","text":"different"}]
+                        }],
+                        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                    }
+                }),
+            ),
+        ],
+        "gpt-lifecycle-standalone-message-done" => {
+            let item = json!({
+                "type":"message",
+                "id":"standalone-message",
+                "role":"assistant",
+                "status":"completed",
+                "content":[{"type":"output_text","text":"standalone text","annotations":[]}]
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                (
+                    "response.completed",
+                    json!({
+                        "type":"response.completed",
+                        "sequence_number":99,
+                        "response":{
+                            "id":"resp_lifecycle_fixture",
+                            "status":"completed",
+                            "model":model,
+                            "output":[item],
+                            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                        }
+                    }),
+                ),
+            ]
+        }
+        "gpt-lifecycle-standalone-function-done" => {
+            let item = json!({
+                "type":"function_call",
+                "id":"standalone-function",
+                "call_id":"standalone-call",
+                "name":"read",
+                "arguments":"{\"path\":\"standalone\"}",
+                "status":"completed"
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                (
+                    "response.completed",
+                    json!({
+                        "type":"response.completed",
+                        "sequence_number":99,
+                        "response":{
+                            "id":"resp_lifecycle_fixture",
+                            "status":"completed",
+                            "model":model,
+                            "output":[item],
+                            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                        }
+                    }),
+                ),
+            ]
+        }
+        "gpt-lifecycle-partial-message-completion" => {
+            let item = json!({
+                "type":"message",
+                "id":"partial-message",
+                "role":"assistant",
+                "status":"completed",
+                "content":[{"type":"output_text","text":"AB","annotations":[]}]
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index":0,
+                        "item":{
+                            "type":"message",
+                            "id":"partial-message",
+                            "role":"assistant",
+                            "status":"in_progress",
+                            "content":[]
+                        }
+                    }),
+                ),
+                (
+                    "response.output_text.delta",
+                    json!({
+                        "type":"response.output_text.delta",
+                        "output_index":0,
+                        "content_index":0,
+                        "delta":"A"
+                    }),
+                ),
+                (
+                    "response.output_text.done",
+                    json!({
+                        "type":"response.output_text.done",
+                        "output_index":0,
+                        "content_index":0,
+                        "text":"AB"
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                (
+                    "response.completed",
+                    json!({
+                        "type":"response.completed",
+                        "sequence_number":99,
+                        "response":{
+                            "id":"resp_lifecycle_fixture",
+                            "status":"completed",
+                            "model":model,
+                            "output":[item],
+                            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                        }
+                    }),
+                ),
+            ]
+        }
+        "gpt-lifecycle-partial-function-completion" => {
+            let item = json!({
+                "type":"function_call",
+                "id":"partial-function",
+                "call_id":"partial-call",
+                "name":"read",
+                "arguments":"{\"path\":\"x\"}",
+                "status":"completed"
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index":0,
+                        "item":{
+                            "type":"function_call",
+                            "id":"partial-function",
+                            "call_id":"partial-call",
+                            "name":"read",
+                            "arguments":"",
+                            "status":"in_progress"
+                        }
+                    }),
+                ),
+                (
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type":"response.function_call_arguments.delta",
+                        "output_index":0,
+                        "delta":"{\"path\":\""
+                    }),
+                ),
+                (
+                    "response.function_call_arguments.done",
+                    json!({
+                        "type":"response.function_call_arguments.done",
+                        "output_index":0,
+                        "arguments":"{\"path\":\"x\"}"
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                (
+                    "response.completed",
+                    json!({
+                        "type":"response.completed",
+                        "sequence_number":99,
+                        "response":{
+                            "id":"resp_lifecycle_fixture",
+                            "status":"completed",
+                            "model":model,
+                            "output":[item],
+                            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                        }
+                    }),
+                ),
+            ]
+        }
+        "gpt-lifecycle-conflicting-message-completion" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "id":"conflicting-message",
+                        "role":"assistant",
+                        "content":[]
+                    }
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type":"response.output_text.delta",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"A"
+                }),
+            ),
+            (
+                "response.output_text.done",
+                json!({
+                    "type":"response.output_text.done",
+                    "output_index":0,
+                    "content_index":0,
+                    "text":"X"
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-conflicting-function-completion" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"conflicting-function",
+                        "call_id":"conflicting-call",
+                        "name":"read",
+                        "arguments":""
+                    }
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "output_index":0,
+                    "delta":"{\"a\":"
+                }),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({
+                    "type":"response.function_call_arguments.done",
+                    "output_index":0,
+                    "arguments":"{\"b\":1}"
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-missing-reasoning-delta" => vec![
+            created,
+            added,
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "output_index":0,
+                    "content_index":0
+                }),
+            ),
+            done,
+            completed,
+        ],
+        "gpt-lifecycle-missing-summary-done-text" => vec![
+            created,
+            added,
+            (
+                "response.reasoning_summary_text.done",
+                json!({
+                    "type":"response.reasoning_summary_text.done",
+                    "output_index":0,
+                    "summary_index":0
+                }),
+            ),
+            done,
+            completed,
+        ],
+        "gpt-lifecycle-conflicting-function-identity" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-identity",
+                        "call_id":"call-a",
+                        "name":"read",
+                        "arguments":""
+                    }
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-identity",
+                        "call_id":"call-b",
+                        "name":"write",
+                        "arguments":"{}"
+                    }
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-missing-terminal-response" => vec![
+            created,
+            (
+                "response.completed",
+                json!({"type":"response.completed","sequence_number":1}),
+            ),
+        ],
+        "gpt-lifecycle-terminal-status-mismatch" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_lifecycle_fixture","status":"incomplete"}
+                }),
+            ),
+        ],
+        "gpt-lifecycle-missing-function-done" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-life",
+                        "call_id":"call-life",
+                        "name":"read",
+                        "arguments":""
+                    }
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "output_index":0,
+                    "delta":"{\"path\":\"unfinished\"}"
+                }),
+            ),
+            completed,
+        ],
+        "gpt-lifecycle-missing-message-done" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "id":"message-life",
+                        "role":"assistant",
+                        "content":[]
+                    }
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type":"response.output_text.delta",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"unfinished"
+                }),
+            ),
+            completed,
+        ],
+        _ => return None,
+    };
+    Some(sse_response(render_sse(&events)))
 }
 
 fn responses_fixture(body: &Value) -> Response {
@@ -422,6 +1403,12 @@ fn responses_fixture(body: &Value) -> Response {
         _ => {}
     }
 
+    if body["stream"] == true {
+        if let Some(response) = reasoning_lifecycle_stream_fixture(model) {
+            return response;
+        }
+    }
+
     if let Some(reasoning) = reasoning_summary_fixture_item(model) {
         if body["stream"] == true {
             let mut events = vec![(
@@ -439,6 +1426,27 @@ fn responses_fixture(body: &Value) -> Response {
                     }
                 }),
             )];
+            if matches!(
+                model,
+                "gpt-reasoning-leading-text" | "gpt-reasoning-multiple-parts"
+            ) {
+                events.push((
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index":0,
+                        "item":{
+                            "type":"reasoning",
+                            "id":if model == "gpt-reasoning-leading-text" {
+                                "reasoning-leading"
+                            } else {
+                                "reasoning-parts"
+                            },
+                            "summary":[]
+                        }
+                    }),
+                ));
+            }
             if model == "gpt-reasoning-leading-text" {
                 events.extend([
                     (
@@ -550,7 +1558,7 @@ fn responses_fixture(body: &Value) -> Response {
                     "type":"response.output_item.done",
                     "sequence_number":98,
                     "output_index":0,
-                    "item":reasoning
+                    "item":reasoning.clone()
                 }),
             ));
             events.push((
@@ -564,7 +1572,7 @@ fn responses_fixture(body: &Value) -> Response {
                         "created_at":1,
                         "status":"completed",
                         "model":model,
-                        "output":[],
+                        "output":[reasoning],
                         "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
                     }
                 }),
@@ -655,7 +1663,13 @@ fn responses_fixture(body: &Value) -> Response {
                             "created_at":1,
                             "status":"completed",
                             "model":model,
-                            "output":[],
+                            "output":[{
+                                "id":"msg_cli",
+                                "type":"message",
+                                "role":"assistant",
+                                "status":"completed",
+                                "content":[{"type":"output_text","text":"OK","annotations":[]}]
+                            }],
                             "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
                         }
                     }),
@@ -671,11 +1685,27 @@ fn responses_fixture(body: &Value) -> Response {
             return sse_response(render_sse(&[
                 created,
                 (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":{
+                            "id":"msg_partial",
+                            "type":"message",
+                            "role":"assistant",
+                            "status":"in_progress",
+                            "content":[]
+                        }
+                    }),
+                ),
+                (
                     "response.output_text.delta",
                     json!({
                         "type":"response.output_text.delta",
-                        "sequence_number":1,
+                        "sequence_number":2,
                         "output_index":0,
+                        "item_id":"msg_partial",
                         "content_index":0,
                         "delta":"partial"
                     }),
@@ -688,12 +1718,36 @@ fn responses_fixture(body: &Value) -> Response {
                 "response.incomplete",
                 json!({
                     "type":"response.incomplete",
-                    "sequence_number":2,
+                    "sequence_number":11,
                     "response":{
                         "id":"resp_fixture",
                         "status":"incomplete",
                         "incomplete_details":{"reason":"max_output_tokens"},
-                        "output":[],
+                        "output":[
+                            {
+                                "id":"rs_1",
+                                "type":"reasoning",
+                                "summary":[{"type":"summary_text","text":"inspect"}],
+                                "encrypted_content":"enc_fixture",
+                                "status":"completed"
+                            },
+                            {
+                                "id":"fc_a",
+                                "type":"function_call",
+                                "call_id":"call_a",
+                                "name":"read",
+                                "arguments":"{\"path\":\"a\"}",
+                                "status":"completed"
+                            },
+                            {
+                                "id":"fc_b",
+                                "type":"function_call",
+                                "call_id":"call_b",
+                                "name":"read",
+                                "arguments":"{\"path\":\"b\"}",
+                                "status":"completed"
+                            }
+                        ],
                         "usage":{"input_tokens":13,"output_tokens":2,"total_tokens":15}
                     }
                 }),
@@ -710,7 +1764,31 @@ fn responses_fixture(body: &Value) -> Response {
                         "created_at":1,
                         "status":"completed",
                         "model":model,
-                        "output":[],
+                        "output":[
+                            {
+                                "id":"rs_1",
+                                "type":"reasoning",
+                                "summary":[{"type":"summary_text","text":"inspect"}],
+                                "encrypted_content":"enc_fixture",
+                                "status":"completed"
+                            },
+                            {
+                                "id":"fc_a",
+                                "type":"function_call",
+                                "call_id":"call_a",
+                                "name":"read",
+                                "arguments":"{\"path\":\"a\"}",
+                                "status":"completed"
+                            },
+                            {
+                                "id":"fc_b",
+                                "type":"function_call",
+                                "call_id":"call_b",
+                                "name":"read",
+                                "arguments":"{\"path\":\"b\"}",
+                                "status":"completed"
+                            }
+                        ],
                         "usage":{
                             "input_tokens":13,
                             "input_tokens_details":{"cached_tokens":4},
@@ -829,7 +1907,7 @@ fn responses_fixture(body: &Value) -> Response {
                     "sequence_number":9,
                     "output_index":1,
                     "item":{
-                        "id":"different_a",
+                        "id":"fc_a",
                         "type":"function_call",
                         "call_id":"call_a",
                         "name":"read",
@@ -845,7 +1923,7 @@ fn responses_fixture(body: &Value) -> Response {
                     "sequence_number":10,
                     "output_index":2,
                     "item":{
-                        "id":"different_b",
+                        "id":"fc_b",
                         "type":"function_call",
                         "call_id":"call_b",
                         "name":"read",
@@ -956,6 +2034,39 @@ fn configure(fixture: &Fixture) {
         "gpt-reasoning-both-empty-values",
         "gpt-reasoning-leading-text",
         "gpt-reasoning-multiple-parts",
+        "gpt-reasoning-summary-content",
+        "gpt-lifecycle-missing-reasoning-done",
+        "gpt-lifecycle-duplicate-reasoning-done",
+        "gpt-lifecycle-conflicting-reasoning-done",
+        "gpt-lifecycle-summary-before-added",
+        "gpt-lifecycle-summary-after-done",
+        "gpt-lifecycle-summary-delta-after-text-done",
+        "gpt-lifecycle-duplicate-added",
+        "gpt-lifecycle-summary-done-without-part",
+        "gpt-lifecycle-late-reasoning-id",
+        "gpt-lifecycle-duplicate-delta-sequence",
+        "gpt-lifecycle-empty-content-part",
+        "gpt-lifecycle-conflicting-delta-sequence",
+        "gpt-lifecycle-out-of-order-sequence",
+        "gpt-lifecycle-reused-reasoning-id",
+        "gpt-lifecycle-sparse-summary-index",
+        "gpt-lifecycle-sparse-content-index",
+        "gpt-lifecycle-terminal-untracked-output",
+        "gpt-lifecycle-terminal-omitted-output",
+        "gpt-lifecycle-terminal-mismatched-output",
+        "gpt-lifecycle-standalone-message-done",
+        "gpt-lifecycle-standalone-function-done",
+        "gpt-lifecycle-partial-message-completion",
+        "gpt-lifecycle-partial-function-completion",
+        "gpt-lifecycle-conflicting-message-completion",
+        "gpt-lifecycle-conflicting-function-completion",
+        "gpt-lifecycle-missing-reasoning-delta",
+        "gpt-lifecycle-missing-summary-done-text",
+        "gpt-lifecycle-conflicting-function-identity",
+        "gpt-lifecycle-missing-terminal-response",
+        "gpt-lifecycle-terminal-status-mismatch",
+        "gpt-lifecycle-missing-function-done",
+        "gpt-lifecycle-missing-message-done",
     ]
     .into_iter()
     .map(|model| (model.to_string(), ModelConfig::default()))
@@ -1666,6 +2777,362 @@ async fn claude_reasoning_content_framing_stream_matches_nonstream_exactly() {
                 "duplicate part.added must not duplicate separators"
             );
         }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_reasoning_content_deltas_cross_public_stream_losslessly() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let expected = [" summary ", " raw content ", "second"].join(REASONING_SUMMARY_SEPARATOR);
+
+    let nonstream = json!({
+        "model":"responses-fixture/gpt-reasoning-summary-content",
+        "max_tokens":128,
+        "messages":[{"role":"user","content":"reason"}],
+        "stream":false
+    });
+    let (status, body) = send(post_json("/v1/messages", nonstream, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = json_body(&body);
+    assert_eq!(response["content"][0]["type"], "thinking");
+    assert_eq!(response["content"][0]["thinking"], expected);
+    assert_eq!(
+        response["content"][0]["signature"],
+        "encrypted-content@reasoning-content"
+    );
+
+    let stream = json!({
+        "model":"responses-fixture/gpt-reasoning-summary-content",
+        "max_tokens":128,
+        "messages":[{"role":"user","content":"reason"}],
+        "stream":true
+    });
+    let (status, body) = send(post_json("/v1/messages", stream, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let thinking: String = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "thinking_delta"
+        })
+        .filter_map(|event| event["delta"]["thinking"].as_str())
+        .collect();
+    assert_eq!(thinking, expected);
+    let signatures: Vec<&str> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "signature_delta"
+        })
+        .filter_map(|event| event["delta"]["signature"].as_str())
+        .collect();
+    assert_eq!(
+        signatures,
+        ["encrypted-content@reasoning-content"],
+        "reasoning carrier must be emitted exactly once"
+    );
+
+    let position = |event_type: &str, delta_type: Option<&str>| {
+        events
+            .iter()
+            .position(|event| {
+                event["type"] == event_type
+                    && delta_type.is_none_or(|kind| event["delta"]["type"] == kind)
+            })
+            .unwrap_or_else(|| panic!("missing {event_type}/{delta_type:?}"))
+    };
+    let thinking_position = position("content_block_delta", Some("thinking_delta"));
+    let signature_position = position("content_block_delta", Some("signature_delta"));
+    let stop_position = position("content_block_stop", None);
+    let message_delta_position = position("message_delta", None);
+    let message_stop_position = position("message_stop", None);
+    assert!(
+        thinking_position < signature_position
+            && signature_position < stop_position
+            && stop_position < message_delta_position
+            && message_delta_position < message_stop_position
+    );
+    assert_eq!(
+        events.last().and_then(|event| event["type"].as_str()),
+        Some("message_stop")
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_reasoning_lifecycle_replays_and_adjacent_variants_are_deterministic() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, expected_thinking, expected_signature) in [
+        (
+            "gpt-lifecycle-duplicate-reasoning-done",
+            "once",
+            "encrypted-life@reasoning-life",
+        ),
+        (
+            "gpt-lifecycle-duplicate-added",
+            "once",
+            "encrypted-life@reasoning-life",
+        ),
+        (
+            "gpt-lifecycle-summary-done-without-part",
+            "buffered-authoritative",
+            "encrypted-life@reasoning-life",
+        ),
+        (
+            "gpt-lifecycle-late-reasoning-id",
+            "late-id",
+            "encrypted-late@reasoning-late",
+        ),
+        (
+            "gpt-lifecycle-duplicate-delta-sequence",
+            "sequence-once",
+            "encrypted-life@reasoning-life",
+        ),
+        (
+            "gpt-lifecycle-empty-content-part",
+            "\u{2063}\n\nsecond",
+            "encrypted-life@reasoning-life",
+        ),
+    ] {
+        let request = json!({
+            "model":format!("responses-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"reason"}],
+            "stream":true
+        });
+        let (status, body) = send(post_json("/v1/messages", request, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            0,
+            "{model}: valid replay/variant failed"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}: terminal success count"
+        );
+        let thinking: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta" && event["delta"]["type"] == "thinking_delta"
+            })
+            .filter_map(|event| event["delta"]["thinking"].as_str())
+            .collect();
+        assert_eq!(thinking, [expected_thinking], "{model}");
+        let signatures: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta"
+                    && event["delta"]["type"] == "signature_delta"
+            })
+            .filter_map(|event| event["delta"]["signature"].as_str())
+            .collect();
+        assert_eq!(signatures, [expected_signature], "{model}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_standalone_done_items_render_complete_text_and_function_calls() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let request = |model: &str| {
+        post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"complete item"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        )
+    };
+
+    let (status, body) = send(request("gpt-lifecycle-standalone-message-done")).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let text: String = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta"
+        })
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "standalone text");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
+    );
+
+    let (status, body) = send(request("gpt-lifecycle-partial-message-completion")).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let text: String = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta"
+        })
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(
+        text, "AB",
+        "output_text.done must append the verified suffix"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
+    );
+
+    let (status, body) = send(request("gpt-lifecycle-standalone-function-done")).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let tool_starts: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "tool_use"
+        })
+        .collect();
+    assert_eq!(tool_starts.len(), 1);
+    assert_eq!(tool_starts[0]["content_block"]["id"], "standalone-call");
+    assert_eq!(tool_starts[0]["content_block"]["name"], "read");
+    let arguments: String = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "input_json_delta"
+        })
+        .filter_map(|event| event["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(arguments, "{\"path\":\"standalone\"}");
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .and_then(|event| event["delta"]["stop_reason"].as_str()),
+        Some("tool_use")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
+    );
+
+    let (status, body) = send(request("gpt-lifecycle-partial-function-completion")).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let arguments: String = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "input_json_delta"
+        })
+        .filter_map(|event| event["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(
+        arguments, "{\"path\":\"x\"}",
+        "arguments.done must append the verified suffix"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_incomplete_or_out_of_order_response_items_fail_once_without_success() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for model in [
+        "gpt-lifecycle-missing-reasoning-done",
+        "gpt-lifecycle-conflicting-reasoning-done",
+        "gpt-lifecycle-summary-before-added",
+        "gpt-lifecycle-summary-after-done",
+        "gpt-lifecycle-summary-delta-after-text-done",
+        "gpt-lifecycle-conflicting-delta-sequence",
+        "gpt-lifecycle-out-of-order-sequence",
+        "gpt-lifecycle-reused-reasoning-id",
+        "gpt-lifecycle-sparse-summary-index",
+        "gpt-lifecycle-sparse-content-index",
+        "gpt-lifecycle-terminal-untracked-output",
+        "gpt-lifecycle-terminal-omitted-output",
+        "gpt-lifecycle-terminal-mismatched-output",
+        "gpt-lifecycle-missing-terminal-response",
+        "gpt-lifecycle-terminal-status-mismatch",
+        "gpt-lifecycle-conflicting-message-completion",
+        "gpt-lifecycle-conflicting-function-completion",
+        "gpt-lifecycle-missing-reasoning-delta",
+        "gpt-lifecycle-missing-summary-done-text",
+        "gpt-lifecycle-conflicting-function-identity",
+        "gpt-lifecycle-missing-function-done",
+        "gpt-lifecycle-missing-message-done",
+    ] {
+        let request = json!({
+            "model":format!("responses-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"reason"}],
+            "stream":true
+        });
+        let (status, body) = send(post_json("/v1/messages", request, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        let errors: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 1, "{model}: {events:#?}");
+        assert_eq!(errors[0]["error"]["type"], "api_error", "{model}");
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}: terminal error must be final"
+        );
+        assert!(
+            !events.iter().any(|event| event["type"] == "message_delta"),
+            "{model}: fabricated Anthropic success delta"
+        );
+        assert!(
+            !events.iter().any(|event| event["type"] == "message_stop"),
+            "{model}: fabricated Anthropic success stop"
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|event| {
+                    event["type"] == "content_block_delta"
+                        && event["delta"]["type"] == "signature_delta"
+                })
+                .count()
+                <= 1,
+            "{model}: malformed lifecycle duplicated a carrier"
+        );
     }
 }
 

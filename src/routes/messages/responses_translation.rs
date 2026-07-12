@@ -1256,7 +1256,13 @@ fn extract_reasoning_text(
         item.summary
             .iter()
             .flatten()
-            .map(|block| block.text.as_deref().unwrap_or("")),
+            .map(|block| block.text.as_deref().unwrap_or(""))
+            .chain(
+                item.content
+                    .iter()
+                    .flatten()
+                    .map(|block| block.text.as_deref().unwrap_or("")),
+            ),
         item.encrypted_content.as_deref(),
         item.id.as_deref(),
     )
@@ -1818,6 +1824,7 @@ mod tests {
                         text: Some("pondering".to_string()),
                         extra: Default::default(),
                     }]),
+                    content: None,
                     encrypted_content: Some("ENC".to_string()),
                     status: None,
                     extra: Default::default(),
@@ -1857,6 +1864,39 @@ mod tests {
         assert_eq!(
             anthropic.content[1].get("text").and_then(Value::as_str),
             Some("the answer")
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_and_content_share_lossless_framing() {
+        let result: ResponsesResult = serde_json::from_value(json!({
+            "id":"resp_reasoning_content",
+            "model":"gpt-5.4",
+            "status":"completed",
+            "output":[
+                {
+                    "type":"reasoning",
+                    "id":"reasoning-content",
+                    "encrypted_content":"opaque",
+                    "summary":[
+                        {"type":"summary_text","text":" summary "},
+                        {"type":"summary_text","text":""}
+                    ],
+                    "content":[
+                        {"type":"reasoning_text","text":" raw "},
+                        {"type":"reasoning_text","text":"second\n"}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let anthropic = translate_responses_result_to_anthropic(&result, None);
+        let expected = [" summary ", "", " raw ", "second\n"].join(REASONING_SUMMARY_SEPARATOR);
+        assert_eq!(anthropic.content[0]["thinking"], expected);
+        assert_eq!(
+            anthropic.content[0]["signature"],
+            "opaque@reasoning-content"
         );
     }
 
@@ -1942,6 +1982,7 @@ mod tests {
                 id: Some("rs".to_string()),
                 item_type: "reasoning".to_string(),
                 summary: None,
+                content: None,
                 encrypted_content: Some("E".to_string()),
                 status: None,
                 extra: Default::default(),
@@ -1997,6 +2038,7 @@ mod tests {
                     id: Some("reasoning-id".to_string()),
                     item_type: "reasoning".to_string(),
                     summary: summary.clone(),
+                    content: None,
                     encrypted_content: Some("encrypted".to_string()),
                     status: None,
                     extra: Default::default(),
@@ -2014,6 +2056,7 @@ mod tests {
                     id: None,
                     item_type: "reasoning".to_string(),
                     summary: summary.clone(),
+                    content: None,
                     encrypted_content: None,
                     status: None,
                     extra: Default::default(),
@@ -2040,6 +2083,7 @@ mod tests {
                         text: Some(" \n".to_string()),
                         extra: Default::default(),
                     }]),
+                    content: None,
                     encrypted_content: encrypted_content.map(str::to_string),
                     status: None,
                     extra: Default::default(),
@@ -2077,6 +2121,7 @@ mod tests {
                             })
                             .collect(),
                     ),
+                    content: None,
                     encrypted_content: Some("encrypted".to_string()),
                     status: None,
                     extra: Default::default(),

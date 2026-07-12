@@ -487,6 +487,8 @@ pub struct ResponseOutputReasoning {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<Vec<ResponseReasoningBlock>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ResponseReasoningBlock>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
