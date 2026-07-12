@@ -77,6 +77,55 @@ fn opt_string(v: Option<&Value>) -> Option<String> {
     }
 }
 
+const DEFAULT_UPSTREAM_ERROR_TYPE: &str = "api_error";
+const DEFAULT_UPSTREAM_ERROR_MESSAGE: &str = "The upstream model stream reported an error.";
+const MAX_UPSTREAM_ERROR_TYPE_BYTES: usize = 64;
+const MAX_UPSTREAM_ERROR_MESSAGE_BYTES: usize = 1024;
+
+/// Extract the only two upstream error fields that are safe and useful to an
+/// Anthropic client. A present, non-null top-level `error` always terminates the
+/// stream, even when its value is malformed; treating it as an empty-choice
+/// usage chunk could otherwise fabricate a successful completion.
+fn top_level_upstream_error_event(chunk: &Value) -> Option<AnthropicStreamEventData> {
+    let error = chunk.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+
+    let kind = safe_upstream_error_type(error.get("type"))
+        .unwrap_or_else(|| DEFAULT_UPSTREAM_ERROR_TYPE.to_string());
+    let message = safe_upstream_error_message(error.get("message"))
+        .unwrap_or_else(|| DEFAULT_UPSTREAM_ERROR_MESSAGE.to_string());
+
+    Some(AnthropicStreamEventData::Error {
+        error: super::anthropic_types::AnthropicErrorBody { kind, message },
+    })
+}
+
+fn safe_upstream_error_type(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty()
+        || value.len() > MAX_UPSTREAM_ERROR_TYPE_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn safe_upstream_error_message(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty()
+        || value.len() > MAX_UPSTREAM_ERROR_MESSAGE_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -87,6 +136,20 @@ pub fn translate_chunk_to_anthropic_events(
     chunk: &Value,
     state: &mut AnthropicStreamState,
 ) -> Vec<AnthropicStreamEventData> {
+    // Once success or failure has terminated the stream, every later chunk is
+    // ignored. This prevents an upstream aggregator from turning a terminal
+    // error into a later success or producing a second terminal event.
+    if state.terminal_event_emitted {
+        return Vec::new();
+    }
+
+    // OpenAI-compatible providers commonly send failures as a valid JSON SSE
+    // record with a top-level `error`. Detect it before the empty-choice usage
+    // path, which is also a valid Chat Completions record shape.
+    if let Some(error) = top_level_upstream_error_event(chunk) {
+        return terminal_stream_error_events(state, error);
+    }
+
     let mut events: Vec<AnthropicStreamEventData> = Vec::new();
 
     let choices = chunk.get("choices").and_then(|v| v.as_array());
@@ -121,6 +184,14 @@ pub fn translate_chunk_to_anthropic_events(
 pub fn flush_pending_anthropic_stream_events(
     state: &mut AnthropicStreamState,
 ) -> Vec<AnthropicStreamEventData> {
+    // Terminal failure takes precedence over any stale deferred success state.
+    // The normal error path clears the pending delta, but this ordering makes
+    // EOF flushing safe even if a future caller constructs state manually.
+    if state.terminal_event_emitted {
+        state.pending_message_delta = None;
+        return Vec::new();
+    }
+
     let mut events: Vec<AnthropicStreamEventData> = Vec::new();
 
     if state.pending_message_delta.is_some() {
@@ -128,32 +199,22 @@ pub fn flush_pending_anthropic_stream_events(
         return events;
     }
 
-    if state.terminal_event_emitted {
-        return events;
-    }
-
-    close_stream_for_error(state, &mut events);
-    events.push(protocol_error_event(
-        "The upstream model stream ended before a finish reason was received.",
-    ));
-    state.terminal_event_emitted = true;
-    events
+    terminal_stream_error_events(
+        state,
+        protocol_error_event(
+            "The upstream model stream ended before a finish reason was received.",
+        ),
+    )
 }
 
 /// Terminate a translated stream after malformed upstream SSE data.
 pub fn malformed_stream_error_events(
     state: &mut AnthropicStreamState,
 ) -> Vec<AnthropicStreamEventData> {
-    if state.terminal_event_emitted {
-        return Vec::new();
-    }
-    let mut events = Vec::new();
-    close_stream_for_error(state, &mut events);
-    events.push(protocol_error_event(
-        "The upstream model stream returned a malformed event.",
-    ));
-    state.terminal_event_emitted = true;
-    events
+    terminal_stream_error_events(
+        state,
+        protocol_error_event("The upstream model stream returned a malformed event."),
+    )
 }
 
 /// Terminate a translated stream after its transport fails.
@@ -161,12 +222,19 @@ pub fn transport_stream_error_events(
     state: &mut AnthropicStreamState,
     cause: Option<&std::io::Error>,
 ) -> Vec<AnthropicStreamEventData> {
+    terminal_stream_error_events(state, translate_error_to_anthropic_error_event(cause))
+}
+
+fn terminal_stream_error_events(
+    state: &mut AnthropicStreamState,
+    error: AnthropicStreamEventData,
+) -> Vec<AnthropicStreamEventData> {
     if state.terminal_event_emitted {
         return Vec::new();
     }
     let mut events = Vec::new();
     close_stream_for_error(state, &mut events);
-    events.push(translate_error_to_anthropic_error_event(cause));
+    events.push(error);
     state.terminal_event_emitted = true;
     events
 }
@@ -260,6 +328,11 @@ fn complete_pending_message(
     events: &mut Vec<AnthropicStreamEventData>,
     chunk: Option<&Value>,
 ) {
+    if state.terminal_event_emitted {
+        state.pending_message_delta = None;
+        return;
+    }
+
     let Some(pending) = state.pending_message_delta.take() else {
         return;
     };
@@ -1296,6 +1369,230 @@ mod tests {
     }
 
     #[test]
+    fn top_level_upstream_error_closes_open_block_before_safe_error() {
+        let mut state = AnthropicStreamState::default();
+        let mut all = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        ));
+        assert!(state.content_block_open);
+        assert!(state.pending_message_delta.is_none());
+
+        let got = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "error": {
+                    "type": "server_error",
+                    "message": " upstream boom ",
+                    "internal": { "request_body": "must-not-leak" }
+                },
+                "choices": [],
+                "usage": { "prompt_tokens": 99, "completion_tokens": 99 }
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            got,
+            vec![
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "server_error",
+                        "message": "upstream boom"
+                    }
+                }),
+            ]
+        );
+
+        all.extend(got);
+        assert_single_open_block_invariant(&all);
+        assert!(!state.content_block_open);
+        assert!(!state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
+        assert!(state.pending_message_delta.is_none());
+    }
+
+    #[test]
+    fn top_level_upstream_error_closes_thinking_block_in_protocol_order() {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "reasoning_text": "partial thought" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        assert!(state.thinking_block_open);
+
+        let got = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "capacity unavailable"
+                }
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            got,
+            vec![
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": "capacity unavailable"
+                    }
+                }),
+            ]
+        );
+        assert!(!state.thinking_block_open);
+        assert!(state.terminal_event_emitted);
+    }
+
+    #[test]
+    fn top_level_upstream_error_discards_pending_success_and_terminates_once() {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        let finish = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            finish,
+            vec![json!({ "type": "content_block_stop", "index": 0 })]
+        );
+        assert!(state.pending_message_delta.is_some());
+        assert!(!state.terminal_event_emitted);
+
+        let error_chunk = json!({
+            "error": {
+                "type": "server_error",
+                "message": "upstream failed after finish"
+            },
+            "choices": []
+        });
+        let terminal = to_values(&translate_chunk_to_anthropic_events(
+            &error_chunk,
+            &mut state,
+        ));
+        assert_eq!(
+            terminal,
+            vec![json!({
+                "type": "error",
+                "error": {
+                    "type": "server_error",
+                    "message": "upstream failed after finish"
+                }
+            })]
+        );
+        assert!(state.pending_message_delta.is_none());
+        assert!(state.terminal_event_emitted);
+        assert!(!state.message_stop_emitted);
+
+        // Neither a duplicate upstream error, a complete success chunk, a
+        // usage-only chunk, nor EOF may produce success or a second terminal.
+        assert!(translate_chunk_to_anthropic_events(&error_chunk, &mut state).is_empty());
+        assert!(translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "late success" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert!(translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert!(flush_pending_anthropic_stream_events(&mut state).is_empty());
+
+        let terminal_count = terminal
+            .iter()
+            .filter(|event| matches!(event["type"].as_str(), Some("error" | "message_stop")))
+            .count();
+        assert_eq!(terminal_count, 1);
+    }
+
+    #[test]
+    fn malformed_or_unsafe_top_level_error_uses_opaque_fallback() {
+        for chunk in [
+            json!({
+                "error": {
+                    "type": "server error",
+                    "message": "unsafe\u{0000}diagnostic",
+                    "internal": "must-not-leak"
+                },
+                "choices": []
+            }),
+            json!({
+                "error": ["opaque", "provider", "details"],
+                "choices": []
+            }),
+        ] {
+            let mut state = AnthropicStreamState::default();
+            let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut state));
+            assert_eq!(
+                got,
+                vec![json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream reported an error."
+                    }
+                })]
+            );
+            assert!(!serde_json::to_string(&got)
+                .unwrap()
+                .contains("must-not-leak"));
+            assert!(state.terminal_event_emitted);
+        }
+    }
+
+    #[test]
     fn classifies_transient_error_kinds() {
         for kind in [
             std::io::ErrorKind::TimedOut,
@@ -1458,6 +1755,7 @@ mod tests {
 
         let chunk = json!({
             "choices": [],
+            "error": null,
             "usage": { "prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6 },
         });
         let ev = translate_chunk_to_anthropic_events(&chunk, &mut state);
@@ -1474,5 +1772,7 @@ mod tests {
             ]
         );
         assert!(state.pending_message_delta.is_none());
+        assert!(state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
     }
 }

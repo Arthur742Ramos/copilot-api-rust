@@ -297,11 +297,25 @@ pub async fn handle_with_chat_completions(
                         }
                     }
 
-                    for event in translate_chunk_to_anthropic_events(&chunk, &mut state) {
+                    let translated = translate_chunk_to_anthropic_events(&chunk, &mut state);
+                    let terminal_error = translated
+                        .iter()
+                        .any(|event| matches!(event, AnthropicStreamEventData::Error { .. }));
+                    for event in translated {
                         if let Some(frame) = emit_event(&event) {
-                            timer.on_content_frame();
+                            if !matches!(&event, AnthropicStreamEventData::Error { .. }) {
+                                timer.on_content_frame();
+                            }
                             yield Ok(frame);
                         }
+                    }
+                    if terminal_error {
+                        tracing::warn!(
+                            "chat-completions stream reported a terminal upstream error"
+                        );
+                        timer.mark_error();
+                        recorder.record(usage);
+                        return;
                     }
                 }
 
