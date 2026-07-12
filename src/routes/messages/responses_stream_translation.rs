@@ -43,7 +43,7 @@ use super::utils::THINKING_TEXT;
 /// signature must match exactly for Copilot cache hits, so a divergent second
 /// copy would silently corrupt them.
 use super::responses_translation::{
-    encode_compaction_carrier_signature, encode_reasoning_signature,
+    effective_reasoning_text, encode_compaction_carrier_signature, encode_reasoning_signature,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,6 +77,8 @@ pub struct ResponsesStreamState {
     pub function_call_state_by_output_index: HashMap<i64, FunctionCallStreamState>,
     pub function_call_order: Vec<i64>,
     pub active_function_call_output_index: Option<i64>,
+    pub reasoning_summary_has_text: HashSet<i64>,
+    pub pending_reasoning_whitespace: HashMap<i64, String>,
     pub tool_search_name: String,
     pub has_tool_call: bool,
 }
@@ -94,6 +96,8 @@ impl ResponsesStreamState {
             function_call_state_by_output_index: HashMap::new(),
             function_call_order: Vec::new(),
             active_function_call_output_index: None,
+            reasoning_summary_has_text: HashSet::new(),
+            pending_reasoning_whitespace: HashMap::new(),
             tool_search_name: tool_search_name
                 .unwrap_or_else(|| BRIDGE_TOOL_SEARCH_NAME.to_string()),
             has_tool_call: false,
@@ -730,30 +734,39 @@ fn handle_output_item_done(
         return events;
     }
 
-    let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
-    let encrypted_content = get_str(item, "encrypted_content").unwrap_or("");
-    let id = get_str(item, "id").unwrap_or("");
-    let signature = encode_reasoning_signature(
-        (!encrypted_content.is_empty()).then_some(encrypted_content),
-        (!id.is_empty()).then_some(id),
+    let encrypted_content = get_str(item, "encrypted_content");
+    let id = get_str(item, "id");
+    let display_text = effective_reasoning_text(
+        item.get("summary")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block.get("text").and_then(Value::as_str)),
+        encrypted_content,
+        id,
     );
+    let had_substantive_text = state.reasoning_summary_has_text.contains(&output_index);
+    state.pending_reasoning_whitespace.remove(&output_index);
 
-    // The legacy or versioned carrier is always non-empty, including when both
-    // Codex fields are absent.
-    let summary_empty = item
-        .get("summary")
-        .and_then(Value::as_array)
-        .map(|a| a.is_empty())
-        .unwrap_or(true);
-    if summary_empty {
+    // A carrier-free item with no aggregate summary has no Anthropic thinking
+    // content to represent. Do not open a block or invent a signature.
+    if display_text.is_none() && !had_substantive_text {
+        return events;
+    }
+
+    let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
+    if !had_substantive_text {
         events.push(AnthropicStreamEventData::ContentBlockDelta {
             index: block_index,
             delta: AnthropicContentBlockDelta::ThinkingDelta {
-                thinking: THINKING_TEXT.to_string(),
+                thinking: display_text.expect("display text checked above"),
             },
         });
+        state.reasoning_summary_has_text.insert(output_index);
+        state.block_has_delta.insert(block_index);
     }
 
+    let signature = encode_reasoning_signature(encrypted_content, id);
     events.push(AnthropicStreamEventData::ContentBlockDelta {
         index: block_index,
         delta: AnthropicContentBlockDelta::SignatureDelta { signature },
@@ -905,15 +918,39 @@ fn handle_reasoning_summary_text_delta(
 ) -> Vec<AnthropicStreamEventData> {
     let mut events = Vec::new();
     let output_index = get_i64(event, "output_index");
-    let delta_text = get_str(event, "delta").unwrap_or("").to_string();
+    let delta_text = get_str(event, "delta").unwrap_or("");
+    if delta_text.is_empty() {
+        return events;
+    }
+    let has_substantive_text = state.reasoning_summary_has_text.contains(&output_index);
+    if !has_substantive_text && delta_text.trim().is_empty() {
+        state
+            .pending_reasoning_whitespace
+            .entry(output_index)
+            .or_default()
+            .push_str(delta_text);
+        return events;
+    }
+
+    let emitted_text = if has_substantive_text {
+        delta_text.to_string()
+    } else {
+        let mut pending = state
+            .pending_reasoning_whitespace
+            .remove(&output_index)
+            .unwrap_or_default();
+        pending.push_str(delta_text);
+        pending
+    };
     let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
 
     events.push(AnthropicStreamEventData::ContentBlockDelta {
         index: block_index,
         delta: AnthropicContentBlockDelta::ThinkingDelta {
-            thinking: delta_text,
+            thinking: emitted_text,
         },
     });
+    state.reasoning_summary_has_text.insert(output_index);
     state.block_has_delta.insert(block_index);
 
     events
@@ -926,16 +963,23 @@ fn handle_reasoning_summary_text_done(
     let mut events = Vec::new();
     let output_index = get_i64(event, "output_index");
     let text = get_str(event, "text").unwrap_or("");
+    if state.reasoning_summary_has_text.contains(&output_index) {
+        return events;
+    }
+    state.pending_reasoning_whitespace.remove(&output_index);
+    if text.trim().is_empty() {
+        return events;
+    }
     let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
 
-    if !text.is_empty() && !state.block_has_delta.contains(&block_index) {
-        events.push(AnthropicStreamEventData::ContentBlockDelta {
-            index: block_index,
-            delta: AnthropicContentBlockDelta::ThinkingDelta {
-                thinking: text.to_string(),
-            },
-        });
-    }
+    events.push(AnthropicStreamEventData::ContentBlockDelta {
+        index: block_index,
+        delta: AnthropicContentBlockDelta::ThinkingDelta {
+            thinking: text.to_string(),
+        },
+    });
+    state.reasoning_summary_has_text.insert(output_index);
+    state.block_has_delta.insert(block_index);
 
     events
 }
@@ -1563,6 +1607,128 @@ mod tests {
             }) => assert_eq!(signature, "enc@r1"),
             other => panic!("expected signature_delta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn aggregate_empty_reasoning_stream_uses_placeholder_only_with_carrier() {
+        for summary in [
+            json!([]),
+            json!([{"type":"summary_text","text":""}]),
+            json!([
+                {"type":"summary_text","text":" \n\t"},
+                {"type":"summary_text","text":""}
+            ]),
+        ] {
+            let mut state = started_state();
+            let events = translate_responses_stream_event(
+                &json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-id",
+                        "encrypted_content":"encrypted",
+                        "summary":summary.clone()
+                    }
+                }),
+                &mut state,
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AnthropicStreamEventData::ContentBlockDelta {
+                    delta: AnthropicContentBlockDelta::ThinkingDelta { thinking },
+                    ..
+                } if thinking == THINKING_TEXT
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AnthropicStreamEventData::ContentBlockDelta {
+                    delta: AnthropicContentBlockDelta::SignatureDelta { signature },
+                    ..
+                } if signature == "encrypted@reasoning-id"
+            )));
+
+            let mut state = started_state();
+            let carrier_free = translate_responses_stream_event(
+                &json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":summary}
+                }),
+                &mut state,
+            );
+            assert!(
+                carrier_free.is_empty(),
+                "carrier-free aggregate-empty reasoning emitted {carrier_free:?}"
+            );
+        }
+
+        for (encrypted_content, id) in [(Some(""), None), (None, Some("")), (Some(""), Some(""))] {
+            let mut item = json!({
+                "type":"reasoning",
+                "summary":[{"type":"summary_text","text":" \n"}]
+            });
+            if let Some(encrypted_content) = encrypted_content {
+                item["encrypted_content"] = json!(encrypted_content);
+            }
+            if let Some(id) = id {
+                item["id"] = json!(id);
+            }
+            let mut state = started_state();
+            let events = translate_responses_stream_event(
+                &json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":item
+                }),
+                &mut state,
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AnthropicStreamEventData::ContentBlockDelta {
+                    delta: AnthropicContentBlockDelta::ThinkingDelta { thinking },
+                    ..
+                } if thinking == THINKING_TEXT
+            )));
+            let expected = encode_reasoning_signature(encrypted_content, id);
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AnthropicStreamEventData::ContentBlockDelta {
+                    delta: AnthropicContentBlockDelta::SignatureDelta { signature },
+                    ..
+                } if signature == &expected
+            )));
+        }
+    }
+
+    #[test]
+    fn leading_reasoning_whitespace_is_buffered_until_substantive_text() {
+        let mut state = started_state();
+        let whitespace = translate_responses_stream_event(
+            &json!({
+                "type":"response.reasoning_summary_text.delta",
+                "output_index":0,
+                "delta":"  "
+            }),
+            &mut state,
+        );
+        assert!(whitespace.is_empty());
+
+        let substantive = translate_responses_stream_event(
+            &json!({
+                "type":"response.reasoning_summary_text.delta",
+                "output_index":0,
+                "delta":"analysis"
+            }),
+            &mut state,
+        );
+        assert!(substantive.iter().any(|event| matches!(
+            event,
+            AnthropicStreamEventData::ContentBlockDelta {
+                delta: AnthropicContentBlockDelta::ThinkingDelta { thinking },
+                ..
+            } if thinking == "  analysis"
+        )));
     }
 
     #[test]

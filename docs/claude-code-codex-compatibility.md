@@ -153,6 +153,15 @@ starts with Anthropic assistant thinking history and proves that all four
 `encrypted_content`/`id` presence combinations reach the typed Responses
 reasoning item unchanged; complete legacy values retain
 `encrypted_content@id`, while missing-field combinations use `rs1#...`.
+Present-but-empty strings also use the versioned carrier and remain distinct
+from absent fields.
+For Responses output, the paired public non-stream/stream
+`claude_aggregate_empty_reasoning_*` regressions cover absent summaries, empty
+arrays, empty text, and whitespace-only text. They emit the standard thinking
+placeholder plus the exact opaque signature only when an ID or encrypted
+content field is present (including an explicitly empty string); carrier-free
+aggregate-empty reasoning emits no fabricated
+Anthropic thinking/signature data.
 
 To route Codex through a configured OpenAI Responses provider, set the model to
 `provider/model`, or map a friendly model name in `config.json`:
@@ -182,7 +191,7 @@ Status means deterministic, credential-free evidence exists.
 | Tool definitions/results | tool use/result, multi-turn | function/custom/tool-search calls and outputs, including optional IDs | optional-item boundary audit |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
 | Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
-| Thinking/reasoning | thinking blocks/signatures, including optional-field carriers | reasoning items with every optional ID/encrypted-content combination | public Messages→Responses carrier regression plus non-stream/stream carrier tests |
+| Thinking/reasoning | exact optional carriers; aggregate-empty placeholders only with opaque data | reasoning items with every optional ID/encrypted-content combination | public request-carrier and non-stream/stream empty-summary regressions |
 | Usage | Anthropic cache/input/output fields | OpenAI cached/reasoning token details | native response assertions |
 | Model routing | aliases, `[1m]`, provider models | aliases and `provider/model` | model helpers and provider boundary tests |
 | Unknown fields | retained in known top-level/items | retained in typed items; uninspected variants raw-preserved | captured extension sentinels and complete `ResponseItem` audit |

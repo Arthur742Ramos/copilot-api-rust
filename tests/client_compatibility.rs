@@ -20,7 +20,9 @@ use common::{json_body, send, send_full};
 use copilot_api::libs::config::{
     set_cached_config_for_test, AppConfig, AuthConfig, ModelConfig, ProviderConfig,
 };
-use copilot_api::routes::messages::responses_translation::encode_reasoning_signature;
+use copilot_api::routes::messages::responses_translation::{
+    encode_reasoning_signature, THINKING_TEXT,
+};
 use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
@@ -260,6 +262,59 @@ fn anthropic_fixture(body: &Value) -> Response {
     .into_response()
 }
 
+fn reasoning_summary_fixture_item(model: &str) -> Option<Value> {
+    Some(match model {
+        "gpt-reasoning-absent-both" => json!({
+            "type":"reasoning",
+            "id":"reasoning-absent",
+            "encrypted_content":"encrypted-absent"
+        }),
+        "gpt-reasoning-empty-array-id" => json!({
+            "type":"reasoning",
+            "id":"reasoning-empty-array",
+            "summary":[]
+        }),
+        "gpt-reasoning-empty-text-both" => json!({
+            "type":"reasoning",
+            "id":"reasoning-empty-text",
+            "encrypted_content":"encrypted-empty-text",
+            "summary":[{"type":"summary_text","text":""}]
+        }),
+        "gpt-reasoning-whitespace-encrypted" => json!({
+            "type":"reasoning",
+            "encrypted_content":"encrypted-whitespace",
+            "summary":[
+                {"type":"summary_text","text":" \n\t"},
+                {"type":"summary_text","text":""}
+            ]
+        }),
+        "gpt-reasoning-empty-carrier-free" => json!({
+            "type":"reasoning",
+            "summary":[
+                {"type":"summary_text","text":""},
+                {"type":"summary_text","text":"  "}
+            ]
+        }),
+        "gpt-reasoning-empty-id-value" => json!({
+            "type":"reasoning",
+            "id":"",
+            "summary":[{"type":"summary_text","text":""}]
+        }),
+        "gpt-reasoning-empty-encrypted-value" => json!({
+            "type":"reasoning",
+            "encrypted_content":"",
+            "summary":[{"type":"summary_text","text":" \n"}]
+        }),
+        "gpt-reasoning-both-empty-values" => json!({
+            "type":"reasoning",
+            "id":"",
+            "encrypted_content":"",
+            "summary":[]
+        }),
+        _ => return None,
+    })
+}
+
 fn responses_fixture(body: &Value) -> Response {
     let model = body["model"].as_str().unwrap_or("gpt-fixture");
     match model {
@@ -348,6 +403,64 @@ fn responses_fixture(body: &Value) -> Response {
                 .unwrap()
         }
         _ => {}
+    }
+
+    if let Some(reasoning) = reasoning_summary_fixture_item(model) {
+        if body["stream"] == true {
+            return sse_response(render_sse(&[
+                (
+                    "response.created",
+                    json!({
+                        "type":"response.created",
+                        "sequence_number":0,
+                        "response":{
+                            "id":"resp_reasoning_fixture",
+                            "object":"response",
+                            "created_at":1,
+                            "status":"in_progress",
+                            "model":model,
+                            "output":[]
+                        }
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":reasoning
+                    }),
+                ),
+                (
+                    "response.completed",
+                    json!({
+                        "type":"response.completed",
+                        "sequence_number":2,
+                        "response":{
+                            "id":"resp_reasoning_fixture",
+                            "object":"response",
+                            "created_at":1,
+                            "status":"completed",
+                            "model":model,
+                            "output":[],
+                            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                        }
+                    }),
+                ),
+            ]));
+        }
+        return Json(json!({
+            "id":"resp_reasoning_fixture",
+            "object":"response",
+            "created_at":1,
+            "status":"completed",
+            "model":model,
+            "output":[reasoning],
+            "output_text":"",
+            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }))
+        .into_response();
     }
 
     if body["stream"] == true {
@@ -712,6 +825,14 @@ fn configure(fixture: &Fixture) {
         "gpt-premature-eof",
         "gpt-incomplete",
         "gpt-cli-smoke",
+        "gpt-reasoning-absent-both",
+        "gpt-reasoning-empty-array-id",
+        "gpt-reasoning-empty-text-both",
+        "gpt-reasoning-whitespace-encrypted",
+        "gpt-reasoning-empty-carrier-free",
+        "gpt-reasoning-empty-id-value",
+        "gpt-reasoning-empty-encrypted-value",
+        "gpt-reasoning-both-empty-values",
     ]
     .into_iter()
     .map(|model| (model.to_string(), ModelConfig::default()))
@@ -999,6 +1120,36 @@ fn normalized_optional_item(mut item: Value) -> Value {
     item
 }
 
+fn aggregate_empty_reasoning_cases(
+) -> [(&'static str, Option<&'static str>, Option<&'static str>); 8] {
+    [
+        (
+            "gpt-reasoning-absent-both",
+            Some("encrypted-absent"),
+            Some("reasoning-absent"),
+        ),
+        (
+            "gpt-reasoning-empty-array-id",
+            None,
+            Some("reasoning-empty-array"),
+        ),
+        (
+            "gpt-reasoning-empty-text-both",
+            Some("encrypted-empty-text"),
+            Some("reasoning-empty-text"),
+        ),
+        (
+            "gpt-reasoning-whitespace-encrypted",
+            Some("encrypted-whitespace"),
+            None,
+        ),
+        ("gpt-reasoning-empty-carrier-free", None, None),
+        ("gpt-reasoning-empty-id-value", None, Some("")),
+        ("gpt-reasoning-empty-encrypted-value", Some(""), None),
+        ("gpt-reasoning-both-empty-values", Some(""), Some("")),
+    ]
+}
+
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
 async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
@@ -1137,6 +1288,9 @@ async fn claude_optional_reasoning_carriers_cross_public_messages_boundary() {
         ("versioned-encrypted-only", Some("enc-public-only"), None),
         ("versioned-id-only", None, Some("reasoning-public-only")),
         ("versioned-neither", None, None),
+        ("versioned-empty-encrypted", Some(""), None),
+        ("versioned-empty-id", None, Some("")),
+        ("versioned-both-empty", Some(""), Some("")),
     ] {
         let signature = encode_reasoning_signature(encrypted_content, id);
         if case == "legacy-both" {
@@ -1196,6 +1350,105 @@ async fn claude_optional_reasoning_carriers_cross_public_messages_boundary() {
             reasoning["summary"][0]["text"],
             "preserve optional reasoning"
         );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_aggregate_empty_reasoning_nonstream_preserves_only_real_carriers() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, encrypted_content, id) in aggregate_empty_reasoning_cases() {
+        let request = json!({
+            "model":format!("responses-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"reason"}],
+            "stream":false
+        });
+        let (status, body) = send(post_json("/v1/messages", request, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let response = json_body(&body);
+        let thinking = response["content"]
+            .as_array()
+            .and_then(|content| content.iter().find(|block| block["type"] == "thinking"));
+
+        if encrypted_content.is_some() || id.is_some() {
+            let thinking = thinking.unwrap_or_else(|| panic!("{model}: thinking carrier dropped"));
+            assert_eq!(thinking["thinking"], THINKING_TEXT, "{model}");
+            assert_eq!(
+                thinking["signature"],
+                encode_reasoning_signature(encrypted_content, id),
+                "{model}"
+            );
+        } else {
+            assert!(
+                thinking.is_none(),
+                "{model}: carrier-free empty reasoning invented {thinking:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_aggregate_empty_reasoning_stream_matches_nonstream_rules() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, encrypted_content, id) in aggregate_empty_reasoning_cases() {
+        let request = json!({
+            "model":format!("responses-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"reason"}],
+            "stream":true
+        });
+        let (status, body) = send(post_json("/v1/messages", request, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let events = data_events(&body);
+        let thinking_start = events.iter().find(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "thinking"
+        });
+        let thinking_delta = events.iter().find(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "thinking_delta"
+        });
+        let signature_delta = events.iter().find(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "signature_delta"
+        });
+
+        if encrypted_content.is_some() || id.is_some() {
+            assert!(thinking_start.is_some(), "{model}: thinking block missing");
+            assert_eq!(
+                thinking_delta.and_then(|event| event["delta"]["thinking"].as_str()),
+                Some(THINKING_TEXT),
+                "{model}"
+            );
+            let expected_signature = encode_reasoning_signature(encrypted_content, id);
+            assert_eq!(
+                signature_delta.and_then(|event| event["delta"]["signature"].as_str()),
+                Some(expected_signature.as_str()),
+                "{model}"
+            );
+        } else {
+            assert!(thinking_start.is_none(), "{model}: invented thinking block");
+            assert!(thinking_delta.is_none(), "{model}: invented thinking delta");
+            assert!(
+                signature_delta.is_none(),
+                "{model}: invented signature delta"
+            );
+        }
     }
 }
 

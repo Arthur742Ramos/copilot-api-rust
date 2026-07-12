@@ -121,10 +121,10 @@ fn decode_compaction_carrier_signature(signature: &str) -> Option<CompactionCarr
 /// Codex 0.144.1 makes either field optional, so missing-field combinations use
 /// a small versioned JSON carrier that round-trips without inventing values.
 pub fn encode_reasoning_signature(encrypted_content: Option<&str>, id: Option<&str>) -> String {
-    let encrypted_content = encrypted_content.filter(|value| !value.is_empty());
-    let id = id.filter(|value| !value.is_empty());
     if let (Some(encrypted_content), Some(id)) = (encrypted_content, id) {
-        return format!("{encrypted_content}@{id}");
+        if !encrypted_content.is_empty() && !id.is_empty() {
+            return format!("{encrypted_content}@{id}");
+        }
     }
     format!(
         "{OPTIONAL_REASONING_SIGNATURE_PREFIX}{}",
@@ -140,13 +140,8 @@ fn parse_reasoning_signature(signature: &str) -> (Option<String>, Option<String>
             let encrypted_content = value
                 .get("encrypted_content")
                 .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
                 .map(str::to_owned);
-            let id = value
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
+            let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
             return (encrypted_content, id);
         }
     }
@@ -1140,8 +1135,7 @@ fn map_output_to_anthropic_content(
     for item in output {
         match item {
             ResponseOutputItem::Reasoning(reasoning) => {
-                let thinking_text = extract_reasoning_text(reasoning);
-                if !thinking_text.is_empty() {
+                if let Some(thinking_text) = extract_reasoning_text(reasoning) {
                     let signature = encode_reasoning_signature(
                         reasoning.encrypted_content.as_deref(),
                         reasoning.id.as_deref(),
@@ -1243,21 +1237,33 @@ fn combine_message_text_content_value(blocks: &[Value]) -> String {
 
 fn extract_reasoning_text(
     item: &crate::services::copilot::create_responses::ResponseOutputReasoning,
-) -> String {
-    // Compatible with opencode: it filters out blocks with empty thinking text,
-    // so emit a default when the summary is absent/empty.
-    let summary = match item.summary.as_ref() {
-        Some(s) if !s.is_empty() => s,
-        _ => return THINKING_TEXT.to_string(),
-    };
+) -> Option<String> {
+    effective_reasoning_text(
+        item.summary
+            .iter()
+            .flatten()
+            .filter_map(|block| block.text.as_deref()),
+        item.encrypted_content.as_deref(),
+        item.id.as_deref(),
+    )
+}
 
-    let mut segments = String::new();
-    for block in summary {
-        if let Some(text) = block.text.as_deref() {
-            segments.push_str(text);
-        }
+pub(crate) fn effective_reasoning_text<'a>(
+    summary_texts: impl IntoIterator<Item = &'a str>,
+    encrypted_content: Option<&str>,
+    id: Option<&str>,
+) -> Option<String> {
+    let mut aggregate = String::new();
+    for text in summary_texts {
+        aggregate.push_str(text);
     }
-    segments.trim().to_string()
+    let aggregate = aggregate.trim();
+    if !aggregate.is_empty() {
+        return Some(aggregate.to_string());
+    }
+
+    let has_opaque_carrier = encrypted_content.is_some() || id.is_some();
+    has_opaque_carrier.then(|| THINKING_TEXT.to_string())
 }
 
 fn create_tool_use_content_block(
@@ -1469,6 +1475,9 @@ mod tests {
             (Some("enc"), None),
             (None, Some("reasoning-id")),
             (None, None),
+            (Some(""), None),
+            (None, Some("")),
+            (Some(""), Some("")),
         ] {
             let signature = encode_reasoning_signature(encrypted_content, id);
             let (decoded_encrypted_content, decoded_id) = parse_reasoning_signature(&signature);
@@ -1484,6 +1493,9 @@ mod tests {
             (Some("enc-only"), None),
             (None, Some("reasoning-only")),
             (None, None),
+            (Some(""), None),
+            (None, Some("")),
+            (Some(""), Some("")),
         ] {
             let signature = encode_reasoning_signature(encrypted_content, id);
             let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
@@ -1939,5 +1951,98 @@ mod tests {
                 .and_then(Value::as_str),
             Some("E@rs")
         );
+    }
+
+    #[test]
+    fn aggregate_empty_reasoning_uses_placeholder_only_for_opaque_carriers() {
+        use crate::services::copilot::create_responses::{
+            ResponseOutputReasoning, ResponseReasoningBlock,
+        };
+
+        let summaries = vec![
+            None,
+            Some(vec![]),
+            Some(vec![ResponseReasoningBlock {
+                block_type: "summary_text".to_string(),
+                text: Some(String::new()),
+                extra: Default::default(),
+            }]),
+            Some(vec![
+                ResponseReasoningBlock {
+                    block_type: "summary_text".to_string(),
+                    text: Some(" \n\t".to_string()),
+                    extra: Default::default(),
+                },
+                ResponseReasoningBlock {
+                    block_type: "summary_text".to_string(),
+                    text: Some(String::new()),
+                    extra: Default::default(),
+                },
+            ]),
+        ];
+
+        for summary in summaries {
+            let carrier = ResponsesResult {
+                output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
+                    id: Some("reasoning-id".to_string()),
+                    item_type: "reasoning".to_string(),
+                    summary: summary.clone(),
+                    encrypted_content: Some("encrypted".to_string()),
+                    status: None,
+                    extra: Default::default(),
+                })],
+                ..Default::default()
+            };
+            let anthropic = translate_responses_result_to_anthropic(&carrier, None);
+            assert_eq!(anthropic.content.len(), 1, "summary: {summary:?}");
+            assert_eq!(anthropic.content[0]["type"], "thinking");
+            assert_eq!(anthropic.content[0]["thinking"], THINKING_TEXT);
+            assert_eq!(anthropic.content[0]["signature"], "encrypted@reasoning-id");
+
+            let carrier_free = ResponsesResult {
+                output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
+                    id: None,
+                    item_type: "reasoning".to_string(),
+                    summary: summary.clone(),
+                    encrypted_content: None,
+                    status: None,
+                    extra: Default::default(),
+                })],
+                ..Default::default()
+            };
+            let anthropic = translate_responses_result_to_anthropic(&carrier_free, None);
+            assert!(
+                !anthropic
+                    .content
+                    .iter()
+                    .any(|block| block["type"] == "thinking"),
+                "carrier-free empty summary invented thinking: {summary:?}"
+            );
+        }
+
+        for (encrypted_content, id) in [(Some(""), None), (None, Some("")), (Some(""), Some(""))] {
+            let result = ResponsesResult {
+                output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
+                    id: id.map(str::to_string),
+                    item_type: "reasoning".to_string(),
+                    summary: Some(vec![ResponseReasoningBlock {
+                        block_type: "summary_text".to_string(),
+                        text: Some(" \n".to_string()),
+                        extra: Default::default(),
+                    }]),
+                    encrypted_content: encrypted_content.map(str::to_string),
+                    status: None,
+                    extra: Default::default(),
+                })],
+                ..Default::default()
+            };
+            let anthropic = translate_responses_result_to_anthropic(&result, None);
+            assert_eq!(anthropic.content.len(), 1);
+            assert_eq!(anthropic.content[0]["thinking"], THINKING_TEXT);
+            assert_eq!(
+                anthropic.content[0]["signature"],
+                encode_reasoning_signature(encrypted_content, id)
+            );
+        }
     }
 }
