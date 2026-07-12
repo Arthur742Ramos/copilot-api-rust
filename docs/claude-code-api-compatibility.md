@@ -61,7 +61,7 @@ Status terms:
 | `content_filter` stop semantics | **Fixed here** | `utils.rs`; test `content_filter_incomplete_maps_to_refusal` | Maps to Anthropic `refusal`, not a misleading successful `end_turn`. |
 | Empty, truncated, or `[DONE]`-before-finish translated streams | **Fixed here** | Tests `unterminated_stream_closes_block_then_errors` and `unterminated_empty_stream_emits_terminal_error` | Emits one terminal `api_error`; never fabricates success for partial output. |
 | Malformed translated SSE JSON | **Fixed here** | Test `malformed_event_closes_open_block_and_errors_once`; flow drivers in `api_flows.rs` and provider routes | Closes any active block, emits one terminal error, and stops reading. |
-| Structurally malformed translated Chat Completions chunks | **Fixed here** | `stream_translation.rs`; tests `malformed_choices_discards_pending_success_and_suppresses_followups`, `malformed_choices_closes_open_blocks_and_clears_tool_state`, `malformed_choice_and_neighboring_shapes_are_terminal`, `public_translated_driver_stops_after_malformed_choices`, `provider_translated_driver_stops_after_malformed_choices`, and `empty_choices_completes_pending_with_usage` | Only an explicit `choices: []` record with object-shaped usage after a deferred finish is a valid usage-only completion. Missing, null, non-array, or malformed choices/delta/tool-call/usage structure closes open blocks in order, clears deferred success and tool state, emits one safe terminal error, and suppresses later chunks and EOF flushing. |
+| Malformed translated Chat Completions chunks and consumed nested fields | **Fixed here** | `stream_translation.rs`; tests `malformed_choice_and_neighboring_shapes_are_terminal`, `malformed_choices_discards_pending_success_and_suppresses_followups`, `malformed_choices_closes_open_blocks_and_clears_tool_state`, `malformed_delta_and_reasoning_fields_are_terminal_in_every_state`, `malformed_tool_call_fields_are_terminal_in_every_state`, `malformed_usage_fields_are_terminal_in_every_state`, `legitimate_null_omitted_and_fragmented_nested_fields_remain_valid`, `empty_choices_completes_pending_with_usage`, `public_translated_driver_stops_after_malformed_nested_fields`, and `provider_translated_driver_stops_after_malformed_nested_fields` | Only an explicit `choices: []` record with object-shaped, validated usage after a deferred finish is a usage-only completion. Structural choices/delta failures; non-null wrong-typed content/reasoning, tool index/id/function/name/arguments fields; and wrong-typed, negative, or fractional prompt/completion/total/cache token counts terminate through ordered cleanup. Optional nulls/omissions and string argument fragments remain valid. Every failure closes open blocks, clears deferred success/tool state, emits one safe terminal error, and suppresses later success/error/usage chunks and EOF flushing. |
 | Top-level translated Chat Completions upstream error objects | **Fixed here** | `stream_translation.rs`; tests `top_level_upstream_error_closes_open_block_before_safe_error`, `top_level_upstream_error_closes_thinking_block_in_protocol_order`, `top_level_upstream_error_discards_pending_success_and_terminates_once`, and `malformed_or_unsafe_top_level_error_uses_opaque_fallback`; public and provider flow drivers | Detects a non-null top-level `error` before structural validation and the legitimate empty-choice usage path. Active blocks close first, deferred success is discarded, only safe bounded type/message fields are retained, and later chunks/EOF cannot emit success or another terminal event. |
 | Out-of-order or duplicate Responses lifecycle events | **Fixed here** | Tests `completion_before_created_terminates_with_error` and `duplicate_created_terminates_with_error_without_second_start` | Completion cannot precede `message_start`, and duplicate starts terminate with an error instead of emitting an invalid Anthropic lifecycle. |
 | Native Anthropic stream truncation/malformed JSON | **Fixed here** | Native stream drivers in `api_flows.rs` and `provider/messages.rs` | A native stream must end in upstream `message_stop` or `error`; silent EOF is converted to an error, not synthetic `message_stop`. |
@@ -100,11 +100,13 @@ Status terms:
    count-token route uses the configured tokenizer and Claude multiplier. It is
    suitable for context budgeting but is not represented as byte-for-byte
    billing authority.
-6. **Malformed translated chunk structure is terminal.** Unlike the reference's
-   permissive optional chaining, this proxy does not conflate a missing or
-   wrongly typed `choices`/delta field with the explicit empty `choices` array in
-   OpenAI's final usage-only record. Continuing after structural corruption could
-   fabricate a successful Anthropic completion.
+6. **Malformed translated chunk data is terminal.** Unlike the reference's
+   permissive optional chaining, this proxy does not conflate missing or wrongly
+   typed `choices`/delta data with the explicit empty `choices` array in OpenAI's
+   final usage-only record, nor does it discard malformed content/tool fields or
+   truncate malformed token counts. Optional nulls and fragmented string tool
+   arguments remain accepted. Continuing after consumed-field corruption could
+   fabricate a successful Anthropic completion or incorrect accounting.
 
 ## Explicitly out of scope
 

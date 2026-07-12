@@ -77,6 +77,32 @@ fn opt_string(v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// The translated stream treats omitted and explicit-null optional strings the
+/// same way, but any other present JSON type is malformed. Keep this predicate
+/// shared with the `opt_string` projection so validation and extraction cannot
+/// drift apart.
+fn validate_optional_string(v: Option<&Value>) -> Result<(), ()> {
+    match v {
+        None | Some(Value::Null | Value::String(_)) => Ok(()),
+        Some(_) => Err(()),
+    }
+}
+
+/// OpenAI tool indices and token counts are JSON integers in the range this
+/// state machine stores. In particular, do not accept a floating-point number
+/// and truncate it while extracting the value.
+fn nonnegative_i64(v: &Value) -> Option<i64> {
+    v.as_i64().filter(|value| *value >= 0)
+}
+
+fn validate_optional_nonnegative_i64(v: Option<&Value>) -> Result<(), ()> {
+    match v {
+        None | Some(Value::Null) => Ok(()),
+        Some(value) if nonnegative_i64(value).is_some() => Ok(()),
+        Some(_) => Err(()),
+    }
+}
+
 const DEFAULT_UPSTREAM_ERROR_TYPE: &str = "api_error";
 const DEFAULT_UPSTREAM_ERROR_MESSAGE: &str = "The upstream model stream reported an error.";
 const MAX_UPSTREAM_ERROR_TYPE_BYTES: usize = 64;
@@ -136,6 +162,63 @@ enum ValidatedChatChunk<'a> {
     UsageOnly,
 }
 
+fn validate_tool_call(tool_call: &Value) -> Result<(), ()> {
+    let tool_call = tool_call.as_object().ok_or(())?;
+    validate_optional_nonnegative_i64(tool_call.get("index"))?;
+    validate_optional_string(tool_call.get("id"))?;
+
+    let Some(function) = tool_call.get("function") else {
+        return Ok(());
+    };
+    if function.is_null() {
+        return Ok(());
+    }
+    let function = function.as_object().ok_or(())?;
+    validate_optional_string(function.get("name"))?;
+    validate_optional_string(function.get("arguments"))
+}
+
+fn validate_delta(delta: &Value) -> Result<(), ()> {
+    for field in [
+        "content",
+        "reasoning_text",
+        "reasoning_content",
+        "reasoning_opaque",
+    ] {
+        validate_optional_string(delta.get(field))?;
+    }
+
+    match delta.get("tool_calls") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(tool_calls)) => tool_calls.iter().try_for_each(validate_tool_call),
+        Some(_) => Err(()),
+    }
+}
+
+/// Validate every OpenAI Chat Completions usage field consumed by either the
+/// Anthropic wire translator or the translated-flow token recorder. Unknown
+/// usage fields remain allowed. Omitted/null optional counts retain the
+/// existing zero/default semantics, while present counts must be non-negative
+/// JSON integers.
+fn validate_usage(usage: &Value) -> Result<(), ()> {
+    let usage = usage.as_object().ok_or(())?;
+    for field in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+        validate_optional_nonnegative_i64(usage.get(field))?;
+    }
+
+    let Some(prompt_details) = usage.get("prompt_tokens_details") else {
+        return Ok(());
+    };
+    if prompt_details.is_null() {
+        return Ok(());
+    }
+    let prompt_details = prompt_details.as_object().ok_or(())?;
+    for field in ["cached_tokens", "cache_creation_input_tokens"] {
+        validate_optional_nonnegative_i64(prompt_details.get(field))?;
+    }
+    Ok(())
+}
+
 /// Validate the structural fields that drive the translated stream state
 /// machine. Missing data and a value of the wrong JSON type must not collapse
 /// into the same branch as a legitimate empty array: doing so can turn upstream
@@ -148,43 +231,28 @@ fn validate_chat_chunk(chunk: &Value) -> Result<ValidatedChatChunk<'_>, ()> {
         // OpenAI's final include_usage record has an explicitly empty choices
         // array and a usage object. A bare `choices: []`, null usage, or a usage
         // value of another type is not that record.
-        return object
-            .get("usage")
-            .filter(|usage| usage.is_object())
-            .map(|_| ValidatedChatChunk::UsageOnly)
-            .ok_or(());
+        let usage = object.get("usage").ok_or(())?;
+        validate_usage(usage)?;
+        return Ok(ValidatedChatChunk::UsageOnly);
     }
 
     // Usage is optional/null on ordinary chunks, but a present non-null value
     // must retain the object shape consumed by the accounting helpers.
-    if object
-        .get("usage")
-        .is_some_and(|usage| !usage.is_null() && !usage.is_object())
-    {
-        return Err(());
+    if let Some(usage) = object.get("usage").filter(|usage| !usage.is_null()) {
+        validate_usage(usage)?;
     }
 
     for choice in choices {
-        if !choice.is_object() {
-            return Err(());
-        }
-        if choice.get("delta").and_then(Value::as_object).is_none() {
-            return Err(());
-        }
+        let choice = choice.as_object().ok_or(())?;
+        let delta = choice
+            .get("delta")
+            .filter(|delta| delta.is_object())
+            .ok_or(())?;
+        validate_delta(delta)?;
         if choice
             .get("finish_reason")
             .is_some_and(|reason| !reason.is_null() && !reason.is_string())
         {
-            return Err(());
-        }
-
-        let delta = choice.get("delta").ok_or(())?;
-        if delta.get("tool_calls").is_some_and(|tool_calls| {
-            !tool_calls.is_null()
-                && tool_calls
-                    .as_array()
-                    .is_none_or(|calls| calls.iter().any(|call| !call.is_object()))
-        }) {
             return Err(());
         }
     }
@@ -538,7 +606,10 @@ fn get_openai_chunk_usage_tokens(chunk: &Value) -> (i64, i64, i64) {
     (
         cache_creation_tokens,
         cached_tokens,
-        (prompt_tokens - cached_tokens - cache_creation_tokens).max(0),
+        prompt_tokens
+            .saturating_sub(cached_tokens)
+            .saturating_sub(cache_creation_tokens)
+            .max(0),
     )
 }
 
@@ -557,15 +628,15 @@ fn handle_tool_calls(
     handle_reasoning_opaque_in_tool_calls(state, events, delta);
 
     for tool_call in &delta.tool_calls {
-        let index = tool_call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-        let id = tool_call
-            .get("id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
+        let index = tool_call
+            .get("index")
+            .and_then(nonnegative_i64)
+            .unwrap_or(0);
+        let id = opt_string(tool_call.get("id")).filter(|s| !s.is_empty());
         let name = tool_call
             .get("function")
             .and_then(|f| f.get("name"))
-            .and_then(|v| v.as_str())
+            .and_then(|v| opt_string(Some(v)))
             .filter(|s| !s.is_empty());
 
         if let (Some(id), Some(name)) = (id, name) {
@@ -574,8 +645,8 @@ fn handle_tool_calls(
                 state.tool_calls.insert(
                     index,
                     AnthropicStreamToolCall {
-                        id: id.to_string(),
-                        name: name.to_string(),
+                        id,
+                        name,
                         anthropic_block_index: -1,
                         buffered_arguments: Vec::new(),
                         started: false,
@@ -615,7 +686,7 @@ fn handle_tool_calls(
         let arguments = tool_call
             .get("function")
             .and_then(|f| f.get("arguments"))
-            .and_then(|v| v.as_str())
+            .and_then(|v| opt_string(Some(v)))
             .filter(|s| !s.is_empty());
 
         if let Some(arguments) = arguments {
@@ -624,12 +695,12 @@ fn handle_tool_calls(
                     events.push(AnthropicStreamEventData::ContentBlockDelta {
                         index: info.anthropic_block_index,
                         delta: AnthropicContentBlockDelta::InputJsonDelta {
-                            partial_json: arguments.to_string(),
+                            partial_json: arguments,
                         },
                     });
                 }
             } else if let Some(info) = state.tool_calls.get_mut(&index) {
-                info.buffered_arguments.push(arguments.to_string());
+                info.buffered_arguments.push(arguments);
             }
         }
     }
@@ -928,7 +999,8 @@ fn has_usage(chunk: &Value) -> bool {
     chunk.get("usage").is_some_and(Value::is_object)
 }
 
-/// Navigate `path` and read an integer with a `?? 0` default.
+/// Navigate a previously validated usage path and read its non-negative integer
+/// value, retaining the existing `?? 0` behavior for omitted/null fields.
 fn usage_num(chunk: &Value, path: &[&str]) -> i64 {
     let mut cur = chunk;
     for key in path {
@@ -937,9 +1009,7 @@ fn usage_num(chunk: &Value, path: &[&str]) -> i64 {
             None => return 0,
         }
     }
-    cur.as_i64()
-        .or_else(|| cur.as_f64().map(|f| f as i64))
-        .unwrap_or(0)
+    nonnegative_i64(cur).unwrap_or(0)
 }
 
 /// `chunk.usage?.prompt_tokens_details?.<key> !== undefined` — the key exists
@@ -994,6 +1064,213 @@ mod tests {
             }
         }
         assert!(open.is_none(), "stream ended with an open content block");
+    }
+
+    fn malformed_error_event() -> Value {
+        json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "The upstream model stream returned a malformed event."
+            }
+        })
+    }
+
+    fn pending_success_state() -> AnthropicStreamState {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "pending",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        let finish = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            finish,
+            vec![json!({ "type": "content_block_stop", "index": 0 })]
+        );
+        assert!(state.pending_message_delta.is_some());
+        state
+    }
+
+    fn open_thinking_state() -> AnthropicStreamState {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "thinking",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "reasoning_text": "partial thought" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        assert!(state.thinking_block_open);
+        state
+    }
+
+    fn open_tool_state() -> AnthropicStreamState {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "tool",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"q\":"
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        let deferred = translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "deferred" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        assert!(deferred.is_empty());
+        assert!(state.content_block_open);
+        assert_eq!(state.active_tool_call_index, Some(0));
+        assert_eq!(state.deferred_content.as_deref(), Some("deferred"));
+        assert!(!state.tool_calls.is_empty());
+        state
+    }
+
+    fn assert_terminal_followups_are_suppressed(state: &mut AnthropicStreamState) {
+        for late_chunk in [
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "late success" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }),
+            json!({
+                "error": {
+                    "type": "server_error",
+                    "message": "late upstream error"
+                }
+            }),
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }),
+        ] {
+            assert!(translate_chunk_to_anthropic_events(&late_chunk, state).is_empty());
+        }
+        assert!(flush_pending_anthropic_stream_events(state).is_empty());
+    }
+
+    fn assert_malformed_events_and_cleanup(
+        got: Vec<Value>,
+        expected_before_error: Vec<Value>,
+        state: &mut AnthropicStreamState,
+        chunk: &Value,
+        context: &str,
+    ) {
+        let mut expected = expected_before_error;
+        expected.push(malformed_error_event());
+        assert_eq!(
+            got, expected,
+            "{context} state should terminate for malformed nested chunk: {chunk}"
+        );
+        assert_eq!(
+            got.iter()
+                .filter(|event| matches!(event["type"].as_str(), Some("error" | "message_stop")))
+                .count(),
+            1,
+            "{context} state emitted more than one terminal event for: {chunk}"
+        );
+        assert!(!state.content_block_open);
+        assert!(!state.thinking_block_open);
+        assert!(state.active_tool_call_index.is_none());
+        assert!(state.tool_calls.is_empty());
+        assert!(state.tool_call_order.is_empty());
+        assert!(state.deferred_content.is_none());
+        assert!(state.pending_message_delta.is_none());
+        assert!(state.terminal_event_emitted);
+        assert!(!state.message_stop_emitted);
+        assert_terminal_followups_are_suppressed(state);
+    }
+
+    /// Exercise each malformed nested field in every state that previously
+    /// allowed corruption to become a later success: fresh/non-pending,
+    /// deferred-success pending, open thinking, and open tool/deferred content.
+    fn assert_malformed_nested_chunk_is_terminal(chunk: Value) {
+        let mut fresh = AnthropicStreamState::default();
+        let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut fresh));
+        assert_malformed_events_and_cleanup(got, vec![], &mut fresh, &chunk, "fresh");
+
+        let mut pending = pending_success_state();
+        let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut pending));
+        assert_malformed_events_and_cleanup(got, vec![], &mut pending, &chunk, "pending");
+
+        let mut thinking = open_thinking_state();
+        let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut thinking));
+        assert_malformed_events_and_cleanup(
+            got,
+            vec![
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ],
+            &mut thinking,
+            &chunk,
+            "open-thinking",
+        );
+
+        let mut tool = open_tool_state();
+        let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut tool));
+        assert_malformed_events_and_cleanup(
+            got,
+            vec![json!({ "type": "content_block_stop", "index": 0 })],
+            &mut tool,
+            &chunk,
+            "open-tool",
+        );
     }
 
     #[test]
@@ -1814,6 +2091,252 @@ mod tests {
         assert!(tool_state.deferred_content.is_none());
         assert!(tool_state.pending_message_delta.is_none());
         assert!(tool_state.terminal_event_emitted);
+    }
+
+    #[test]
+    fn malformed_delta_and_reasoning_fields_are_terminal_in_every_state() {
+        for chunk in [
+            json!({
+                "choices": [{
+                    "delta": { "content": 42 },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "content": [] },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "reasoning_text": {} },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "reasoning_content": 1.5 },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "reasoning_opaque": false },
+                    "finish_reason": null
+                }]
+            }),
+        ] {
+            assert_malformed_nested_chunk_is_terminal(chunk);
+        }
+    }
+
+    #[test]
+    fn malformed_tool_call_fields_are_terminal_in_every_state() {
+        for tool_call in [
+            json!({ "index": "bad" }),
+            json!({ "index": 0.5 }),
+            json!({ "index": -1 }),
+            json!({ "index": 0, "id": 123 }),
+            json!({ "index": 0, "function": [] }),
+            json!({ "index": 0, "function": { "name": 99 } }),
+            json!({ "index": 0, "function": { "arguments": {} } }),
+        ] {
+            assert_malformed_nested_chunk_is_terminal(json!({
+                "choices": [{
+                    "delta": { "tool_calls": [tool_call] },
+                    "finish_reason": null
+                }]
+            }));
+        }
+    }
+
+    #[test]
+    fn malformed_usage_fields_are_terminal_in_every_state() {
+        for chunk in [
+            json!({
+                "choices": [{ "delta": {}, "finish_reason": null }],
+                "usage": { "prompt_tokens": "bad" }
+            }),
+            json!({
+                "choices": [{ "delta": {}, "finish_reason": null }],
+                "usage": { "completion_tokens": [] }
+            }),
+            json!({
+                "choices": [{ "delta": {}, "finish_reason": null }],
+                "usage": { "total_tokens": {} }
+            }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 1.5 }
+            }),
+            json!({
+                "choices": [],
+                "usage": { "completion_tokens": -1 }
+            }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens_details": [] }
+            }),
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens_details": { "cached_tokens": "bad" }
+                }
+            }),
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens_details": {
+                        "cache_creation_input_tokens": 0.25
+                    }
+                }
+            }),
+        ] {
+            assert_malformed_nested_chunk_is_terminal(chunk);
+        }
+    }
+
+    #[test]
+    fn legitimate_null_omitted_and_fragmented_nested_fields_remain_valid() {
+        let mut state = AnthropicStreamState::default();
+        let announced = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "null-and-fragmented",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": null,
+                        "reasoning_text": null,
+                        "reasoning_content": null,
+                        "reasoning_opaque": null,
+                        "tool_calls": [{
+                            "index": null,
+                            "id": "call_1",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": null
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }],
+                "usage": null
+            }),
+            &mut state,
+        ));
+        assert_eq!(announced.len(), 2);
+        assert_eq!(announced[0]["type"], "message_start");
+        assert_eq!(announced[1]["type"], "content_block_start");
+        assert_eq!(announced[1]["content_block"]["id"], "call_1");
+        assert_eq!(state.active_tool_call_index, Some(0));
+
+        // Later argument fragments may omit index, id, and name. Explicit nulls
+        // carry the same optional-field meaning and must not be rejected.
+        for (fragment, expected) in [
+            (
+                json!({ "function": { "arguments": "{\"city\":" } }),
+                "{\"city\":",
+            ),
+            (
+                json!({
+                    "index": null,
+                    "id": null,
+                    "function": { "name": null, "arguments": "\"Paris\"}" }
+                }),
+                "\"Paris\"}",
+            ),
+        ] {
+            let got = to_values(&translate_chunk_to_anthropic_events(
+                &json!({
+                    "choices": [{
+                        "delta": { "tool_calls": [fragment] },
+                        "finish_reason": null
+                    }]
+                }),
+                &mut state,
+            ));
+            assert_eq!(
+                got,
+                vec![json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": expected
+                    }
+                })]
+            );
+        }
+
+        for no_op in [
+            json!({
+                "choices": [{
+                    "delta": {
+                        "content": null,
+                        "reasoning_text": null,
+                        "reasoning_content": null,
+                        "reasoning_opaque": null,
+                        "tool_calls": null
+                    },
+                    "finish_reason": null
+                }],
+                "usage": { "prompt_tokens_details": null }
+            }),
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": null,
+                            "id": null,
+                            "function": null
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+        ] {
+            assert!(translate_chunk_to_anthropic_events(&no_op, &mut state).is_empty());
+        }
+
+        let finish = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": null,
+                    "completion_tokens": null,
+                    "total_tokens": null,
+                    "prompt_tokens_details": {
+                        "cached_tokens": null,
+                        "cache_creation_input_tokens": null
+                    }
+                }
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            finish,
+            vec![
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0
+                    }
+                }),
+                json!({ "type": "message_stop" }),
+            ]
+        );
+        assert!(state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
     }
 
     #[test]

@@ -301,16 +301,19 @@ fn stream_chat_completions_response(
                     return;
                 }
             };
-            if let Some(u) = chunk.get("usage") {
-                if !u.is_null() {
-                    usage = normalize_openai_usage(Some(u));
-                }
-            }
-
+            let was_terminal = state.terminal_event_emitted;
             let translated = translate_chunk_to_anthropic_events(&chunk, &mut state);
             let terminal_error = translated
                 .iter()
                 .any(|event| matches!(event, AnthropicStreamEventData::Error { .. }));
+            // The translator validates every usage field this flow consumes.
+            // Account only a chunk it accepted, and never let trailing records
+            // mutate usage after success or failure became terminal.
+            if !was_terminal && !terminal_error {
+                if let Some(u) = chunk.get("usage").filter(|usage| !usage.is_null()) {
+                    usage = normalize_openai_usage(Some(u));
+                }
+            }
             for event in translated {
                 if let Some(frame) = emit_event(&event) {
                     if !matches!(&event, AnthropicStreamEventData::Error { .. }) {
@@ -1021,6 +1024,79 @@ mod tests {
             ),
             "terminal malformed error must be the final public frame: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn public_translated_driver_stops_after_malformed_nested_fields() {
+        let cases = [
+            (
+                "delta/reasoning",
+                concat!(
+                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"partial thought\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":42},\"finish_reason\":null}]}\n\n",
+                ),
+            ),
+            (
+                "tool/function",
+                concat!(
+                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":{}}}]},\"finish_reason\":null}]}\n\n",
+                ),
+            ),
+            (
+                "usage/details",
+                concat!(
+                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":0.5}}}\n\n",
+                ),
+            ),
+        ];
+
+        for (class, prefix) in cases {
+            let stream = format!(
+                "{}{}",
+                prefix,
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: {\"error\":{\"type\":\"server_error\",\"message\":\"late error\"}}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: [DONE]\n\n",
+                )
+            );
+            let upstream = upstream_sse_response(&stream).await;
+            let recorder = create_copilot_token_usage_recorder("chat_completions", "m", None);
+            let response = stream_chat_completions_response(upstream, recorder, None);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect translated public stream")
+                .to_bytes();
+            let body = std::str::from_utf8(&body).expect("translated stream is UTF-8");
+
+            assert_eq!(body.matches("event: error\n").count(), 1, "{class}: {body}");
+            assert!(
+                body.contains("The upstream model stream returned a malformed event."),
+                "{class}: {body}"
+            );
+            assert!(
+                body.contains("event: content_block_stop\n"),
+                "{class}: an open block or pending finish must close before error: {body}"
+            );
+            assert!(!body.contains("event: message_delta"), "{class}: {body}");
+            assert!(!body.contains("event: message_stop"), "{class}: {body}");
+            assert!(!body.contains("late success"), "{class}: {body}");
+            assert!(!body.contains("late error"), "{class}: {body}");
+            assert!(!body.contains("deferred"), "{class}: {body}");
+            assert!(
+                body.ends_with(
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"The upstream model stream returned a malformed event.\"}}\n\n"
+                ),
+                "{class}: terminal malformed error must be the final public frame: {body}"
+            );
+        }
     }
 
     #[test]
