@@ -350,8 +350,7 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
             "sequence_number":0,
             "response":{
                 "id":"resp_terminal_fixture",
-                "object":"response",
-                "model":model
+                "object":"response"
             }
         }),
     );
@@ -395,7 +394,10 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
         json!({
             "type":"response.incomplete",
             "sequence_number":1,
-            "response":{"incomplete_details":{"reason":"content_filter"}}
+            "response":{
+                "id":"resp_terminal_fixture",
+                "incomplete_details":{"reason":"content_filter"}
+            }
         }),
     );
     let pending_item = (
@@ -514,7 +516,10 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
                 json!({
                     "type":"response.incomplete",
                     "sequence_number":2,
-                    "response":{"incomplete_details":{"reason":"max_output_tokens"}}
+                    "response":{
+                        "id":"resp_terminal_fixture",
+                        "incomplete_details":{"reason":"max_output_tokens"}
+                    }
                 }),
             ),
             error,
@@ -544,7 +549,10 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
                 json!({
                     "type":"response.incomplete",
                     "sequence_number":1,
-                    "response":{"incomplete_details":{"reason":"unknown_fixture_reason"}}
+                    "response":{
+                        "id":"resp_terminal_fixture",
+                        "incomplete_details":{"reason":"unknown_fixture_reason"}
+                    }
                 }),
             ),
             completed_no_status_no_usage,
@@ -571,6 +579,240 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
         ],
         _ => return None,
     };
+
+    Some(sse_response(render_sse(&events)))
+}
+
+fn created_usage_contract_stream_fixture(model: &str) -> Option<Response> {
+    let mut include_created = true;
+    let mut created_response = json!({"id":"resp_contract_fixture"});
+    let mut terminal_type = "response.completed";
+    let mut terminal_response = json!({"id":"resp_contract_fixture"});
+    let valid_usage = json!({
+        "input_tokens":5,
+        "input_tokens_details":{"cached_tokens":2},
+        "output_tokens":3,
+        "output_tokens_details":{"reasoning_tokens":1},
+        "total_tokens":8
+    });
+
+    match model {
+        "gpt-contract-created-model-less" => {}
+        "gpt-contract-created-with-model" => {
+            created_response["model"] = json!(model);
+        }
+        "gpt-contract-created-upstream-model" => {
+            created_response["model"] = json!("upstream-reported-model");
+        }
+        "gpt-contract-created-empty-id" => created_response["id"] = json!(""),
+        "gpt-contract-created-wrong-id" => created_response["id"] = json!(42),
+        "gpt-contract-created-missing-id" => {
+            created_response.as_object_mut().unwrap().remove("id");
+        }
+        "gpt-contract-created-empty-model" => created_response["model"] = json!(""),
+        "gpt-contract-created-wrong-model" => created_response["model"] = json!(42),
+        "gpt-contract-created-status-mismatch" => {
+            created_response["status"] = json!("completed");
+        }
+        "gpt-contract-created-partial-usage" => {
+            created_response["usage"] = json!({"input_tokens":1});
+        }
+        "gpt-contract-completed-empty-id" => terminal_response["id"] = json!(""),
+        "gpt-contract-completed-wrong-id" => terminal_response["id"] = json!(42),
+        "gpt-contract-completed-mismatched-id" => {
+            terminal_response["id"] = json!("different-response");
+        }
+        "gpt-contract-incomplete-empty-id" => {
+            terminal_type = "response.incomplete";
+            terminal_response["id"] = json!("");
+            terminal_response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        }
+        "gpt-contract-incomplete-wrong-id" => {
+            terminal_type = "response.incomplete";
+            terminal_response["id"] = json!(42);
+            terminal_response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        }
+        "gpt-contract-incomplete-mismatched-id" => {
+            terminal_type = "response.incomplete";
+            terminal_response["id"] = json!("different-response");
+            terminal_response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        }
+        "gpt-contract-failed-empty-id" => {
+            terminal_type = "response.failed";
+            terminal_response["id"] = json!("");
+            terminal_response["error"] = json!({"message":"failed"});
+        }
+        "gpt-contract-failed-wrong-id" => {
+            terminal_type = "response.failed";
+            terminal_response["id"] = json!(42);
+            terminal_response["error"] = json!({"message":"failed"});
+        }
+        "gpt-contract-failed-mismatched-id" => {
+            terminal_type = "response.failed";
+            terminal_response["id"] = json!("different-response");
+            terminal_response["error"] = json!({"message":"failed"});
+        }
+        "gpt-contract-failed-without-created" => {
+            include_created = false;
+            terminal_type = "response.failed";
+            terminal_response["error"] = json!({"message":"failed before created"});
+        }
+        "gpt-contract-terminal-wrong-end-turn" => {
+            terminal_response["end_turn"] = json!("yes");
+        }
+        "gpt-contract-terminal-null-end-turn" => {
+            terminal_response["end_turn"] = Value::Null;
+        }
+        "gpt-contract-usage-valid-details" => terminal_response["usage"] = valid_usage,
+        "gpt-contract-usage-null-details" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "input_tokens_details":null,
+                "output_tokens":3,
+                "output_tokens_details":null,
+                "total_tokens":8
+            });
+        }
+        "gpt-contract-usage-null" => terminal_response["usage"] = Value::Null,
+        "gpt-contract-usage-wrong-type" => terminal_response["usage"] = json!("tokens"),
+        "gpt-contract-usage-missing-input" => {
+            terminal_response["usage"] = json!({"output_tokens":3,"total_tokens":3});
+        }
+        "gpt-contract-usage-missing-output" => {
+            terminal_response["usage"] = json!({"input_tokens":5,"total_tokens":5});
+        }
+        "gpt-contract-usage-missing-total" => {
+            terminal_response["usage"] = json!({"input_tokens":5,"output_tokens":3});
+        }
+        "gpt-contract-usage-wrong-input" => {
+            terminal_response["usage"] =
+                json!({"input_tokens":"5","output_tokens":3,"total_tokens":8});
+        }
+        "gpt-contract-usage-wrong-output" => {
+            terminal_response["usage"] =
+                json!({"input_tokens":5,"output_tokens":3.5,"total_tokens":8});
+        }
+        "gpt-contract-usage-null-total" => {
+            terminal_response["usage"] =
+                json!({"input_tokens":5,"output_tokens":3,"total_tokens":null});
+        }
+        "gpt-contract-usage-negative-input" => {
+            terminal_response["usage"] =
+                json!({"input_tokens":-1,"output_tokens":3,"total_tokens":2});
+        }
+        "gpt-contract-usage-negative-output" => {
+            terminal_response["usage"] =
+                json!({"input_tokens":5,"output_tokens":-1,"total_tokens":4});
+        }
+        "gpt-contract-usage-negative-total" => {
+            terminal_response["usage"] =
+                json!({"input_tokens":5,"output_tokens":3,"total_tokens":-8});
+        }
+        "gpt-contract-usage-integer-overflow" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":9223372036854775808_u64,
+                "output_tokens":0,
+                "total_tokens":9223372036854775808_u64
+            });
+        }
+        "gpt-contract-usage-sum-overflow" => {
+            terminal_response["usage"] =
+                json!({"input_tokens":i64::MAX,"output_tokens":1,"total_tokens":i64::MAX});
+        }
+        "gpt-contract-usage-total-mismatch" => {
+            terminal_response["usage"] =
+                json!({"input_tokens":5,"output_tokens":3,"total_tokens":9});
+        }
+        "gpt-contract-usage-input-details-wrong" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "input_tokens_details":[],
+                "output_tokens":3,
+                "total_tokens":8
+            });
+        }
+        "gpt-contract-usage-output-details-wrong" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "output_tokens":3,
+                "output_tokens_details":"reasoning",
+                "total_tokens":8
+            });
+        }
+        "gpt-contract-usage-missing-cached" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "input_tokens_details":{},
+                "output_tokens":3,
+                "total_tokens":8
+            });
+        }
+        "gpt-contract-usage-missing-reasoning" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "output_tokens":3,
+                "output_tokens_details":{},
+                "total_tokens":8
+            });
+        }
+        "gpt-contract-usage-negative-cached" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "input_tokens_details":{"cached_tokens":-1},
+                "output_tokens":3,
+                "total_tokens":8
+            });
+        }
+        "gpt-contract-usage-negative-reasoning" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "output_tokens":3,
+                "output_tokens_details":{"reasoning_tokens":-1},
+                "total_tokens":8
+            });
+        }
+        "gpt-contract-usage-cached-exceeds-input" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "input_tokens_details":{"cached_tokens":6},
+                "output_tokens":3,
+                "total_tokens":8
+            });
+        }
+        "gpt-contract-usage-reasoning-exceeds-output" => {
+            terminal_response["usage"] = json!({
+                "input_tokens":5,
+                "output_tokens":3,
+                "output_tokens_details":{"reasoning_tokens":4},
+                "total_tokens":8
+            });
+        }
+        _ => return None,
+    }
+
+    let mut events = Vec::new();
+    if include_created {
+        events.push((
+            "response.created",
+            json!({
+                "type":"response.created",
+                "sequence_number":0,
+                "response":created_response
+            }),
+        ));
+    }
+    events.push((
+        terminal_type,
+        json!({
+            "type":terminal_type,
+            "sequence_number":1,
+            "response":terminal_response
+        }),
+    ));
+    events.push((
+        "error",
+        json!({"type":"error","sequence_number":2,"message":"later terminal"}),
+    ));
 
     Some(sse_response(render_sse(&events)))
 }
@@ -1636,6 +1878,9 @@ fn responses_fixture(body: &Value) -> Response {
     }
 
     if body["stream"] == true {
+        if let Some(response) = created_usage_contract_stream_fixture(model) {
+            return response;
+        }
         if let Some(response) = terminal_contract_stream_fixture(model) {
             return response;
         }
@@ -2259,6 +2504,52 @@ fn configure(fixture: &Fixture) {
         "gpt-premature-eof",
         "gpt-incomplete",
         "gpt-cli-smoke",
+        "gpt-contract-created-model-less",
+        "gpt-contract-created-with-model",
+        "gpt-contract-created-upstream-model",
+        "gpt-contract-created-empty-id",
+        "gpt-contract-created-wrong-id",
+        "gpt-contract-created-missing-id",
+        "gpt-contract-created-empty-model",
+        "gpt-contract-created-wrong-model",
+        "gpt-contract-created-status-mismatch",
+        "gpt-contract-created-partial-usage",
+        "gpt-contract-completed-empty-id",
+        "gpt-contract-completed-wrong-id",
+        "gpt-contract-completed-mismatched-id",
+        "gpt-contract-incomplete-empty-id",
+        "gpt-contract-incomplete-wrong-id",
+        "gpt-contract-incomplete-mismatched-id",
+        "gpt-contract-failed-empty-id",
+        "gpt-contract-failed-wrong-id",
+        "gpt-contract-failed-mismatched-id",
+        "gpt-contract-failed-without-created",
+        "gpt-contract-terminal-wrong-end-turn",
+        "gpt-contract-terminal-null-end-turn",
+        "gpt-contract-usage-valid-details",
+        "gpt-contract-usage-null-details",
+        "gpt-contract-usage-null",
+        "gpt-contract-usage-wrong-type",
+        "gpt-contract-usage-missing-input",
+        "gpt-contract-usage-missing-output",
+        "gpt-contract-usage-missing-total",
+        "gpt-contract-usage-wrong-input",
+        "gpt-contract-usage-wrong-output",
+        "gpt-contract-usage-null-total",
+        "gpt-contract-usage-negative-input",
+        "gpt-contract-usage-negative-output",
+        "gpt-contract-usage-negative-total",
+        "gpt-contract-usage-integer-overflow",
+        "gpt-contract-usage-sum-overflow",
+        "gpt-contract-usage-total-mismatch",
+        "gpt-contract-usage-input-details-wrong",
+        "gpt-contract-usage-output-details-wrong",
+        "gpt-contract-usage-missing-cached",
+        "gpt-contract-usage-missing-reasoning",
+        "gpt-contract-usage-negative-cached",
+        "gpt-contract-usage-negative-reasoning",
+        "gpt-contract-usage-cached-exceeds-input",
+        "gpt-contract-usage-reasoning-exceeds-output",
         "gpt-terminal-completed-no-status-usage",
         "gpt-terminal-completed-no-status-no-usage",
         "gpt-terminal-completed-matching-status",
@@ -3647,6 +3938,273 @@ async fn claude_failed_and_error_terminals_suppress_all_later_terminals() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
+async fn claude_model_less_created_uses_resolved_model_context() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, expected_message_model) in [
+        (
+            "gpt-contract-created-model-less",
+            "gpt-contract-created-model-less",
+        ),
+        (
+            "gpt-contract-created-with-model",
+            "gpt-contract-created-with-model",
+        ),
+        (
+            "gpt-contract-created-upstream-model",
+            "upstream-reported-model",
+        ),
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"created contract"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            0,
+            "{model}: {events:#?}"
+        );
+        let start = events
+            .iter()
+            .find(|event| event["type"] == "message_start")
+            .expect("model contract emits message_start");
+        assert_eq!(start["message"]["id"], "resp_contract_fixture", "{model}");
+        assert_eq!(
+            start["message"]["model"], expected_message_model,
+            "{model}: fallback/reported model changed"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_created_and_terminal_identity_fields_fail_closed() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for model in [
+        "gpt-contract-created-empty-id",
+        "gpt-contract-created-wrong-id",
+        "gpt-contract-created-missing-id",
+        "gpt-contract-created-empty-model",
+        "gpt-contract-created-wrong-model",
+        "gpt-contract-created-status-mismatch",
+        "gpt-contract-completed-empty-id",
+        "gpt-contract-completed-wrong-id",
+        "gpt-contract-completed-mismatched-id",
+        "gpt-contract-incomplete-empty-id",
+        "gpt-contract-incomplete-wrong-id",
+        "gpt-contract-incomplete-mismatched-id",
+        "gpt-contract-failed-empty-id",
+        "gpt-contract-failed-wrong-id",
+        "gpt-contract-failed-mismatched-id",
+        "gpt-contract-terminal-wrong-end-turn",
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"identity contract"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}: {events:#?}"
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["type"].as_str(),
+                Some("message_delta" | "message_stop")
+            )),
+            "{model}: invalid identity/scalar fabricated success"
+        );
+    }
+
+    let (status, body) = send(post_json(
+        "/v1/messages",
+        json!({
+            "model":"responses-fixture/gpt-contract-failed-without-created",
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"failed contract"}],
+            "stream":true
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let errors: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{events:#?}");
+    assert_eq!(errors[0]["error"]["message"], "failed before created");
+    assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_usage_contract_preserves_valid_details_and_omission() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, input_tokens, output_tokens, cached_tokens) in [
+        (
+            "gpt-contract-usage-valid-details",
+            3_i64,
+            3_i64,
+            Some(2_i64),
+        ),
+        ("gpt-contract-usage-null-details", 5, 3, None),
+        ("gpt-contract-usage-null", 0, 0, None),
+        ("gpt-contract-terminal-null-end-turn", 0, 0, None),
+        ("gpt-contract-created-model-less", 0, 0, None),
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"usage contract"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            0,
+            "{model}: {events:#?}"
+        );
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("valid usage emits terminal delta");
+        assert_eq!(delta["usage"]["input_tokens"], input_tokens, "{model}");
+        assert_eq!(delta["usage"]["output_tokens"], output_tokens, "{model}");
+        assert_eq!(
+            delta["usage"]
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_i64),
+            cached_tokens,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_malformed_usage_never_coerces_to_success() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for model in [
+        "gpt-contract-created-partial-usage",
+        "gpt-contract-usage-wrong-type",
+        "gpt-contract-usage-missing-input",
+        "gpt-contract-usage-missing-output",
+        "gpt-contract-usage-missing-total",
+        "gpt-contract-usage-wrong-input",
+        "gpt-contract-usage-wrong-output",
+        "gpt-contract-usage-null-total",
+        "gpt-contract-usage-negative-input",
+        "gpt-contract-usage-negative-output",
+        "gpt-contract-usage-negative-total",
+        "gpt-contract-usage-integer-overflow",
+        "gpt-contract-usage-sum-overflow",
+        "gpt-contract-usage-total-mismatch",
+        "gpt-contract-usage-input-details-wrong",
+        "gpt-contract-usage-output-details-wrong",
+        "gpt-contract-usage-missing-cached",
+        "gpt-contract-usage-missing-reasoning",
+        "gpt-contract-usage-negative-cached",
+        "gpt-contract-usage-negative-reasoning",
+        "gpt-contract-usage-cached-exceeds-input",
+        "gpt-contract-usage-reasoning-exceeds-output",
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"invalid usage"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}: {events:#?}"
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["type"].as_str(),
+                Some("message_delta" | "message_stop")
+            )),
+            "{model}: malformed usage was coerced to success"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
 async fn native_responses_forwards_statusless_codex_terminal_unchanged() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
@@ -3668,6 +4226,11 @@ async fn native_responses_forwards_statusless_codex_terminal_unchanged() {
     assert_eq!(completed[0]["response"]["id"], "resp_terminal_fixture");
     assert!(completed[0]["response"].get("status").is_none());
     assert_eq!(completed[0]["response"]["usage"]["input_tokens"], 11);
+    let created = events
+        .iter()
+        .find(|event| event["type"] == "response.created")
+        .expect("native created event");
+    assert!(created["response"].get("model").is_none());
     assert!(
         !events.iter().any(|event| {
             matches!(
@@ -3676,6 +4239,24 @@ async fn native_responses_forwards_statusless_codex_terminal_unchanged() {
             )
         }),
         "native Responses events were translated into Anthropic events"
+    );
+
+    let (status, body) = send(post_json(
+        "/v1/responses",
+        codex_request("gpt-contract-usage-wrong-input", true),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("native malformed-usage terminal remains forwarded");
+    assert_eq!(completed["response"]["usage"]["input_tokens"], "5");
+    assert!(
+        !events.iter().any(|event| event["type"] == "error"),
+        "translated usage validation leaked into native Responses"
     );
 }
 

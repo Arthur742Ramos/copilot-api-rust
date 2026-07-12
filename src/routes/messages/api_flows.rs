@@ -378,6 +378,7 @@ pub async fn handle_with_responses_api(
     let subagent_agent_id = opts.subagent_marker.as_ref().map(|m| m.agent_id.as_str());
     let mut responses_payload =
         translate_anthropic_messages_to_responses_payload(payload, subagent_agent_id)?;
+    let response_model = responses_payload.model.clone();
 
     // Capture context in-scope for the deferred stream body + summary line.
     let req_ctx = crate::libs::request_context::request_context_store();
@@ -449,7 +450,10 @@ pub async fn handle_with_responses_api(
             let stream = async_stream::stream! {
                 let mut timer = StreamTimer::new("responses", stream_transport::TRANSLATED)
                     .with_request_context(req_ctx);
-                let mut state = ResponsesStreamState::new(Some(tool_search_name));
+                let mut state = ResponsesStreamState::new_with_model(
+                    Some(tool_search_name),
+                    Some(response_model),
+                );
                 let mut usage = UsageTokens::default();
 
                 let heartbeat = crate::libs::sse::sse_heartbeat_interval();

@@ -392,6 +392,7 @@ fn stream_responses_provider_messages(
     let recorder = create_provider_messages_usage_recorder(payload, provider);
     let tool_search_name =
         resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
+    let response_model = payload.model.clone();
     let provider_label = provider.to_string();
     let event_stream = crate::libs::sse::events(upstream);
 
@@ -400,7 +401,10 @@ fn stream_responses_provider_messages(
         let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)
             .with_request_context(crate::libs::request_context::request_context_store());
         let mut usage = UsageTokens::default();
-        let mut state = ResponsesStreamState::new(Some(tool_search_name));
+        let mut state = ResponsesStreamState::new_with_model(
+            Some(tool_search_name),
+            Some(response_model),
+        );
         futures_util::pin_mut!(event_stream);
 
         while let Some(item) = event_stream.next().await {

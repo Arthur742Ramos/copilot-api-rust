@@ -96,6 +96,8 @@ pub struct ReasoningItemStreamState {
 pub struct ResponsesStreamState {
     pub message_start_sent: bool,
     pub message_completed: bool,
+    pub created_response_id: Option<String>,
+    pub fallback_model: Option<String>,
     pub next_content_block_index: i64,
     pub block_index_by_key: HashMap<String, i64>,
     /// Insertion-ordered (JS `Set` iteration order is significant here).
@@ -120,9 +122,18 @@ pub struct ResponsesStreamState {
 impl ResponsesStreamState {
     /// Mirrors the TS `createResponsesStreamState({ toolSearchName })`.
     pub fn new(tool_search_name: Option<String>) -> Self {
+        Self::new_with_model(tool_search_name, None)
+    }
+
+    pub fn new_with_model(
+        tool_search_name: Option<String>,
+        fallback_model: Option<String>,
+    ) -> Self {
         Self {
             message_start_sent: false,
             message_completed: false,
+            created_response_id: None,
+            fallback_model: fallback_model.filter(|model| !model.trim().is_empty()),
             next_content_block_index: 0,
             block_index_by_key: HashMap::new(),
             open_blocks: Vec::new(),
@@ -273,6 +284,80 @@ fn required_nonnegative_index(
         return Err(negative_message);
     }
     Ok(index)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ValidatedResponsesUsage {
+    input_tokens: i64,
+    cached_input_tokens: Option<i64>,
+    output_tokens: i64,
+}
+
+fn required_nonnegative_usage_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<i64, &'static str> {
+    object
+        .get(field)
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or("A Responses usage object had a missing, wrong-typed, or negative token field.")
+}
+
+fn optional_usage_detail(
+    usage: &serde_json::Map<String, Value>,
+    details_field: &str,
+    token_field: &str,
+) -> Result<Option<i64>, &'static str> {
+    let Some(details) = usage.get(details_field) else {
+        return Ok(None);
+    };
+    if details.is_null() {
+        return Ok(None);
+    }
+    let Some(details) = details.as_object() else {
+        return Err("A Responses usage details field was not an object or null.");
+    };
+    required_nonnegative_usage_field(details, token_field).map(Some)
+}
+
+fn validate_responses_usage(response: &Value) -> Result<ValidatedResponsesUsage, &'static str> {
+    let Some(usage) = response.get("usage") else {
+        return Ok(ValidatedResponsesUsage::default());
+    };
+    if usage.is_null() {
+        return Ok(ValidatedResponsesUsage::default());
+    }
+    let Some(usage) = usage.as_object() else {
+        return Err("A Responses usage field was not an object or null.");
+    };
+
+    let input_tokens = required_nonnegative_usage_field(usage, "input_tokens")?;
+    let output_tokens = required_nonnegative_usage_field(usage, "output_tokens")?;
+    let total_tokens = required_nonnegative_usage_field(usage, "total_tokens")?;
+    let cached_input_tokens =
+        optional_usage_detail(usage, "input_tokens_details", "cached_tokens")?;
+    let reasoning_output_tokens =
+        optional_usage_detail(usage, "output_tokens_details", "reasoning_tokens")?;
+
+    let Some(expected_total) = input_tokens.checked_add(output_tokens) else {
+        return Err("A Responses usage total overflowed the supported integer range.");
+    };
+    if total_tokens != expected_total {
+        return Err("A Responses usage total did not equal input plus output tokens.");
+    }
+    if cached_input_tokens.is_some_and(|cached| cached > input_tokens) {
+        return Err("A Responses cached token count exceeded its input token count.");
+    }
+    if reasoning_output_tokens.is_some_and(|reasoning| reasoning > output_tokens) {
+        return Err("A Responses reasoning token count exceeded its output token count.");
+    }
+
+    Ok(ValidatedResponsesUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+    })
 }
 
 fn validate_event_sequence(
@@ -759,50 +844,75 @@ fn handle_response_created(
             build_error_event("A response.created event was missing its response object."),
         );
     };
-    if get_str(response, "id").is_none() || get_str(response, "model").is_none() {
+    let Some(id) = get_str(response, "id").filter(|id| !id.trim().is_empty()) else {
         return terminate_responses_stream_with_error(
             state,
-            build_error_event("A response.created event was missing its response id or model."),
+            build_error_event("A response.created event had a missing or empty response id."),
         );
+    };
+    if let Some(status) = response.get("status") {
+        if status.as_str() != Some("in_progress") {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event("A response.created event had an inconsistent response status."),
+            );
+        }
     }
-    message_start(state, response)
+    let model = match response.get("model") {
+        Some(Value::String(model)) if !model.trim().is_empty() => model.clone(),
+        None => match state.fallback_model.clone() {
+            Some(model) => model,
+            None => {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event(
+                        "A model-less response.created event had no requested model context.",
+                    ),
+                )
+            }
+        },
+        _ => {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event("A response.created event contained an invalid model."),
+            )
+        }
+    };
+    let usage = match validate_responses_usage(response) {
+        Ok(usage) => usage,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
+    state.created_response_id = Some(id.to_string());
+    message_start(state, id, &model, usage)
 }
 
 /// Mirrors `messageStart`.
 fn message_start(
     state: &mut ResponsesStreamState,
-    response: &Value,
+    id: &str,
+    model: &str,
+    usage: ValidatedResponsesUsage,
 ) -> Vec<AnthropicStreamEventData> {
     state.message_start_sent = true;
 
-    let usage = response.get("usage");
-    let input_cached_tokens = usage
-        .and_then(|u| u.get("input_tokens_details"))
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(Value::as_i64);
-    let input_tokens_raw = usage
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let input_tokens = (input_tokens_raw - input_cached_tokens.unwrap_or(0)).max(0);
-
-    let id = get_str(response, "id").unwrap_or("").to_string();
-    let model = get_str(response, "model").unwrap_or("").to_string();
+    let input_tokens = usage.input_tokens - usage.cached_input_tokens.unwrap_or(0);
 
     vec![AnthropicStreamEventData::MessageStart {
         message: AnthropicMessageStart {
-            id,
+            id: id.to_string(),
             kind: "message".to_string(),
             role: "assistant".to_string(),
             content: Vec::new(),
-            model,
+            model: model.to_string(),
             stop_reason: None,
             stop_sequence: None,
             usage: AnthropicUsage {
                 input_tokens,
                 output_tokens: 0,
                 cache_creation_input_tokens: None,
-                cache_read_input_tokens: input_cached_tokens,
+                cache_read_input_tokens: usage.cached_input_tokens,
                 service_tier: None,
                 extra: serde_json::Map::new(),
             },
@@ -1812,26 +1922,28 @@ fn handle_response_completed(
         );
     };
 
-    let empty_response = json!({});
-    let response = match event.get("response") {
-        Some(response) if response.is_object() => response,
-        None if terminal_kind == ResponsesTerminalKind::Incomplete => &empty_response,
-        _ => {
-            return terminate_responses_stream_with_error(
-                state,
-                build_error_event(
-                    "A terminal Responses event contained an invalid response object.",
-                ),
-            )
-        }
-    };
-
-    if terminal_kind == ResponsesTerminalKind::Completed
-        && response.get("id").and_then(Value::as_str).is_none()
-    {
+    let Some(response) = event
+        .get("response")
+        .filter(|response| response.is_object())
+    else {
         return terminate_responses_stream_with_error(
             state,
-            build_error_event("A response.completed event was missing its response id."),
+            build_error_event("A terminal Responses event contained an invalid response object."),
+        );
+    };
+
+    let Some(terminal_id) = get_str(response, "id").filter(|id| !id.trim().is_empty()) else {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event("A terminal Responses event had a missing or empty response id."),
+        );
+    };
+    if state.created_response_id.as_deref() != Some(terminal_id) {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event(
+                "A terminal Responses event id did not match its response.created id.",
+            ),
         );
     }
 
@@ -1845,6 +1957,22 @@ fn handle_response_completed(
             );
         }
     }
+    if let Some(end_turn) = response.get("end_turn") {
+        if !end_turn.is_null() && !end_turn.is_boolean() {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event(
+                    "A terminal Responses event contained an invalid end_turn value.",
+                ),
+            );
+        }
+    }
+    let validated_usage = match validate_responses_usage(response) {
+        Ok(usage) => usage,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
 
     let mut events = Vec::new();
 
@@ -1886,7 +2014,7 @@ fn handle_response_completed(
             return terminate_responses_stream_with_error(state, build_error_event(message))
         }
     };
-    let usage = map_responses_usage_delta(response);
+    let usage = map_responses_usage_delta(validated_usage);
 
     finish_all_function_calls(state, &mut events);
     close_all_open_blocks(state, &mut events);
@@ -1908,8 +2036,39 @@ fn handle_response_failed(
     event: &Value,
     state: &mut ResponsesStreamState,
 ) -> Vec<AnthropicStreamEventData> {
-    let empty = Value::Null;
-    let response = event.get("response").unwrap_or(&empty);
+    let Some(response) = event
+        .get("response")
+        .filter(|response| response.is_object())
+    else {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event("A response.failed event contained an invalid response object."),
+        );
+    };
+    let Some(failed_id) = get_str(response, "id").filter(|id| !id.trim().is_empty()) else {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event("A response.failed event had a missing or empty response id."),
+        );
+    };
+    if state
+        .created_response_id
+        .as_deref()
+        .is_some_and(|created_id| created_id != failed_id)
+    {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event("A response.failed event id did not match its response.created id."),
+        );
+    }
+    if let Some(status) = response.get("status") {
+        if status.as_str() != Some("failed") {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event("A response.failed event had an inconsistent response status."),
+            );
+        }
+    }
     let mut events = Vec::new();
     close_all_open_blocks(state, &mut events);
 
@@ -2011,26 +2170,12 @@ fn map_responses_stop_reason(
 }
 
 /// Mirrors `mapResponsesUsage`, shaped for the streaming `message_delta`.
-fn map_responses_usage_delta(response: &Value) -> AnthropicMessageDeltaUsage {
-    let usage = response.get("usage");
-    let input_tokens = usage
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let output_tokens = usage
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let cached = usage
-        .and_then(|u| u.get("input_tokens_details"))
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(Value::as_i64);
-
+fn map_responses_usage_delta(usage: ValidatedResponsesUsage) -> AnthropicMessageDeltaUsage {
     AnthropicMessageDeltaUsage {
-        input_tokens: Some((input_tokens - cached.unwrap_or(0)).max(0)),
-        output_tokens,
+        input_tokens: Some(usage.input_tokens - usage.cached_input_tokens.unwrap_or(0)),
+        output_tokens: usage.output_tokens,
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: cached,
+        cache_read_input_tokens: usage.cached_input_tokens,
     }
 }
 
@@ -2137,7 +2282,12 @@ mod tests {
             "response": {
                 "id": "resp_1",
                 "model": "gpt-5",
-                "usage": { "input_tokens": 10, "input_tokens_details": { "cached_tokens": 2 } }
+                "usage": {
+                    "input_tokens": 10,
+                    "input_tokens_details": { "cached_tokens": 2 },
+                    "output_tokens": 0,
+                    "total_tokens": 10
+                }
             }
         });
         let evs = translate_responses_stream_event(&created, &mut state);
@@ -2227,7 +2377,12 @@ mod tests {
                     "role":"assistant",
                     "content":[{"type":"output_text","text":"Hello world"}]
                 }],
-                "usage": { "input_tokens": 10, "output_tokens": 5, "input_tokens_details": { "cached_tokens": 2 } }
+                "usage": {
+                    "input_tokens": 10,
+                    "input_tokens_details": { "cached_tokens": 2 },
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                }
             }
         });
         let evs = translate_responses_stream_event(&completed, &mut state);
@@ -2322,7 +2477,7 @@ mod tests {
         let mut state = create_responses_stream_state(None);
         let failed = json!({
             "type": "response.failed",
-            "response": { "error": { "message": "boom" } }
+            "response": { "id":"resp_failed", "error": { "message": "boom" } }
         });
         let evs = translate_responses_stream_event(&failed, &mut state);
         assert_eq!(evs.len(), 1);
@@ -2443,7 +2598,7 @@ mod tests {
                             "name": "second", "arguments": "{\"b\":2}"
                         }
                     ],
-                    "usage": {"input_tokens": 3, "output_tokens": 2}
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
                 }
             }),
         ] {
@@ -2489,9 +2644,10 @@ mod tests {
         let event = json!({
             "type": "response.incomplete",
             "response": {
+                "id":"resp_test",
                 "status": "incomplete",
                 "incomplete_details": {"reason": "content_filter"},
-                "usage": {"input_tokens": 1, "output_tokens": 0}
+                "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1}
             }
         });
         let events = translate_responses_stream_event(&event, &mut state);
@@ -2799,7 +2955,11 @@ mod tests {
         }
         let completed = json!({
             "type":"response.completed",
-            "response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}
+            "response":{
+                "id":"resp_test",
+                "status":"completed",
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+            }
         });
         let events = translate_responses_stream_event(&completed, &mut state);
         assert!(matches!(
@@ -2861,7 +3021,7 @@ mod tests {
                         "encrypted_content":"opaque",
                         "summary":[{"type":"summary_text","text":"once"}]
                     }],
-                    "usage":{}
+                    "usage":null
                 }
             }),
             &mut state,

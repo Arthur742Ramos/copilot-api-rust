@@ -207,6 +207,18 @@ fixture therefore contains `id` and usage but no status. The parser handles
 `incomplete_details.reason`, while `response.failed` becomes an error from its
 nested error payload
 ([source](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/sse/responses.rs#L386-L449)).
+The canonical
+[`ev_response_created`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/core/tests/common/responses.rs#L658-L666)
+contains only a non-empty response id—no model. The bridge therefore uses the
+already validated requested/resolved provider model for Anthropic
+`message_start` when model is absent; a non-empty upstream model, when present,
+is retained instead.
+
+Codex's typed
+[`ResponseCompletedUsage`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/sse/responses.rs#L122-L157)
+requires integer `input_tokens`, `output_tokens`, and `total_tokens` whenever
+usage is present. Cached-input and reasoning-output detail objects are optional,
+but their integer fields are required when those objects exist.
 
 Every incrementally streamed item must first have an active
 `response.output_item.added` at its non-negative output index. Optional item IDs
@@ -245,6 +257,17 @@ The SSE event type—not `response.status`—is the terminal discriminator:
 - `response.failed` and top-level `error` terminate with one Anthropic error.
   Any repeated or later terminal event is ignored.
 
+Created and terminal identities are non-empty and stable: completed and
+incomplete ids must exactly match `response.created`; failed ids must match when
+a created event preceded them. A canonical failed-only stream remains valid.
+Usage omission or `null` is accepted. A present usage object must contain all
+three required non-negative `i64` counters, `total_tokens` must equal input plus
+output without overflow, and cached/reasoning details must be well typed,
+non-negative, and no larger than their parent counters. Partial, wrong-typed,
+negative, inconsistent, or overflowing usage produces one Anthropic error
+instead of being coerced to zero. Optional `end_turn` is likewise accepted only
+as a boolean or `null`.
+
 Lifecycle state is bounded: at most 4,096 output items, 4,096 reasoning parts,
 and 4,096 text parts are tracked. Stored item JSON, reasoning/text
 reconciliation data, and queued function arguments share the existing 16 MiB
@@ -262,6 +285,10 @@ evidence is in
 `claude_completed_terminals_follow_codex_event_discriminator`,
 `claude_incomplete_terminals_preserve_truncation_semantics_without_status`,
 `claude_failed_and_error_terminals_suppress_all_later_terminals`,
+`claude_model_less_created_uses_resolved_model_context`,
+`claude_created_and_terminal_identity_fields_fail_closed`,
+`claude_usage_contract_preserves_valid_details_and_omission`,
+`claude_malformed_usage_never_coerces_to_success`,
 and
 `claude_incomplete_or_out_of_order_response_items_fail_once_without_success`,
 in addition to the JSON/SSE framing regressions.
@@ -302,8 +329,8 @@ Status means deterministic, credential-free evidence exists.
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
 | Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
-| Usage | Anthropic cache/input/output fields | OpenAI cached/reasoning token details | native response assertions |
-| Model routing | aliases, `[1m]`, provider models | aliases and `provider/model` | model helpers and provider boundary tests |
+| Usage | strict nonnegative input/output/cache mapping; malformed Responses usage errors once | OpenAI cached/reasoning token details | public valid/absent/partial/type/range/overflow usage fixtures |
+| Model routing | aliases, `[1m]`, provider models; model-less created events use validated request context | aliases and `provider/model` | model helpers and public model-less-created boundary tests |
 | Unknown fields | retained in known top-level/items | retained in typed items; uninspected variants raw-preserved | captured extension sentinels and complete `ResponseItem` audit |
 | Cancellation | response-body drop releases admission/upstream resources | same | load-shedding and WebSocket cancellation tests |
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
@@ -329,6 +356,7 @@ authentication, body limits, admission, and JSON parsing:
 | malformed stream frame | one terminal Anthropic `error`; no `message_stop` | one terminal OpenAI `error` or `response.failed`; no completion |
 | premature EOF/transport reset | one retryable terminal error | one terminal OpenAI error; no completion |
 | incomplete/conflicting output-item lifecycle | one terminal Anthropic `error`; open blocks close; later events ignored | native Responses stream is forwarded unchanged |
+| empty/mismatched response id or malformed usage | one terminal Anthropic `error`; no success terminal | forwarded unchanged |
 | statusless `response.completed` | one `end_turn`/`tool_use` terminal; usage optional | forwarded unchanged |
 | `response.incomplete` | known truncation reason becomes one Anthropic terminal; unknown reason errors once | forwarded once as terminal incomplete |
 | `response.failed` / `error` | one Anthropic error; later terminals ignored | forwarded in native Responses shape |
