@@ -267,7 +267,8 @@ fn reasoning_summary_fixture_item(model: &str) -> Option<Value> {
         "gpt-reasoning-absent-both" => json!({
             "type":"reasoning",
             "id":"reasoning-absent",
-            "encrypted_content":"encrypted-absent"
+            "encrypted_content":"encrypted-absent",
+            "summary":[]
         }),
         "gpt-reasoning-empty-array-id" => json!({
             "type":"reasoning",
@@ -663,6 +664,12 @@ fn created_usage_contract_stream_fixture(model: &str) -> Option<Response> {
         "gpt-contract-terminal-null-end-turn" => {
             terminal_response["end_turn"] = Value::Null;
         }
+        "gpt-contract-terminal-true-end-turn" => {
+            terminal_response["end_turn"] = json!(true);
+        }
+        "gpt-contract-terminal-false-end-turn" => {
+            terminal_response["end_turn"] = json!(false);
+        }
         "gpt-contract-usage-valid-details" => terminal_response["usage"] = valid_usage,
         "gpt-contract-usage-null-details" => {
             terminal_response["usage"] = json!({
@@ -814,6 +821,1477 @@ fn created_usage_contract_stream_fixture(model: &str) -> Option<Response> {
         json!({"type":"error","sequence_number":2,"message":"later terminal"}),
     ));
 
+    Some(sse_response(render_sse(&events)))
+}
+
+fn malformed_scalar_stream_fixture(model: &str) -> Option<Response> {
+    let created = (
+        "response.created",
+        json!({
+            "type":"response.created",
+            "sequence_number":0,
+            "response":{"id":"resp_scalar_fixture"}
+        }),
+    );
+    let later_terminal = (
+        "response.completed",
+        json!({
+            "type":"response.completed",
+            "sequence_number":99,
+            "response":{"id":"resp_scalar_fixture"}
+        }),
+    );
+    let function_added = (
+        "response.output_item.added",
+        json!({
+            "type":"response.output_item.added",
+            "sequence_number":1,
+            "output_index":0,
+            "item":{
+                "type":"function_call",
+                "id":"function-scalar",
+                "call_id":"call-scalar",
+                "name":"read",
+                "arguments":""
+            }
+        }),
+    );
+    let function_done_item = json!({
+        "type":"function_call",
+        "id":"function-scalar",
+        "call_id":"call-scalar",
+        "name":"read",
+        "arguments":"{\"path\":\"a\"}"
+    });
+    let message_added = (
+        "response.output_item.added",
+        json!({
+            "type":"response.output_item.added",
+            "sequence_number":1,
+            "output_index":0,
+            "item":{
+                "type":"message",
+                "id":"message-scalar",
+                "role":"assistant",
+                "content":[]
+            }
+        }),
+    );
+    let reasoning_added = (
+        "response.output_item.added",
+        json!({
+            "type":"response.output_item.added",
+            "sequence_number":1,
+            "output_index":0,
+            "item":{"type":"reasoning","id":"reasoning-scalar","summary":[]}
+        }),
+    );
+    let completed_with = |sequence_number: i64, output: Vec<Value>| {
+        (
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "sequence_number":sequence_number,
+                "response":{"id":"resp_scalar_fixture","output":output}
+            }),
+        )
+    };
+
+    let events = match model {
+        "gpt-scalar-function-valid" => vec![
+            created,
+            function_added,
+            (
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item_id":"function-scalar",
+                    "call_id":"call-scalar",
+                    "delta":"{\"path\":"
+                }),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({
+                    "type":"response.function_call_arguments.done",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "item_id":"function-scalar",
+                    "call_id":"call-scalar",
+                    "arguments":"{\"path\":\"a\"}"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":4,
+                    "output_index":0,
+                    "item":function_done_item.clone()
+                }),
+            ),
+            completed_with(5, vec![function_done_item]),
+        ],
+        "gpt-scalar-function-whitespace-namespace-valid" => {
+            let added = json!({
+                "type":"function_call",
+                "id":"function-namespace",
+                "call_id":"call-namespace",
+                "name":"read",
+                "namespace":" ",
+                "arguments":""
+            });
+            let done = json!({
+                "type":"function_call",
+                "id":"function-namespace",
+                "call_id":"call-namespace",
+                "name":"read",
+                "namespace":" ",
+                "arguments":"{}"
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":added
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "item":done.clone()
+                    }),
+                ),
+                completed_with(3, vec![done]),
+            ]
+        }
+        "gpt-scalar-tool-search-valid" => {
+            let item = json!({
+                "type":"tool_search_call",
+                "execution":"client",
+                "arguments":{"query":"calendar","limit":1}
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                completed_with(3, vec![item]),
+            ]
+        }
+        "gpt-scalar-tool-search-output-valid" => {
+            let item = json!({
+                "type":"tool_search_output",
+                "status":"completed",
+                "execution":"client",
+                "tools":[{"name":"calendar"}]
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                completed_with(2, vec![item]),
+            ]
+        }
+        "gpt-scalar-message-valid" => {
+            let annotations = json!([{"type":"url_citation","url":"https://example.test"}]);
+            let item = json!({
+                "type":"message",
+                "id":"message-scalar",
+                "role":"assistant",
+                "content":[{
+                    "type":"output_text",
+                    "text":"AB",
+                    "annotations":annotations.clone()
+                }],
+                "internal_chat_message_metadata_passthrough":{"turn_id":"turn-scalar"}
+            });
+            vec![
+                created,
+                message_added,
+                (
+                    "response.output_text.delta",
+                    json!({
+                        "type":"response.output_text.delta",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "item_id":"message-scalar",
+                        "content_index":0,
+                        "delta":"A",
+                        "annotations":[]
+                    }),
+                ),
+                (
+                    "response.output_text.done",
+                    json!({
+                        "type":"response.output_text.done",
+                        "sequence_number":3,
+                        "output_index":0,
+                        "item_id":"message-scalar",
+                        "content_index":0,
+                        "text":"AB",
+                        "annotations":annotations
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":4,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                completed_with(5, vec![item]),
+            ]
+        }
+        "gpt-scalar-reasoning-valid" => {
+            let item = json!({
+                "type":"reasoning",
+                "id":"reasoning-scalar",
+                "summary":[{"type":"summary_text","text":"summary"}],
+                "content":[{"type":"reasoning_text","text":"content"}],
+                "encrypted_content":"opaque"
+            });
+            vec![
+                created,
+                reasoning_added,
+                (
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "type":"response.reasoning_summary_part.added",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "summary_index":0,
+                        "part":{"type":"summary_text","text":""}
+                    }),
+                ),
+                (
+                    "response.reasoning_summary_text.delta",
+                    json!({
+                        "type":"response.reasoning_summary_text.delta",
+                        "sequence_number":3,
+                        "output_index":0,
+                        "summary_index":0,
+                        "delta":"summary"
+                    }),
+                ),
+                (
+                    "response.reasoning_summary_text.done",
+                    json!({
+                        "type":"response.reasoning_summary_text.done",
+                        "sequence_number":4,
+                        "item_id":"reasoning-scalar",
+                        "output_index":0,
+                        "summary_index":0,
+                        "text":"summary"
+                    }),
+                ),
+                (
+                    "response.reasoning_text.delta",
+                    json!({
+                        "type":"response.reasoning_text.delta",
+                        "sequence_number":5,
+                        "output_index":0,
+                        "content_index":0,
+                        "delta":"content"
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":6,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                completed_with(7, vec![item]),
+            ]
+        }
+        "gpt-scalar-compaction-valid" => {
+            let item = json!({"type":"compaction","encrypted_content":"opaque-compaction"});
+            vec![
+                created,
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                completed_with(2, vec![item]),
+            ]
+        }
+        "gpt-scalar-function-added-missing" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"function_call"}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-added-missing-call-id" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"function_call","name":"read","arguments":""}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-added-missing-name" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call-scalar","arguments":""}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-added-missing-arguments" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call-scalar","name":"read"}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-added-wrong" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":42,
+                        "name":null,
+                        "arguments":{}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-added-wrong-name" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":"call-scalar",
+                        "name":42,
+                        "arguments":""
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-added-wrong-arguments" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":"call-scalar",
+                        "name":"read",
+                        "arguments":{}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-added-empty" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"","name":" ","arguments":""}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-added-invalid-json" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":"call-scalar",
+                        "name":"read",
+                        "arguments":"{bad"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-done-missing" => vec![
+            created,
+            function_added,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":{"type":"function_call","id":"function-scalar"}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-done-missing-call-id" => vec![
+            created,
+            function_added,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-scalar",
+                        "name":"read",
+                        "arguments":"{}"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-done-missing-name" => vec![
+            created,
+            function_added,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-scalar",
+                        "call_id":"call-scalar",
+                        "arguments":"{}"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-done-missing-arguments" => vec![
+            created,
+            function_added,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-scalar",
+                        "call_id":"call-scalar",
+                        "name":"read"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-done-invalid-json" => vec![
+            created,
+            function_added,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-scalar",
+                        "call_id":"call-scalar",
+                        "name":"read",
+                        "arguments":"not-json"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-done-wrong-call-id" => vec![
+            created,
+            function_added,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-scalar",
+                        "call_id":42,
+                        "name":"read",
+                        "arguments":"{}"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-done-wrong-name" => vec![
+            created,
+            function_added,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-scalar",
+                        "call_id":"call-scalar",
+                        "name":42,
+                        "arguments":"{}"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-done-wrong-arguments" => vec![
+            created,
+            function_added,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"function-scalar",
+                        "call_id":"call-scalar",
+                        "name":"read",
+                        "arguments":{}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-delta-wrong" => vec![
+            created,
+            function_added,
+            (
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "delta":42
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-delta-empty" => vec![
+            created,
+            function_added,
+            (
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "delta":""
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-arguments-done-invalid" => vec![
+            created,
+            function_added,
+            (
+                "response.function_call_arguments.done",
+                json!({
+                    "type":"response.function_call_arguments.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "arguments":"{bad"
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-arguments-done-duplicate" => vec![
+            created,
+            function_added,
+            (
+                "response.function_call_arguments.done",
+                json!({
+                    "type":"response.function_call_arguments.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "arguments":"{}"
+                }),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({
+                    "type":"response.function_call_arguments.done",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "arguments":"{}"
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-function-delta-after-done" => vec![
+            created,
+            function_added,
+            (
+                "response.function_call_arguments.done",
+                json!({
+                    "type":"response.function_call_arguments.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "arguments":"{}"
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "delta":" "
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-missing-execution" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"tool_search_call","arguments":{}}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-wrong" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"tool_search_call",
+                        "call_id":42,
+                        "execution":[],
+                        "status":{},
+                        "arguments":{}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-wrong-execution" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"tool_search_call",
+                        "execution":42,
+                        "arguments":{}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-wrong-status" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"tool_search_call",
+                        "execution":"client",
+                        "status":[],
+                        "arguments":{}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-missing-arguments" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"tool_search_call","execution":"client"}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-output-malformed" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"tool_search_output","tools":"not-an-array"}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-output-wrong-execution" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"tool_search_output",
+                        "status":"completed",
+                        "execution":42,
+                        "tools":[]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-output-wrong-tools" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"tool_search_output",
+                        "status":"completed",
+                        "execution":"client",
+                        "tools":{}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-message-missing" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"message"}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-message-wrong-content" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"message","role":42,"content":{}}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-message-wrong-role" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"message","role":42,"content":[]}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-message-content-not-array" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"message","role":"assistant","content":{}}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-message-block-malformed" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":42}]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-message-annotations-malformed" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{
+                            "type":"output_text",
+                            "text":"text",
+                            "annotations":"bad"
+                        }]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-message-refusal-unsupported" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"refusal","refusal":"blocked"}]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-message-image-unsupported" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{
+                            "type":"input_image",
+                            "image_url":"https://example.test/image.png",
+                            "detail":"high"
+                        }]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-output-annotations-late" => vec![
+            created,
+            message_added,
+            (
+                "response.output_text.delta",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"partial"
+                }),
+            ),
+            (
+                "response.output_text.done",
+                json!({
+                    "type":"response.output_text.done",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "content_index":0,
+                    "text":"partial",
+                    "annotations":[42]
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-output-done-duplicate" => vec![
+            created,
+            message_added,
+            (
+                "response.output_text.done",
+                json!({
+                    "type":"response.output_text.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "text":"text"
+                }),
+            ),
+            (
+                "response.output_text.done",
+                json!({
+                    "type":"response.output_text.done",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "content_index":0,
+                    "text":"text"
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-output-delta-after-done" => vec![
+            created,
+            message_added,
+            (
+                "response.output_text.done",
+                json!({
+                    "type":"response.output_text.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "text":"text"
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"late"
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-output-index-mismatch" => vec![
+            created,
+            message_added,
+            (
+                "response.output_text.done",
+                json!({
+                    "type":"response.output_text.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":1,
+                    "text":"extra"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "id":"message-scalar",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"only"}]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-wrong" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":42,
+                        "summary":{},
+                        "content":"bad",
+                        "encrypted_content":[]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-missing-summary" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-scalar",
+                        "encrypted_content":"opaque"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-wrong-id" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":42,"summary":[]}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-wrong-encrypted" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "summary":[],
+                        "encrypted_content":[]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-summary-not-array" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":{}}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-content-not-array" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"content":{}}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-summary-malformed" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "summary":[{"type":"summary_text"}]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-content-malformed" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "summary":[],
+                        "content":[{"type":"reasoning_text","text":42}]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-event-id-wrong" => vec![
+            created,
+            reasoning_added,
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "sequence_number":2,
+                    "item_id":42,
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"reasoning"
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-part-malformed" => vec![
+            created,
+            reasoning_added,
+            (
+                "response.reasoning_summary_part.added",
+                json!({
+                    "type":"response.reasoning_summary_part.added",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "summary_index":0,
+                    "part":{"type":"summary_text","text":42}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-done-missing-item-id" => vec![
+            created,
+            reasoning_added,
+            (
+                "response.reasoning_summary_text.done",
+                json!({
+                    "type":"response.reasoning_summary_text.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "summary_index":0,
+                    "text":"summary"
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-summary-conflict" => vec![
+            created,
+            reasoning_added,
+            (
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "summary_index":0,
+                    "delta":"A"
+                }),
+            ),
+            (
+                "response.reasoning_summary_text.done",
+                json!({
+                    "type":"response.reasoning_summary_text.done",
+                    "sequence_number":3,
+                    "item_id":"reasoning-scalar",
+                    "output_index":0,
+                    "summary_index":0,
+                    "text":"B"
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-reasoning-content-conflict" => vec![
+            created,
+            reasoning_added,
+            (
+                "response.reasoning_text.delta",
+                json!({
+                    "type":"response.reasoning_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"A"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "item":{
+                        "type":"reasoning",
+                        "id":"reasoning-scalar",
+                        "summary":[],
+                        "content":[{"type":"reasoning_text","text":"B"}]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-compaction-missing" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"compaction"}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-compaction-wrong" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"compaction","id":42,"encrypted_content":[]}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-compaction-wrong-id" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"compaction",
+                        "id":42,
+                        "encrypted_content":"opaque"
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-compaction-wrong-encrypted" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"compaction","encrypted_content":[]}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-output-index-wrong" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":"zero",
+                    "item":{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-output-index-sparse" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":1,
+                    "item":{"type":"message","role":"assistant","content":[]}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-output-item-id-wrong" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item_id":42,
+                    "item":{
+                        "type":"message",
+                        "id":[],
+                        "role":"assistant",
+                        "content":[]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-output-wrapper-id-mismatch" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item_id":"outer-id",
+                    "item":{
+                        "type":"message",
+                        "id":"inner-id",
+                        "role":"assistant",
+                        "content":[]
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-metadata-wrong" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[],
+                        "internal_chat_message_metadata_passthrough":42
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-metadata-turn-id-wrong" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[],
+                        "internal_chat_message_metadata_passthrough":{"turn_id":42}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
+        _ => return None,
+    };
+
+    let mut events = events;
+    events.push((
+        "error",
+        json!({
+            "type":"error",
+            "sequence_number":100,
+            "message":"later scalar fixture terminal"
+        }),
+    ));
     Some(sse_response(render_sse(&events)))
 }
 
@@ -1069,7 +2547,8 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
                     "item":{
                         "type":"reasoning",
                         "id":"reasoning-life",
-                        "encrypted_content":"encrypted-life"
+                        "encrypted_content":"encrypted-life",
+                        "summary":[]
                     }
                 }),
             ),
@@ -1103,7 +2582,8 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
                     "item":{
                         "type":"reasoning",
                         "id":"reasoning-late",
-                        "encrypted_content":"encrypted-late"
+                        "encrypted_content":"encrypted-late",
+                        "summary":[]
                     }
                 }),
             ),
@@ -1142,7 +2622,8 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
                         "item":{
                             "type":"reasoning",
                             "id":"reasoning-life",
-                            "encrypted_content":"encrypted-life"
+                            "encrypted_content":"encrypted-life",
+                            "summary":[]
                         }
                     }),
                 ),
@@ -1178,7 +2659,8 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
                     "item":{
                         "type":"reasoning",
                         "id":"reasoning-life",
-                        "encrypted_content":"encrypted-life"
+                        "encrypted_content":"encrypted-life",
+                        "summary":[]
                     }
                 }),
             ),
@@ -1285,7 +2767,8 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
                     "item":{
                         "type":"reasoning",
                         "id":"reasoning-life",
-                        "encrypted_content":"encrypted-life"
+                        "encrypted_content":"encrypted-life",
+                        "summary":[]
                     }
                 }),
             ),
@@ -1311,7 +2794,8 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
                     "item":{
                         "type":"reasoning",
                         "id":"reasoning-life",
-                        "encrypted_content":"encrypted-life"
+                        "encrypted_content":"encrypted-life",
+                        "summary":[]
                     }
                 }),
             ),
@@ -1878,6 +3362,9 @@ fn responses_fixture(body: &Value) -> Response {
     }
 
     if body["stream"] == true {
+        if let Some(response) = malformed_scalar_stream_fixture(model) {
+            return response;
+        }
         if let Some(response) = created_usage_contract_stream_fixture(model) {
             return response;
         }
@@ -2504,6 +3991,78 @@ fn configure(fixture: &Fixture) {
         "gpt-premature-eof",
         "gpt-incomplete",
         "gpt-cli-smoke",
+        "gpt-scalar-function-valid",
+        "gpt-scalar-function-whitespace-namespace-valid",
+        "gpt-scalar-tool-search-valid",
+        "gpt-scalar-tool-search-output-valid",
+        "gpt-scalar-message-valid",
+        "gpt-scalar-reasoning-valid",
+        "gpt-scalar-compaction-valid",
+        "gpt-scalar-function-added-missing",
+        "gpt-scalar-function-added-missing-call-id",
+        "gpt-scalar-function-added-missing-name",
+        "gpt-scalar-function-added-missing-arguments",
+        "gpt-scalar-function-added-wrong",
+        "gpt-scalar-function-added-wrong-name",
+        "gpt-scalar-function-added-wrong-arguments",
+        "gpt-scalar-function-added-empty",
+        "gpt-scalar-function-added-invalid-json",
+        "gpt-scalar-function-done-missing",
+        "gpt-scalar-function-done-missing-call-id",
+        "gpt-scalar-function-done-missing-name",
+        "gpt-scalar-function-done-missing-arguments",
+        "gpt-scalar-function-done-invalid-json",
+        "gpt-scalar-function-done-wrong-call-id",
+        "gpt-scalar-function-done-wrong-name",
+        "gpt-scalar-function-done-wrong-arguments",
+        "gpt-scalar-function-delta-wrong",
+        "gpt-scalar-function-delta-empty",
+        "gpt-scalar-function-arguments-done-invalid",
+        "gpt-scalar-function-arguments-done-duplicate",
+        "gpt-scalar-function-delta-after-done",
+        "gpt-scalar-tool-search-missing-execution",
+        "gpt-scalar-tool-search-wrong",
+        "gpt-scalar-tool-search-wrong-execution",
+        "gpt-scalar-tool-search-wrong-status",
+        "gpt-scalar-tool-search-missing-arguments",
+        "gpt-scalar-tool-search-output-malformed",
+        "gpt-scalar-tool-search-output-wrong-execution",
+        "gpt-scalar-tool-search-output-wrong-tools",
+        "gpt-scalar-message-missing",
+        "gpt-scalar-message-wrong-content",
+        "gpt-scalar-message-wrong-role",
+        "gpt-scalar-message-content-not-array",
+        "gpt-scalar-message-block-malformed",
+        "gpt-scalar-message-annotations-malformed",
+        "gpt-scalar-message-refusal-unsupported",
+        "gpt-scalar-message-image-unsupported",
+        "gpt-scalar-output-annotations-late",
+        "gpt-scalar-output-done-duplicate",
+        "gpt-scalar-output-delta-after-done",
+        "gpt-scalar-output-index-mismatch",
+        "gpt-scalar-reasoning-wrong",
+        "gpt-scalar-reasoning-missing-summary",
+        "gpt-scalar-reasoning-wrong-id",
+        "gpt-scalar-reasoning-wrong-encrypted",
+        "gpt-scalar-reasoning-summary-not-array",
+        "gpt-scalar-reasoning-content-not-array",
+        "gpt-scalar-reasoning-summary-malformed",
+        "gpt-scalar-reasoning-content-malformed",
+        "gpt-scalar-reasoning-event-id-wrong",
+        "gpt-scalar-reasoning-part-malformed",
+        "gpt-scalar-reasoning-done-missing-item-id",
+        "gpt-scalar-reasoning-summary-conflict",
+        "gpt-scalar-reasoning-content-conflict",
+        "gpt-scalar-compaction-missing",
+        "gpt-scalar-compaction-wrong",
+        "gpt-scalar-compaction-wrong-id",
+        "gpt-scalar-compaction-wrong-encrypted",
+        "gpt-scalar-output-index-wrong",
+        "gpt-scalar-output-index-sparse",
+        "gpt-scalar-output-item-id-wrong",
+        "gpt-scalar-output-wrapper-id-mismatch",
+        "gpt-scalar-metadata-wrong",
+        "gpt-scalar-metadata-turn-id-wrong",
         "gpt-contract-created-model-less",
         "gpt-contract-created-with-model",
         "gpt-contract-created-upstream-model",
@@ -2526,6 +4085,8 @@ fn configure(fixture: &Fixture) {
         "gpt-contract-failed-without-created",
         "gpt-contract-terminal-wrong-end-turn",
         "gpt-contract-terminal-null-end-turn",
+        "gpt-contract-terminal-true-end-turn",
+        "gpt-contract-terminal-false-end-turn",
         "gpt-contract-usage-valid-details",
         "gpt-contract-usage-null-details",
         "gpt-contract-usage-null",
@@ -3758,6 +5319,46 @@ async fn claude_completed_terminals_follow_codex_event_discriminator() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
+async fn claude_completed_end_turn_false_maps_to_pause_turn() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, expected_stop) in [
+        ("gpt-contract-terminal-true-end-turn", "end_turn"),
+        ("gpt-contract-terminal-false-end-turn", "pause_turn"),
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"end turn contract"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("valid completed event emits message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], expected_stop, "{model}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
 async fn claude_incomplete_terminals_preserve_truncation_semantics_without_status() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
@@ -4205,6 +5806,208 @@ async fn claude_malformed_usage_never_coerces_to_success() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
+async fn claude_handled_scalar_families_accept_source_valid_shapes() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for model in [
+        "gpt-scalar-function-valid",
+        "gpt-scalar-function-whitespace-namespace-valid",
+        "gpt-scalar-tool-search-valid",
+        "gpt-scalar-tool-search-output-valid",
+        "gpt-scalar-message-valid",
+        "gpt-scalar-reasoning-valid",
+        "gpt-scalar-compaction-valid",
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"valid scalar family"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            0,
+            "{model}: {events:#?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+        for start in events
+            .iter()
+            .filter(|event| event["type"] == "content_block_start")
+        {
+            if start["content_block"]["type"] == "tool_use" {
+                assert!(
+                    start["content_block"]["id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty()),
+                    "{model}: empty tool id"
+                );
+                assert!(
+                    start["content_block"]["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty()),
+                    "{model}: empty tool name"
+                );
+                if model == "gpt-scalar-function-whitespace-namespace-valid" {
+                    assert_eq!(
+                        start["content_block"]["name"], "read",
+                        "trimmed-empty namespace must fall back to required name"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_malformed_handled_scalars_fail_once_without_empty_blocks() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for model in [
+        "gpt-scalar-function-added-missing",
+        "gpt-scalar-function-added-missing-call-id",
+        "gpt-scalar-function-added-missing-name",
+        "gpt-scalar-function-added-missing-arguments",
+        "gpt-scalar-function-added-wrong",
+        "gpt-scalar-function-added-wrong-name",
+        "gpt-scalar-function-added-wrong-arguments",
+        "gpt-scalar-function-added-empty",
+        "gpt-scalar-function-added-invalid-json",
+        "gpt-scalar-function-done-missing",
+        "gpt-scalar-function-done-missing-call-id",
+        "gpt-scalar-function-done-missing-name",
+        "gpt-scalar-function-done-missing-arguments",
+        "gpt-scalar-function-done-invalid-json",
+        "gpt-scalar-function-done-wrong-call-id",
+        "gpt-scalar-function-done-wrong-name",
+        "gpt-scalar-function-done-wrong-arguments",
+        "gpt-scalar-function-delta-wrong",
+        "gpt-scalar-function-delta-empty",
+        "gpt-scalar-function-arguments-done-invalid",
+        "gpt-scalar-function-arguments-done-duplicate",
+        "gpt-scalar-function-delta-after-done",
+        "gpt-scalar-tool-search-missing-execution",
+        "gpt-scalar-tool-search-wrong",
+        "gpt-scalar-tool-search-wrong-execution",
+        "gpt-scalar-tool-search-wrong-status",
+        "gpt-scalar-tool-search-missing-arguments",
+        "gpt-scalar-tool-search-output-malformed",
+        "gpt-scalar-tool-search-output-wrong-execution",
+        "gpt-scalar-tool-search-output-wrong-tools",
+        "gpt-scalar-message-missing",
+        "gpt-scalar-message-wrong-content",
+        "gpt-scalar-message-wrong-role",
+        "gpt-scalar-message-content-not-array",
+        "gpt-scalar-message-block-malformed",
+        "gpt-scalar-message-annotations-malformed",
+        "gpt-scalar-message-refusal-unsupported",
+        "gpt-scalar-message-image-unsupported",
+        "gpt-scalar-output-annotations-late",
+        "gpt-scalar-output-done-duplicate",
+        "gpt-scalar-output-delta-after-done",
+        "gpt-scalar-output-index-mismatch",
+        "gpt-scalar-reasoning-wrong",
+        "gpt-scalar-reasoning-missing-summary",
+        "gpt-scalar-reasoning-wrong-id",
+        "gpt-scalar-reasoning-wrong-encrypted",
+        "gpt-scalar-reasoning-summary-not-array",
+        "gpt-scalar-reasoning-content-not-array",
+        "gpt-scalar-reasoning-summary-malformed",
+        "gpt-scalar-reasoning-content-malformed",
+        "gpt-scalar-reasoning-event-id-wrong",
+        "gpt-scalar-reasoning-part-malformed",
+        "gpt-scalar-reasoning-done-missing-item-id",
+        "gpt-scalar-reasoning-summary-conflict",
+        "gpt-scalar-reasoning-content-conflict",
+        "gpt-scalar-compaction-missing",
+        "gpt-scalar-compaction-wrong",
+        "gpt-scalar-compaction-wrong-id",
+        "gpt-scalar-compaction-wrong-encrypted",
+        "gpt-scalar-output-index-wrong",
+        "gpt-scalar-output-index-sparse",
+        "gpt-scalar-output-item-id-wrong",
+        "gpt-scalar-output-wrapper-id-mismatch",
+        "gpt-scalar-metadata-wrong",
+        "gpt-scalar-metadata-turn-id-wrong",
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"malformed scalar family"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}: {events:#?}"
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}: later frames escaped terminal cleanup"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["type"].as_str(),
+                Some("message_delta" | "message_stop")
+            )),
+            "{model}: malformed scalar fabricated success"
+        );
+        for start in events
+            .iter()
+            .filter(|event| event["type"] == "content_block_start")
+        {
+            if start["content_block"]["type"] == "tool_use" {
+                assert!(
+                    start["content_block"]["id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty()),
+                    "{model}: malformed input opened an empty tool id"
+                );
+                assert!(
+                    start["content_block"]["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty()),
+                    "{model}: malformed input opened an empty tool name"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
 async fn native_responses_forwards_statusless_codex_terminal_unchanged() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
@@ -4257,6 +6060,25 @@ async fn native_responses_forwards_statusless_codex_terminal_unchanged() {
     assert!(
         !events.iter().any(|event| event["type"] == "error"),
         "translated usage validation leaked into native Responses"
+    );
+
+    let (status, body) = send(post_json(
+        "/v1/responses",
+        codex_request("gpt-scalar-function-added-missing", true),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let malformed = events
+        .iter()
+        .find(|event| event["type"] == "response.output_item.added")
+        .expect("native malformed function item remains forwarded");
+    assert_eq!(malformed["item"]["type"], "function_call");
+    assert!(malformed["item"].get("call_id").is_none());
+    assert!(
+        !events.iter().any(|event| event["type"] == "message_stop"),
+        "translated scalar validation leaked into native Responses"
     );
 }
 

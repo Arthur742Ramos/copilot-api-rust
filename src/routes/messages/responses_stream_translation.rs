@@ -64,6 +64,7 @@ pub struct FunctionCallStreamState {
     pub consecutive_whitespace_count: i64,
     pub buffered_arguments: Vec<String>,
     pub accumulated_arguments: String,
+    pub arguments_done: Option<String>,
     pub started: bool,
     pub done: bool,
 }
@@ -115,6 +116,7 @@ pub struct ResponsesStreamState {
     pub tracked_reasoning_parts: usize,
     pub tracked_text_parts: usize,
     pub output_text_by_key: HashMap<String, String>,
+    pub output_text_done_by_key: HashMap<String, String>,
     pub tool_search_name: String,
     pub has_tool_call: bool,
 }
@@ -150,7 +152,9 @@ impl ResponsesStreamState {
             tracked_reasoning_parts: 0,
             tracked_text_parts: 0,
             output_text_by_key: HashMap::new(),
+            output_text_done_by_key: HashMap::new(),
             tool_search_name: tool_search_name
+                .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| BRIDGE_TOOL_SEARCH_NAME.to_string()),
             has_tool_call: false,
         }
@@ -267,8 +271,60 @@ fn get_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
-fn get_i64(v: &Value, key: &str) -> i64 {
-    v.get(key).and_then(Value::as_i64).unwrap_or(0)
+fn required_string_field<'a>(
+    value: &'a Value,
+    field: &str,
+    error: &'static str,
+) -> Result<&'a str, &'static str> {
+    value.get(field).and_then(Value::as_str).ok_or(error)
+}
+
+fn required_nonempty_string_field<'a>(
+    value: &'a Value,
+    field: &str,
+    error: &'static str,
+) -> Result<&'a str, &'static str> {
+    required_string_field(value, field, error).and_then(|field| {
+        if field.trim().is_empty() {
+            Err(error)
+        } else {
+            Ok(field)
+        }
+    })
+}
+
+fn optional_string_field<'a>(
+    value: &'a Value,
+    field: &str,
+    error: &'static str,
+) -> Result<Option<&'a str>, &'static str> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(error),
+    }
+}
+
+fn optional_array_field<'a>(
+    value: &'a Value,
+    field: &str,
+    error: &'static str,
+) -> Result<Option<&'a Vec<Value>>, &'static str> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(value)) => Ok(Some(value)),
+        Some(_) => Err(error),
+    }
+}
+
+fn validate_json_arguments(arguments: &str, allow_empty: bool) -> Result<(), &'static str> {
+    if arguments.is_empty() && allow_empty {
+        return Ok(());
+    }
+    if arguments.is_empty() || serde_json::from_str::<Value>(arguments).is_err() {
+        return Err("Function call arguments were empty or invalid JSON.");
+    }
+    Ok(())
 }
 
 fn required_nonnegative_index(
@@ -418,7 +474,7 @@ fn indices_are_contiguous<T>(parts: &BTreeMap<i64, T>) -> bool {
     parts
         .keys()
         .enumerate()
-        .all(|(expected, actual)| *actual == expected as i64)
+        .all(|(expected, actual)| i64::try_from(expected).ok() == Some(*actual))
 }
 
 fn reserve_reasoning_part(
@@ -446,17 +502,259 @@ fn reserve_reasoning_part(
     Ok(())
 }
 
-/// Mirrors the TS `resolveToolUseName`: a non-empty `namespace` wins, else `name`.
-fn resolve_tool_use_name(item: &Value) -> String {
-    if let Some(ns) = item.get("namespace").and_then(Value::as_str) {
-        if !ns.is_empty() {
-            return ns.to_string();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputItemPhase {
+    Added,
+    Done,
+}
+
+fn validate_optional_item_scalars(item: &Value) -> Result<(), &'static str> {
+    optional_string_field(item, "id", "An output item id was not a string or null.")?;
+    optional_string_field(
+        item,
+        "status",
+        "An output item status was not a string or null.",
+    )?;
+    if let Some(metadata) = item.get("internal_chat_message_metadata_passthrough") {
+        if !metadata.is_null() {
+            let Some(metadata) = metadata.as_object() else {
+                return Err("Internal chat message metadata was not an object or null.");
+            };
+            optional_string_field(
+                &Value::Object(metadata.clone()),
+                "turn_id",
+                "Internal chat message metadata turn_id was not a string or null.",
+            )?;
         }
     }
-    item.get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+    Ok(())
+}
+
+fn validate_annotations_field(value: &Value) -> Result<(), &'static str> {
+    if optional_array_field(
+        value,
+        "annotations",
+        "An annotations field was not an array or null.",
+    )?
+    .is_some_and(|annotations| annotations.iter().any(|annotation| !annotation.is_object()))
+    {
+        return Err("An annotation entry was not an object.");
+    }
+    Ok(())
+}
+
+fn reconciled_event_item_id(event: &Value, item: &Value) -> Result<Option<String>, &'static str> {
+    let outer = optional_string_field(
+        event,
+        "item_id",
+        "An output item event item_id was not a string or null.",
+    )?;
+    let inner = optional_string_field(item, "id", "An output item id was not a string or null.")?;
+    if let (Some(outer), Some(inner)) = (
+        outer.filter(|id| !id.is_empty()),
+        inner.filter(|id| !id.is_empty()),
+    ) {
+        if outer != inner {
+            return Err("An output item event item_id did not match its item id.");
+        }
+    }
+    Ok(inner.or(outer).map(str::to_string))
+}
+
+fn validate_message_content(content: &[Value]) -> Result<(), &'static str> {
+    for block in content {
+        let Some(block) = block.as_object() else {
+            return Err("A message content block was not an object.");
+        };
+        let block = Value::Object(block.clone());
+        let block_type = required_nonempty_string_field(
+            &block,
+            "type",
+            "A message content block had a missing or invalid type.",
+        )?;
+        match block_type {
+            "output_text" | "input_text" => {
+                required_string_field(
+                    &block,
+                    "text",
+                    "A text content block had a missing or invalid text field.",
+                )?;
+                validate_annotations_field(&block)?;
+            }
+            "input_image" => {
+                return Err("Image content is unsupported in a streamed assistant output message.");
+            }
+            _ => return Err("A message content block had an unsupported type."),
+        }
+    }
+    Ok(())
+}
+
+fn validate_reasoning_blocks(blocks: &[Value], summary: bool) -> Result<(), &'static str> {
+    for block in blocks {
+        let Some(block) = block.as_object() else {
+            return Err("A reasoning block was not an object.");
+        };
+        let block = Value::Object(block.clone());
+        let block_type = required_nonempty_string_field(
+            &block,
+            "type",
+            "A reasoning block had a missing or invalid type.",
+        )?;
+        if (summary && block_type != "summary_text")
+            || (!summary && !matches!(block_type, "reasoning_text" | "text"))
+        {
+            return Err("A reasoning block had an unsupported type.");
+        }
+        required_string_field(
+            &block,
+            "text",
+            "A reasoning block had a missing or invalid text field.",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_known_output_item(
+    item: &Value,
+    item_type: &str,
+    phase: OutputItemPhase,
+) -> Result<(), &'static str> {
+    match item_type {
+        "function_call" => {
+            validate_optional_item_scalars(item)?;
+            required_nonempty_string_field(
+                item,
+                "call_id",
+                "A function_call item had a missing, empty, or invalid call_id.",
+            )?;
+            required_nonempty_string_field(
+                item,
+                "name",
+                "A function_call item had a missing, empty, or invalid name.",
+            )?;
+            optional_string_field(
+                item,
+                "namespace",
+                "A function_call namespace was not a string or null.",
+            )?;
+            let arguments = required_string_field(
+                item,
+                "arguments",
+                "A function_call item had missing or invalid arguments.",
+            )?;
+            validate_json_arguments(arguments, phase == OutputItemPhase::Added)?;
+        }
+        "tool_search_call" => {
+            validate_optional_item_scalars(item)?;
+            optional_string_field(
+                item,
+                "call_id",
+                "A tool_search_call call_id was not a string or null.",
+            )?;
+            required_nonempty_string_field(
+                item,
+                "execution",
+                "A tool_search_call item had a missing, empty, or invalid execution.",
+            )?;
+            if item.get("arguments").is_none() {
+                return Err("A tool_search_call item was missing its arguments.");
+            }
+        }
+        "tool_search_output" => {
+            validate_optional_item_scalars(item)?;
+            optional_string_field(
+                item,
+                "call_id",
+                "A tool_search_output call_id was not a string or null.",
+            )?;
+            required_nonempty_string_field(
+                item,
+                "status",
+                "A tool_search_output item had a missing, empty, or invalid status.",
+            )?;
+            required_nonempty_string_field(
+                item,
+                "execution",
+                "A tool_search_output item had a missing, empty, or invalid execution.",
+            )?;
+            item.get("tools")
+                .and_then(Value::as_array)
+                .ok_or("A tool_search_output item had missing or invalid tools.")?;
+        }
+        "message" => {
+            validate_optional_item_scalars(item)?;
+            let role = required_nonempty_string_field(
+                item,
+                "role",
+                "A message item had a missing, empty, or invalid role.",
+            )?;
+            if role != "assistant" {
+                return Err("A streamed output message did not have the assistant role.");
+            }
+            let content = item
+                .get("content")
+                .and_then(Value::as_array)
+                .ok_or("A message item had missing or invalid content.")?;
+            validate_message_content(content)?;
+            if let Some(phase) =
+                optional_string_field(item, "phase", "A message phase was not a string or null.")?
+            {
+                if !matches!(phase, "commentary" | "final_answer") {
+                    return Err("A message item had an invalid phase.");
+                }
+            }
+        }
+        "reasoning" => {
+            validate_optional_item_scalars(item)?;
+            optional_string_field(
+                item,
+                "encrypted_content",
+                "A reasoning encrypted_content field was not a string or null.",
+            )?;
+            let summary = item
+                .get("summary")
+                .and_then(Value::as_array)
+                .ok_or("A reasoning item had missing or invalid summary.")?;
+            validate_reasoning_blocks(summary, true)?;
+            if let Some(content) = optional_array_field(
+                item,
+                "content",
+                "A reasoning content field was not an array or null.",
+            )? {
+                validate_reasoning_blocks(content, false)?;
+            }
+        }
+        "compaction" | "compaction_summary" => {
+            validate_optional_item_scalars(item)?;
+            required_nonempty_string_field(
+                item,
+                "encrypted_content",
+                "A compaction item had missing, empty, or invalid encrypted_content.",
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A non-empty namespace wins over the required function name.
+fn resolve_tool_use_name(item: &Value) -> &str {
+    optional_string_field(
+        item,
+        "namespace",
+        "A function_call namespace was not a string or null.",
+    )
+    .expect("function item validated before name resolution")
+    .filter(|namespace| !namespace.trim().is_empty())
+    .unwrap_or_else(|| {
+        required_nonempty_string_field(
+            item,
+            "name",
+            "A function_call item had a missing, empty, or invalid name.",
+        )
+        .expect("function item validated before name resolution")
+    })
 }
 
 fn validate_done_item_identity(
@@ -467,6 +765,13 @@ fn validate_done_item_identity(
     let conflicts = |field: &str| {
         let added = get_str(added, field).filter(|value| !value.is_empty());
         let done = get_str(done, field).filter(|value| !value.is_empty());
+        added.is_some() && done.is_some() && added != done
+    };
+    let optional_changed = |field: &str| {
+        let added = optional_string_field(added, field, "An item identity field was invalid.")
+            .expect("known item validated before identity reconciliation");
+        let done = optional_string_field(done, field, "An item identity field was invalid.")
+            .expect("known item validated before identity reconciliation");
         added.is_some() && done.is_some() && added != done
     };
     if matches!(item_type, "function_call" | "tool_search_call") && conflicts("call_id") {
@@ -481,6 +786,26 @@ fn validate_done_item_identity(
     }
     if item_type == "message" && conflicts("role") {
         return Err("A completed message changed its role.");
+    }
+    if item_type == "tool_search_call" {
+        if conflicts("execution") {
+            return Err("A completed tool search changed its execution mode.");
+        }
+        if let (Some(added_arguments), Some(done_arguments)) =
+            (added.get("arguments"), done.get("arguments"))
+        {
+            if added_arguments != done_arguments {
+                return Err("A completed tool search changed its arguments.");
+            }
+        }
+    }
+    if item_type == "reasoning" && optional_changed("encrypted_content") {
+        return Err("A completed reasoning item changed its encrypted content.");
+    }
+    if matches!(item_type, "compaction" | "compaction_summary")
+        && optional_changed("encrypted_content")
+    {
+        return Err("A completed compaction item changed its encrypted content.");
     }
     Ok(())
 }
@@ -549,6 +874,7 @@ fn close_all_open_blocks(
     state.tracked_reasoning_parts = 0;
     state.tracked_text_parts = 0;
     state.output_text_by_key.clear();
+    state.output_text_done_by_key.clear();
 }
 
 /// Mirrors `openTextBlockIfNeeded`.
@@ -633,8 +959,9 @@ fn open_function_call_block(
             .map(str::to_string)
             .unwrap_or_else(|| format!("tool_call_{block_index}"));
         let resolved_name = name
-            .map(str::to_string)
-            .unwrap_or_else(|| "function".to_string());
+            .filter(|name| !name.trim().is_empty())
+            .expect("function/tool-search item validated before block creation")
+            .to_string();
 
         state.function_call_state_by_output_index.insert(
             output_index,
@@ -645,6 +972,7 @@ fn open_function_call_block(
                 consecutive_whitespace_count: 0,
                 buffered_arguments: Vec::new(),
                 accumulated_arguments: String::new(),
+                arguments_done: None,
                 started: false,
                 done: false,
             },
@@ -654,8 +982,7 @@ fn open_function_call_block(
         .function_call_state_by_output_index
         .get_mut(&output_index)
     {
-        // An arguments event can arrive before output_item.added. Replace the
-        // temporary defaults once authoritative metadata appears.
+        // Reconcile metadata that may first appear on the authoritative done item.
         if let Some(id) = tool_call_id.filter(|id| !id.is_empty()) {
             fc.tool_call_id = id.to_string();
         }
@@ -722,6 +1049,9 @@ fn append_function_call_arguments(
     else {
         return Err("Received function call arguments without an output item.");
     };
+    if call.arguments_done.is_some() {
+        return Err("Function call argument data arrived after arguments.done.");
+    }
     call.accumulated_arguments.push_str(&arguments);
     let block_index = call.block_index;
     if active {
@@ -931,10 +1261,16 @@ fn handle_output_item_added(
             build_error_event("A response.output_item.added event was missing its item."),
         );
     };
-    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+    let Some(item_type) = item
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|item_type| !item_type.is_empty())
+    else {
         return terminate_responses_stream_with_error(
             state,
-            build_error_event("A response.output_item.added event was missing its item type."),
+            build_error_event(
+                "A response.output_item.added event had a missing or invalid item type.",
+            ),
         );
     };
     let output_index = match required_nonnegative_index(
@@ -948,7 +1284,15 @@ fn handle_output_item_added(
             return terminate_responses_stream_with_error(state, build_error_event(message))
         }
     };
-    let item_id = item.get("id").and_then(Value::as_str).map(str::to_owned);
+    let item_id = match reconciled_event_item_id(event, item).and_then(|item_id| {
+        validate_known_output_item(item, item_type, OutputItemPhase::Added)?;
+        Ok(item_id)
+    }) {
+        Ok(item_id) => item_id,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
 
     if let Some(existing) = state.output_items_by_index.get(&output_index) {
         if !existing.done && existing.added_item.as_ref() == Some(item) {
@@ -1008,7 +1352,7 @@ fn handle_output_item_added(
         );
     }
 
-    let details = match extract_function_call_details(event, state) {
+    let details = match extract_function_call_details(item, output_index, state) {
         Some(d) => d,
         None => return events,
     };
@@ -1016,7 +1360,7 @@ fn handle_output_item_added(
     open_function_call_block(
         state,
         details.output_index,
-        Some(&details.tool_call_id),
+        details.tool_call_id.as_deref(),
         Some(&details.name),
         &mut events,
     );
@@ -1034,24 +1378,35 @@ fn handle_output_item_added(
 
 struct FunctionCallDetails {
     output_index: i64,
-    tool_call_id: String,
+    tool_call_id: Option<String>,
     name: String,
     initial_arguments: Option<String>,
 }
 
-/// Mirrors `extractFunctionCallDetails`.
 fn extract_function_call_details(
-    event: &Value,
+    item: &Value,
+    output_index: i64,
     state: &ResponsesStreamState,
 ) -> Option<FunctionCallDetails> {
-    let item = event.get("item")?;
     let item_type = item.get("type").and_then(Value::as_str)?;
-    let output_index = get_i64(event, "output_index");
 
     if item_type == "tool_search_call" {
+        let tool_call_id = optional_string_field(
+            item,
+            "call_id",
+            "A tool_search_call call_id was not a string or null.",
+        )
+        .expect("tool search item validated before extraction")
+        .filter(|call_id| !call_id.is_empty())
+        .or_else(|| {
+            optional_string_field(item, "id", "A tool_search_call id was invalid.")
+                .expect("tool search item validated before extraction")
+                .filter(|id| !id.is_empty())
+        })
+        .map(str::to_string);
         return Some(FunctionCallDetails {
             output_index,
-            tool_call_id: get_str(item, "call_id").unwrap_or("").to_string(),
+            tool_call_id,
             name: state.tool_search_name.clone(),
             initial_arguments: Some(String::new()),
         });
@@ -1063,9 +1418,25 @@ fn extract_function_call_details(
 
     Some(FunctionCallDetails {
         output_index,
-        tool_call_id: get_str(item, "call_id").unwrap_or("").to_string(),
-        name: resolve_tool_use_name(item),
-        initial_arguments: Some(get_str(item, "arguments").unwrap_or("").to_string()),
+        tool_call_id: Some(
+            required_nonempty_string_field(
+                item,
+                "call_id",
+                "A function_call item had a missing, empty, or invalid call_id.",
+            )
+            .expect("function item validated before extraction")
+            .to_string(),
+        ),
+        name: resolve_tool_use_name(item).to_string(),
+        initial_arguments: Some(
+            required_string_field(
+                item,
+                "arguments",
+                "A function_call item had missing or invalid arguments.",
+            )
+            .expect("function item validated before extraction")
+            .to_string(),
+        ),
     })
 }
 
@@ -1080,10 +1451,16 @@ fn handle_output_item_done(
             build_error_event("A response.output_item.done event was missing its item."),
         );
     };
-    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+    let Some(item_type) = item
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|item_type| !item_type.is_empty())
+    else {
         return terminate_responses_stream_with_error(
             state,
-            build_error_event("A response.output_item.done event was missing its item type."),
+            build_error_event(
+                "A response.output_item.done event had a missing or invalid item type.",
+            ),
         );
     };
     let output_index = match required_nonnegative_index(
@@ -1097,7 +1474,15 @@ fn handle_output_item_done(
             return terminate_responses_stream_with_error(state, build_error_event(message))
         }
     };
-    let item_id = item.get("id").and_then(Value::as_str).map(str::to_owned);
+    let item_id = match reconciled_event_item_id(event, item).and_then(|item_id| {
+        validate_known_output_item(item, item_type, OutputItemPhase::Done)?;
+        Ok(item_id)
+    }) {
+        Ok(item_id) => item_id,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
 
     if let Some(existing) = state.output_items_by_index.get(&output_index).cloned() {
         if existing.item_type != item_type {
@@ -1195,27 +1580,83 @@ fn handle_output_item_done(
     }
 
     if matches!(item_type, "function_call" | "tool_search_call") {
-        let call_id = get_str(item, "call_id").unwrap_or("").to_string();
-        let (name, final_arguments) = if item_type == "tool_search_call" {
+        let tool_search_arguments = if item_type == "tool_search_call" {
+            match stringify_tool_search_arguments(
+                item.get("arguments")
+                    .expect("tool search arguments validated above"),
+            ) {
+                Ok(arguments) => Some(arguments),
+                Err(message) => {
+                    return terminate_responses_stream_with_error(state, build_error_event(message))
+                }
+            }
+        } else {
+            None
+        };
+        let (call_id, name, final_arguments) = if item_type == "tool_search_call" {
             (
+                optional_string_field(
+                    item,
+                    "call_id",
+                    "A tool_search_call call_id was not a string or null.",
+                )
+                .expect("tool search item validated above")
+                .filter(|call_id| !call_id.is_empty())
+                .or_else(|| {
+                    optional_string_field(item, "id", "A tool_search_call id was invalid.")
+                        .expect("tool search item validated above")
+                        .filter(|id| !id.is_empty())
+                })
+                .map(str::to_string),
                 state.tool_search_name.clone(),
-                stringify_tool_search_arguments(item.get("arguments").unwrap_or(&Value::Null)),
+                tool_search_arguments,
             )
         } else {
             (
-                resolve_tool_use_name(item),
-                get_str(item, "arguments").map(str::to_string),
+                Some(
+                    required_nonempty_string_field(
+                        item,
+                        "call_id",
+                        "A function_call item had a missing, empty, or invalid call_id.",
+                    )
+                    .expect("function item validated above")
+                    .to_string(),
+                ),
+                resolve_tool_use_name(item).to_string(),
+                Some(
+                    required_string_field(
+                        item,
+                        "arguments",
+                        "A function_call item had missing or invalid arguments.",
+                    )
+                    .expect("function item validated above")
+                    .to_string(),
+                ),
             )
         };
         open_function_call_block(
             state,
             output_index,
-            Some(&call_id),
+            call_id.as_deref(),
             Some(&name),
             &mut events,
         );
 
         if let Some(args) = final_arguments {
+            if let Some(arguments_done) = state
+                .function_call_state_by_output_index
+                .get(&output_index)
+                .and_then(|call| call.arguments_done.as_deref())
+            {
+                if arguments_done != args {
+                    return terminate_responses_stream_with_error(
+                        state,
+                        build_error_event(
+                            "Function call output_item.done arguments conflicted with arguments.done.",
+                        ),
+                    );
+                }
+            }
             if let Err(message) =
                 reconcile_function_call_arguments(state, output_index, &args, &mut events)
             {
@@ -1236,12 +1677,16 @@ fn handle_output_item_done(
         return events;
     }
 
-    if item_type == "compaction" {
-        let id = get_str(item, "id").unwrap_or("");
-        let encrypted_content = get_str(item, "encrypted_content").unwrap_or("");
-        if encrypted_content.is_empty() {
-            return events;
-        }
+    if matches!(item_type, "compaction" | "compaction_summary") {
+        let id = optional_string_field(item, "id", "A compaction item id was invalid.")
+            .expect("compaction item validated above")
+            .unwrap_or("");
+        let encrypted_content = required_nonempty_string_field(
+            item,
+            "encrypted_content",
+            "A compaction item had missing, empty, or invalid encrypted_content.",
+        )
+        .expect("compaction item validated above");
 
         let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
 
@@ -1268,7 +1713,12 @@ fn handle_output_item_done(
         return events;
     }
 
-    let encrypted_content = get_str(item, "encrypted_content");
+    let encrypted_content = optional_string_field(
+        item,
+        "encrypted_content",
+        "A reasoning encrypted_content field was not a string or null.",
+    )
+    .expect("reasoning item validated above");
     let lifecycle_id = state
         .output_items_by_index
         .get(&output_index)
@@ -1288,38 +1738,85 @@ fn handle_output_item_done(
             ),
         );
     }
-    let buffered_summary_segments: Vec<String> = buffered
-        .summary_parts
-        .into_values()
-        .map(|part| part.text)
-        .collect();
+    let buffered_summary_parts: Vec<ReasoningSummaryPartState> =
+        buffered.summary_parts.into_values().collect();
     let buffered_content_segments: Vec<String> = buffered.content_parts.into_values().collect();
-    let summary_segments: Vec<String> = match item.get("summary").and_then(Value::as_array) {
-        Some(summary) if !summary.is_empty() || buffered_summary_segments.is_empty() => summary
-            .iter()
-            .map(|block| {
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .collect(),
-        _ => buffered_summary_segments,
-    };
-    let content_segments: Vec<String> = match item.get("content").and_then(Value::as_array) {
-        Some(content) if !content.is_empty() || buffered_content_segments.is_empty() => content
-            .iter()
-            .map(|block| {
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .collect(),
-        _ => buffered_content_segments,
-    };
+    let final_summary_segments: Vec<String> = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .expect("reasoning summary validated above")
+        .iter()
+        .map(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .expect("reasoning summary block validated above")
+                .to_string()
+        })
+        .collect();
+    let summary_segments =
+        if final_summary_segments.is_empty() && !buffered_summary_parts.is_empty() {
+            buffered_summary_parts
+                .iter()
+                .map(|part| part.text.clone())
+                .collect()
+        } else {
+            if final_summary_segments.len() < buffered_summary_parts.len()
+                || buffered_summary_parts
+                    .iter()
+                    .enumerate()
+                    .any(|(index, buffered)| {
+                        let final_text = &final_summary_segments[index];
+                        buffered.done_text.as_ref().map_or_else(
+                            || !final_text.starts_with(&buffered.text),
+                            |done| final_text != done,
+                        )
+                    })
+            {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event(
+                        "A completed reasoning summary conflicted with streamed summary text.",
+                    ),
+                );
+            }
+            final_summary_segments
+        };
+    let final_content_segments: Vec<String> = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .map(|block| {
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .expect("reasoning content block validated above")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let content_segments =
+        if final_content_segments.is_empty() && !buffered_content_segments.is_empty() {
+            buffered_content_segments
+        } else {
+            if final_content_segments.len() < buffered_content_segments.len()
+                || buffered_content_segments
+                    .iter()
+                    .enumerate()
+                    .any(|(index, buffered)| !final_content_segments[index].starts_with(buffered))
+            {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event(
+                        "Completed reasoning content conflicted with streamed content deltas.",
+                    ),
+                );
+            }
+            final_content_segments
+        };
     let display_text = effective_reasoning_text(
         summary_segments
             .iter()
@@ -1362,6 +1859,9 @@ fn append_output_text(
     events: &mut Vec<AnthropicStreamEventData>,
 ) -> Result<(), &'static str> {
     let key = block_key(output_index, content_index);
+    if state.output_text_done_by_key.contains_key(&key) {
+        return Err("Output text data arrived after output_text.done.");
+    }
     if !state.output_text_by_key.contains_key(&key) {
         if state.tracked_text_parts >= MAX_TRACKED_CONTENT_PARTS {
             return Err("The Responses stream emitted too many text content parts.");
@@ -1397,6 +1897,13 @@ fn reconcile_output_text(
     events: &mut Vec<AnthropicStreamEventData>,
 ) -> Result<(), &'static str> {
     let key = block_key(output_index, content_index);
+    if let Some(done) = state.output_text_done_by_key.get(&key) {
+        return if done == authoritative {
+            Ok(())
+        } else {
+            Err("Completed output text conflicted with output_text.done.")
+        };
+    }
     let current = state
         .output_text_by_key
         .get(&key)
@@ -1408,29 +1915,52 @@ fn reconcile_output_text(
     append_output_text(state, output_index, content_index, suffix, events)
 }
 
+fn message_block_text(block: &Value) -> Option<&str> {
+    match block.get("type").and_then(Value::as_str) {
+        Some("output_text" | "input_text") => block.get("text").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
 fn render_complete_message_item(
     item: &Value,
     state: &mut ResponsesStreamState,
     output_index: i64,
     events: &mut Vec<AnthropicStreamEventData>,
 ) -> Result<(), &'static str> {
-    let Some(content) = item.get("content").and_then(Value::as_array) else {
-        return Ok(());
-    };
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or("A completed message item had missing or invalid content.")?;
     for (content_index, block) in content.iter().enumerate() {
-        let text = match block.get("type").and_then(Value::as_str) {
-            Some("output_text") => block.get("text").and_then(Value::as_str),
-            Some("refusal") => block.get("refusal").and_then(Value::as_str),
-            _ => block
-                .get("text")
-                .or_else(|| block.get("reasoning"))
-                .and_then(Value::as_str),
-        };
-        let Some(text) = text.filter(|text| !text.is_empty()) else {
+        let text = message_block_text(block);
+        let Some(text) = text else {
             continue;
         };
-        let content_index = content_index as i64;
+        let content_index = i64::try_from(content_index)
+            .map_err(|_| "A message content index exceeded the supported integer range.")?;
         reconcile_output_text(state, output_index, content_index, text, events)?;
+    }
+    let prefix = format!("{output_index}:");
+    for key in state
+        .output_text_by_key
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+    {
+        let content_index = key
+            .strip_prefix(&prefix)
+            .and_then(|index| index.parse::<i64>().ok())
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or("A tracked message content index was invalid.")?;
+        if content
+            .get(content_index)
+            .and_then(message_block_text)
+            .is_none()
+        {
+            return Err(
+                "Streamed output text referenced a content index absent from the completed message.",
+            );
+        }
     }
     Ok(())
 }
@@ -1455,9 +1985,13 @@ fn handle_function_call_arguments_delta(
             ),
         );
     };
-
     if delta_text.is_empty() {
-        return events;
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event(
+                "A response.function_call_arguments.delta event contained an empty delta.",
+            ),
+        );
     }
 
     open_function_call_block(state, output_index, None, None, &mut events);
@@ -1513,7 +2047,6 @@ fn handle_function_call_arguments_done(
                 return terminate_responses_stream_with_error(state, build_error_event(message))
             }
         };
-    open_function_call_block(state, output_index, None, None, &mut events);
     let Some(final_arguments) = get_str(event, "arguments") else {
         return terminate_responses_stream_with_error(
             state,
@@ -1522,10 +2055,30 @@ fn handle_function_call_arguments_done(
             ),
         );
     };
+    if let Err(message) = validate_json_arguments(final_arguments, false) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
+    if state
+        .function_call_state_by_output_index
+        .get(&output_index)
+        .is_some_and(|call| call.arguments_done.is_some())
+    {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event("A function call emitted duplicate arguments.done events."),
+        );
+    }
+    open_function_call_block(state, output_index, None, None, &mut events);
     if let Err(message) =
         reconcile_function_call_arguments(state, output_index, final_arguments, &mut events)
     {
         return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
+    if let Some(call) = state
+        .function_call_state_by_output_index
+        .get_mut(&output_index)
+    {
+        call.arguments_done = Some(final_arguments.to_string());
     }
     events
 }
@@ -1558,6 +2111,9 @@ fn handle_output_text_delta(
             build_error_event("A response.output_text.delta event was missing its delta."),
         );
     };
+    if let Err(message) = validate_annotations_field(event) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     if let Err(message) =
         append_output_text(state, output_index, content_index, delta_text, &mut events)
     {
@@ -1589,10 +2145,12 @@ fn validate_active_output_item(
         .as_deref()
         .filter(|id| !id.is_empty())
         .map(str::to_string);
-    let actual_id = event
-        .get("item_id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty());
+    let actual_id = optional_string_field(
+        event,
+        "item_id",
+        "An incremental output event item_id was not a string or null.",
+    )?
+    .filter(|id| !id.is_empty());
     if let (Some(expected), Some(actual)) = (expected_id.as_deref(), actual_id) {
         if expected != actual {
             return Err("An incremental output event item id did not match its output item.");
@@ -1612,6 +2170,23 @@ fn validate_active_output_item(
                 .insert(actual.to_string(), output_index);
             if let Some(lifecycle) = state.output_items_by_index.get_mut(&output_index) {
                 lifecycle.item_id = Some(actual.to_string());
+            }
+        }
+    }
+    if let Some(actual_call_id) = optional_string_field(
+        event,
+        "call_id",
+        "An incremental output event call_id was not a string or null.",
+    )?
+    .filter(|call_id| !call_id.is_empty())
+    {
+        if let Some(expected_call_id) = state
+            .function_call_state_by_output_index
+            .get(&output_index)
+            .map(|call| call.tool_call_id.as_str())
+        {
+            if expected_call_id != actual_call_id {
+                return Err("An incremental output event call_id did not match its output item.");
             }
         }
     }
@@ -1646,10 +2221,12 @@ fn validate_reasoning_event(
         .as_deref()
         .filter(|id| !id.is_empty())
         .map(str::to_string);
-    let actual_id = event
-        .get("item_id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty());
+    let actual_id = optional_string_field(
+        event,
+        "item_id",
+        "A reasoning stream event item_id was not a string or null.",
+    )?
+    .filter(|id| !id.is_empty());
     if let (Some(expected), Some(actual)) = (expected_id.as_deref(), actual_id) {
         if expected != actual {
             return Err("A reasoning stream event item id did not match its output item.");
@@ -1689,6 +2266,11 @@ fn handle_reasoning_summary_part_added(
                 return terminate_responses_stream_with_error(state, build_error_event(message))
             }
         };
+    if let Some(part) = event.get("part") {
+        if let Err(message) = validate_reasoning_blocks(std::slice::from_ref(part), true) {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
+    }
     if let Err(message) = reserve_reasoning_part(state, output_index, summary_index, true) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
@@ -1777,6 +2359,20 @@ fn handle_reasoning_summary_text_done(
                 return terminate_responses_stream_with_error(state, build_error_event(message))
             }
         };
+    if required_nonempty_string_field(
+        event,
+        "item_id",
+        "A response.reasoning_summary_text.done event had a missing or invalid item_id.",
+    )
+    .is_err()
+    {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event(
+                "A response.reasoning_summary_text.done event had a missing or invalid item_id.",
+            ),
+        );
+    }
     let Some(text) = get_str(event, "text") else {
         return terminate_responses_stream_with_error(
             state,
@@ -1786,6 +2382,13 @@ fn handle_reasoning_summary_text_done(
     if let Err(message) = reserve_reasoning_part(state, output_index, summary_index, true) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
+    state
+        .reasoning_state_by_output_index
+        .get_mut(&output_index)
+        .expect("validated reasoning item")
+        .summary_parts
+        .entry(summary_index)
+        .or_default();
     let previous = state
         .reasoning_state_by_output_index
         .get(&output_index)
@@ -1800,7 +2403,21 @@ fn handle_reasoning_summary_text_done(
             build_error_event("A reasoning summary part emitted conflicting text.done events."),
         );
     }
-    if let Err(message) = reserve_buffered_translation_bytes(state, text.len()) {
+    let current = state
+        .reasoning_state_by_output_index
+        .get(&output_index)
+        .and_then(|reasoning| reasoning.summary_parts.get(&summary_index))
+        .map(|part| part.text.as_str())
+        .expect("reasoning part reserved above");
+    let Some(suffix) = text.strip_prefix(current) else {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event(
+                "A reasoning summary text.done value conflicted with streamed deltas.",
+            ),
+        );
+    };
+    if let Err(message) = reserve_buffered_translation_bytes(state, suffix.len()) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     // `text.done` is the authoritative complete text for this summary part.
@@ -1879,11 +2496,22 @@ fn handle_output_text_done(
             build_error_event("A response.output_text.done event was missing its text."),
         );
     };
+    if let Err(message) = validate_annotations_field(event) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
+    let key = block_key(output_index, content_index);
+    if state.output_text_done_by_key.contains_key(&key) {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event("A text content part emitted duplicate output_text.done events."),
+        );
+    }
     if let Err(message) =
         reconcile_output_text(state, output_index, content_index, text, &mut events)
     {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
+    state.output_text_done_by_key.insert(key, text.to_string());
 
     events
 }
@@ -1981,15 +2609,22 @@ fn handle_response_completed(
         .function_call_state_by_output_index
         .values()
         .any(|call| !call.done);
+    let output_indices_contiguous = (0..state.output_items_by_index.len()).all(|index| {
+        i64::try_from(index)
+            .ok()
+            .is_some_and(|index| state.output_items_by_index.contains_key(&index))
+    });
     let terminal_output_mismatch = match response.get("output") {
         None => false,
         Some(Value::Array(output)) => {
             output.len() != state.output_items_by_index.len()
                 || output.iter().enumerate().any(|(index, item)| {
-                    state
-                        .output_items_by_index
-                        .get(&(index as i64))
-                        .is_none_or(|lifecycle| lifecycle.done_item.as_ref() != Some(item))
+                    i64::try_from(index).ok().is_none_or(|index| {
+                        state
+                            .output_items_by_index
+                            .get(&index)
+                            .is_none_or(|lifecycle| lifecycle.done_item.as_ref() != Some(item))
+                    })
                 })
         }
         Some(_) => true,
@@ -1997,6 +2632,7 @@ fn handle_response_completed(
     if pending_output_item
         || pending_function_call
         || !state.reasoning_state_by_output_index.is_empty()
+        || !output_indices_contiguous
         || terminal_output_mismatch
     {
         return terminate_responses_stream_with_error(
@@ -2120,6 +2756,9 @@ fn map_responses_stop_reason(
     terminal_kind: ResponsesTerminalKind,
 ) -> Result<Option<String>, &'static str> {
     if terminal_kind == ResponsesTerminalKind::Completed {
+        if response.get("end_turn").and_then(Value::as_bool) == Some(false) && !has_tool_call {
+            return Ok(Some("pause_turn".to_string()));
+        }
         let output = response.get("output").and_then(Value::as_array);
         match output {
             None => {
@@ -2180,8 +2819,9 @@ fn map_responses_usage_delta(usage: ValidatedResponsesUsage) -> AnthropicMessage
 }
 
 /// Mirrors `stringifyToolSearchArguments`.
-fn stringify_tool_search_arguments(arguments_value: &Value) -> Option<String> {
-    serde_json::to_string(&format_tool_search_bridge_arguments(arguments_value)).ok()
+fn stringify_tool_search_arguments(arguments_value: &Value) -> Result<String, &'static str> {
+    serde_json::to_string(&format_tool_search_bridge_arguments(arguments_value))
+        .map_err(|_| "Tool search arguments could not be serialized.")
 }
 
 // ---------------------------------------------------------------------------
@@ -2844,11 +3484,11 @@ mod tests {
         for event in [
             json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0}),
             json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"one"}),
-            json!({"type":"response.reasoning_summary_text.done","output_index":0,"summary_index":0,"text":"one"}),
+            json!({"type":"response.reasoning_summary_text.done","item_id":"reasoning-id","output_index":0,"summary_index":0,"text":"one"}),
             json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1}),
             json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1}),
             json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":1,"delta":"two"}),
-            json!({"type":"response.reasoning_summary_text.done","output_index":0,"summary_index":1,"text":"two"}),
+            json!({"type":"response.reasoning_summary_text.done","item_id":"reasoning-id","output_index":0,"summary_index":1,"text":"two"}),
         ] {
             assert!(translate_responses_stream_event(&event, &mut state).is_empty());
         }
@@ -2859,7 +3499,8 @@ mod tests {
                 "item":{
                     "type":"reasoning",
                     "id":"reasoning-id",
-                    "encrypted_content":"encrypted"
+                    "encrypted_content":"encrypted",
+                    "summary":[]
                 }
             }),
             &mut state,

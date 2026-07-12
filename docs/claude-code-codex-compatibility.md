@@ -156,7 +156,7 @@ reasoning item unchanged; complete legacy values retain
 Present-but-empty strings also use the versioned carrier and remain distinct
 from absent fields.
 For Responses output, the paired public non-stream/stream
-`claude_aggregate_empty_reasoning_*` regressions cover absent summaries, empty
+`claude_aggregate_empty_reasoning_*` regressions cover required empty summary
 arrays, empty text, and whitespace-only text. They emit the standard thinking
 placeholder plus the exact opaque signature only when an ID or encrypted
 content field is present (including an explicitly empty string); carrier-free
@@ -220,6 +220,38 @@ requires integer `input_tokens`, `output_tokens`, and `total_tokens` whenever
 usage is present. Cached-input and reasoning-output detail objects are optional,
 but their integer fields are required when those objects exist.
 
+Handled stream items are validated against Codex's tagged
+[`ResponseItem`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/protocol/src/models.rs#L932-L1163)
+contract before any Anthropic block opens:
+
+- `function_call` requires non-empty string `call_id` and `name`, plus string
+  `arguments`. Empty arguments are valid only on the initial added item;
+  authoritative done values must contain valid JSON. Argument deltas, the
+  optional item/call IDs, `arguments.done`, and final item values must reconcile.
+  Duplicate done events, late deltas, invalid JSON, or identity/content conflicts
+  fail once.
+- `tool_search_call` requires non-empty string `execution` and a present JSON
+  `arguments` value; `id`, `call_id`, and status remain optional string/null
+  fields. A deterministic non-empty bridge ID is used only when both optional
+  IDs are absent. `tool_search_output` requires status, execution, and a tools
+  array.
+- Streamed messages require assistant role and a content array containing
+  audited text variants with correctly typed required fields. Unsupported
+  assistant output variants fail explicitly rather than disappearing. Optional
+  annotations must be arrays of objects. Streamed content indices and
+  authoritative completed text must reconcile.
+- Reasoning requires a summary array with typed `summary_text` blocks. Optional
+  reasoning content and encrypted carriers remain optional, but malformed
+  present values fail; summary/content deltas must be prefixes of their
+  authoritative values.
+- Compaction requires non-empty string `encrypted_content`; its ID remains
+  optional. Optional item IDs, statuses, namespaces, and internal passthrough
+  metadata are accepted only with their source-defined string/null or object
+  shapes.
+
+Unknown item variants remain lifecycle-preserved. These translated validation
+rules do not alter native `/v1/responses` forwarding.
+
 Every incrementally streamed item must first have an active
 `response.output_item.added` at its non-negative output index. Optional item IDs
 may first appear on a later event and are then reconciled to that index; a
@@ -238,17 +270,20 @@ When provider events include OpenAI `sequence_number`, it must increase
 monotonically; an immediately replayed identical frame is ignored, while reused
 or decreasing numbers fail closed. Summary and reasoning-content part indices
 must be contiguous from zero at item completion, so a sparse stream cannot
-silently erase an empty boundary. A terminal response containing an output item
-that was never completed through the item lifecycle is likewise rejected rather
-than silently discarded. When a terminal `output` array is supplied, its length,
-order, IDs, and complete item payloads must match the recorded
-`output_item.done` items; explicit omission or conflicts fail closed.
+silently erase an empty boundary. Completed output-item indices must likewise be
+contiguous from zero. A terminal response containing an output item that was
+never completed through the item lifecycle is rejected rather than silently
+discarded. When a terminal `output` array is supplied, its length, order, IDs,
+and complete item payloads must match the recorded `output_item.done` items;
+explicit omission or conflicts fail closed.
 
 The SSE event type—not `response.status`—is the terminal discriminator:
 
 - `response.completed` requires the Codex-required response `id`. Optional
   status is accepted only when it is `completed`; usage is optional and maps to
-  zero when absent.
+  zero when absent. `end_turn: false` maps to Anthropic `pause_turn`
+  ([Codex requests follow-up inference](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/core/src/session/turn.rs#L2288-L2303)),
+  while true/absent values retain normal `end_turn` or `tool_use` behavior.
 - `response.incomplete` accepts absent status and maps
   `max_output_tokens` to Anthropic `max_tokens` and `content_filter` to
   `refusal`. Unknown or missing truncation reasons terminate with one
@@ -283,12 +318,15 @@ evidence is in
 `claude_reasoning_lifecycle_replays_and_adjacent_variants_are_deterministic`,
 `claude_standalone_done_items_render_complete_text_and_function_calls`,
 `claude_completed_terminals_follow_codex_event_discriminator`,
+`claude_completed_end_turn_false_maps_to_pause_turn`,
 `claude_incomplete_terminals_preserve_truncation_semantics_without_status`,
 `claude_failed_and_error_terminals_suppress_all_later_terminals`,
 `claude_model_less_created_uses_resolved_model_context`,
 `claude_created_and_terminal_identity_fields_fail_closed`,
 `claude_usage_contract_preserves_valid_details_and_omission`,
 `claude_malformed_usage_never_coerces_to_success`,
+`claude_handled_scalar_families_accept_source_valid_shapes`,
+`claude_malformed_handled_scalars_fail_once_without_empty_blocks`,
 and
 `claude_incomplete_or_out_of_order_response_items_fail_once_without_success`,
 in addition to the JSON/SSE framing regressions.
@@ -325,7 +363,7 @@ Status means deterministic, credential-free evidence exists.
 | Streaming and non-streaming | Supported | Supported | fixture captures and native response assertions |
 | Instructions/system variants | string and structured system blocks | `instructions` plus input messages | request captures |
 | Text and structured input | Messages content blocks | string/array input; images with optional `detail` | typed audit and provider-boundary captures |
-| Tool definitions/results | tool use/result, multi-turn | function/custom/tool-search calls and outputs, including optional IDs | optional-item boundary audit |
+| Tool definitions/results | tool use/result, multi-turn; malformed identities/arguments fail before empty blocks | function/custom/tool-search calls and outputs, including optional IDs | optional-item and public scalar-family boundary audits |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
 | Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
@@ -356,6 +394,7 @@ authentication, body limits, admission, and JSON parsing:
 | malformed stream frame | one terminal Anthropic `error`; no `message_stop` | one terminal OpenAI `error` or `response.failed`; no completion |
 | premature EOF/transport reset | one retryable terminal error | one terminal OpenAI error; no completion |
 | incomplete/conflicting output-item lifecycle | one terminal Anthropic `error`; open blocks close; later events ignored | native Responses stream is forwarded unchanged |
+| malformed handled item/event scalar | one terminal Anthropic `error`; no empty block or success terminal | forwarded unchanged |
 | empty/mismatched response id or malformed usage | one terminal Anthropic `error`; no success terminal | forwarded unchanged |
 | statusless `response.completed` | one `end_turn`/`tool_use` terminal; usage optional | forwarded unchanged |
 | `response.incomplete` | known truncation reason becomes one Anthropic terminal; unknown reason errors once | forwarded once as terminal incomplete |
