@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 7,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -36,6 +36,11 @@
       "iteration": 6,
       "verdict": "FAIL",
       "summary": "Reasoning lifecycle and bounded-state fixes pass, but valid Codex completed/incomplete terminals without response.status are rejected by the bridge."
+    },
+    {
+      "iteration": 7,
+      "verdict": "FAIL",
+      "summary": "Statusless terminals pass, but the bridge still requires response.created.model, accepts terminal id conflicts, and coerces malformed usage to zero."
     }
   ]
 }
