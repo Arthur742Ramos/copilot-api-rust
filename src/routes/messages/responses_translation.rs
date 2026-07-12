@@ -160,6 +160,10 @@ fn parse_reasoning_signature(signature: &str) -> (Option<String>, Option<String>
     }
 }
 
+fn is_reasoning_carrier_signature(signature: &str) -> bool {
+    signature.contains('@') || signature.starts_with(OPTIONAL_REASONING_SIGNATURE_PREFIX)
+}
+
 // ---------------------------------------------------------------------------
 // Request translation: Anthropic Messages -> Responses payload
 // ---------------------------------------------------------------------------
@@ -418,7 +422,7 @@ fn translate_assistant_message(
                     continue;
                 }
 
-                if signature.contains('@') {
+                if is_reasoning_carrier_signature(signature) {
                     flush_pending_content(
                         &mut pending,
                         &mut items,
@@ -1470,6 +1474,44 @@ mod tests {
             let (decoded_encrypted_content, decoded_id) = parse_reasoning_signature(&signature);
             assert_eq!(decoded_encrypted_content.as_deref(), encrypted_content);
             assert_eq!(decoded_id.as_deref(), id);
+        }
+    }
+
+    #[test]
+    fn assistant_reasoning_carriers_translate_all_optional_field_combinations() {
+        for (encrypted_content, id) in [
+            (Some("enc-both"), Some("reasoning-both")),
+            (Some("enc-only"), None),
+            (None, Some("reasoning-only")),
+            (None, None),
+        ] {
+            let signature = encode_reasoning_signature(encrypted_content, id);
+            let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
+                "model":"gpt-5.4",
+                "max_tokens":128,
+                "messages":[{
+                    "role":"assistant",
+                    "content":[{
+                        "type":"thinking",
+                        "thinking":"optional reasoning",
+                        "signature":signature
+                    }]
+                }]
+            }))
+            .expect("Anthropic reasoning history");
+            let translated = translate_anthropic_messages_to_responses_payload(&payload, None)
+                .expect("translate reasoning history");
+            let InputField::Items(items) = translated.input.expect("translated input") else {
+                panic!("expected item input");
+            };
+            assert_eq!(items.len(), 1, "signature: {signature}");
+            let ResponseInputItem::Reasoning(reasoning) = &items[0] else {
+                panic!("reasoning carrier was dropped: {signature}");
+            };
+            assert_eq!(reasoning.encrypted_content.as_deref(), encrypted_content);
+            assert_eq!(reasoning.id.as_deref(), id);
+            assert_eq!(reasoning.summary.len(), 1);
+            assert_eq!(reasoning.summary[0].text, "optional reasoning");
         }
     }
 

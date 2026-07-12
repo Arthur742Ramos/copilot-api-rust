@@ -20,6 +20,7 @@ use common::{json_body, send, send_full};
 use copilot_api::libs::config::{
     set_cached_config_for_test, AppConfig, AuthConfig, ModelConfig, ProviderConfig,
 };
+use copilot_api::routes::messages::responses_translation::encode_reasoning_signature;
 use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
@@ -1118,6 +1119,84 @@ async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
         .unwrap()
         .contains("prompt-caching"));
     assert!(first.headers.get("authorization").is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_optional_reasoning_carriers_cross_public_messages_boundary() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (case, encrypted_content, id) in [
+        (
+            "legacy-both",
+            Some("enc-public-both"),
+            Some("reasoning-public-both"),
+        ),
+        ("versioned-encrypted-only", Some("enc-public-only"), None),
+        ("versioned-id-only", None, Some("reasoning-public-only")),
+        ("versioned-neither", None, None),
+    ] {
+        let signature = encode_reasoning_signature(encrypted_content, id);
+        if case == "legacy-both" {
+            assert_eq!(signature, "enc-public-both@reasoning-public-both");
+        } else {
+            assert!(
+                signature.starts_with("rs1#"),
+                "{case}: expected versioned carrier"
+            );
+        }
+
+        let request = json!({
+            "model":"responses-fixture/gpt-fixture",
+            "max_tokens":128,
+            "messages":[
+                {
+                    "role":"assistant",
+                    "content":[{
+                        "type":"thinking",
+                        "thinking":"preserve optional reasoning",
+                        "signature":signature
+                    }]
+                },
+                {"role":"user","content":"continue"}
+            ],
+            "stream":false
+        });
+        let (status, body) = send(post_json("/v1/messages", request, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{case}: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let captures = fixture.requests();
+        let captured = captures
+            .iter()
+            .rev()
+            .find(|capture| capture.path == "/v1/responses")
+            .unwrap_or_else(|| panic!("{case}: translated Responses request not captured"));
+        let reasoning = captured.body["input"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["type"] == "reasoning"))
+            .unwrap_or_else(|| panic!("{case}: reasoning item was dropped"));
+        assert_eq!(
+            reasoning.get("encrypted_content").and_then(Value::as_str),
+            encrypted_content,
+            "{case}: encrypted_content changed"
+        );
+        assert_eq!(
+            reasoning.get("id").and_then(Value::as_str),
+            id,
+            "{case}: id changed"
+        );
+        assert_eq!(
+            reasoning["summary"][0]["text"],
+            "preserve optional reasoning"
+        );
+    }
 }
 
 #[tokio::test]
