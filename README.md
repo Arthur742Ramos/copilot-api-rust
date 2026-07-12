@@ -16,7 +16,8 @@ into GitHub Copilot requests, using your own Copilot subscription. It exposes:
   `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/images/generations`
 - **Anthropic-compatible** endpoints: `POST /v1/messages` and
   `POST /v1/messages/count_tokens`
-- **OpenAI Responses API**: `POST /v1/responses`
+- **OpenAI Responses API**: `POST /v1/responses` and Codex compaction at
+  `POST /v1/responses/compact`
 - **Provider routing** for Codex and third-party providers via a
   `provider/model` alias syntax and per-provider `/:provider/v1/...` routes
 
@@ -26,6 +27,9 @@ at a local endpoint backed by GitHub Copilot.
 See the [Claude Code / Anthropic API compatibility
 matrix](./docs/claude-code-api-compatibility.md) for audited behaviors,
 intentional divergences, and explicit scope limits.
+The combined [Claude Code 2.1.207 and Codex CLI 0.144.1 compatibility
+guide](./docs/claude-code-codex-compatibility.md) includes exact setup,
+headers, transport evidence, failure behavior, and an opt-in local canary.
 
 ## Install / build
 
@@ -142,6 +146,10 @@ copilot-api start --claude-code
 - **Claude Code / Anthropic clients:** set
   `ANTHROPIC_BASE_URL=http://localhost:4141` and
   `ANTHROPIC_AUTH_TOKEN` to any non-empty value (e.g. `dummy`).
+- **Codex CLI 0.144.1:** configure a custom model provider with
+  `base_url = "http://localhost:4141/v1"` and `wire_api = "responses"`.
+  See the [audited client guide](./docs/claude-code-codex-compatibility.md#codex-cli-01441-setup)
+  for the complete `config.toml`.
 
 ## Running with Docker
 
@@ -401,6 +409,7 @@ By default the server binds to `127.0.0.1:<port>` (loopback only). Pass
 | `GET`  | `/token` | Returns the live Copilot bearer token (see [Security](#security-warning)). |
 | `*`    | `/token-usage`, `/token-usage/` | Token-usage subsystem routes. |
 | `POST` | `/responses`, `/v1/responses` | OpenAI Responses API. |
+| `POST` | `/responses/compact`, `/v1/responses/compact` | Unary Responses compaction used by Codex CLI. |
 | `POST` | `/v1/messages` | Anthropic-compatible messages. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. |
 | `GET` / `POST` | `/admin/config/model-mappings` | Read / write the model-mapping table (admin auth). |

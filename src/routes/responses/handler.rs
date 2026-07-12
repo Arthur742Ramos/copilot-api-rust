@@ -4,11 +4,11 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::libs::approval::await_approval;
 use crate::libs::config::{is_responses_api_web_search_enabled, resolve_mapped_model};
-use crate::libs::error::AppError;
+use crate::libs::error::{openai_error_response, AppError};
 use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::state;
 use crate::libs::subagent::SubagentMarker;
@@ -19,7 +19,8 @@ use crate::services::copilot::create_responses::{
     ResponsesPayload, ResponsesRequestOptions,
 };
 
-use crate::routes::responses::stream_id_sync::{fix_stream_ids, StreamIdTracker};
+use crate::routes::responses::stream_guard::{ResponsesStreamGuard, ResponsesTerminal};
+use crate::routes::responses::stream_id_sync::StreamIdTracker;
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
     get_responses_request_options, get_responses_transport_for_model,
@@ -31,11 +32,7 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
     let mut payload: ResponsesPayload = serde_json::from_value(body)
         .map_err(|e| AppError::BadRequest(format!("Invalid request payload: {e}")))?;
 
-    if payload.model.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "model: field required and must be a non-empty string".to_string(),
-        ));
-    }
+    validate_responses_payload(&payload)?;
 
     let requested_model = payload.model.clone();
     payload.model = resolve_mapped_model(&payload.model);
@@ -104,16 +101,12 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
     let responses_transport = get_responses_transport_for_model(selected_model.as_ref(), None);
 
     let Some(responses_transport) = responses_transport else {
-        return Ok((
+        return Ok(openai_error_response(
             StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": {
-                    "message": "This model does not support the responses endpoint. Please choose a different model.",
-                    "type": "invalid_request_error",
-                }
-            })),
-        )
-            .into_response());
+            "invalid_request_error",
+            Some("model_not_supported"),
+            "This model does not support the responses endpoint. Please choose a different model.",
+        ));
     };
 
     let max_prompt_image_size = selected_model
@@ -189,6 +182,30 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
     }
 }
 
+#[allow(clippy::result_large_err)]
+pub(crate) fn validate_responses_payload(payload: &ResponsesPayload) -> Result<(), AppError> {
+    if payload.model.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "model: field required and must be a non-empty string".to_string(),
+        ));
+    }
+    match payload.input.as_ref() {
+        Some(InputField::Text(text)) if !text.trim().is_empty() => {}
+        Some(InputField::Items(items)) if !items.is_empty() => {}
+        _ => {
+            return Err(AppError::BadRequest(
+                "input: field required and must not be empty".to_string(),
+            ))
+        }
+    }
+    if matches!(payload.max_output_tokens, Some(value) if value <= 0) {
+        return Err(AppError::BadRequest(
+            "max_output_tokens: must be a positive integer".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Mirrors the streaming arm: forward each upstream Responses SSE event after
 /// running `fixStreamIds` over its data, while sniffing usage from the terminal
 /// events, then record usage when the stream completes.
@@ -213,6 +230,7 @@ fn stream_responses_sse(
         let mut timer = StreamTimer::new("responses", transport::NATIVE)
             .with_request_context(req_ctx);
         let mut tracker = StreamIdTracker::new();
+        let mut guard = ResponsesStreamGuard::new();
         let mut usage: UsageTokens = UsageTokens::default();
         futures_util::pin_mut!(event_stream);
 
@@ -238,31 +256,68 @@ fn stream_responses_sse(
             let Some(item) = item else { break };
             let ev = match item {
                 Ok(ev) => ev,
-                Err(err) => {
+                Err(error) => {
+                    tracing::warn!(error = %error, "Responses upstream stream transport failed");
                     timer.mark_error();
-                    yield Err(err);
+                    if let Some(frame) = guard.fail(
+                        "upstream_transport_error",
+                        "The upstream Responses stream was interrupted.",
+                    ) {
+                        yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(frame));
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
 
-            if let Some(captured) = sniff_responses_usage(&ev.data) {
+            let processed = match guard.process(&ev, &mut tracker) {
+                Ok(Some(processed)) => processed,
+                Ok(None) => continue,
+                Err(reason) => {
+                    tracing::warn!(reason, "Rejected malformed Responses stream event");
+                    timer.mark_error();
+                    if let Some(frame) = guard.fail(
+                        "invalid_stream",
+                        "The upstream Responses stream returned malformed data.",
+                    ) {
+                        yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(frame));
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
+
+            if let Some(captured) = responses_event_usage(&processed.value) {
                 usage = captured;
             }
 
-            let processed = fix_stream_ids(&ev.data, ev.event.as_deref(), &mut tracker);
-            let frame = build_sse_frame(ev.id.as_deref(), ev.event.as_deref(), &processed);
-            // Count only genuine content events toward TTFT: skip keep-alive
-            // pings and empty/[DONE] data so first-token timing isn't under-reported.
-            let data_trimmed = ev.data.trim();
-            let is_ping = ev.event.as_deref() == Some("ping");
-            if !is_ping && !data_trimmed.is_empty() && data_trimmed != "[DONE]" {
+            let event_type = processed.value.get("type").and_then(Value::as_str);
+            if !matches!(
+                event_type,
+                Some("ping" | "codex.rate_limits" | "response.metadata")
+            ) {
                 timer.on_content_frame();
             }
-            yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(frame));
+            let terminal = processed.terminal;
+            yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(processed.frame));
+
+            if let Some(terminal) = terminal {
+                match terminal {
+                    ResponsesTerminal::Completed => timer.mark_finished(),
+                    ResponsesTerminal::Failed => timer.mark_error(),
+                }
+                recorder.record(usage);
+                return;
+            }
         }
 
-        // Stream exhausted naturally (upstream sent all events and closed).
-        timer.mark_finished();
+        timer.mark_error();
+        if let Some(frame) = guard.fail(
+            "upstream_eof",
+            "The upstream Responses stream ended before a terminal event.",
+        ) {
+            yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(frame));
+        }
         recorder.record(usage);
     });
 
@@ -275,32 +330,10 @@ fn stream_responses_sse(
         .unwrap()
 }
 
-/// Build an SSE frame matching hono's `streamSSE`/`writeSSE` field ordering
-/// (`event`, then `id`, then one `data:` line per line of payload).
-fn build_sse_frame(id: Option<&str>, event: Option<&str>, data: &str) -> String {
-    let mut frame = String::new();
-    if let Some(event) = event {
-        frame.push_str("event: ");
-        frame.push_str(event);
-        frame.push('\n');
-    }
-    if let Some(id) = id {
-        frame.push_str("id: ");
-        frame.push_str(id);
-        frame.push('\n');
-    }
-    for line in data.split('\n') {
-        frame.push_str("data: ");
-        frame.push_str(line);
-        frame.push('\n');
-    }
-    frame.push('\n');
-    frame
-}
-
 /// Mirrors `parseResponsesStreamEvent` + the terminal-event usage capture:
 /// returns normalized usage when `data` is a `response.completed`/`failed`/
 /// `incomplete` event carrying a `response.usage`.
+#[cfg(test)]
 fn sniff_responses_usage(data: &str) -> Option<crate::libs::token_usage::UsageTokens> {
     if data.is_empty() || data == "[DONE]" {
         return None;
@@ -316,6 +349,10 @@ fn sniff_responses_usage(data: &str) -> Option<crate::libs::token_usage::UsageTo
         return None;
     }
     let parsed: Value = serde_json::from_str(data).ok()?;
+    responses_event_usage(&parsed)
+}
+
+fn responses_event_usage(parsed: &Value) -> Option<crate::libs::token_usage::UsageTokens> {
     let event_type = parsed.get("type").and_then(Value::as_str)?;
     if !matches!(
         event_type,
@@ -329,7 +366,7 @@ fn sniff_responses_usage(data: &str) -> Option<crate::libs::token_usage::UsageTo
 
 /// Mirrors `generateRequestIdFromPayload({ messages: payload.input }, sessionId)`,
 /// honoring the string-input branch the array-only helper cannot represent.
-fn responses_request_id(payload: &ResponsesPayload, session_id: Option<&str>) -> String {
+pub(crate) fn responses_request_id(payload: &ResponsesPayload, session_id: Option<&str>) -> String {
     match payload.input.as_ref() {
         Some(InputField::Text(text)) if !text.is_empty() => {
             let mac = state::with_state(|s| s.mac_machine_id.clone().unwrap_or_default());
@@ -397,6 +434,7 @@ fn responses_last_user_content(items: &[ResponseInputItem]) -> Option<String> {
 }
 
 const COPILOT_UNSUPPORTED_TOOL_TYPES: &[&str] = &["image_generation"];
+const COPILOT_UNSUPPORTED_TOOL_NAMESPACES: &[&str] = &["image_gen"];
 
 /// Mirrors `removeUnsupportedTools`: drop tools Copilot does not support.
 pub fn remove_unsupported_tools(payload: &mut ResponsesPayload) {
@@ -410,8 +448,14 @@ pub fn remove_unsupported_tools(payload: &mut ResponsesPayload) {
     let mut dropped: Vec<String> = Vec::new();
     tools.retain(|tool| {
         let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
-        if COPILOT_UNSUPPORTED_TOOL_TYPES.contains(&tool_type) {
-            dropped.push(tool_type.to_string());
+        let namespace = tool.get("name").and_then(Value::as_str);
+        let unsupported_namespace = tool_type == "namespace"
+            && namespace.is_some_and(|name| COPILOT_UNSUPPORTED_TOOL_NAMESPACES.contains(&name));
+        if COPILOT_UNSUPPORTED_TOOL_TYPES.contains(&tool_type) || unsupported_namespace {
+            dropped.push(match namespace.filter(|_| unsupported_namespace) {
+                Some(name) => format!("{tool_type}:{name}"),
+                None => tool_type.to_string(),
+            });
             return false;
         }
         true
@@ -432,7 +476,7 @@ fn remove_web_search_tool(payload: &mut ResponsesPayload) {
     tools.retain(|tool| tool.get("type").and_then(Value::as_str) != Some("web_search"));
 }
 
-fn get_incoming_responses_session_id(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn get_incoming_responses_session_id(headers: &HeaderMap) -> Option<String> {
     get_trimmed_header(headers, "session-id")
         .or_else(|| get_trimmed_header(headers, "x-session-id"))
 }
@@ -441,7 +485,7 @@ const CODEX_SUBAGENT_HEADER_VALUES: &[&str] =
     &["collab_spawn", "compact", "memory_consolidation", "review"];
 
 /// Mirrors `getCodexResponsesSubagentMarker`.
-fn get_codex_responses_subagent_marker(headers: &HeaderMap) -> Option<SubagentMarker> {
+pub(crate) fn get_codex_responses_subagent_marker(headers: &HeaderMap) -> Option<SubagentMarker> {
     let agent_type = get_trimmed_header(headers, "x-openai-subagent")?;
     if !CODEX_SUBAGENT_HEADER_VALUES.contains(&agent_type.as_str()) {
         return None;
@@ -483,6 +527,7 @@ fn get_trimmed_header(headers: &HeaderMap, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Env-mutating heartbeat tests share the `COPILOT_API_SSE_HEARTBEAT_SECS`
     /// process-global, so they run serially (via `serial_test`) to avoid races.
@@ -514,15 +559,16 @@ mod tests {
         // and ends. With a 10s heartbeat that idle gap must produce comment pings
         // BEFORE the real frame, and the pings must not appear after the stream
         // ends (a None read resolves immediately, breaking the loop).
-        let upstream: crate::services::copilot::create_responses::ResponsesEventStream =
-            Box::pin(async_stream::stream! {
+        let upstream: crate::services::copilot::create_responses::ResponsesEventStream = Box::pin(
+            async_stream::stream! {
                 tokio::time::sleep(std::time::Duration::from_secs(25)).await;
                 yield Ok(crate::libs::sse::SseEvent {
                     id: None,
                     event: Some("response.created".to_string()),
-                    data: "{\"type\":\"response.created\"}".to_string(),
+                    data: "{\"type\":\"response.created\",\"response\":{\"id\":\"resp_heartbeat\",\"model\":\"gpt-5\"}}".to_string(),
                 });
-            });
+            },
+        );
 
         let recorder = crate::libs::token_usage::create_copilot_token_usage_recorder(
             "responses",
@@ -600,6 +646,7 @@ mod tests {
         let mut payload = payload_with_tools(json!([
             { "type": "function", "name": "f" },
             { "type": "image_generation" },
+            { "type": "namespace", "name": "image_gen" },
         ]));
         remove_unsupported_tools(&mut payload);
         let tools = payload.tools.unwrap();
@@ -658,7 +705,11 @@ mod tests {
 
     #[test]
     fn build_sse_frame_orders_event_id_data() {
-        let frame = build_sse_frame(Some("e1"), Some("response.created"), "{\"a\":1}");
+        let frame = crate::routes::responses::stream_guard::build_sse_frame(
+            Some("e1"),
+            Some("response.created"),
+            "{\"a\":1}",
+        );
         assert_eq!(
             frame,
             "event: response.created\nid: e1\ndata: {\"a\":1}\n\n"
@@ -667,7 +718,8 @@ mod tests {
 
     #[test]
     fn build_sse_frame_splits_multiline_data() {
-        let frame = build_sse_frame(None, None, "line1\nline2");
+        let frame =
+            crate::routes::responses::stream_guard::build_sse_frame(None, None, "line1\nline2");
         assert_eq!(frame, "data: line1\ndata: line2\n\n");
     }
 

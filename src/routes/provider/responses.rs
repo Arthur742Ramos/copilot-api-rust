@@ -26,6 +26,10 @@ use crate::libs::token_usage::{
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
 };
+use crate::routes::responses::{
+    stream_guard::{ResponsesStreamGuard, ResponsesTerminal},
+    stream_id_sync::StreamIdTracker,
+};
 use crate::services::codex::create_responses::forward_codex_responses;
 use crate::services::codex::get_models::get_codex_models;
 use crate::services::copilot::create_responses::ResponsesPayload;
@@ -126,15 +130,28 @@ pub async fn handle_provider_responses_for_provider(
     let resp_headers = upstream_response.headers().clone();
     let bytes = crate::libs::http::read_bytes_capped(upstream_response)
         .await
-        .map_err(|e| {
-            AppError::Other(anyhow::anyhow!(
-                "Failed to read provider response body: {e}"
+        .map_err(|error| {
+            AppError::Http(crate::libs::error::HttpError::new(
+                if error.contains("too large") {
+                    "Upstream Responses body exceeded the maximum allowed size."
+                } else {
+                    "The upstream Responses body could not be read."
+                },
+                StatusCode::BAD_GATEWAY,
+                HeaderMap::new(),
+                String::new(),
             ))
         })?;
 
-    if let Ok(body_value) = serde_json::from_slice::<Value>(&bytes) {
-        recorder.record(normalize_responses_usage(body_value.get("usage")));
-    }
+    let body_value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        AppError::Http(crate::libs::error::HttpError::new(
+            "The upstream Responses body was not valid JSON.",
+            StatusCode::BAD_GATEWAY,
+            HeaderMap::new(),
+            String::new(),
+        ))
+    })?;
+    recorder.record(normalize_responses_usage(body_value.get("usage")));
 
     Ok(build_proxy_response_from_parts(
         status,
@@ -217,27 +234,84 @@ async fn stream_provider_responses(
         }
     }
 
+    let provider_label = provider.to_string();
     let body = Body::from_stream(async_stream::stream! {
         let mut usage = UsageTokens::default();
+        let mut guard = ResponsesStreamGuard::new();
+        let mut ids = StreamIdTracker::new();
 
-        // Emit the already-peeked first chunk, then the rest.
-        if let Some(frame) = render_responses_chunk(&first_chunk, normalize_codex, &mut usage) {
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-        }
-
-        while let Some(item) = event_stream.next().await {
+        let combined = futures_util::stream::once(async move {
+            Ok::<_, std::io::Error>(first_chunk)
+        })
+        .chain(event_stream);
+        futures_util::pin_mut!(combined);
+        while let Some(item) = combined.next().await {
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {
-                    yield Err(err);
+                    tracing::warn!(
+                        error = %err,
+                        provider = %provider_label,
+                        "Provider Responses stream failed"
+                    );
+                    if let Some(frame) = guard.fail(
+                        "upstream_transport_error",
+                        "The upstream Responses stream was interrupted.",
+                    ) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
-            if let Some(frame) = render_responses_chunk(&chunk, normalize_codex, &mut usage) {
-                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+
+            let processed = match guard.process(&chunk, &mut ids) {
+                Ok(Some(processed)) => processed,
+                Ok(None) => continue,
+                Err(reason) => {
+                    tracing::warn!(
+                        reason,
+                        provider = %provider_label,
+                        "Rejected malformed provider Responses stream event"
+                    );
+                    if let Some(frame) = guard.fail(
+                        "invalid_stream",
+                        "The upstream Responses stream returned malformed data.",
+                    ) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
+
+            if normalize_codex {
+                crate::libs::codex_rate_limit::log_codex_rate_limits_event(&processed.value);
+            }
+            if let Some(next) = responses_stream_event_usage(&processed.value) {
+                usage = next;
+            }
+
+            let terminal = processed.terminal;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(processed.frame));
+            if let Some(terminal) = terminal {
+                if terminal == ResponsesTerminal::Failed {
+                    tracing::warn!(
+                        provider = %provider_label,
+                        "Provider Responses stream ended with failure"
+                    );
+                }
+                recorder.record(usage);
+                return;
             }
         }
 
+        if let Some(frame) = guard.fail(
+            "upstream_eof",
+            "The upstream Responses stream ended before a terminal event.",
+        ) {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+        }
         recorder.record(usage);
     });
 
@@ -248,45 +322,6 @@ async fn stream_provider_responses(
         .header(header::CONNECTION, "keep-alive")
         .body(body)
         .unwrap())
-}
-
-/// Render one upstream Responses SSE chunk, optionally normalizing Codex events
-/// (re-serialize + set the SSE event name to the JSON `type`) and updating usage
-/// from terminal events.
-fn render_responses_chunk(
-    chunk: &crate::libs::sse::SseEvent,
-    normalize_codex: bool,
-    usage: &mut UsageTokens,
-) -> Option<String> {
-    let mut data = chunk.data.clone();
-    let mut event_name = chunk.event.clone();
-
-    if !chunk.data.is_empty() && chunk.data != "[DONE]" {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&chunk.data) {
-            // The codex branch logs `codex.rate_limits` events (TS
-            // `parseResponsesProviderStreamChunk` does this when the provider is
-            // codex, which is exactly when `normalize_codex` is set).
-            if normalize_codex {
-                crate::libs::codex_rate_limit::log_codex_rate_limits_event(&parsed);
-            }
-            if let Some(next) = responses_stream_event_usage(&parsed) {
-                *usage = next;
-            }
-            if normalize_codex {
-                if let Some(event_type) = parsed.get("type").and_then(Value::as_str) {
-                    event_name = Some(event_type.to_string());
-                }
-                if let Ok(reser) = serde_json::to_string(&parsed) {
-                    data = reser;
-                }
-            }
-        }
-    }
-
-    match event_name {
-        Some(name) => Some(format!("event: {name}\ndata: {data}\n\n")),
-        None => Some(format!("data: {data}\n\n")),
-    }
 }
 
 /// Mirrors `getResponsesStreamEventUsage`: usage from the terminal events.
@@ -301,12 +336,28 @@ fn responses_stream_event_usage(event: &Value) -> Option<UsageTokens> {
 
 /// Read a non-streaming Codex responses body into a JSON `Value`.
 async fn read_responses_result(response: reqwest::Response) -> Result<Value, AppError> {
-    let bytes = response
-        .bytes()
+    let bytes = crate::libs::http::read_bytes_capped(response)
         .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Failed to read codex response body: {e}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Failed to parse codex response body: {e}")))
+        .map_err(|error| {
+            AppError::Http(crate::libs::error::HttpError::new(
+                if error.contains("too large") {
+                    "Upstream Responses body exceeded the maximum allowed size."
+                } else {
+                    "The upstream Responses body could not be read."
+                },
+                StatusCode::BAD_GATEWAY,
+                HeaderMap::new(),
+                String::new(),
+            ))
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        AppError::Http(crate::libs::error::HttpError::new(
+            "The upstream Responses body was not valid JSON.",
+            StatusCode::BAD_GATEWAY,
+            HeaderMap::new(),
+            String::new(),
+        ))
+    })
 }
 
 fn usage_value(body: &Value) -> Option<Value> {

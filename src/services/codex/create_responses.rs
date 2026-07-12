@@ -77,6 +77,14 @@ pub fn resolve_codex_responses_url(base_url: &str) -> String {
     format!("{normalized}/codex/responses")
 }
 
+pub fn resolve_codex_compact_url(base_url: &str) -> String {
+    let normalized = base_url.trim().trim_end_matches('/');
+    if normalized.ends_with("/codex/responses/compact") {
+        return normalized.to_string();
+    }
+    format!("{}/compact", resolve_codex_responses_url(normalized))
+}
+
 fn set_req_header(map: &mut reqwest::header::HeaderMap, name: &str, value: &str) {
     if let (Ok(n), Ok(v)) = (
         reqwest::header::HeaderName::from_bytes(name.as_bytes()),
@@ -342,6 +350,34 @@ pub async fn forward_codex_responses(
     })?;
     drop(payload);
 
+    send_codex_request(body, request_headers, &url, stream, custom_base_url).await
+}
+
+/// Forward the unary Codex `/responses/compact` contract without applying the
+/// generation-only payload normalization used by [`forward_codex_responses`].
+pub async fn forward_codex_compact(
+    payload: ResponsesPayload,
+    request_headers: &axum::http::HeaderMap,
+    base_url: &str,
+) -> Result<reqwest::Response, HttpError> {
+    let url = resolve_codex_compact_url(base_url);
+    let custom_base_url = !base_url.trim().is_empty();
+    if custom_base_url {
+        crate::services::providers::provider_proxy::validate_upstream_url(&url)?;
+    }
+    let body = serialize_json_body(&payload).map_err(|e| {
+        HttpError::internal(format!("Failed to serialize codex compact payload: {e}"))
+    })?;
+    send_codex_request(body, request_headers, &url, Some(false), custom_base_url).await
+}
+
+async fn send_codex_request(
+    body: bytes::Bytes,
+    request_headers: &axum::http::HeaderMap,
+    url: &str,
+    stream: Option<bool>,
+    custom_base_url: bool,
+) -> Result<reqwest::Response, HttpError> {
     // Inline 401 recovery: a stale/revoked Codex oauth token self-heals on the
     // request that hit it. Codex auth is a DISTINCT path from the Copilot token
     // (oauth2 access token), so it force-refreshes the Codex credential. The 401
@@ -361,7 +397,7 @@ pub async fn forward_codex_responses(
     };
     let send = |headers: reqwest::header::HeaderMap| {
         let request = upstream_client
-            .post(&url)
+            .post(url)
             .headers(headers)
             .body(body.clone());
         crate::libs::http::send_with_retry(
@@ -423,6 +459,14 @@ mod tests {
         assert_eq!(
             resolve_codex_responses_url("https://example.com/codex/responses"),
             "https://example.com/codex/responses"
+        );
+        assert_eq!(
+            resolve_codex_compact_url("https://example.com"),
+            "https://example.com/codex/responses/compact"
+        );
+        assert_eq!(
+            resolve_codex_compact_url("https://example.com/codex/responses/compact"),
+            "https://example.com/codex/responses/compact"
         );
     }
 

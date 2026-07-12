@@ -8,9 +8,9 @@ use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::FutureExt;
 use metrics::{counter, gauge, histogram};
 use serde_json::json;
-use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::{info_span, Instrument, Level};
@@ -88,6 +88,14 @@ pub fn build_router_with_admission(
             post(crate::routes::responses::route::post_responses),
         )
         .route(
+            "/responses/compact",
+            post(crate::routes::responses::compact::post_responses_compact),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(crate::routes::responses::compact::post_responses_compact),
+        )
+        .route(
             "/v1/messages",
             post(crate::routes::messages::route::post_messages),
         )
@@ -129,6 +137,8 @@ pub fn build_router_with_admission(
             "/:provider/v1/models",
             get(crate::routes::provider::models::get_provider_models),
         )
+        .fallback(api_not_found)
+        .method_not_allowed_fallback(api_method_not_allowed)
         // Middleware stack (innermost first; trace ends up outermost).
         .layer(from_fn(
             crate::libs::zstd_request::zstd_decompression_middleware,
@@ -148,9 +158,9 @@ pub fn build_router_with_admission(
         // gets the same error shape as every other client error. Listed AFTER
         // (outside) DefaultBodyLimit so it sees that layer's response.
         .layer(from_fn(normalize_oversize_response))
-        // Convert a panic in any handler into a 500 JSON response instead of an
-        // abruptly reset connection.
-        .layer(CatchPanicLayer::custom(handle_panic))
+        // Convert a panic in any handler into a route-native 500 JSON response
+        // instead of an abruptly reset connection.
+        .layer(from_fn(panic_middleware))
         // Per-request access logging (method/path/status/latency) for all
         // requests, including those rejected by auth. The default `on_response`
         // emits at DEBUG, which is below the prod `info` filter — bump the
@@ -191,6 +201,8 @@ fn is_upstream_proxy_route(method: &Method, route: &str) -> bool {
         | "/v1/images/generations"
         | "/responses"
         | "/v1/responses"
+        | "/responses/compact"
+        | "/v1/responses/compact"
         | "/v1/messages"
         | "/v1/messages/count_tokens"
         | "/:provider/v1/messages"
@@ -285,14 +297,62 @@ fn is_loopback_origin(origin: &[u8]) -> bool {
     matches!(host.parse::<std::net::Ipv4Addr>(), Ok(ip) if ip.is_loopback())
 }
 
-/// Render a handler panic as a 500 JSON error (instead of dropping the
-/// connection). The panic is still logged by the default panic hook.
-fn handle_panic(_err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> {
-    crate::libs::error::anthropic_error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "api_error",
-        "Internal server error.",
-    )
+/// Catch handler panics while the request URI is still available, so the error
+/// envelope remains native to the selected public protocol. The panic hook still
+/// records the original diagnostic.
+async fn panic_middleware(req: Request, next: Next) -> Response {
+    let openai_native = crate::libs::error::is_openai_native_path(req.uri().path());
+    match std::panic::AssertUnwindSafe(next.run(req))
+        .catch_unwind()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) if openai_native => crate::libs::error::openai_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            Some("server_error"),
+            "Internal server error.",
+        ),
+        Err(_) => crate::libs::error::anthropic_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "Internal server error.",
+        ),
+    }
+}
+
+async fn api_not_found(uri: axum::http::Uri) -> Response {
+    if crate::libs::error::is_openai_native_path(uri.path()) {
+        crate::libs::error::openai_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            Some("not_found"),
+            format!("No route for {}.", uri.path()),
+        )
+    } else {
+        crate::libs::error::anthropic_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("No route for {}.", uri.path()),
+        )
+    }
+}
+
+async fn api_method_not_allowed(uri: axum::http::Uri) -> Response {
+    if crate::libs::error::is_openai_native_path(uri.path()) {
+        crate::libs::error::openai_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request_error",
+            Some("method_not_allowed"),
+            format!("Method is not allowed for {}.", uri.path()),
+        )
+    } else {
+        crate::libs::error::anthropic_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request_error",
+            format!("Method is not allowed for {}.", uri.path()),
+        )
+    }
 }
 
 /// Rewrite a `413 Payload Too Large` whose body is not already JSON (the
@@ -300,6 +360,7 @@ fn handle_panic(_err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body>
 /// the complete Anthropic `request_too_large` envelope, so clients that parse error
 /// JSON get a consistent shape. Other responses pass through untouched.
 async fn normalize_oversize_response(req: Request, next: Next) -> Response {
+    let openai_native = crate::libs::error::is_openai_native_path(req.uri().path());
     let response = next.run(req).await;
     if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
         return response;
@@ -312,11 +373,20 @@ async fn normalize_oversize_response(req: Request, next: Next) -> Response {
     if is_json {
         return response;
     }
-    crate::libs::error::anthropic_error_response(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "request_too_large",
-        "Request body is too large.",
-    )
+    if openai_native {
+        crate::libs::error::openai_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            Some("request_too_large"),
+            "Request body is too large.",
+        )
+    } else {
+        crate::libs::error::anthropic_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "Request body is too large.",
+        )
+    }
 }
 
 async fn trace_middleware(req: Request, next: Next) -> Response {
@@ -586,4 +656,45 @@ async fn token_usage_redirect() -> Response {
         .header("location", "/token-usage")
         .body(Body::empty())
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn panic_handler() -> &'static str {
+        panic!("fixture panic")
+    }
+
+    async fn panic_response(path: &str) -> serde_json::Value {
+        let app = Router::new()
+            .route("/v1/responses", get(panic_handler))
+            .route("/v1/messages", get(panic_handler))
+            .layer(from_fn(panic_middleware));
+        let response = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .expect("panic middleware responds");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect panic body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("panic body is JSON")
+    }
+
+    #[tokio::test]
+    async fn panic_errors_are_protocol_native() {
+        let openai = panic_response("/v1/responses").await;
+        assert!(openai.get("type").is_none());
+        assert_eq!(openai["error"]["type"], "server_error");
+
+        let anthropic = panic_response("/v1/messages").await;
+        assert_eq!(anthropic["type"], "error");
+        assert_eq!(anthropic["error"]["type"], "api_error");
+    }
 }

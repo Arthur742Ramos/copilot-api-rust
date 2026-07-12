@@ -4,7 +4,7 @@
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// Mirrors the TS `HTTPError` class: wraps an upstream response so the status,
 /// headers, and body can be forwarded to the client. We capture the parts we
@@ -76,6 +76,53 @@ pub fn anthropic_error_response(
             "error": {
                 "type": error_type.into(),
                 "message": message.into(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Whether `path` belongs to an OpenAI-native public API surface.
+///
+/// Messages endpoints deliberately keep Anthropic envelopes. Responses and Chat
+/// Completions must not leak those envelopes into Codex/OpenAI clients, including
+/// middleware failures that occur before a route handler runs.
+pub fn is_openai_native_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/responses"
+            | "/v1/responses"
+            | "/responses/compact"
+            | "/v1/responses/compact"
+            | "/chat/completions"
+            | "/v1/chat/completions"
+            | "/models"
+            | "/v1/models"
+    ) || path.starts_with("/responses/")
+        || path.starts_with("/v1/responses/")
+        || path.starts_with("/chat/completions/")
+        || path.starts_with("/v1/chat/completions/")
+        || path.starts_with("/models/")
+        || path.starts_with("/v1/models/")
+        || path.ends_with("/v1/models")
+}
+
+/// Render a locally generated failure using the OpenAI error envelope consumed
+/// by Codex and OpenAI SDKs.
+pub fn openai_error_response(
+    status: StatusCode,
+    error_type: impl Into<String>,
+    code: Option<&str>,
+    message: impl Into<String>,
+) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message.into(),
+                "type": error_type.into(),
+                "param": Value::Null,
+                "code": code,
             }
         })),
     )
@@ -167,6 +214,34 @@ fn parse_upstream_error_envelope(body: &str) -> Option<serde_json::Value> {
     Some(value)
 }
 
+/// Parse an OpenAI `{"error": {...}}` envelope without adding Anthropic's
+/// top-level `type` discriminator or otherwise rewriting unknown fields.
+fn parse_openai_error_envelope(body: &str, status: StatusCode) -> Option<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let object = value.as_object_mut()?;
+
+    // A Messages upstream can return Anthropic's top-level discriminator.
+    // Responses/Chat clients must never receive it.
+    if object.get("type").and_then(Value::as_str) == Some("error") {
+        object.remove("type");
+    }
+    let error = object.get_mut("error")?.as_object_mut()?;
+
+    let normalized_type = match error.get("type").and_then(Value::as_str) {
+        Some("overloaded_error" | "api_error") => Some("server_error"),
+        Some("request_too_large") => Some("invalid_request_error"),
+        _ => None,
+    };
+    if let Some(error_type) = normalized_type {
+        error.insert("type".to_string(), json!(error_type));
+    }
+    error.entry("param".to_string()).or_insert(Value::Null);
+    error
+        .entry("code".to_string())
+        .or_insert_with(|| openai_error_code(status).map_or(Value::Null, Value::from));
+    Some(value)
+}
+
 /// Best-effort extraction of a human-readable message from a non-envelope JSON
 /// error body (e.g. `{"message": "..."}`), so we don't embed raw JSON in our
 /// `message` field. Returns `None` when no string message is found.
@@ -226,6 +301,28 @@ fn anthropic_error_type(status: StatusCode) -> &'static str {
         404 => "not_found_error",
         413 => "request_too_large",
         _ => "api_error",
+    }
+}
+
+fn openai_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        500..=599 => "server_error",
+        _ => "invalid_request_error",
+    }
+}
+
+fn openai_error_code(status: StatusCode) -> Option<&'static str> {
+    match status.as_u16() {
+        401 => Some("invalid_api_key"),
+        403 => Some("insufficient_permissions"),
+        404 => Some("not_found"),
+        413 => Some("request_too_large"),
+        429 => Some("rate_limit_exceeded"),
+        500..=599 => Some("server_error"),
+        _ => None,
     }
 }
 
@@ -321,6 +418,71 @@ impl IntoResponse for AppError {
     }
 }
 
+impl AppError {
+    /// Render this failure for an OpenAI-native endpoint.
+    ///
+    /// This intentionally lives alongside the Anthropic `IntoResponse`
+    /// implementation rather than changing the crate-wide default: Messages
+    /// handlers and middleware still rely on Anthropic retry/error semantics.
+    pub fn into_openai_response(self) -> Response {
+        match self {
+            AppError::Http(e) => {
+                tracing::error!("Error occurred: {}", e.message);
+                let retryable_status =
+                    e.status == StatusCode::TOO_MANY_REQUESTS || e.status.is_server_error();
+                let mut out_headers = HeaderMap::new();
+                for (name, value) in e.headers.iter() {
+                    if should_forward_error_header(name.as_str(), retryable_status) {
+                        out_headers.insert(name.clone(), value.clone());
+                    }
+                }
+
+                let fallback_message = if e.body.is_empty() && !e.expose_message {
+                    internal_reference_message()
+                } else if e.body.is_empty() {
+                    e.message.clone()
+                } else {
+                    e.body.clone()
+                };
+
+                let body = if let Some(envelope) = parse_openai_error_envelope(&e.body, e.status) {
+                    Json(envelope)
+                } else {
+                    let message = lift_upstream_error_message(&e.body).unwrap_or(fallback_message);
+                    Json(json!({
+                        "error": {
+                            "message": message,
+                            "type": openai_error_type(e.status),
+                            "param": Value::Null,
+                            "code": openai_error_code(e.status),
+                        }
+                    }))
+                };
+                (e.status, out_headers, body).into_response()
+            }
+            AppError::BadRequest(message) => {
+                tracing::warn!("Bad request: {message}");
+                openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    None,
+                    message,
+                )
+            }
+            AppError::Other(error) => {
+                let message = internal_reference_message();
+                tracing::error!(error = ?error, "internal error");
+                openai_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    Some("server_error"),
+                    message,
+                )
+            }
+        }
+    }
+}
+
 pub type AppResult<T> = Result<T, AppError>;
 
 #[cfg(test)]
@@ -330,6 +492,20 @@ mod tests {
 
     async fn render(err: AppError) -> (StatusCode, HeaderMap, serde_json::Value) {
         let resp = err.into_response();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body is json");
+        (status, headers, json)
+    }
+
+    async fn render_openai(err: AppError) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let resp = err.into_openai_response();
         let status = resp.status();
         let headers = resp.headers().clone();
         let bytes = resp
@@ -597,5 +773,32 @@ mod tests {
         assert!(message.starts_with("An internal error occurred. Reference:"));
         assert!(!message.contains("private-host"));
         assert!(!message.contains("token abc"));
+    }
+
+    #[tokio::test]
+    async fn openai_renderer_removes_anthropic_discriminator_and_normalizes_fields() {
+        let err = AppError::Http(HttpError::new(
+            "overloaded",
+            StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
+            json!({
+                "type":"error",
+                "error":{
+                    "type":"overloaded_error",
+                    "message":"try later",
+                    "upstream_extension":true
+                },
+                "request_id":"req_fixture"
+            })
+            .to_string(),
+        ));
+        let (status, _, body) = render_openai(err).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.get("type").is_none());
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["code"], "server_error");
+        assert!(body["error"]["param"].is_null());
+        assert_eq!(body["error"]["upstream_extension"], true);
+        assert_eq!(body["request_id"], "req_fixture");
     }
 }

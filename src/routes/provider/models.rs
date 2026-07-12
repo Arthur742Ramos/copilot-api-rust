@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use crate::libs::error::{anthropic_error_response, AppError};
+use crate::libs::error::{openai_error_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::services::codex::get_models::get_codex_models;
 use crate::services::providers::provider_proxy::{
@@ -24,7 +24,7 @@ pub async fn get_provider_models(
 ) -> Response {
     match handle_provider_models(headers, provider).await {
         Ok(r) => r,
-        Err(e) => AppError::into_response(e),
+        Err(e) => e.into_openai_response(),
     }
 }
 
@@ -34,9 +34,10 @@ pub async fn handle_provider_models(
     provider: String,
 ) -> Result<Response, AppError> {
     let Some(provider_config) = resolve_provider_config(&provider).await else {
-        return Ok(anthropic_error_response(
+        return Ok(openai_error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
+            Some("provider_not_found"),
             format!("Provider '{provider}' not found or disabled"),
         ));
     };

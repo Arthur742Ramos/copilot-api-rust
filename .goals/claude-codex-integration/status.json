@@ -1,0 +1,10 @@
+{
+  "goal_id": "claude-codex-integration",
+  "status": "building",
+  "iteration": 1,
+  "builder_model": "OpenAI:GPT-5.6-Sol",
+  "inspector_model": "OpenAI:GPT-5.6-Luna",
+  "initial_sha": "8b7472013665b168737dbb055d9f98f4f735b6d5",
+  "created_at": "2026-07-12T11:06:14.239-04:00",
+  "history": []
+}

@@ -240,6 +240,22 @@ const SHARED_FORWARDABLE_HEADERS: [&str; 2] = ["accept", "user-agent"];
 /// Additional request headers copied through only for `anthropic` providers.
 const ANTHROPIC_FORWARDABLE_HEADERS: [&str; 2] = ["anthropic-version", "anthropic-beta"];
 
+/// Codex session/routing metadata that is safe and meaningful to an OpenAI
+/// Responses provider. Client authorization is deliberately absent: the proxy
+/// always replaces it with the configured provider credential.
+const RESPONSES_FORWARDABLE_HEADERS: [&str; 10] = [
+    "openai-beta",
+    "session-id",
+    "thread-id",
+    "x-client-request-id",
+    "x-codex-installation-id",
+    "x-codex-turn-metadata",
+    "x-codex-parent-thread-id",
+    "x-codex-window-id",
+    "x-openai-subagent",
+    "x-responsesapi-include-timing-metrics",
+];
+
 /// Hop-by-hop / encoding headers stripped from the upstream response before it
 /// is forwarded to the client.
 const STRIPPED_RESPONSE_HEADERS: [&str; 10] = [
@@ -290,12 +306,15 @@ pub fn build_provider_upstream_headers(
         copy_header(name);
     }
 
-    if cfg.provider_type != "anthropic" {
-        return headers;
+    if cfg.provider_type == "anthropic" {
+        for name in ANTHROPIC_FORWARDABLE_HEADERS {
+            copy_header(name);
+        }
     }
-
-    for name in ANTHROPIC_FORWARDABLE_HEADERS {
-        copy_header(name);
+    if cfg.provider_type == "openai-responses" {
+        for name in RESPONSES_FORWARDABLE_HEADERS {
+            copy_header(name);
+        }
     }
 
     headers
@@ -389,6 +408,27 @@ pub async fn forward_provider_responses(
         .send()
         .await
         .map_err(|e| HttpError::internal(format!("Failed to forward provider responses: {e}")))
+}
+
+/// POST `{base_url}/v1/responses/compact`, the unary compaction contract used by
+/// Codex CLI. The body uses the same lossless request model as `/v1/responses`.
+pub async fn forward_provider_responses_compact(
+    cfg: &ResolvedProviderConfig,
+    payload: &ResponsesPayload,
+    request_headers: &HeaderMap,
+) -> Result<reqwest::Response, HttpError> {
+    tracing::info!("<-- compact model: {}", payload.model);
+    validate_upstream_url(&cfg.base_url)?;
+    let body = serde_json::to_vec(payload).map_err(|e| HttpError::internal(format!("{e}")))?;
+    restricted_upstream_client()
+        .post(format!("{}/v1/responses/compact", cfg.base_url))
+        .headers(build_provider_upstream_headers(cfg, request_headers))
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| {
+            HttpError::internal(format!("Failed to forward provider responses compact: {e}"))
+        })
 }
 
 /// GET {base_url}/v1/models (no body, no model log). Mirrors
@@ -551,6 +591,26 @@ mod tests {
             build_provider_upstream_headers(&cfg("openai-compatible", "authorization", "k"), &req);
         assert!(openai.get("anthropic-version").is_none());
         assert!(openai.get("anthropic-beta").is_none());
+    }
+
+    #[test]
+    fn responses_headers_forward_codex_metadata_but_replace_auth() {
+        let mut req = HeaderMap::new();
+        req.insert("authorization", "Bearer client-secret".parse().unwrap());
+        req.insert("session-id", "session-1".parse().unwrap());
+        req.insert("thread-id", "thread-1".parse().unwrap());
+        req.insert("x-openai-subagent", "review".parse().unwrap());
+        req.insert("x-codex-installation-id", "install-1".parse().unwrap());
+
+        let headers = build_provider_upstream_headers(
+            &cfg("openai-responses", "authorization", "upstream"),
+            &req,
+        );
+        assert_eq!(headers["authorization"], "Bearer upstream");
+        assert_eq!(headers["session-id"], "session-1");
+        assert_eq!(headers["thread-id"], "thread-1");
+        assert_eq!(headers["x-openai-subagent"], "review");
+        assert_eq!(headers["x-codex-installation-id"], "install-1");
     }
 
     // Validation tests mutate the process-wide opt-out env var, which is global

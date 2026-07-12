@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
 
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::response::Response;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::libs::config::get_config;
 
@@ -203,20 +202,28 @@ pub fn extract_request_api_key(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-fn unauthorized_response() -> Response {
+fn unauthorized_response(path: &str) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         "WWW-Authenticate",
         axum::http::HeaderValue::from_static("Bearer realm=\"copilot-api\""),
     );
-    let body = Json(json!({
-        "type": "error",
-        "error": {
-            "message": "Unauthorized",
-            "type": "authentication_error",
-        }
-    }));
-    (StatusCode::UNAUTHORIZED, headers, body).into_response()
+    let mut response = if crate::libs::error::is_openai_native_path(path) {
+        crate::libs::error::openai_error_response(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            Some("invalid_api_key"),
+            "Unauthorized",
+        )
+    } else {
+        crate::libs::error::anthropic_error_response(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "Unauthorized",
+        )
+    };
+    response.headers_mut().extend(headers);
+    response
 }
 
 /// Options matching `AuthMiddlewareOptions`.
@@ -307,13 +314,13 @@ pub fn check_auth(
         return if options.allow_when_no_api_keys {
             AuthOutcome::Allow(None)
         } else {
-            AuthOutcome::Reject(unauthorized_response())
+            AuthOutcome::Reject(unauthorized_response(path))
         };
     }
 
     let request_api_key = match extract_request_api_key(headers) {
         Some(key) => key,
-        None => return AuthOutcome::Reject(unauthorized_response()),
+        None => return AuthOutcome::Reject(unauthorized_response(path)),
     };
 
     // Compare against every configured key without short-circuiting, so neither
@@ -328,7 +335,7 @@ pub fn check_auth(
     }
     match matched {
         Some(attribution) => AuthOutcome::Allow(Some(attribution)),
-        None => AuthOutcome::Reject(unauthorized_response()),
+        None => AuthOutcome::Reject(unauthorized_response(path)),
     }
 }
 
