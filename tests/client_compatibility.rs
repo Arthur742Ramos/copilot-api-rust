@@ -107,10 +107,11 @@ async fn fixture_handler(
         "/v1/responses/compact" => Json(json!({
             "output": [
                 {
-                    "id": "msg_compact",
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type":"input_text","text":"compacted history"}]
+                    "type": "compaction",
+                    "encrypted_content": "enc_compacted_history",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "turn_compacted"
+                    }
                 }
             ],
             "fixture_extension": {"preserved": true}
@@ -830,6 +831,173 @@ fn codex_request(model: &str, stream: bool) -> Value {
     })
 }
 
+/// Every Codex 0.144.1 `ResponseItem` variant whose optional fields can appear
+/// in HTTP continuation history. Typed proxy variants and raw forward-compatible
+/// variants are both represented so adding a stricter local field cannot regress
+/// provider/model dispatch again.
+fn codex_optional_response_item_cases() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "message-image-without-detail",
+            json!({
+                "type":"message",
+                "role":"user",
+                "content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]
+            }),
+        ),
+        (
+            "reasoning-without-encrypted-content",
+            json!({
+                "type":"reasoning",
+                "summary":[],
+                "content":[{"type":"reasoning_text","text":"preserve me"}]
+            }),
+        ),
+        (
+            "reasoning-with-null-encrypted-content",
+            json!({
+                "type":"reasoning",
+                "summary":[],
+                "encrypted_content":Value::Null
+            }),
+        ),
+        (
+            "local-shell-without-ids",
+            json!({
+                "type":"local_shell_call",
+                "status":"completed",
+                "action":{
+                    "type":"exec",
+                    "command":["pwd"],
+                    "timeout_ms":Value::Null,
+                    "working_directory":Value::Null,
+                    "env":Value::Null,
+                    "user":Value::Null
+                }
+            }),
+        ),
+        (
+            "function-call-without-item-id",
+            json!({
+                "type":"function_call",
+                "name":"read",
+                "arguments":"{}",
+                "call_id":"call_function"
+            }),
+        ),
+        (
+            "function-output-image-without-detail",
+            json!({
+                "type":"function_call_output",
+                "call_id":"call_function",
+                "output":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]
+            }),
+        ),
+        (
+            "tool-search-call-without-ids",
+            json!({
+                "type":"tool_search_call",
+                "call_id":Value::Null,
+                "execution":"client",
+                "arguments":{"query":"read"}
+            }),
+        ),
+        (
+            "tool-search-output-without-ids",
+            json!({
+                "type":"tool_search_output",
+                "call_id":Value::Null,
+                "status":"completed",
+                "execution":"client",
+                "tools":[]
+            }),
+        ),
+        (
+            "custom-tool-call-optional-fields",
+            json!({
+                "type":"custom_tool_call",
+                "call_id":"call_custom",
+                "name":"freeform",
+                "input":"payload"
+            }),
+        ),
+        (
+            "custom-tool-output-optional-fields",
+            json!({
+                "type":"custom_tool_call_output",
+                "call_id":"call_custom",
+                "output":"done"
+            }),
+        ),
+        (
+            "web-search-all-optional-fields",
+            json!({"type":"web_search_call"}),
+        ),
+        (
+            "image-generation-optional-fields",
+            json!({
+                "type":"image_generation_call",
+                "status":"completed",
+                "result":"image-data"
+            }),
+        ),
+        (
+            "compaction-without-id",
+            json!({
+                "type":"compaction",
+                "encrypted_content":"enc_compact"
+            }),
+        ),
+        (
+            "legacy-compaction-summary-without-id",
+            json!({
+                "type":"compaction_summary",
+                "encrypted_content":"enc_legacy_compact"
+            }),
+        ),
+        (
+            "context-compaction-all-optional-fields",
+            json!({"type":"context_compaction"}),
+        ),
+        (
+            "additional-tools-without-id",
+            json!({
+                "type":"additional_tools",
+                "role":"developer",
+                "tools":[]
+            }),
+        ),
+        ("compaction-trigger", json!({"type":"compaction_trigger"})),
+        (
+            "agent-message-without-id",
+            json!({
+                "type":"agent_message",
+                "author":"agent",
+                "recipient":"user",
+                "content":[{"type":"input_text","text":"hi"}]
+            }),
+        ),
+    ]
+}
+
+fn normalized_optional_item(mut item: Value) -> Value {
+    let item_type = item.get("type").and_then(Value::as_str).map(str::to_owned);
+    let optional_null = match item_type.as_deref() {
+        Some("reasoning") => Some("encrypted_content"),
+        Some("tool_search_call" | "tool_search_output") => Some("call_id"),
+        _ => None,
+    };
+    if let (Some(key), Some(object)) = (optional_null, item.as_object_mut()) {
+        if object.get(key).is_some_and(Value::is_null) {
+            object.remove(key);
+        }
+    }
+    if item_type.as_deref() == Some("compaction_summary") {
+        item["type"] = json!("compaction");
+    }
+    item
+}
+
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
 async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
@@ -1082,8 +1250,40 @@ async fn codex_0_144_1_responses_and_compaction_cross_public_axum_boundary() {
     let (status, body) = send(compact).await;
     assert_eq!(status, StatusCode::OK);
     let body = json_body(&body);
-    assert_eq!(body["output"][0]["id"], "msg_compact");
+    let compacted_item = body["output"][0].clone();
+    assert_eq!(compacted_item["type"], "compaction");
+    assert_eq!(compacted_item["encrypted_content"], "enc_compacted_history");
+    assert!(
+        compacted_item.get("id").is_none(),
+        "Codex-valid compaction output must remain id-less"
+    );
     assert_eq!(body["fixture_extension"]["preserved"], true);
+
+    let continuation = post_json(
+        "/v1/responses",
+        json!({
+            "model":"responses-fixture/gpt-fixture",
+            "instructions":"Continue after compaction.",
+            "input":[
+                compacted_item,
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[{"type":"input_text","text":"next turn"}]
+                }
+            ],
+            "stream":false,
+            "fixture_compaction_continuation":true
+        }),
+        Some(CLIENT_KEY),
+    );
+    let (status, body) = send(continuation).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "id-less compacted history must be accepted on the next turn: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     let captures = fixture.requests();
     let response_capture = captures
@@ -1124,6 +1324,53 @@ async fn codex_0_144_1_responses_and_compaction_cross_public_axum_boundary() {
         true
     );
     assert!(compact_capture.body.get("stream").is_none());
+    let continuation_capture = captures
+        .iter()
+        .find(|capture| capture.body["fixture_compaction_continuation"] == true)
+        .expect("captured post-compaction continuation");
+    assert_eq!(continuation_capture.body["input"][0]["type"], "compaction");
+    assert_eq!(
+        continuation_capture.body["input"][0]["encrypted_content"],
+        "enc_compacted_history"
+    );
+    assert!(continuation_capture.body["input"][0].get("id").is_none());
+    assert_eq!(continuation_capture.body["input"][1]["type"], "message");
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn codex_0_144_1_optional_continuation_items_cross_provider_boundary() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (case, item) in codex_optional_response_item_cases() {
+        let request = json!({
+            "model":"responses-fixture/gpt-fixture",
+            "input":[item.clone()],
+            "stream":false,
+            "fixture_optionality_case":case
+        });
+        let (status, body) = send(post_json("/v1/responses", request, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{case}: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let captures = fixture.requests();
+        let captured = captures
+            .iter()
+            .rev()
+            .find(|capture| capture.body["fixture_optionality_case"] == case)
+            .unwrap_or_else(|| panic!("{case}: provider did not capture request"));
+        assert_eq!(
+            captured.body["input"][0],
+            normalized_optional_item(item),
+            "{case}: continuation item changed at the public boundary"
+        );
+    }
 }
 
 #[tokio::test]

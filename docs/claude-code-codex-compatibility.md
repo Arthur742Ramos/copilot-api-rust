@@ -11,7 +11,7 @@ Audited on **2026-07-12**:
 
 | Client/reference | Exact identity | Evidence |
 |---|---|---|
-| Claude Code | **2.1.207**, release [`v2.1.207`](https://github.com/anthropics/claude-code/releases/tag/v2.1.207) | `claude --version`; npm package `@anthropic-ai/claude-code@2.1.207` (`sha512-30D3lGMO0iPmWnz6rCSHKd6d6gWtQ8CV2zKHHspEHZFyjDJsNOr2Xg6Kb/XEPsaFFu4BGIJz/7L6FQkcFq5cNA==`) |
+| Claude Code | **2.1.207**, release [`v2.1.207`](https://github.com/anthropics/claude-code/releases/tag/v2.1.207) | Official release tag; installed `claude --version` → `2.1.207 (Claude Code)` |
 | OpenAI Codex CLI | **0.144.1**, release [`rust-v0.144.1`](https://github.com/openai/codex/releases/tag/rust-v0.144.1) | Source commit [`44918ea10c0f99151c6710411b4322c2f5c96bea`](https://github.com/openai/codex/tree/44918ea10c0f99151c6710411b4322c2f5c96bea); `codex --version` |
 | TypeScript reference | `caozhiyuan/copilot-api` | Commit [`cd8207cb70ede07771bf37a04accfbf2af76d980`](https://github.com/caozhiyuan/copilot-api/tree/cd8207cb70ede07771bf37a04accfbf2af76d980) |
 | Rust boundary harness | this repository | `cargo test --test client_compatibility` |
@@ -32,6 +32,8 @@ supported wire protocol is `responses`; see
 Its HTTP client posts to `responses`, its remote compactor posts to
 `responses/compact`, and its canonical request fields are defined in
 [`codex-api/src/common.rs`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/common.rs#L216-L239).
+Continuation item optionality is audited against
+[`protocol/src/models.rs`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/protocol/src/models.rs#L932-L1163).
 
 The normal test suite never starts the production port, contacts an external
 provider, or consumes quota. `tests/client_compatibility.rs` enters through the
@@ -122,6 +124,31 @@ WebSocket-only `previous_response_id` optimization is not required by the HTTP
 configuration above. Unknown public Responses fields, including continuation
 fields, are retained.
 
+### Audited Codex continuation items
+
+Codex sends the full prior `ResponseItem` history on the HTTP transport. The
+proxy accepts every 0.144.1 variant and preserves variants it does not need to
+inspect as raw JSON. The typed variants use the following required/optional
+contract:
+
+| Item/content | Required fields | Optional fields accepted |
+|---|---|---|
+| `message` | `role`, `content` | `id`, `phase`, internal metadata |
+| `input_image` | `image_url` | `detail` |
+| `reasoning` | `summary` | `id`, `content`, `encrypted_content`, internal metadata |
+| `function_call` | `name`, `arguments`, `call_id` | `id`, `namespace`, internal metadata |
+| `function_call_output` | `call_id`, `output` | `id`, internal metadata; image-output `detail` |
+| `tool_search_call` | `execution`, `arguments` | `id`, `call_id`, `status`, internal metadata |
+| `tool_search_output` | `status`, `execution`, `tools` | `id`, `call_id`, internal metadata |
+| `compaction` | `encrypted_content` | `id`, internal metadata |
+| raw-preserved variants | variant-specific Codex fields | optional IDs/metadata on `additional_tools`, `agent_message`, `local_shell_call`, custom tools, web/image calls, `context_compaction`, and triggers |
+
+`codex_0_144_1_optional_continuation_items_cross_provider_boundary` submits
+these shapes through public `/v1/responses` using a configured
+`provider/model` and asserts the deterministic upstream capture.
+Legacy `type: "compaction_summary"` history is accepted and canonicalized to
+`type: "compaction"` before latest-compaction trimming and forwarding.
+
 To route Codex through a configured OpenAI Responses provider, set the model to
 `provider/model`, or map a friendly model name in `config.json`:
 
@@ -146,17 +173,17 @@ Status means deterministic, credential-free evidence exists.
 | Native public protocol | Anthropic Messages JSON/SSE | OpenAI Responses JSON/SSE | `client_compatibility` positive boundary tests |
 | Streaming and non-streaming | Supported | Supported | fixture captures and native response assertions |
 | Instructions/system variants | string and structured system blocks | `instructions` plus input messages | request captures |
-| Text and structured input | Messages content blocks | string/array input model; audited array workflow | typed round trips and boundary capture |
-| Tool definitions/results | tool use/result, multi-turn | function calls/outputs, multi-turn | boundary captures and translator tests |
+| Text and structured input | Messages content blocks | string/array input; images with optional `detail` | typed audit and provider-boundary captures |
+| Tool definitions/results | tool use/result, multi-turn | function/custom/tool-search calls and outputs, including optional IDs | optional-item boundary audit |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
 | Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
-| Thinking/reasoning | thinking blocks/signatures | reasoning items, summaries, encrypted content | JSON/SSE fixtures and existing translator tests |
+| Thinking/reasoning | thinking blocks/signatures, including optional-field carriers | reasoning items with optional ID/encrypted content | optional-item boundary audit and non-stream/stream carrier tests |
 | Usage | Anthropic cache/input/output fields | OpenAI cached/reasoning token details | native response assertions |
 | Model routing | aliases, `[1m]`, provider models | aliases and `provider/model` | model helpers and provider boundary tests |
-| Unknown fields | retained in known top-level/items | retained in known top-level/items | captured extension sentinels |
+| Unknown fields | retained in known top-level/items | retained in typed items; uninspected variants raw-preserved | captured extension sentinels and complete `ResponseItem` audit |
 | Cancellation | response-body drop releases admission/upstream resources | same | load-shedding and WebSocket cancellation tests |
 | Truncation | incomplete upstream becomes Anthropic error/stop semantics | `response.incomplete` remains terminal, never completed | failure boundary test |
-| Compaction | Messages compaction carriers/context management | unary `/v1/responses/compact` | compact boundary capture |
+| Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
 | Chat Completions | translation fallback retained | not Codex 0.144.1's wire API | existing Chat Completions suite |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
@@ -234,4 +261,3 @@ and an ephemeral upstream fixture. It does not use port 4141 or an external
 provider. Claude Code's long-lived process/environment behavior makes an equally
 strong opt-in binary canary less deterministic; the credential-free Axum
 boundary harness is the maintained Claude evidence.
-

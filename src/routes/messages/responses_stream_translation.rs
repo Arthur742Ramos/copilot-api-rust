@@ -42,7 +42,9 @@ use super::utils::THINKING_TEXT;
 /// carrier signature (`cm1#{enc}@{id}`) has a single source of truth — the
 /// signature must match exactly for Copilot cache hits, so a divergent second
 /// copy would silently corrupt them.
-use super::responses_translation::encode_compaction_carrier_signature;
+use super::responses_translation::{
+    encode_compaction_carrier_signature, encode_reasoning_signature,
+};
 
 // ---------------------------------------------------------------------------
 // State
@@ -699,7 +701,7 @@ fn handle_output_item_done(
     if item_type == "compaction" {
         let id = get_str(item, "id").unwrap_or("");
         let encrypted_content = get_str(item, "encrypted_content").unwrap_or("");
-        if id.is_empty() || encrypted_content.is_empty() {
+        if encrypted_content.is_empty() {
             return events;
         }
 
@@ -731,9 +733,13 @@ fn handle_output_item_done(
     let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
     let encrypted_content = get_str(item, "encrypted_content").unwrap_or("");
     let id = get_str(item, "id").unwrap_or("");
-    let signature = format!("{encrypted_content}@{id}");
+    let signature = encode_reasoning_signature(
+        (!encrypted_content.is_empty()).then_some(encrypted_content),
+        (!id.is_empty()).then_some(id),
+    );
 
-    // signature is always a non-empty string (it contains the "@" separator).
+    // The legacy or versioned carrier is always non-empty, including when both
+    // Codex fields are absent.
     let summary_empty = item
         .get("summary")
         .and_then(Value::as_array)
@@ -1148,6 +1154,59 @@ mod tests {
             } => Some(text.clone()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn idless_compaction_stream_emits_decodable_carrier() {
+        let mut state = started_state();
+        let events = translate_responses_stream_event(
+            &json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"compaction",
+                    "encrypted_content":"enc_stream_idless"
+                }
+            }),
+            &mut state,
+        );
+        let signature = events.iter().find_map(|event| match event {
+            AnthropicStreamEventData::ContentBlockDelta {
+                delta: AnthropicContentBlockDelta::SignatureDelta { signature },
+                ..
+            } => Some(signature.as_str()),
+            _ => None,
+        });
+        assert_eq!(signature, Some("cm1#enc_stream_idless@"));
+    }
+
+    #[test]
+    fn optional_reasoning_stream_uses_versioned_carrier() {
+        let mut state = started_state();
+        let events = translate_responses_stream_event(
+            &json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"reasoning",
+                    "encrypted_content":"enc_without_id",
+                    "summary":[]
+                }
+            }),
+            &mut state,
+        );
+        let signature = events.iter().find_map(|event| match event {
+            AnthropicStreamEventData::ContentBlockDelta {
+                delta: AnthropicContentBlockDelta::SignatureDelta { signature },
+                ..
+            } => Some(signature.as_str()),
+            _ => None,
+        });
+        assert!(signature.is_some_and(|value| {
+            value.starts_with("rs1#")
+                && value.contains("\"encrypted_content\":\"enc_without_id\"")
+                && value.contains("\"id\":null")
+        }));
     }
 
     #[test]

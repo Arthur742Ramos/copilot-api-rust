@@ -10,10 +10,10 @@
 //! `serde_json::Value`; fixed shapes use the typed structs from
 //! `create_responses` / `anthropic_types`.
 //!
-//! Reasoning-signature and compaction-carrier encode/decode reproduce the TS
-//! byte-for-byte: reasoning splits on the LAST `@` (`encrypted_content@id`),
-//! compaction carriers use the `cm1#...@id` prefix form and split on the FIRST
-//! `@`. Byte exactness matters for Copilot prompt-cache hits.
+//! Legacy complete reasoning/compaction carriers reproduce the TS format
+//! byte-for-byte. Codex 0.144.1 also permits missing reasoning fields and
+//! id-less compactions; versioned reasoning JSON carriers and the compaction
+//! trailing-separator extension preserve those combinations across Messages.
 
 use serde_json::{json, Map, Value};
 
@@ -43,6 +43,7 @@ use crate::services::copilot::create_responses::{
 const MESSAGE_TYPE: &str = "message";
 const COMPACTION_SIGNATURE_PREFIX: &str = "cm1#";
 const COMPACTION_SIGNATURE_SEPARATOR: &str = "@";
+const OPTIONAL_REASONING_SIGNATURE_PREFIX: &str = "rs1#";
 
 /// Re-exported from [`super::utils`] so all translation modules share one
 /// source of truth for the "Thinking..." placeholder.
@@ -82,7 +83,9 @@ struct CompactionCarrier {
     encrypted_content: String,
 }
 
-/// `cm1#${encrypted_content}@${id}`.
+/// `cm1#${encrypted_content}@${id}`. An absent Codex compaction ID is encoded as
+/// an empty suffix (`cm1#...@`) so the carrier remains distinguishable from an
+/// ordinary reasoning signature.
 pub fn encode_compaction_carrier_signature(encrypted_content: &str, id: &str) -> String {
     format!("{COMPACTION_SIGNATURE_PREFIX}{encrypted_content}{COMPACTION_SIGNATURE_SEPARATOR}{id}")
 }
@@ -95,8 +98,9 @@ fn decode_compaction_carrier_signature(signature: &str) -> Option<CompactionCarr
     // indexOf — first occurrence (byte index, ASCII '@').
     let separator_index = raw.find(COMPACTION_SIGNATURE_SEPARATOR)?;
 
-    // separatorIndex <= 0 || separatorIndex === raw.length - 1 -> undefined
-    if separator_index == 0 || separator_index == raw.len() - 1 {
+    // Empty encrypted content is invalid. A trailing separator is valid and
+    // represents Codex's optional compaction id.
+    if separator_index == 0 {
         return None;
     }
 
@@ -113,16 +117,46 @@ fn decode_compaction_carrier_signature(signature: &str) -> Option<CompactionCarr
     })
 }
 
-/// Splits a reasoning signature on the LAST `@` into `(encrypted_content, id)`.
-/// When there is no valid split, the whole signature is the encrypted content
-/// and the id is empty.
-fn parse_reasoning_signature(signature: &str) -> (String, String) {
+/// Preserve the legacy `encrypted_content@id` form when both fields exist.
+/// Codex 0.144.1 makes either field optional, so missing-field combinations use
+/// a small versioned JSON carrier that round-trips without inventing values.
+pub fn encode_reasoning_signature(encrypted_content: Option<&str>, id: Option<&str>) -> String {
+    let encrypted_content = encrypted_content.filter(|value| !value.is_empty());
+    let id = id.filter(|value| !value.is_empty());
+    if let (Some(encrypted_content), Some(id)) = (encrypted_content, id) {
+        return format!("{encrypted_content}@{id}");
+    }
+    format!(
+        "{OPTIONAL_REASONING_SIGNATURE_PREFIX}{}",
+        json!({"encrypted_content": encrypted_content, "id": id})
+    )
+}
+
+/// Splits a legacy reasoning signature on the LAST `@`, or decodes the
+/// versioned optional-field carrier emitted by [`encode_reasoning_signature`].
+fn parse_reasoning_signature(signature: &str) -> (Option<String>, Option<String>) {
+    if let Some(raw) = signature.strip_prefix(OPTIONAL_REASONING_SIGNATURE_PREFIX) {
+        if let Ok(value) = serde_json::from_str::<Value>(raw) {
+            let encrypted_content = value
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            return (encrypted_content, id);
+        }
+    }
+
     match signature.rfind('@') {
         Some(idx) if idx != 0 && idx != signature.len() - 1 => (
-            signature[..idx].to_string(),
-            signature[idx + 1..].to_string(),
+            Some(signature[..idx].to_string()),
+            Some(signature[idx + 1..].to_string()),
         ),
-        _ => (signature.to_string(), String::new()),
+        _ => ((!signature.is_empty()).then(|| signature.to_string()), None),
     }
 }
 
@@ -530,7 +564,7 @@ fn create_image_content(block: &Value) -> Result<ResponseInputImage, AppError> {
         block_type: "input_image".to_string(),
         image_url: Some(image_url),
         file_id: None,
-        detail: "auto".to_string(),
+        detail: Some("auto".to_string()),
         extra: Default::default(),
     })
 }
@@ -638,7 +672,7 @@ fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
         }]
     };
     ResponseInputReasoning {
-        id: Some(id),
+        id,
         item_type: "reasoning".to_string(),
         summary,
         encrypted_content,
@@ -649,7 +683,7 @@ fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
 fn create_compaction_content(signature: &str) -> Option<ResponseInputCompaction> {
     let compaction = decode_compaction_carrier_signature(signature)?;
     Some(ResponseInputCompaction {
-        id: compaction.id,
+        id: (!compaction.id.is_empty()).then_some(compaction.id),
         item_type: "compaction".to_string(),
         encrypted_content: compaction.encrypted_content,
         extra: Default::default(),
@@ -692,7 +726,7 @@ fn create_tool_search_call(block: &Value) -> ResponseToolSearchCallItem {
     let input = block.get("input").cloned().unwrap_or(Value::Null);
     ResponseToolSearchCallItem {
         item_type: "tool_search_call".to_string(),
-        call_id: id.to_string(),
+        call_id: (!id.is_empty()).then(|| id.to_string()),
         arguments: normalize_tool_search_bridge_arguments(&input),
         execution: Some("client".to_string()),
         status: Some("completed".to_string()),
@@ -781,7 +815,7 @@ fn create_tool_search_output(
 
     ResponseToolSearchOutputItem {
         item_type: "tool_search_output".to_string(),
-        call_id: call_id.to_string(),
+        call_id: (!call_id.is_empty()).then(|| call_id.to_string()),
         tools,
         execution: Some("client".to_string()),
         status: Some(if is_error { "incomplete" } else { "completed" }.to_string()),
@@ -1104,10 +1138,9 @@ fn map_output_to_anthropic_content(
             ResponseOutputItem::Reasoning(reasoning) => {
                 let thinking_text = extract_reasoning_text(reasoning);
                 if !thinking_text.is_empty() {
-                    let signature = format!(
-                        "{}@{}",
-                        reasoning.encrypted_content.clone().unwrap_or_default(),
-                        reasoning.id
+                    let signature = encode_reasoning_signature(
+                        reasoning.encrypted_content.as_deref(),
+                        reasoning.id.as_deref(),
                     );
                     content_blocks.push(json!({
                         "type": "thinking",
@@ -1245,7 +1278,7 @@ fn create_tool_search_use_content_block(
     call: &crate::services::copilot::create_responses::ResponseOutputToolSearchCall,
     tool_search_name: Option<&str>,
 ) -> Option<Value> {
-    let tool_id = &call.call_id;
+    let tool_id = call.call_id.as_deref().unwrap_or_default();
     if tool_id.is_empty() {
         return None;
     }
@@ -1269,14 +1302,15 @@ pub fn resolve_tool_use_name(name: &str, namespace: Option<&str>) -> String {
 fn create_compaction_thinking_block(
     item: &crate::services::copilot::create_responses::ResponseOutputCompaction,
 ) -> Option<Value> {
-    if item.id.is_empty() || item.encrypted_content.is_empty() {
+    if item.encrypted_content.is_empty() {
         return None;
     }
+    let id = item.id.as_deref().unwrap_or_default();
 
     Some(json!({
         "type": "thinking",
         "thinking": THINKING_TEXT,
-        "signature": encode_compaction_carrier_signature(&item.encrypted_content, &item.id),
+        "signature": encode_compaction_carrier_signature(&item.encrypted_content, id),
     }))
 }
 
@@ -1407,22 +1441,36 @@ mod tests {
     #[test]
     fn reasoning_signature_splits_on_last_at() {
         let (enc, id) = parse_reasoning_signature("abc@def@id123");
-        assert_eq!(enc, "abc@def");
-        assert_eq!(id, "id123");
+        assert_eq!(enc.as_deref(), Some("abc@def"));
+        assert_eq!(id.as_deref(), Some("id123"));
     }
 
     #[test]
     fn reasoning_signature_no_at_returns_whole() {
         let (enc, id) = parse_reasoning_signature("noatsign");
-        assert_eq!(enc, "noatsign");
-        assert_eq!(id, "");
+        assert_eq!(enc.as_deref(), Some("noatsign"));
+        assert!(id.is_none());
     }
 
     #[test]
     fn reasoning_signature_trailing_at_is_invalid() {
         let (enc, id) = parse_reasoning_signature("abc@");
-        assert_eq!(enc, "abc@");
-        assert_eq!(id, "");
+        assert_eq!(enc.as_deref(), Some("abc@"));
+        assert!(id.is_none());
+    }
+
+    #[test]
+    fn optional_reasoning_signature_combinations_round_trip() {
+        for (encrypted_content, id) in [
+            (Some("enc"), None),
+            (None, Some("reasoning-id")),
+            (None, None),
+        ] {
+            let signature = encode_reasoning_signature(encrypted_content, id);
+            let (decoded_encrypted_content, decoded_id) = parse_reasoning_signature(&signature);
+            assert_eq!(decoded_encrypted_content.as_deref(), encrypted_content);
+            assert_eq!(decoded_id.as_deref(), id);
+        }
     }
 
     #[test]
@@ -1437,6 +1485,23 @@ mod tests {
     #[test]
     fn compaction_decode_requires_prefix() {
         assert!(decode_compaction_carrier_signature("enc@id").is_none());
+    }
+
+    #[test]
+    fn idless_compaction_carrier_round_trips() {
+        let output = crate::services::copilot::create_responses::ResponseOutputCompaction {
+            id: None,
+            item_type: "compaction".to_string(),
+            encrypted_content: "enc_idless".to_string(),
+            extra: Default::default(),
+        };
+        let block = create_compaction_thinking_block(&output).expect("thinking carrier");
+        let signature = block["signature"].as_str().expect("signature");
+        assert_eq!(signature, "cm1#enc_idless@");
+
+        let decoded = create_compaction_content(signature).expect("decode id-less carrier");
+        assert!(decoded.id.is_none());
+        assert_eq!(decoded.encrypted_content, "enc_idless");
     }
 
     #[test]
@@ -1682,7 +1747,7 @@ mod tests {
             output_text: "ignored fallback".to_string(),
             output: vec![
                 ResponseOutputItem::Reasoning(ResponseOutputReasoning {
-                    id: "rs_1".to_string(),
+                    id: Some("rs_1".to_string()),
                     item_type: "reasoning".to_string(),
                     summary: Some(vec![ResponseReasoningBlock {
                         block_type: "summary_text".to_string(),
@@ -1694,7 +1759,7 @@ mod tests {
                     extra: Default::default(),
                 }),
                 ResponseOutputItem::Message(ResponseOutputMessage {
-                    id: "msg_1".to_string(),
+                    id: Some("msg_1".to_string()),
                     item_type: "message".to_string(),
                     role: "assistant".to_string(),
                     status: "completed".to_string(),
@@ -1810,7 +1875,7 @@ mod tests {
             model: "gpt-5.4".to_string(),
             status: "completed".to_string(),
             output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
-                id: "rs".to_string(),
+                id: Some("rs".to_string()),
                 item_type: "reasoning".to_string(),
                 summary: None,
                 encrypted_content: Some("E".to_string()),

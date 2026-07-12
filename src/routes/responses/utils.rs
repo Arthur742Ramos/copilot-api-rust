@@ -240,7 +240,7 @@ fn input_image_data_url_bytes(image: &ResponseInputImage) -> Option<i64> {
 fn replace_input_image_with_placeholder(image: &mut ResponseInputImage) {
     image.block_type = "input_image".to_string();
     image.image_url = Some(REDACTED_IMAGE_PLACEHOLDER_DATA_URL.to_string());
-    image.detail = "low".to_string();
+    image.detail = Some("low".to_string());
     image.file_id = None;
 }
 
@@ -318,9 +318,10 @@ pub fn compact_input_by_latest_compaction(payload: &mut ResponsesPayload) {
 }
 
 fn latest_compaction_message_index(items: &[ResponseInputItem]) -> Option<usize> {
-    (0..items.len())
-        .rev()
-        .find(|&i| is_response_input_item_type(&items[i], "compaction"))
+    (0..items.len()).rev().find(|&i| {
+        is_response_input_item_type(&items[i], "compaction")
+            || is_response_input_item_type(&items[i], "compaction_summary")
+    })
 }
 
 fn has_terminal_compaction_trigger(payload: &ResponsesPayload) -> bool {
@@ -554,6 +555,21 @@ mod tests {
             Some(InputField::Items(items)) => assert_eq!(items.len(), 2),
             other => panic!("expected items, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compact_input_recognizes_legacy_compaction_summary_alias() {
+        let mut payload = payload_with_input(json!([
+            { "role": "user", "content": "discard" },
+            { "type": "compaction_summary", "encrypted_content": "enc_legacy" },
+            { "role": "user", "content": "keep" }
+        ]));
+        compact_input_by_latest_compaction(&mut payload);
+        let value = serde_json::to_value(payload).unwrap();
+        assert_eq!(value["input"].as_array().unwrap().len(), 2);
+        assert_eq!(value["input"][0]["type"], "compaction");
+        assert!(value["input"][0].get("id").is_none());
+        assert_eq!(value["input"][1]["content"], "keep");
     }
 
     #[test]
