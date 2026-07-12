@@ -670,35 +670,37 @@ pub async fn handle_with_messages_api(
                         continue;
                     }
 
-                    let parsed = match serde_json::from_str::<Value>(&data) {
-                        Ok(parsed) => parsed,
-                        Err(e) => {
-                            record_stream_chunk_parse_failure("messages", &e);
-                            timer.mark_error();
-                            if let Some(frame) = emit_event(&build_error_event(
-                                "The upstream Messages stream returned a malformed event.",
-                            )) {
-                                yield Ok(frame);
+                    if native_message_event_needs_parsing(event_name.as_deref(), &data) {
+                        let parsed = match serde_json::from_str::<Value>(&data) {
+                            Ok(parsed) => parsed,
+                            Err(e) => {
+                                record_stream_chunk_parse_failure("messages", &e);
+                                timer.mark_error();
+                                if let Some(frame) = emit_event(&build_error_event(
+                                    "The upstream Messages stream returned a malformed event.",
+                                )) {
+                                    yield Ok(frame);
+                                }
+                                recorder.record(usage);
+                                return;
                             }
-                            recorder.record(usage);
-                            return;
+                        };
+                        match parsed.get("type").and_then(Value::as_str) {
+                            Some("message_start") => {
+                                let next = normalize_anthropic_usage(
+                                    parsed.get("message").and_then(|m| m.get("usage")),
+                                );
+                                usage = merge_anthropic_usage(usage, next);
+                            }
+                            Some("message_delta") => {
+                                let next = normalize_anthropic_usage(parsed.get("usage"));
+                                usage = merge_anthropic_usage(usage, next);
+                            }
+                            Some("message_stop" | "error") => {
+                                terminal_event_seen = true;
+                            }
+                            _ => {}
                         }
-                    };
-                    match parsed.get("type").and_then(Value::as_str) {
-                        Some("message_start") => {
-                            let next = normalize_anthropic_usage(
-                                parsed.get("message").and_then(|m| m.get("usage")),
-                            );
-                            usage = merge_anthropic_usage(usage, next);
-                        }
-                        Some("message_delta") => {
-                            let next = normalize_anthropic_usage(parsed.get("usage"));
-                            usage = merge_anthropic_usage(usage, next);
-                        }
-                        Some("message_stop" | "error") => {
-                            terminal_event_seen = true;
-                        }
-                        _ => {}
                     }
 
                     timer.on_content_frame();
@@ -725,6 +727,35 @@ pub async fn handle_with_messages_api(
                 recorder.record(usage);
             };
             Ok(sse_response(stream))
+        }
+    }
+}
+
+fn native_message_event_needs_parsing(event_name: Option<&str>, data: &str) -> bool {
+    match event_name {
+        Some("message_start" | "message_delta" | "message_stop" | "error") => true,
+        Some(_) => false,
+        None => {
+            let mut remaining = data;
+            while let Some(index) = remaining.find("\"type\"") {
+                let after_key = &remaining[index + "\"type\"".len()..];
+                if let Some(value) = after_key.trim_start().strip_prefix(':') {
+                    let value = value.trim_start();
+                    if [
+                        "\"message_start\"",
+                        "\"message_delta\"",
+                        "\"message_stop\"",
+                        "\"error\"",
+                    ]
+                    .iter()
+                    .any(|marker| value.starts_with(marker))
+                    {
+                        return true;
+                    }
+                }
+                remaining = after_key;
+            }
+            false
         }
     }
 }
@@ -1109,5 +1140,37 @@ mod tests {
             native_message_frame(None, "[DONE]").as_ref(),
             b"data: [DONE]\n\n"
         );
+    }
+
+    #[test]
+    fn native_message_parse_fast_path_skips_token_frames() {
+        for event_name in ["message_start", "message_delta", "message_stop", "error"] {
+            assert!(native_message_event_needs_parsing(
+                Some(event_name),
+                "not-json"
+            ));
+        }
+
+        assert!(!native_message_event_needs_parsing(
+            Some("content_block_delta"),
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"message_stop"}}"#
+        ));
+        assert!(!native_message_event_needs_parsing(
+            Some("ping"),
+            r#"{"type":"ping"}"#
+        ));
+
+        assert!(native_message_event_needs_parsing(
+            None,
+            r#"{ "type" : "message_start", "message": {} }"#
+        ));
+        assert!(native_message_event_needs_parsing(
+            None,
+            r#"{"type":"error","error":{"type":"api_error"}}"#
+        ));
+        assert!(!native_message_event_needs_parsing(
+            None,
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"token"}}"#
+        ));
     }
 }
