@@ -15,7 +15,7 @@
 //!   `responses_translation` module are re-declared here so this file compiles
 //!   standalone against Phase-1 foundations.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{json, Value};
 
@@ -77,8 +77,7 @@ pub struct ResponsesStreamState {
     pub function_call_state_by_output_index: HashMap<i64, FunctionCallStreamState>,
     pub function_call_order: Vec<i64>,
     pub active_function_call_output_index: Option<i64>,
-    pub reasoning_summary_has_text: HashSet<i64>,
-    pub pending_reasoning_whitespace: HashMap<i64, String>,
+    pub reasoning_summary_parts: HashMap<i64, BTreeMap<i64, String>>,
     pub tool_search_name: String,
     pub has_tool_call: bool,
 }
@@ -96,8 +95,7 @@ impl ResponsesStreamState {
             function_call_state_by_output_index: HashMap::new(),
             function_call_order: Vec::new(),
             active_function_call_output_index: None,
-            reasoning_summary_has_text: HashSet::new(),
-            pending_reasoning_whitespace: HashMap::new(),
+            reasoning_summary_parts: HashMap::new(),
             tool_search_name: tool_search_name
                 .unwrap_or_else(|| BRIDGE_TOOL_SEARCH_NAME.to_string()),
             has_tool_call: false,
@@ -146,6 +144,9 @@ pub fn translate_responses_stream_event(
     match event_type {
         Some("response.created") => handle_response_created(event, state),
         Some("response.output_item.added") => handle_output_item_added(event, state),
+        Some("response.reasoning_summary_part.added") => {
+            handle_reasoning_summary_part_added(event, state)
+        }
         Some("response.reasoning_summary_text.delta") => {
             handle_reasoning_summary_text_delta(event, state)
         }
@@ -736,35 +737,40 @@ fn handle_output_item_done(
 
     let encrypted_content = get_str(item, "encrypted_content");
     let id = get_str(item, "id");
+    let buffered_parts = state.reasoning_summary_parts.remove(&output_index);
+    let summary_segments: Vec<String> = match item.get("summary").and_then(Value::as_array) {
+        Some(summary) => summary
+            .iter()
+            .map(|block| {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect(),
+        None => buffered_parts.unwrap_or_default().into_values().collect(),
+    };
     let display_text = effective_reasoning_text(
-        item.get("summary")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|block| block.get("text").and_then(Value::as_str)),
+        summary_segments.iter().map(String::as_str),
         encrypted_content,
         id,
     );
-    let had_substantive_text = state.reasoning_summary_has_text.contains(&output_index);
-    state.pending_reasoning_whitespace.remove(&output_index);
 
     // A carrier-free item with no aggregate summary has no Anthropic thinking
     // content to represent. Do not open a block or invent a signature.
-    if display_text.is_none() && !had_substantive_text {
+    let Some(display_text) = display_text else {
         return events;
-    }
+    };
 
     let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
-    if !had_substantive_text {
-        events.push(AnthropicStreamEventData::ContentBlockDelta {
-            index: block_index,
-            delta: AnthropicContentBlockDelta::ThinkingDelta {
-                thinking: display_text.expect("display text checked above"),
-            },
-        });
-        state.reasoning_summary_has_text.insert(output_index);
-        state.block_has_delta.insert(block_index);
-    }
+    events.push(AnthropicStreamEventData::ContentBlockDelta {
+        index: block_index,
+        delta: AnthropicContentBlockDelta::ThinkingDelta {
+            thinking: display_text,
+        },
+    });
+    state.block_has_delta.insert(block_index);
 
     let signature = encode_reasoning_signature(encrypted_content, id);
     events.push(AnthropicStreamEventData::ContentBlockDelta {
@@ -912,76 +918,60 @@ fn handle_output_text_delta(
     events
 }
 
+fn handle_reasoning_summary_part_added(
+    event: &Value,
+    state: &mut ResponsesStreamState,
+) -> Vec<AnthropicStreamEventData> {
+    // Codex 0.144.1 maps this event before the part's text delta/done events.
+    // Keep one ordered slot per semantic part; duplicate `added` events reuse the
+    // same slot and therefore cannot create duplicate separators.
+    let output_index = get_i64(event, "output_index");
+    let summary_index = get_i64(event, "summary_index");
+    state
+        .reasoning_summary_parts
+        .entry(output_index)
+        .or_default()
+        .entry(summary_index)
+        .or_default();
+    Vec::new()
+}
+
 fn handle_reasoning_summary_text_delta(
     event: &Value,
     state: &mut ResponsesStreamState,
 ) -> Vec<AnthropicStreamEventData> {
-    let mut events = Vec::new();
     let output_index = get_i64(event, "output_index");
+    let summary_index = get_i64(event, "summary_index");
     let delta_text = get_str(event, "delta").unwrap_or("");
     if delta_text.is_empty() {
-        return events;
+        return Vec::new();
     }
-    let has_substantive_text = state.reasoning_summary_has_text.contains(&output_index);
-    if !has_substantive_text && delta_text.trim().is_empty() {
-        state
-            .pending_reasoning_whitespace
-            .entry(output_index)
-            .or_default()
-            .push_str(delta_text);
-        return events;
-    }
-
-    let emitted_text = if has_substantive_text {
-        delta_text.to_string()
-    } else {
-        let mut pending = state
-            .pending_reasoning_whitespace
-            .remove(&output_index)
-            .unwrap_or_default();
-        pending.push_str(delta_text);
-        pending
-    };
-    let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
-
-    events.push(AnthropicStreamEventData::ContentBlockDelta {
-        index: block_index,
-        delta: AnthropicContentBlockDelta::ThinkingDelta {
-            thinking: emitted_text,
-        },
-    });
-    state.reasoning_summary_has_text.insert(output_index);
-    state.block_has_delta.insert(block_index);
-
-    events
+    state
+        .reasoning_summary_parts
+        .entry(output_index)
+        .or_default()
+        .entry(summary_index)
+        .or_default()
+        .push_str(delta_text);
+    Vec::new()
 }
 
 fn handle_reasoning_summary_text_done(
     event: &Value,
     state: &mut ResponsesStreamState,
 ) -> Vec<AnthropicStreamEventData> {
-    let mut events = Vec::new();
     let output_index = get_i64(event, "output_index");
-    let text = get_str(event, "text").unwrap_or("");
-    if state.reasoning_summary_has_text.contains(&output_index) {
-        return events;
+    let summary_index = get_i64(event, "summary_index");
+    if let Some(text) = get_str(event, "text") {
+        // `text.done` is the authoritative complete text for this summary part.
+        // Assign rather than append so prior deltas cannot duplicate content.
+        state
+            .reasoning_summary_parts
+            .entry(output_index)
+            .or_default()
+            .insert(summary_index, text.to_string());
     }
-    state.pending_reasoning_whitespace.remove(&output_index);
-    if text.trim().is_empty() {
-        return events;
-    }
-    let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
-
-    events.push(AnthropicStreamEventData::ContentBlockDelta {
-        index: block_index,
-        delta: AnthropicContentBlockDelta::ThinkingDelta {
-            thinking: text.to_string(),
-        },
-    });
-    state.reasoning_summary_has_text.insert(output_index);
-    state.block_has_delta.insert(block_index);
-
-    events
+    Vec::new()
 }
 
 fn handle_output_text_done(
@@ -1173,6 +1163,7 @@ fn stringify_tool_search_arguments(arguments_value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::messages::responses_translation::REASONING_SUMMARY_SEPARATOR;
 
     fn started_state() -> ResponsesStreamState {
         let mut state = create_responses_stream_state(None);
@@ -1702,33 +1693,77 @@ mod tests {
     }
 
     #[test]
-    fn leading_reasoning_whitespace_is_buffered_until_substantive_text() {
+    fn reasoning_stream_framing_preserves_leading_and_trailing_whitespace() {
         let mut state = started_state();
-        let whitespace = translate_responses_stream_event(
+        for delta in ["  ", "analysis", "  "] {
+            let events = translate_responses_stream_event(
+                &json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "output_index":0,
+                    "summary_index":0,
+                    "delta":delta
+                }),
+                &mut state,
+            );
+            assert!(events.is_empty());
+        }
+        let events = translate_responses_stream_event(
             &json!({
-                "type":"response.reasoning_summary_text.delta",
+                "type":"response.output_item.done",
                 "output_index":0,
-                "delta":"  "
+                "item":{
+                    "type":"reasoning",
+                    "id":"reasoning-id",
+                    "encrypted_content":"encrypted",
+                    "summary":[{"type":"summary_text","text":"  analysis  "}]
+                }
             }),
             &mut state,
         );
-        assert!(whitespace.is_empty());
-
-        let substantive = translate_responses_stream_event(
-            &json!({
-                "type":"response.reasoning_summary_text.delta",
-                "output_index":0,
-                "delta":"analysis"
-            }),
-            &mut state,
-        );
-        assert!(substantive.iter().any(|event| matches!(
+        assert!(events.iter().any(|event| matches!(
             event,
             AnthropicStreamEventData::ContentBlockDelta {
                 delta: AnthropicContentBlockDelta::ThinkingDelta { thinking },
                 ..
-            } if thinking == "  analysis"
+            } if thinking == "  analysis  "
         )));
+    }
+
+    #[test]
+    fn reasoning_summary_part_boundaries_are_ordered_and_not_duplicated() {
+        let mut state = started_state();
+        for event in [
+            json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0}),
+            json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"one"}),
+            json!({"type":"response.reasoning_summary_text.done","output_index":0,"summary_index":0,"text":"one"}),
+            json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1}),
+            json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1}),
+            json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":1,"delta":"two"}),
+            json!({"type":"response.reasoning_summary_text.done","output_index":0,"summary_index":1,"text":"two"}),
+        ] {
+            assert!(translate_responses_stream_event(&event, &mut state).is_empty());
+        }
+        let events = translate_responses_stream_event(
+            &json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"reasoning",
+                    "id":"reasoning-id",
+                    "encrypted_content":"encrypted"
+                }
+            }),
+            &mut state,
+        );
+        let thinking = events.iter().find_map(|event| match event {
+            AnthropicStreamEventData::ContentBlockDelta {
+                delta: AnthropicContentBlockDelta::ThinkingDelta { thinking },
+                ..
+            } => Some(thinking.as_str()),
+            _ => None,
+        });
+        let expected = format!("one{REASONING_SUMMARY_SEPARATOR}two");
+        assert_eq!(thinking, Some(expected.as_str()));
     }
 
     #[test]

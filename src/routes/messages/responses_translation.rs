@@ -44,6 +44,14 @@ const MESSAGE_TYPE: &str = "message";
 const COMPACTION_SIGNATURE_PREFIX: &str = "cm1#";
 const COMPACTION_SIGNATURE_SEPARATOR: &str = "@";
 const OPTIONAL_REASONING_SIGNATURE_PREFIX: &str = "rs1#";
+/// Semantic boundary between distinct Codex reasoning-summary parts.
+///
+/// Codex 0.144.1 exposes `response.reasoning_summary_part.added` with a
+/// `summary_index`; the audited TypeScript bridge represents each boundary with
+/// this invisible separator plus a blank line. Unlike the reference's final
+/// `.trim()`, this implementation deliberately preserves each segment's leading
+/// and trailing whitespace exactly.
+pub const REASONING_SUMMARY_SEPARATOR: &str = "\u{2063}\n\n";
 
 /// Re-exported from [`super::utils`] so all translation modules share one
 /// source of truth for the "Thinking..." placeholder.
@@ -661,15 +669,7 @@ fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
     } else {
         raw_thinking
     };
-    let summary = if thinking.is_empty() {
-        Vec::new()
-    } else {
-        vec![ReasoningSummaryText {
-            block_type: "summary_text".to_string(),
-            text: thinking.to_string(),
-            extra: Default::default(),
-        }]
-    };
+    let summary = create_reasoning_summary(thinking);
     ResponseInputReasoning {
         id,
         item_type: "reasoning".to_string(),
@@ -677,6 +677,20 @@ fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
         encrypted_content,
         extra: Default::default(),
     }
+}
+
+fn create_reasoning_summary(thinking: &str) -> Vec<ReasoningSummaryText> {
+    if thinking.is_empty() {
+        return Vec::new();
+    }
+    thinking
+        .split(REASONING_SUMMARY_SEPARATOR)
+        .map(|text| ReasoningSummaryText {
+            block_type: "summary_text".to_string(),
+            text: text.to_string(),
+            extra: Default::default(),
+        })
+        .collect()
 }
 
 fn create_compaction_content(signature: &str) -> Option<ResponseInputCompaction> {
@@ -1242,7 +1256,7 @@ fn extract_reasoning_text(
         item.summary
             .iter()
             .flatten()
-            .filter_map(|block| block.text.as_deref()),
+            .map(|block| block.text.as_deref().unwrap_or("")),
         item.encrypted_content.as_deref(),
         item.id.as_deref(),
     )
@@ -1253,13 +1267,9 @@ pub(crate) fn effective_reasoning_text<'a>(
     encrypted_content: Option<&str>,
     id: Option<&str>,
 ) -> Option<String> {
-    let mut aggregate = String::new();
-    for text in summary_texts {
-        aggregate.push_str(text);
-    }
-    let aggregate = aggregate.trim();
-    if !aggregate.is_empty() {
-        return Some(aggregate.to_string());
+    let segments: Vec<&str> = summary_texts.into_iter().collect();
+    if segments.iter().any(|text| !text.trim().is_empty()) {
+        return Some(segments.join(REASONING_SUMMARY_SEPARATOR));
     }
 
     let has_opaque_carrier = encrypted_content.is_some() || id.is_some();
@@ -2043,6 +2053,64 @@ mod tests {
                 anthropic.content[0]["signature"],
                 encode_reasoning_signature(encrypted_content, id)
             );
+        }
+    }
+
+    #[test]
+    fn reasoning_summary_policy_preserves_whitespace_parts_and_round_trips() {
+        use crate::services::copilot::create_responses::{
+            ResponseOutputReasoning, ResponseReasoningBlock,
+        };
+
+        for segments in [vec!["  analysis  "], vec!["  first ", "", "\tsecond\n", ""]] {
+            let result = ResponsesResult {
+                output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
+                    id: Some("reasoning-id".to_string()),
+                    item_type: "reasoning".to_string(),
+                    summary: Some(
+                        segments
+                            .iter()
+                            .map(|text| ResponseReasoningBlock {
+                                block_type: "summary_text".to_string(),
+                                text: Some((*text).to_string()),
+                                extra: Default::default(),
+                            })
+                            .collect(),
+                    ),
+                    encrypted_content: Some("encrypted".to_string()),
+                    status: None,
+                    extra: Default::default(),
+                })],
+                ..Default::default()
+            };
+            let anthropic = translate_responses_result_to_anthropic(&result, None);
+            let expected = segments.join(REASONING_SUMMARY_SEPARATOR);
+            assert_eq!(anthropic.content[0]["thinking"], expected);
+            assert_eq!(anthropic.content[0]["signature"], "encrypted@reasoning-id");
+
+            let history: AnthropicMessagesPayload = serde_json::from_value(json!({
+                "model":"gpt-5.4",
+                "max_tokens":128,
+                "messages":[{
+                    "role":"assistant",
+                    "content":[anthropic.content[0].clone()]
+                }]
+            }))
+            .unwrap();
+            let translated =
+                translate_anthropic_messages_to_responses_payload(&history, None).unwrap();
+            let InputField::Items(items) = translated.input.unwrap() else {
+                panic!("expected item input");
+            };
+            let ResponseInputItem::Reasoning(reasoning) = &items[0] else {
+                panic!("expected reasoning item");
+            };
+            let round_trip: Vec<&str> = reasoning
+                .summary
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect();
+            assert_eq!(round_trip, segments);
         }
     }
 }

@@ -21,7 +21,7 @@ use copilot_api::libs::config::{
     set_cached_config_for_test, AppConfig, AuthConfig, ModelConfig, ProviderConfig,
 };
 use copilot_api::routes::messages::responses_translation::{
-    encode_reasoning_signature, THINKING_TEXT,
+    encode_reasoning_signature, REASONING_SUMMARY_SEPARATOR, THINKING_TEXT,
 };
 use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
@@ -311,6 +311,23 @@ fn reasoning_summary_fixture_item(model: &str) -> Option<Value> {
             "encrypted_content":"",
             "summary":[]
         }),
+        "gpt-reasoning-leading-text" => json!({
+            "type":"reasoning",
+            "id":"reasoning-leading",
+            "encrypted_content":"encrypted-leading",
+            "summary":[{"type":"summary_text","text":"  analysis  "}]
+        }),
+        "gpt-reasoning-multiple-parts" => json!({
+            "type":"reasoning",
+            "id":"reasoning-parts",
+            "encrypted_content":"encrypted-parts",
+            "summary":[
+                {"type":"summary_text","text":"  first "},
+                {"type":"summary_text","text":""},
+                {"type":"summary_text","text":"\tsecond\n"},
+                {"type":"summary_text","text":""}
+            ]
+        }),
         _ => return None,
     })
 }
@@ -407,48 +424,152 @@ fn responses_fixture(body: &Value) -> Response {
 
     if let Some(reasoning) = reasoning_summary_fixture_item(model) {
         if body["stream"] == true {
-            return sse_response(render_sse(&[
-                (
-                    "response.created",
-                    json!({
-                        "type":"response.created",
-                        "sequence_number":0,
-                        "response":{
-                            "id":"resp_reasoning_fixture",
-                            "object":"response",
-                            "created_at":1,
-                            "status":"in_progress",
-                            "model":model,
-                            "output":[]
-                        }
-                    }),
-                ),
-                (
-                    "response.output_item.done",
-                    json!({
-                        "type":"response.output_item.done",
-                        "sequence_number":1,
-                        "output_index":0,
-                        "item":reasoning
-                    }),
-                ),
-                (
-                    "response.completed",
-                    json!({
-                        "type":"response.completed",
-                        "sequence_number":2,
-                        "response":{
-                            "id":"resp_reasoning_fixture",
-                            "object":"response",
-                            "created_at":1,
-                            "status":"completed",
-                            "model":model,
-                            "output":[],
-                            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
-                        }
-                    }),
-                ),
-            ]));
+            let mut events = vec![(
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_reasoning_fixture",
+                        "object":"response",
+                        "created_at":1,
+                        "status":"in_progress",
+                        "model":model,
+                        "output":[]
+                    }
+                }),
+            )];
+            if model == "gpt-reasoning-leading-text" {
+                events.extend([
+                    (
+                        "response.reasoning_summary_part.added",
+                        json!({
+                            "type":"response.reasoning_summary_part.added",
+                            "output_index":0,
+                            "summary_index":0,
+                            "part":{"type":"summary_text","text":""}
+                        }),
+                    ),
+                    (
+                        "response.reasoning_summary_text.delta",
+                        json!({
+                            "type":"response.reasoning_summary_text.delta",
+                            "item_id":"reasoning-leading",
+                            "output_index":0,
+                            "summary_index":0,
+                            "delta":"  "
+                        }),
+                    ),
+                    (
+                        "response.reasoning_summary_text.delta",
+                        json!({
+                            "type":"response.reasoning_summary_text.delta",
+                            "item_id":"reasoning-leading",
+                            "output_index":0,
+                            "summary_index":0,
+                            "delta":"analysis"
+                        }),
+                    ),
+                    (
+                        "response.reasoning_summary_text.delta",
+                        json!({
+                            "type":"response.reasoning_summary_text.delta",
+                            "item_id":"reasoning-leading",
+                            "output_index":0,
+                            "summary_index":0,
+                            "delta":"  "
+                        }),
+                    ),
+                    (
+                        "response.reasoning_summary_text.done",
+                        json!({
+                            "type":"response.reasoning_summary_text.done",
+                            "item_id":"reasoning-leading",
+                            "output_index":0,
+                            "summary_index":0,
+                            "text":"  analysis  "
+                        }),
+                    ),
+                ]);
+            } else if model == "gpt-reasoning-multiple-parts" {
+                events.extend([
+                    (
+                        "response.reasoning_summary_part.added",
+                        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+                    ),
+                    (
+                        "response.reasoning_summary_text.delta",
+                        json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-parts","output_index":0,"summary_index":0,"delta":"  first "}),
+                    ),
+                    (
+                        "response.reasoning_summary_text.done",
+                        json!({"type":"response.reasoning_summary_text.done","item_id":"reasoning-parts","output_index":0,"summary_index":0,"text":"  first "}),
+                    ),
+                    (
+                        "response.reasoning_summary_part.added",
+                        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}}),
+                    ),
+                    // A duplicate boundary event must not duplicate the separator.
+                    (
+                        "response.reasoning_summary_part.added",
+                        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}}),
+                    ),
+                    (
+                        "response.reasoning_summary_text.done",
+                        json!({"type":"response.reasoning_summary_text.done","item_id":"reasoning-parts","output_index":0,"summary_index":1,"text":""}),
+                    ),
+                    (
+                        "response.reasoning_summary_part.added",
+                        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":2,"part":{"type":"summary_text","text":""}}),
+                    ),
+                    (
+                        "response.reasoning_summary_text.delta",
+                        json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-parts","output_index":0,"summary_index":2,"delta":"\tsecond"}),
+                    ),
+                    (
+                        "response.reasoning_summary_text.delta",
+                        json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-parts","output_index":0,"summary_index":2,"delta":"\n"}),
+                    ),
+                    (
+                        "response.reasoning_summary_text.done",
+                        json!({"type":"response.reasoning_summary_text.done","item_id":"reasoning-parts","output_index":0,"summary_index":2,"text":"\tsecond\n"}),
+                    ),
+                    (
+                        "response.reasoning_summary_part.added",
+                        json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":3,"part":{"type":"summary_text","text":""}}),
+                    ),
+                    (
+                        "response.reasoning_summary_text.done",
+                        json!({"type":"response.reasoning_summary_text.done","item_id":"reasoning-parts","output_index":0,"summary_index":3,"text":""}),
+                    ),
+                ]);
+            }
+            events.push((
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":98,
+                    "output_index":0,
+                    "item":reasoning
+                }),
+            ));
+            events.push((
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":99,
+                    "response":{
+                        "id":"resp_reasoning_fixture",
+                        "object":"response",
+                        "created_at":1,
+                        "status":"completed",
+                        "model":model,
+                        "output":[],
+                        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                    }
+                }),
+            ));
+            return sse_response(render_sse(&events));
         }
         return Json(json!({
             "id":"resp_reasoning_fixture",
@@ -833,6 +954,8 @@ fn configure(fixture: &Fixture) {
         "gpt-reasoning-empty-id-value",
         "gpt-reasoning-empty-encrypted-value",
         "gpt-reasoning-both-empty-values",
+        "gpt-reasoning-leading-text",
+        "gpt-reasoning-multiple-parts",
     ]
     .into_iter()
     .map(|model| (model.to_string(), ModelConfig::default()))
@@ -1150,6 +1273,21 @@ fn aggregate_empty_reasoning_cases(
     ]
 }
 
+fn reasoning_content_framing_cases() -> Vec<(&'static str, String, &'static str)> {
+    vec![
+        (
+            "gpt-reasoning-leading-text",
+            "  analysis  ".to_string(),
+            "encrypted-leading@reasoning-leading",
+        ),
+        (
+            "gpt-reasoning-multiple-parts",
+            ["  first ", "", "\tsecond\n", ""].join(REASONING_SUMMARY_SEPARATOR),
+            "encrypted-parts@reasoning-parts",
+        ),
+    ]
+}
+
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
 async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
@@ -1447,6 +1585,85 @@ async fn claude_aggregate_empty_reasoning_stream_matches_nonstream_rules() {
             assert!(
                 signature_delta.is_none(),
                 "{model}: invented signature delta"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_reasoning_content_framing_nonstream_is_lossless() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, expected_thinking, expected_signature) in reasoning_content_framing_cases() {
+        let request = json!({
+            "model":format!("responses-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"reason"}],
+            "stream":false
+        });
+        let (status, body) = send(post_json("/v1/messages", request, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let response = json_body(&body);
+        let thinking = response["content"]
+            .as_array()
+            .and_then(|content| content.iter().find(|block| block["type"] == "thinking"))
+            .unwrap_or_else(|| panic!("{model}: thinking block missing"));
+        assert_eq!(thinking["thinking"], expected_thinking, "{model}");
+        assert_eq!(thinking["signature"], expected_signature, "{model}");
+        if model == "gpt-reasoning-multiple-parts" {
+            assert_eq!(
+                expected_thinking
+                    .matches(REASONING_SUMMARY_SEPARATOR)
+                    .count(),
+                3,
+                "one separator per semantic part boundary"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_reasoning_content_framing_stream_matches_nonstream_exactly() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, expected_thinking, expected_signature) in reasoning_content_framing_cases() {
+        let request = json!({
+            "model":format!("responses-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"reason"}],
+            "stream":true
+        });
+        let (status, body) = send(post_json("/v1/messages", request, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        let thinking: String = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta" && event["delta"]["type"] == "thinking_delta"
+            })
+            .filter_map(|event| event["delta"]["thinking"].as_str())
+            .collect();
+        let signatures: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta"
+                    && event["delta"]["type"] == "signature_delta"
+            })
+            .filter_map(|event| event["delta"]["signature"].as_str())
+            .collect();
+        assert_eq!(thinking, expected_thinking, "{model}");
+        assert_eq!(signatures, [expected_signature], "{model}");
+        if model == "gpt-reasoning-multiple-parts" {
+            assert_eq!(
+                thinking.matches(REASONING_SUMMARY_SEPARATOR).count(),
+                3,
+                "duplicate part.added must not duplicate separators"
             );
         }
     }

@@ -163,6 +163,42 @@ content field is present (including an explicitly empty string); carrier-free
 aggregate-empty reasoning emits no fabricated
 Anthropic thinking/signature data.
 
+### Reasoning summary framing policy
+
+One policy is shared by JSON and SSE translations:
+
+1. Summary parts stay in ascending `summary_index`/array order.
+2. Each part's text is preserved byte-for-byte, including leading/trailing
+   whitespace and empty elements.
+3. Distinct parts are joined with exactly `U+2063` followed by one blank line
+   (`"\u2063\n\n"`), including boundaries adjacent to empty parts.
+4. Whitespace is inspected only to classify the whole summary as
+   aggregate-empty. An aggregate-empty item with an `id` or
+   `encrypted_content` field emits `Thinking...` plus its exact carrier; a
+   carrier-free aggregate-empty item emits no thinking block or signature.
+5. Anthropic history splits the reserved separator back into the original
+   Responses summary parts.
+
+Codex 0.144.1
+[`process_responses_event`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/sse/responses.rs#L326-L465)
+parses `response.reasoning_summary_part.added`,
+`response.reasoning_summary_text.delta`, and
+`response.reasoning_summary_text.done`, followed by the authoritative
+`response.output_item.done`. The stream bridge buffers those fragments by
+`output_index`/`summary_index`, assigns rather than appends the complete `done`
+text, and renders once from the final item (or the ordered buffer if the final
+summary is absent). This prevents duplicate separators when a part event is
+repeated or when deltas and done events both carry the text. Exact public
+evidence is in `claude_reasoning_content_framing_nonstream_is_lossless` and
+`claude_reasoning_content_framing_stream_matches_nonstream_exactly`.
+
+The `U+2063` boundary follows the
+[audited TypeScript reference](https://github.com/caozhiyuan/copilot-api/blob/cd8207cb70ede07771bf37a04accfbf2af76d980/src/routes/messages/responses-translation.ts#L70-L75).
+This proxy
+intentionally does **not** apply that reference's final `.trim()`, because
+preserving valid reasoning text and making JSON/SSE output identical is safer
+for continuation.
+
 To route Codex through a configured OpenAI Responses provider, set the model to
 `provider/model`, or map a friendly model name in `config.json`:
 
@@ -191,7 +227,7 @@ Status means deterministic, credential-free evidence exists.
 | Tool definitions/results | tool use/result, multi-turn | function/custom/tool-search calls and outputs, including optional IDs | optional-item boundary audit |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
 | Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
-| Thinking/reasoning | exact optional carriers; aggregate-empty placeholders only with opaque data | reasoning items with every optional ID/encrypted-content combination | public request-carrier and non-stream/stream empty-summary regressions |
+| Thinking/reasoning | exact optional carriers; lossless whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders | reasoning items with every optional ID/encrypted-content combination | public request-carrier, framing, and empty-summary regressions in both modes |
 | Usage | Anthropic cache/input/output fields | OpenAI cached/reasoning token details | native response assertions |
 | Model routing | aliases, `[1m]`, provider models | aliases and `provider/model` | model helpers and provider boundary tests |
 | Unknown fields | retained in known top-level/items | retained in typed items; uninspected variants raw-preserved | captured extension sentinels and complete `ResponseItem` audit |
