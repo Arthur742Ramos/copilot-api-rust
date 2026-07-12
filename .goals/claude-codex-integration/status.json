@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 6,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -31,6 +31,11 @@
       "iteration": 5,
       "verdict": "FAIL",
       "summary": "Framing equivalence passes, but reasoning_text.delta is dropped and missing/duplicate output-item lifecycle can lose or duplicate reasoning while reporting success."
+    },
+    {
+      "iteration": 6,
+      "verdict": "FAIL",
+      "summary": "Reasoning lifecycle and bounded-state fixes pass, but valid Codex completed/incomplete terminals without response.status are rejected by the bridge."
     }
   ]
 }
