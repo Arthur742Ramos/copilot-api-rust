@@ -21,6 +21,11 @@
       "iteration": 3,
       "verdict": "FAIL",
       "summary": "Translated Chat Completions upstream error objects are still treated as empty-choice chunks; streaming matrix and regression coverage overstate failure compatibility."
+    },
+    {
+      "iteration": 4,
+      "verdict": "FAIL",
+      "summary": "Missing or non-array translated Chat choices still fabricate successful empty-choice completions or emit no terminal error; matrix and regression coverage overstate malformed-stream compatibility."
     }
   ]
 }
