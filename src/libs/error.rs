@@ -124,18 +124,24 @@ impl std::fmt::Display for AppError {
     }
 }
 
-/// If `body` is a JSON object that already looks like an error envelope, return
-/// it parsed so it can be forwarded to the client verbatim (avoids the
-/// double-encoding where a JSON error body is stringified into our `message`).
-/// Recognizes both `{"error": {...}}` and `{"type":"error","error":{...}}`.
+/// If `body` is a JSON object that looks like an error envelope, normalize it to
+/// the complete Anthropic shape and return it parsed (avoids the double-encoding
+/// where a JSON error body is stringified into our `message`).
+///
+/// Upstreams commonly omit the top-level discriminator and return only
+/// `{"error": {...}}`. Anthropic SDKs require
+/// `{"type":"error","error":{...}}`, so add or correct that discriminator while
+/// preserving the nested error and any other upstream fields. An already
+/// complete Anthropic envelope is unchanged.
 fn parse_upstream_error_envelope(body: &str) -> Option<serde_json::Value> {
-    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-    let obj = value.as_object()?;
-    if obj.get("error").map(|e| e.is_object()).unwrap_or(false) {
-        Some(value)
-    } else {
-        None
-    }
+    let mut value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let obj = value.as_object_mut()?;
+    obj.get("error").filter(|error| error.is_object())?;
+    obj.insert(
+        "type".to_string(),
+        serde_json::Value::String("error".to_string()),
+    );
+    Some(value)
 }
 
 /// Best-effort extraction of a human-readable message from a non-envelope JSON
@@ -257,8 +263,8 @@ impl IntoResponse for AppError {
                         }
                     }))
                 } else if let Some(envelope) = parse_upstream_error_envelope(&e.body) {
-                    // Upstream sent a recognizable error envelope — forward it
-                    // verbatim so the client sees the real structured error.
+                    // Preserve the real structured upstream error while ensuring
+                    // the top-level discriminator required by Anthropic SDKs.
                     Json(envelope)
                 } else {
                     // Non-envelope JSON or plain text: synthesize the Anthropic
@@ -475,6 +481,7 @@ mod tests {
     async fn upstream_json_error_envelope_is_forwarded_verbatim() {
         // A JSON error envelope from upstream must be forwarded as structured
         // JSON, not stringified into our `message` (the double-encoding bug).
+        // A nested-only envelope must also gain the SDK-required discriminator.
         let err = AppError::Http(HttpError::new(
             "Failed",
             status(400),
@@ -483,6 +490,7 @@ mod tests {
         ));
         let (status, _headers, body) = render(err).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(
             body["error"]["message"],
@@ -490,6 +498,29 @@ mod tests {
         );
         // The message must be a string, not escaped JSON.
         assert!(body["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn complete_upstream_error_envelope_is_preserved() {
+        let upstream = json!({
+            "type": "error",
+            "error": {
+                "type": "permission_error",
+                "message": "Access denied",
+                "upstream_code": "forbidden",
+            },
+            "request_id": "req-upstream",
+        });
+        let err = AppError::Http(HttpError::new(
+            "Failed",
+            StatusCode::FORBIDDEN,
+            HeaderMap::new(),
+            upstream.to_string(),
+        ));
+
+        let (status, _headers, body) = render(err).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, upstream);
     }
 
     #[tokio::test]

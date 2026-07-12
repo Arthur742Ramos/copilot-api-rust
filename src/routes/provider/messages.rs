@@ -122,6 +122,7 @@ pub async fn handle_provider_messages_for_provider(
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({
+                "type": "error",
                 "error": {
                     "message": format!("Provider '{provider}' not found or disabled"),
                     "type": "invalid_request_error",

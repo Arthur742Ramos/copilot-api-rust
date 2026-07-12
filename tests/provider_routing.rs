@@ -31,18 +31,22 @@ fn post_provider_messages(provider: &str) -> Request<Body> {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn unknown_provider_returns_404() {
+async fn unknown_provider_returns_complete_anthropic_404() {
     // No keys configured -> general auth allows the request to reach the handler.
     set_config(&[], None);
 
     let (status, body) = send(post_provider_messages("definitely-not-a-real-provider")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let value = json_body(&body);
-    let message = value["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("not found") || message.contains("disabled"),
-        "expected a not-found/disabled error, got: {message}"
+    assert_eq!(
+        json_body(&body),
+        json!({
+            "type": "error",
+            "error": {
+                "message": "Provider 'definitely-not-a-real-provider' not found or disabled",
+                "type": "invalid_request_error",
+            },
+        })
     );
 }
 
