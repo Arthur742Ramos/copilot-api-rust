@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 9,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -46,6 +46,11 @@
       "iteration": 8,
       "verdict": "FAIL",
       "summary": "Terminal identity and usage fixes pass, but malformed required function-call scalars still coerce to empty tool identity and successful Anthropic completion."
+    },
+    {
+      "iteration": 9,
+      "verdict": "FAIL",
+      "summary": "Stream scalar validation passes, but non-stream tool-search optional IDs are dropped and malformed function outputs become end_turn success."
     }
   ]
 }
