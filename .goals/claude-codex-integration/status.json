@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 2,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -11,6 +11,11 @@
       "iteration": 1,
       "verdict": "FAIL",
       "summary": "Valid Codex 0.144.1 reasoning, compaction, and image input items are rejected before provider dispatch; docs also overstate npm evidence."
+    },
+    {
+      "iteration": 2,
+      "verdict": "FAIL",
+      "summary": "Codex optional fields and id-less compaction continuation pass, but rs1 optional-reasoning carriers are silently dropped by Claude request translation."
     }
   ]
 }
