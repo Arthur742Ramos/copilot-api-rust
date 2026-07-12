@@ -49,7 +49,7 @@ use crate::routes::messages::stream_translation::{
 use crate::routes::messages::web_search::fulfill::{
     build_synthetic_stream_events, collect_web_search_responses_stream_result,
     has_web_search_server_tool, is_web_search_only_request, prepare_web_search_responses_payload,
-    reconstruct_web_search_response, strip_web_search_server_tool,
+    reconstruct_web_search_response, strip_web_search_server_tool, validate_web_search_result,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
@@ -520,7 +520,8 @@ fn respond_responses_provider_messages_json(
 
     let tool_search_name =
         resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
-    let anthropic_response = translate_responses_result_to_anthropic(body, Some(&tool_search_name));
+    let anthropic_response =
+        translate_responses_result_to_anthropic(body, Some(&tool_search_name))?;
     Ok(Json(anthropic_response).into_response())
 }
 
@@ -532,6 +533,7 @@ fn respond_web_search_provider_messages_json(
     payload: &AnthropicMessagesPayload,
     provider: &str,
 ) -> Result<Response, AppError> {
+    validate_web_search_result(body)?;
     let recorder = create_provider_messages_usage_recorder(payload, provider);
     recorder.record(normalize_responses_usage(
         responses_usage_value(body).as_ref(),

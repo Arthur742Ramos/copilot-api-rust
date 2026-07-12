@@ -345,19 +345,12 @@ pub struct ResponseInputFile {
 // Result
 // ---------------------------------------------------------------------------
 
-/// Deserialize helper: coerce an explicit JSON `null` into `T::default()`.
+/// Deserialize helper used by the separate GitHub token/usage compatibility
+/// payloads, whose upstream contract historically returns nullable counters.
 ///
-/// `#[serde(default)]` alone only covers a *missing* key — an explicit `null`
-/// still routes to `T::deserialize` and fails for non-`Option` types with
-/// `invalid type: null, expected a string` (and the equivalent for other
-/// types). Copilot's Claude backend intermittently emits `null` for fields it
-/// usually sends as a string/array (observed: `output_text` on tool-use turns,
-/// and required strings on output items), which used to 500 the *entire*
-/// response in [`read_json_capped::<ResponsesResult>`]. Pairing this with
-/// `#[serde(default)]` makes both a missing key and an explicit `null` decode to
-/// the default, keeping the item correctly typed so downstream translation still
-/// emits the right Anthropic blocks (a blanket `Other(Value)` fallback would
-/// instead silently drop tool-use/thinking blocks — strictly worse).
+/// Responses output deliberately does not use this helper: coercing malformed
+/// known output fields to empty strings, arrays, or zeroes can turn an invalid
+/// provider response into a successful empty Anthropic turn.
 pub(crate) fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -366,47 +359,46 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// Mirrors the TS `ResponsesResult`. Fields default-lenient so embedded results
-/// inside stream events deserialize even when partial; unknown keys round-trip
-/// through `extra`.
+/// Mirrors a complete Responses result. Known required output/usage fields are
+/// strict; unknown keys and unknown output variants round-trip through raw maps.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponsesResult {
-    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(default, deserialize_with = "null_to_default")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub object: String,
-    #[serde(default, deserialize_with = "null_to_default")]
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub created_at: i64,
-    #[serde(default, deserialize_with = "null_to_default")]
     pub model: String,
-    #[serde(default, deserialize_with = "null_to_default")]
     pub output: Vec<ResponseOutputItem>,
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub output_text: String,
-    #[serde(default, deserialize_with = "null_to_default")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_text: Option<String>,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ResponseUsage>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub error: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub incomplete_details: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub instructions: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub metadata: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub temperature: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub tool_choice: Value,
-    #[serde(default, deserialize_with = "null_to_default")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub top_p: Value,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +413,7 @@ pub struct ResponsesResult {
 pub enum ResponseOutputItem {
     Message(ResponseOutputMessage),
     FunctionCall(ResponseOutputFunctionCall),
+    CustomToolCall(ResponseOutputCustomToolCall),
     ToolSearchOutput(ResponseOutputToolSearchOutput),
     ToolSearchCall(ResponseOutputToolSearchCall),
     Compaction(ResponseOutputCompaction),
@@ -434,27 +427,34 @@ impl<'de> Deserialize<'de> for ResponseOutputItem {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        let tag = value.get("type").and_then(Value::as_str).map(str::to_owned);
-        Ok(match tag.as_deref() {
-            Some("message") => ResponseOutputItem::Message(
+        let tag = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("output item type must be a string"))?
+            .to_string();
+        Ok(match tag.as_str() {
+            "message" => ResponseOutputItem::Message(
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?,
             ),
-            Some("function_call") => ResponseOutputItem::FunctionCall(
+            "function_call" => ResponseOutputItem::FunctionCall(
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?,
             ),
-            Some("tool_search_output") => ResponseOutputItem::ToolSearchOutput(
+            "custom_tool_call" => ResponseOutputItem::CustomToolCall(
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?,
             ),
-            Some("tool_search_call") => ResponseOutputItem::ToolSearchCall(
+            "tool_search_output" => ResponseOutputItem::ToolSearchOutput(
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?,
             ),
-            Some("compaction" | "compaction_summary") => {
+            "tool_search_call" => ResponseOutputItem::ToolSearchCall(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            ),
+            "compaction" | "compaction_summary" => {
                 let mut item: ResponseOutputCompaction =
                     serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 item.item_type = "compaction".to_string();
                 ResponseOutputItem::Compaction(item)
             }
-            Some("reasoning") => ResponseOutputItem::Reasoning(
+            "reasoning" => ResponseOutputItem::Reasoning(
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?,
             ),
             _ => ResponseOutputItem::Other(value),
@@ -466,14 +466,12 @@ impl<'de> Deserialize<'de> for ResponseOutputItem {
 pub struct ResponseOutputMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
+    #[serde(rename = "type")]
     pub item_type: String,
-    #[serde(default, deserialize_with = "null_to_default")]
     pub role: String,
-    #[serde(default, deserialize_with = "null_to_default")]
-    pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<Vec<ResponseOutputContentBlock>>,
+    pub status: Option<String>,
+    pub content: Vec<ResponseOutputContentBlock>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -482,10 +480,9 @@ pub struct ResponseOutputMessage {
 pub struct ResponseOutputReasoning {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
+    #[serde(rename = "type")]
     pub item_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<Vec<ResponseReasoningBlock>>,
+    pub summary: Vec<ResponseReasoningBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ResponseReasoningBlock>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -498,10 +495,9 @@ pub struct ResponseOutputReasoning {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseReasoningBlock {
-    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
+    #[serde(rename = "type")]
     pub block_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
+    pub text: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -510,13 +506,10 @@ pub struct ResponseReasoningBlock {
 pub struct ResponseOutputFunctionCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
+    #[serde(rename = "type")]
     pub item_type: String,
-    #[serde(default, deserialize_with = "null_to_default")]
     pub call_id: String,
-    #[serde(default, deserialize_with = "null_to_default")]
     pub name: String,
-    #[serde(default, deserialize_with = "null_to_default")]
     pub arguments: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -527,16 +520,32 @@ pub struct ResponseOutputFunctionCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseOutputCustomToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type")]
+    pub item_type: String,
+    pub call_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub input: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseOutputToolSearchCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
+    #[serde(rename = "type")]
     pub item_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
     pub arguments: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution: Option<String>,
+    pub execution: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(flatten)]
@@ -547,16 +556,13 @@ pub struct ResponseOutputToolSearchCall {
 pub struct ResponseOutputToolSearchOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
+    #[serde(rename = "type")]
     pub item_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
-    #[serde(default, deserialize_with = "null_to_default")]
     pub tools: Vec<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
+    pub execution: String,
+    pub status: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -565,16 +571,15 @@ pub struct ResponseOutputToolSearchOutput {
 pub struct ResponseOutputCompaction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type", default, deserialize_with = "null_to_default")]
+    #[serde(rename = "type")]
     pub item_type: String,
-    #[serde(default, deserialize_with = "null_to_default")]
     pub encrypted_content: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
 /// Mirrors the TS `ResponseOutputContentBlock` union.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ResponseOutputContentBlock {
     Text(ResponseOutputText),
@@ -582,11 +587,30 @@ pub enum ResponseOutputContentBlock {
     Other(Value),
 }
 
+impl<'de> Deserialize<'de> for ResponseOutputContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value.get("type").and_then(Value::as_str) {
+            Some("output_text" | "input_text") => serde_json::from_value(value)
+                .map(ResponseOutputContentBlock::Text)
+                .map_err(serde::de::Error::custom),
+            Some("refusal") => serde_json::from_value(value)
+                .map(ResponseOutputContentBlock::Refusal)
+                .map_err(serde::de::Error::custom),
+            _ => Ok(ResponseOutputContentBlock::Other(value)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseOutputText {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: String,
+    #[serde(default)]
     pub annotations: Vec<Value>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -607,11 +631,8 @@ pub struct ResponseOutputRefusal {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseUsage {
-    #[serde(default, deserialize_with = "null_to_default")]
     pub input_tokens: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<i64>,
-    #[serde(default, deserialize_with = "null_to_default")]
+    pub output_tokens: i64,
     pub total_tokens: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<ResponseUsageInputDetails>,
@@ -623,7 +644,6 @@ pub struct ResponseUsage {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseUsageInputDetails {
-    #[serde(default, deserialize_with = "null_to_default")]
     pub cached_tokens: i64,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -631,7 +651,6 @@ pub struct ResponseUsageInputDetails {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseUsageOutputDetails {
-    #[serde(default, deserialize_with = "null_to_default")]
     pub reasoning_tokens: i64,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -651,25 +670,27 @@ pub enum ResponseStreamEvent {
     Completed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         copilot_quota_snapshots: Option<Value>,
-        response: ResponsesResult,
+        /// Terminal response objects are source-valid partials. Callers merge
+        /// them with `response.created` before parsing a complete result.
+        response: Value,
         #[serde(default)]
         sequence_number: i64,
     },
     #[serde(rename = "response.incomplete")]
     Incomplete {
-        response: ResponsesResult,
+        response: Value,
         #[serde(default)]
         sequence_number: i64,
     },
     #[serde(rename = "response.failed")]
     Failed {
-        response: ResponsesResult,
+        response: Value,
         #[serde(default)]
         sequence_number: i64,
     },
     #[serde(rename = "response.created")]
     Created {
-        response: ResponsesResult,
+        response: Value,
         #[serde(default)]
         sequence_number: i64,
     },
@@ -1148,8 +1169,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(sequence_number, 7);
+                let response: ResponsesResult =
+                    serde_json::from_value(response).expect("parse complete terminal response");
                 assert_eq!(response.id, "resp_123");
-                assert_eq!(response.output_text, "hello");
+                assert_eq!(response.output_text.as_deref(), Some("hello"));
                 assert_eq!(response.output.len(), 1);
                 let usage = response.usage.expect("usage present");
                 assert_eq!(usage.input_tokens, 10);
@@ -1158,14 +1181,36 @@ mod tests {
                 match &response.output[0] {
                     ResponseOutputItem::Message(msg) => {
                         assert_eq!(msg.role, "assistant");
-                        let content = msg.content.as_ref().expect("content");
-                        match &content[0] {
+                        match &msg.content[0] {
                             ResponseOutputContentBlock::Text(t) => assert_eq!(t.text, "hello"),
                             other => panic!("expected output_text, got {other:?}"),
                         }
                     }
+
                     other => panic!("expected message output item, got {other:?}"),
                 }
+            }
+            other => panic!("expected completed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_partial_terminal_is_not_deserialized_as_a_complete_result() {
+        let event: ResponseStreamEvent = serde_json::from_value(json!({
+            "type":"response.completed",
+            "sequence_number":2,
+            "response":{
+                "id":"resp_partial",
+                "usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}
+            }
+        }))
+        .expect("source-valid partial terminal event");
+        match event {
+            ResponseStreamEvent::Completed { response, .. } => {
+                assert_eq!(response["id"], "resp_partial");
+                assert!(response.get("model").is_none());
+                assert!(response.get("output").is_none());
+                assert!(serde_json::from_value::<ResponsesResult>(response).is_err());
             }
             other => panic!("expected completed event, got {other:?}"),
         }
@@ -1381,7 +1426,30 @@ mod tests {
                 "execution":"client",
                 "tools":[]
             },
-            {"type":"compaction","encrypted_content":"enc_compact"}
+            {"type":"compaction","encrypted_content":"enc_compact"},
+            {
+                "type":"local_shell_call",
+                "status":"completed",
+                "action":{"type":"exec","command":["pwd"]}
+            },
+            {
+                "type":"custom_tool_call_output",
+                "call_id":"custom_1",
+                "output":"done"
+            },
+            {
+                "type":"web_search_call",
+                "id":"web_1",
+                "status":"completed",
+                "action":{"type":"search","query":"tool"}
+            },
+            {
+                "type":"image_generation_call",
+                "status":"completed",
+                "result":"image-data"
+            },
+            {"type":"context_compaction","encrypted_content":null},
+            {"type":"future_response_item","future":{"keep":true}}
         ]);
         let result: ResponsesResult = serde_json::from_value(json!({
             "id":"resp_optional",
@@ -1421,12 +1489,9 @@ mod tests {
         assert_eq!(t, ResponsesTransport::Http);
     }
 
-    // Regression: Copilot's Claude backend intermittently emits `null` where the
-    // Responses schema declares a string. `#[serde(default)]` does NOT cover an
-    // explicit `null` (only a missing key), so before `null_to_default` these
-    // bodies failed the whole parse with `invalid type: null, expected a string`
-    // and the proxy returned HTTP 500 (observed 2026-06-18). Each case must now
-    // decode, stay correctly typed, and round-trip.
+    // `output_text` is the one explicitly observed nullable compatibility field.
+    // It stays optional rather than being coerced to an indistinguishable empty
+    // string. Known required output and usage fields intentionally reject null.
 
     #[test]
     fn null_output_text_does_not_500() {
@@ -1435,21 +1500,19 @@ mod tests {
         let raw = r#"{
             "id": "resp_1",
             "object": "response",
+            "created_at":1,
             "model": "claude-opus-4-8",
             "status": "completed",
             "output_text": null,
             "output": []
         }"#;
         let result: ResponsesResult = serde_json::from_str(raw).expect("null output_text parses");
-        assert_eq!(result.output_text, "");
+        assert_eq!(result.output_text, None);
         assert_eq!(result.id, "resp_1");
     }
 
     #[test]
-    fn null_function_call_arguments_stays_typed() {
-        // A no-arg tool call where the backend sends `arguments: null` instead of
-        // `"{}"`. Must remain a typed FunctionCall (NOT degrade to Other, which
-        // would silently drop the tool_use block downstream) with empty args.
+    fn null_function_call_arguments_is_rejected() {
         let raw = r#"{
             "id": "resp_2",
             "object": "response",
@@ -1465,21 +1528,17 @@ mod tests {
                 }
             ]
         }"#;
-        let result: ResponsesResult = serde_json::from_str(raw).expect("null arguments parses");
-        match &result.output[0] {
-            ResponseOutputItem::FunctionCall(fc) => {
-                assert_eq!(fc.call_id, "call_1");
-                assert_eq!(fc.name, "list_files");
-                assert_eq!(fc.arguments, "");
-            }
-            other => panic!("expected typed function_call, got {other:?}"),
-        }
+        assert!(serde_json::from_str::<ResponsesResult>(raw).is_err());
     }
 
     #[test]
     fn null_message_status_stays_typed() {
         let raw = r#"{
             "id": "resp_3",
+            "object":"response",
+            "created_at":1,
+            "model":"gpt-5.4",
+            "status":"completed",
             "output": [
                 {
                     "id": "msg_1",
@@ -1495,7 +1554,7 @@ mod tests {
         let result: ResponsesResult = serde_json::from_str(raw).expect("null status parses");
         match &result.output[0] {
             ResponseOutputItem::Message(m) => {
-                assert_eq!(m.status, "");
+                assert_eq!(m.status, None);
                 assert_eq!(m.role, "assistant");
             }
             other => panic!("expected typed message, got {other:?}"),
@@ -1503,25 +1562,21 @@ mod tests {
     }
 
     #[test]
-    fn null_usage_token_counts_do_not_500() {
-        // Same null-class bug for the usage scalars: a `usage` object present
-        // with null token counts must decode to 0 rather than 500 the whole body.
+    fn null_usage_token_counts_are_rejected() {
         let raw = r#"{
             "id": "resp_4",
+            "model":"gpt-5.4",
+            "status":"completed",
             "output": [],
             "usage": {
                 "input_tokens": null,
+                "output_tokens": null,
                 "total_tokens": null,
                 "input_tokens_details": { "cached_tokens": null },
                 "output_tokens_details": { "reasoning_tokens": null }
             }
         }"#;
-        let result: ResponsesResult = serde_json::from_str(raw).expect("null usage parses");
-        let usage = result.usage.expect("usage present");
-        assert_eq!(usage.input_tokens, 0);
-        assert_eq!(usage.total_tokens, 0);
-        assert_eq!(usage.input_tokens_details.unwrap().cached_tokens, 0);
-        assert_eq!(usage.output_tokens_details.unwrap().reasoning_tokens, 0);
+        assert!(serde_json::from_str::<ResponsesResult>(raw).is_err());
     }
 
     #[test]

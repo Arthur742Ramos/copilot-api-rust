@@ -213,7 +213,10 @@ pub fn extract_web_search_result(result: &ResponsesResult) -> WebSearchExtract {
     let answer_text = if !joined_trimmed.is_empty() {
         joined_trimmed.to_string()
     } else {
-        result.output_text.trim().to_string()
+        match result.output_text.as_deref() {
+            Some(output_text) => output_text.trim().to_string(),
+            None => String::new(),
+        }
     };
 
     WebSearchExtract {

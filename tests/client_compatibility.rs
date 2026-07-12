@@ -892,7 +892,17 @@ fn malformed_scalar_stream_fixture(model: &str) -> Option<Response> {
             json!({
                 "type":"response.completed",
                 "sequence_number":sequence_number,
-                "response":{"id":"resp_scalar_fixture","output":output}
+                "response":{
+                    "id":"resp_scalar_fixture",
+                    "output":output,
+                    "usage":{
+                        "input_tokens":5,
+                        "input_tokens_details":{"cached_tokens":2},
+                        "output_tokens":3,
+                        "output_tokens_details":{"reasoning_tokens":1},
+                        "total_tokens":8
+                    }
+                }
             }),
         )
     };
@@ -934,6 +944,44 @@ fn malformed_scalar_stream_fixture(model: &str) -> Option<Response> {
             ),
             completed_with(5, vec![function_done_item]),
         ],
+        "gpt-scalar-custom-tool-valid" => {
+            let added = json!({
+                "type":"custom_tool_call",
+                "id":"custom-scalar",
+                "call_id":"custom-call",
+                "name":"freeform",
+                "input":""
+            });
+            let done = json!({
+                "type":"custom_tool_call",
+                "id":"custom-scalar",
+                "call_id":"custom-call",
+                "name":"freeform",
+                "input":"payload"
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":added
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "item":done.clone()
+                    }),
+                ),
+                completed_with(3, vec![done]),
+            ]
+        }
         "gpt-scalar-function-whitespace-namespace-valid" => {
             let added = json!({
                 "type":"function_call",
@@ -977,6 +1025,7 @@ fn malformed_scalar_stream_fixture(model: &str) -> Option<Response> {
         "gpt-scalar-tool-search-valid" => {
             let item = json!({
                 "type":"tool_search_call",
+                "call_id":null,
                 "execution":"client",
                 "arguments":{"query":"calendar","limit":1}
             });
@@ -1003,6 +1052,195 @@ fn malformed_scalar_stream_fixture(model: &str) -> Option<Response> {
                 completed_with(3, vec![item]),
             ]
         }
+        "gpt-scalar-tool-search-item-id-valid" => {
+            let item = json!({
+                "type":"tool_search_call",
+                "id":"search-item-only",
+                "execution":"client",
+                "arguments":{"query":"calendar"}
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                completed_with(3, vec![item]),
+            ]
+        }
+        "gpt-scalar-tool-search-late-id-valid" => {
+            let added = json!({
+                "type":"tool_search_call",
+                "id":"search-late-item",
+                "call_id":null,
+                "execution":"client",
+                "arguments":{"query":"calendar"}
+            });
+            let done = json!({
+                "type":"tool_search_call",
+                "id":"search-late-item",
+                "call_id":"late-search-call",
+                "execution":"client",
+                "arguments":{"query":"calendar"}
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":added
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "item":done.clone()
+                    }),
+                ),
+                completed_with(3, vec![done]),
+            ]
+        }
+        "gpt-scalar-tool-search-conflicting-id" => {
+            let added = json!({
+                "type":"tool_search_call",
+                "id":"search-conflict-item",
+                "call_id":"search-call-a",
+                "execution":"client",
+                "arguments":{"query":"calendar"}
+            });
+            let done = json!({
+                "type":"tool_search_call",
+                "id":"search-conflict-item",
+                "call_id":"search-call-b",
+                "execution":"client",
+                "arguments":{"query":"calendar"}
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":added
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "item":done
+                    }),
+                ),
+                later_terminal,
+            ]
+        }
+        "gpt-scalar-tool-search-removed-id" => {
+            let added = json!({
+                "type":"tool_search_call",
+                "id":"search-removed-item",
+                "call_id":"search-call-present",
+                "execution":"client",
+                "arguments":{"query":"calendar"}
+            });
+            let done = json!({
+                "type":"tool_search_call",
+                "id":"search-removed-item",
+                "call_id":null,
+                "execution":"client",
+                "arguments":{"query":"calendar"}
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":added
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":2,
+                        "output_index":0,
+                        "item":done
+                    }),
+                ),
+                later_terminal,
+            ]
+        }
+        "gpt-scalar-tool-search-unexpected-delta" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"tool_search_call",
+                        "call_id":null,
+                        "execution":"client",
+                        "arguments":{"query":"calendar"}
+                    }
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "delta":"{}"
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-tool-search-empty-call-id" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"tool_search_call",
+                        "call_id":" ",
+                        "execution":"client",
+                        "arguments":{"query":"calendar"}
+                    }
+                }),
+            ),
+            later_terminal,
+        ],
         "gpt-scalar-tool-search-output-valid" => {
             let item = json!({
                 "type":"tool_search_output",
@@ -1074,6 +1312,28 @@ fn malformed_scalar_stream_fixture(model: &str) -> Option<Response> {
                     }),
                 ),
                 completed_with(5, vec![item]),
+            ]
+        }
+        "gpt-scalar-message-incomplete-on-completed" => {
+            let item = json!({
+                "type":"message",
+                "id":"message-incomplete",
+                "role":"assistant",
+                "status":"incomplete",
+                "content":[{"type":"output_text","text":"partial"}]
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":item.clone()
+                    }),
+                ),
+                completed_with(2, vec![item]),
             ]
         }
         "gpt-scalar-reasoning-valid" => {
@@ -1165,6 +1425,19 @@ fn malformed_scalar_stream_fixture(model: &str) -> Option<Response> {
                     "sequence_number":1,
                     "output_index":0,
                     "item":{"type":"function_call"}
+                }),
+            ),
+            later_terminal,
+        ],
+        "gpt-scalar-custom-tool-malformed" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{"type":"custom_tool_call","call_id":42,"name":null}
                 }),
             ),
             later_terminal,
@@ -2295,6 +2568,488 @@ fn malformed_scalar_stream_fixture(model: &str) -> Option<Response> {
     Some(sse_response(render_sse(&events)))
 }
 
+fn scalar_nonstream_fixture(model: &str) -> Option<Response> {
+    let output = match model {
+        "gpt-scalar-function-valid" => vec![json!({
+            "type":"function_call",
+            "id":"function-scalar",
+            "call_id":"call-scalar",
+            "name":"read",
+            "arguments":"{\"path\":\"a\"}"
+        })],
+        "gpt-scalar-custom-tool-valid" => vec![json!({
+            "type":"custom_tool_call",
+            "id":"custom-scalar",
+            "call_id":"custom-call",
+            "name":"freeform",
+            "input":"payload"
+        })],
+        "gpt-scalar-tool-search-valid" => vec![json!({
+            "type":"tool_search_call",
+            "call_id":null,
+            "execution":"client",
+            "arguments":{"query":"calendar","limit":1}
+        })],
+        "gpt-scalar-tool-search-item-id-valid" => vec![json!({
+            "type":"tool_search_call",
+            "id":"search-item-only",
+            "execution":"client",
+            "arguments":{"query":"calendar"}
+        })],
+        "gpt-scalar-tool-search-late-id-valid" => vec![json!({
+            "type":"tool_search_call",
+            "id":"search-late-item",
+            "call_id":"late-search-call",
+            "execution":"client",
+            "arguments":{"query":"calendar"}
+        })],
+        "gpt-scalar-tool-search-output-valid" => vec![json!({
+            "type":"tool_search_output",
+            "status":"completed",
+            "execution":"client",
+            "tools":[{"name":"calendar"}]
+        })],
+        "gpt-scalar-message-valid" => vec![json!({
+            "type":"message",
+            "id":"message-scalar",
+            "role":"assistant",
+            "content":[{
+                "type":"output_text",
+                "text":"AB",
+                "annotations":[{"type":"url_citation","url":"https://example.test"}]
+            }],
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn-scalar"}
+        })],
+        "gpt-scalar-reasoning-valid" => vec![json!({
+            "type":"reasoning",
+            "id":"reasoning-scalar",
+            "summary":[{"type":"summary_text","text":"summary"}],
+            "content":[{"type":"reasoning_text","text":"content"}],
+            "encrypted_content":"opaque"
+        })],
+        "gpt-scalar-compaction-valid" => {
+            vec![json!({"type":"compaction","encrypted_content":"opaque-compaction"})]
+        }
+        "gpt-scalar-function-added-missing" => vec![json!({"type":"function_call"})],
+        "gpt-scalar-custom-tool-malformed" => {
+            vec![json!({"type":"custom_tool_call","call_id":42,"name":null})]
+        }
+        "gpt-scalar-tool-search-missing-execution" => vec![json!({
+            "type":"tool_search_call",
+            "arguments":{}
+        })],
+        "gpt-scalar-tool-search-wrong" => vec![json!({
+            "type":"tool_search_call",
+            "call_id":42,
+            "execution":"client",
+            "arguments":{}
+        })],
+        "gpt-scalar-tool-search-empty-call-id" => vec![json!({
+            "type":"tool_search_call",
+            "call_id":" ",
+            "execution":"client",
+            "arguments":{}
+        })],
+        "gpt-scalar-tool-search-output-malformed" => vec![json!({
+            "type":"tool_search_output",
+            "tools":"not-an-array"
+        })],
+        "gpt-scalar-message-wrong-role" => vec![json!({
+            "type":"message",
+            "role":"user",
+            "content":[]
+        })],
+        "gpt-scalar-message-incomplete-on-completed" => vec![json!({
+            "type":"message",
+            "id":"message-incomplete",
+            "role":"assistant",
+            "status":"incomplete",
+            "content":[{"type":"output_text","text":"partial"}]
+        })],
+        "gpt-scalar-message-block-malformed" => vec![json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":42}]
+        })],
+        "gpt-scalar-reasoning-missing-summary" => vec![json!({
+            "type":"reasoning",
+            "id":"reasoning-scalar",
+            "encrypted_content":"opaque"
+        })],
+        "gpt-scalar-reasoning-wrong-id" => vec![json!({
+            "type":"reasoning",
+            "id":42,
+            "summary":[]
+        })],
+        "gpt-scalar-compaction-missing" => vec![json!({"type":"compaction"})],
+        "gpt-scalar-metadata-wrong" => vec![json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[],
+            "internal_chat_message_metadata_passthrough":"wrong"
+        })],
+        "gpt-contract-completed-empty-id"
+        | "gpt-contract-created-wrong-model"
+        | "gpt-contract-terminal-wrong-end-turn"
+        | "gpt-contract-usage-wrong-input"
+        | "gpt-contract-usage-total-mismatch" => vec![],
+        _ => return None,
+    };
+    let mut response = json!({
+        "id":"resp_scalar_fixture",
+        "object":"response",
+        "created_at":1,
+        "model":model,
+        "status":"completed",
+        "output":output,
+        "output_text":"",
+        "usage":{
+            "input_tokens":5,
+            "input_tokens_details":{"cached_tokens":2},
+            "output_tokens":3,
+            "output_tokens_details":{"reasoning_tokens":1},
+            "total_tokens":8
+        }
+    });
+    if model == "gpt-contract-usage-wrong-input" {
+        response["usage"] = json!({"input_tokens":"5","output_tokens":3,"total_tokens":8});
+    } else if model == "gpt-contract-usage-total-mismatch" {
+        response["usage"] = json!({"input_tokens":5,"output_tokens":3,"total_tokens":9});
+    } else if model == "gpt-contract-completed-empty-id" {
+        response["id"] = json!("");
+    } else if model == "gpt-contract-created-wrong-model" {
+        response["model"] = json!(42);
+    } else if model == "gpt-contract-terminal-wrong-end-turn" {
+        response["end_turn"] = json!("wrong");
+    }
+    Some(Json(response).into_response())
+}
+
+fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
+    let usage = json!({
+        "input_tokens":6,
+        "input_tokens_details":{"cached_tokens":1},
+        "output_tokens":4,
+        "output_tokens_details":{"reasoning_tokens":1},
+        "total_tokens":10
+    });
+    let created = (
+        "response.created",
+        json!({
+            "type":"response.created",
+            "sequence_number":0,
+            "response":{
+                "id":"resp_web_partial",
+                "object":"response",
+                "created_at":1,
+                "model":model,
+                "status":"in_progress",
+                "output":[],
+                "output_text":null,
+                "usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}
+            }
+        }),
+    );
+    let web_search_item = json!({
+        "type":"web_search_call",
+        "id":"web-search-item",
+        "status":"completed",
+        "action":{"type":"search","query":"rust async"}
+    });
+    let message_item = json!({
+        "type":"message",
+        "id":"web-message",
+        "role":"assistant",
+        "status":"completed",
+        "content":[{
+            "type":"output_text",
+            "text":"Grounded answer.",
+            "annotations":[{
+                "type":"url_citation",
+                "url":"https://example.test/source",
+                "title":"Source"
+            }]
+        }]
+    });
+    let output_events = vec![
+        (
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "sequence_number":1,
+                "output_index":0,
+                "item":web_search_item.clone()
+            }),
+        ),
+        (
+            "response.output_item.added",
+            json!({
+                "type":"response.output_item.added",
+                "sequence_number":2,
+                "output_index":1,
+                "item":{
+                    "type":"message",
+                    "id":"web-message",
+                    "role":"assistant",
+                    "status":"in_progress",
+                    "content":[]
+                }
+            }),
+        ),
+        (
+            "response.output_text.delta",
+            json!({
+                "type":"response.output_text.delta",
+                "sequence_number":3,
+                "output_index":1,
+                "content_index":0,
+                "item_id":"web-message",
+                "delta":"Grounded "
+            }),
+        ),
+        (
+            "response.output_text.annotation.added",
+            json!({
+                "type":"response.output_text.annotation.added",
+                "sequence_number":4,
+                "output_index":1,
+                "content_index":0,
+                "item_id":"web-message",
+                "annotation":{
+                    "type":"url_citation",
+                    "url":"https://example.test/source",
+                    "title":"Source"
+                }
+            }),
+        ),
+        (
+            "response.output_text.done",
+            json!({
+                "type":"response.output_text.done",
+                "sequence_number":5,
+                "output_index":1,
+                "content_index":0,
+                "item_id":"web-message",
+                "text":"Grounded answer."
+            }),
+        ),
+        (
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "sequence_number":6,
+                "output_index":1,
+                "item":message_item.clone()
+            }),
+        ),
+    ];
+
+    let events = match model {
+        "gpt-web-partial-completed" => {
+            let mut events = vec![created];
+            events.extend(output_events);
+            events.push((
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":7,
+                    "response":{"id":"resp_web_partial","usage":usage}
+                }),
+            ));
+            events
+        }
+        "gpt-web-terminal-output-completed" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":usage,
+                        "output":[web_search_item,message_item]
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-id-conflict" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_web_other","usage":usage}
+                }),
+            ),
+        ],
+        "gpt-web-terminal-model-conflict" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "model":"different-model",
+                        "usage":usage
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-status-conflict" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "status":"incomplete",
+                        "usage":usage
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-usage-conflict" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":{"input_tokens":6,"output_tokens":4,"total_tokens":9}
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-output-malformed" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":usage,
+                        "output":[{
+                            "type":"message",
+                            "role":"assistant",
+                            "content":[{"type":"output_text","text":42}]
+                        }]
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-late-text-conflict" => vec![
+            created,
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "id":"web-message",
+                        "role":"assistant",
+                        "status":"in_progress",
+                        "content":[]
+                    }
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "item_id":"web-message",
+                    "delta":"conflicting"
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":3,
+                    "output_index":0,
+                    "item":message_item
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":4,
+                    "response":{"id":"resp_web_partial","usage":usage}
+                }),
+            ),
+        ],
+        "gpt-web-delta-after-item-done" => vec![
+            created,
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":message_item
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "content_index":0,
+                    "item_id":"web-message",
+                    "delta":"late"
+                }),
+            ),
+        ],
+        "gpt-web-terminal-failed" => vec![
+            created,
+            (
+                "response.failed",
+                json!({
+                    "type":"response.failed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "error":{"message":"web fixture failed"}
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-incomplete" => vec![
+            created,
+            (
+                "response.incomplete",
+                json!({
+                    "type":"response.incomplete",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "incomplete_details":{"reason":"max_output_tokens"},
+                        "usage":usage
+                    }
+                }),
+            ),
+        ],
+        _ => return None,
+    };
+    Some(sse_response(render_sse(&events)))
+}
+
 fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
     let created = (
         "response.created",
@@ -3362,6 +4117,18 @@ fn responses_fixture(body: &Value) -> Response {
     }
 
     if body["stream"] == true {
+        if let Some(response) = web_search_partial_terminal_fixture(model) {
+            return response;
+        }
+    }
+
+    if body["stream"] != true {
+        if let Some(response) = scalar_nonstream_fixture(model) {
+            return response;
+        }
+    }
+
+    if body["stream"] == true {
         if let Some(response) = malformed_scalar_stream_fixture(model) {
             return response;
         }
@@ -3965,6 +4732,10 @@ fn sse_response(body: String) -> Response {
 }
 
 fn configure(fixture: &Fixture) {
+    configure_with_web_search_model(fixture, None);
+}
+
+fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&str>) {
     copilot_api::libs::state::with_state_mut(|state| {
         state.provider_only = Some("responses-fixture".to_string());
         state.models = None;
@@ -3992,13 +4763,17 @@ fn configure(fixture: &Fixture) {
         "gpt-incomplete",
         "gpt-cli-smoke",
         "gpt-scalar-function-valid",
+        "gpt-scalar-custom-tool-valid",
         "gpt-scalar-function-whitespace-namespace-valid",
         "gpt-scalar-tool-search-valid",
+        "gpt-scalar-tool-search-item-id-valid",
+        "gpt-scalar-tool-search-late-id-valid",
         "gpt-scalar-tool-search-output-valid",
         "gpt-scalar-message-valid",
         "gpt-scalar-reasoning-valid",
         "gpt-scalar-compaction-valid",
         "gpt-scalar-function-added-missing",
+        "gpt-scalar-custom-tool-malformed",
         "gpt-scalar-function-added-missing-call-id",
         "gpt-scalar-function-added-missing-name",
         "gpt-scalar-function-added-missing-arguments",
@@ -4020,6 +4795,10 @@ fn configure(fixture: &Fixture) {
         "gpt-scalar-function-arguments-done-invalid",
         "gpt-scalar-function-arguments-done-duplicate",
         "gpt-scalar-function-delta-after-done",
+        "gpt-scalar-tool-search-conflicting-id",
+        "gpt-scalar-tool-search-removed-id",
+        "gpt-scalar-tool-search-unexpected-delta",
+        "gpt-scalar-tool-search-empty-call-id",
         "gpt-scalar-tool-search-missing-execution",
         "gpt-scalar-tool-search-wrong",
         "gpt-scalar-tool-search-wrong-execution",
@@ -4029,6 +4808,7 @@ fn configure(fixture: &Fixture) {
         "gpt-scalar-tool-search-output-wrong-execution",
         "gpt-scalar-tool-search-output-wrong-tools",
         "gpt-scalar-message-missing",
+        "gpt-scalar-message-incomplete-on-completed",
         "gpt-scalar-message-wrong-content",
         "gpt-scalar-message-wrong-role",
         "gpt-scalar-message-content-not-array",
@@ -4063,6 +4843,17 @@ fn configure(fixture: &Fixture) {
         "gpt-scalar-output-wrapper-id-mismatch",
         "gpt-scalar-metadata-wrong",
         "gpt-scalar-metadata-turn-id-wrong",
+        "gpt-web-partial-completed",
+        "gpt-web-terminal-output-completed",
+        "gpt-web-terminal-id-conflict",
+        "gpt-web-terminal-model-conflict",
+        "gpt-web-terminal-status-conflict",
+        "gpt-web-terminal-usage-conflict",
+        "gpt-web-terminal-output-malformed",
+        "gpt-web-late-text-conflict",
+        "gpt-web-delta-after-item-done",
+        "gpt-web-terminal-failed",
+        "gpt-web-terminal-incomplete",
         "gpt-contract-created-model-less",
         "gpt-contract-created-with-model",
         "gpt-contract-created-upstream-model",
@@ -4213,6 +5004,7 @@ fn configure(fixture: &Fixture) {
             "coding-default".to_string(),
             json!("responses-fixture/gpt-fixture"),
         )])),
+        message_api_web_search_model: web_search_model.map(str::to_string),
         use_responses_api_context_management: Some(false),
         use_responses_api_web_search: Some(false),
         ..Default::default()
@@ -5813,8 +6605,11 @@ async fn claude_handled_scalar_families_accept_source_valid_shapes() {
 
     for model in [
         "gpt-scalar-function-valid",
+        "gpt-scalar-custom-tool-valid",
         "gpt-scalar-function-whitespace-namespace-valid",
         "gpt-scalar-tool-search-valid",
+        "gpt-scalar-tool-search-item-id-valid",
+        "gpt-scalar-tool-search-late-id-valid",
         "gpt-scalar-tool-search-output-valid",
         "gpt-scalar-message-valid",
         "gpt-scalar-reasoning-valid",
@@ -5886,6 +6681,7 @@ async fn claude_malformed_handled_scalars_fail_once_without_empty_blocks() {
 
     for model in [
         "gpt-scalar-function-added-missing",
+        "gpt-scalar-custom-tool-malformed",
         "gpt-scalar-function-added-missing-call-id",
         "gpt-scalar-function-added-missing-name",
         "gpt-scalar-function-added-missing-arguments",
@@ -5907,6 +6703,8 @@ async fn claude_malformed_handled_scalars_fail_once_without_empty_blocks() {
         "gpt-scalar-function-arguments-done-invalid",
         "gpt-scalar-function-arguments-done-duplicate",
         "gpt-scalar-function-delta-after-done",
+        "gpt-scalar-tool-search-unexpected-delta",
+        "gpt-scalar-tool-search-empty-call-id",
         "gpt-scalar-tool-search-missing-execution",
         "gpt-scalar-tool-search-wrong",
         "gpt-scalar-tool-search-wrong-execution",
@@ -5916,6 +6714,7 @@ async fn claude_malformed_handled_scalars_fail_once_without_empty_blocks() {
         "gpt-scalar-tool-search-output-wrong-execution",
         "gpt-scalar-tool-search-output-wrong-tools",
         "gpt-scalar-message-missing",
+        "gpt-scalar-message-incomplete-on-completed",
         "gpt-scalar-message-wrong-content",
         "gpt-scalar-message-wrong-role",
         "gpt-scalar-message-content-not-array",
@@ -6002,6 +6801,492 @@ async fn claude_malformed_handled_scalars_fail_once_without_empty_blocks() {
                     "{model}: malformed input opened an empty tool name"
                 );
             }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_json_and_sse_outputs_match_for_valid_families() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for model in [
+        "gpt-scalar-function-valid",
+        "gpt-scalar-custom-tool-valid",
+        "gpt-scalar-tool-search-valid",
+        "gpt-scalar-tool-search-item-id-valid",
+        "gpt-scalar-tool-search-late-id-valid",
+        "gpt-scalar-tool-search-output-valid",
+        "gpt-scalar-message-valid",
+        "gpt-scalar-reasoning-valid",
+        "gpt-scalar-compaction-valid",
+    ] {
+        let request = |stream| {
+            post_json(
+                "/v1/messages",
+                json!({
+                    "model":format!("responses-fixture/{model}"),
+                    "max_tokens":128,
+                    "messages":[{"role":"user","content":"paired output"}],
+                    "stream":stream
+                }),
+                Some(CLIENT_KEY),
+            )
+        };
+        let (json_status, json_body_bytes) = send(request(false)).await;
+        assert_eq!(
+            json_status,
+            StatusCode::OK,
+            "{model}: {}",
+            String::from_utf8_lossy(&json_body_bytes)
+        );
+        let json_response = json_body(&json_body_bytes);
+
+        let (sse_status, sse_body) = send(request(true)).await;
+        assert_eq!(sse_status, StatusCode::OK, "{model}");
+        let events = data_events(&sse_body);
+        assert!(!events.iter().any(|event| event["type"] == "error"));
+        assert_eq!(
+            events.first().and_then(|event| event["type"].as_str()),
+            Some("message_start")
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("message_stop")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_start")
+                .count(),
+            1,
+            "{model}: message_start count"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_delta")
+                .count(),
+            1,
+            "{model}: message_delta count"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}: message_stop count"
+        );
+        let stream_stop = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .and_then(|event| event["delta"]["stop_reason"].as_str());
+        assert_eq!(
+            json_response["stop_reason"].as_str(),
+            stream_stop,
+            "{model}: stop reason diverged"
+        );
+        let expected_stop = if matches!(
+            model,
+            "gpt-scalar-function-valid"
+                | "gpt-scalar-custom-tool-valid"
+                | "gpt-scalar-tool-search-valid"
+                | "gpt-scalar-tool-search-item-id-valid"
+                | "gpt-scalar-tool-search-late-id-valid"
+        ) {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+        assert_eq!(json_response["stop_reason"], expected_stop, "{model}");
+        assert_eq!(json_response["usage"]["input_tokens"], 3, "{model}");
+        assert_eq!(json_response["usage"]["output_tokens"], 3, "{model}");
+        assert_eq!(
+            json_response["usage"]["cache_read_input_tokens"], 2,
+            "{model}"
+        );
+        let stream_usage = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("terminal usage");
+        assert_eq!(stream_usage["usage"]["input_tokens"], 3, "{model}");
+        assert_eq!(stream_usage["usage"]["output_tokens"], 3, "{model}");
+        assert_eq!(
+            stream_usage["usage"]["cache_read_input_tokens"], 2,
+            "{model}"
+        );
+
+        let block_starts = events
+            .iter()
+            .filter(|event| event["type"] == "content_block_start")
+            .count();
+        let block_stops = events
+            .iter()
+            .filter(|event| event["type"] == "content_block_stop")
+            .count();
+        assert_eq!(block_starts, block_stops, "{model}: unbalanced blocks");
+        assert_eq!(
+            block_starts,
+            json_response["content"].as_array().map_or(0, Vec::len),
+            "{model}: block count diverged"
+        );
+
+        match model {
+            "gpt-scalar-function-valid"
+            | "gpt-scalar-custom-tool-valid"
+            | "gpt-scalar-tool-search-valid"
+            | "gpt-scalar-tool-search-item-id-valid"
+            | "gpt-scalar-tool-search-late-id-valid" => {
+                let json_tool = json_response["content"]
+                    .as_array()
+                    .and_then(|blocks| blocks.iter().find(|block| block["type"] == "tool_use"))
+                    .expect("JSON tool block");
+                let stream_tool = events
+                    .iter()
+                    .find(|event| {
+                        event["type"] == "content_block_start"
+                            && event["content_block"]["type"] == "tool_use"
+                    })
+                    .expect("SSE tool block");
+                assert_eq!(
+                    json_tool["id"], stream_tool["content_block"]["id"],
+                    "{model}: deterministic tool id diverged"
+                );
+                assert_eq!(
+                    json_tool["name"], stream_tool["content_block"]["name"],
+                    "{model}: tool name diverged"
+                );
+                let partial_json: String = events
+                    .iter()
+                    .filter(|event| event["delta"]["type"] == "input_json_delta")
+                    .filter_map(|event| event["delta"]["partial_json"].as_str())
+                    .collect();
+                let stream_input: Value =
+                    serde_json::from_str(&partial_json).expect("complete streamed tool input");
+                assert_eq!(json_tool["input"], stream_input, "{model}: tool input");
+                if model == "gpt-scalar-tool-search-valid" {
+                    assert_eq!(json_tool["id"], "tool_call_0");
+                } else if model == "gpt-scalar-tool-search-item-id-valid" {
+                    assert_eq!(json_tool["id"], "search-item-only");
+                } else if model == "gpt-scalar-tool-search-late-id-valid" {
+                    assert_eq!(json_tool["id"], "late-search-call");
+                }
+                match model {
+                    "gpt-scalar-function-valid" => {
+                        assert_eq!(json_tool["id"], "call-scalar");
+                        assert_eq!(json_tool["name"], "read");
+                        assert_eq!(json_tool["input"], json!({"path":"a"}));
+                    }
+                    "gpt-scalar-custom-tool-valid" => {
+                        assert_eq!(json_tool["id"], "custom-call");
+                        assert_eq!(json_tool["name"], "freeform");
+                        assert_eq!(json_tool["input"], json!({"input":"payload"}));
+                    }
+                    _ => assert_eq!(json_tool["name"], "mcp__tool_search__search"),
+                }
+            }
+            "gpt-scalar-message-valid" => {
+                let stream_text: String = events
+                    .iter()
+                    .filter(|event| event["delta"]["type"] == "text_delta")
+                    .filter_map(|event| event["delta"]["text"].as_str())
+                    .collect();
+                assert_eq!(json_response["content"][0]["text"], stream_text);
+                assert_eq!(stream_text, "AB");
+            }
+            "gpt-scalar-reasoning-valid" | "gpt-scalar-compaction-valid" => {
+                let stream_thinking: String = events
+                    .iter()
+                    .filter(|event| event["delta"]["type"] == "thinking_delta")
+                    .filter_map(|event| event["delta"]["thinking"].as_str())
+                    .collect();
+                let stream_signature = events
+                    .iter()
+                    .find(|event| event["delta"]["type"] == "signature_delta")
+                    .and_then(|event| event["delta"]["signature"].as_str());
+                assert_eq!(json_response["content"][0]["thinking"], stream_thinking);
+                assert_eq!(
+                    json_response["content"][0]["signature"].as_str(),
+                    stream_signature
+                );
+                if model == "gpt-scalar-reasoning-valid" {
+                    assert_eq!(
+                        json_response["content"][0]["thinking"],
+                        ["summary", "content"].join(REASONING_SUMMARY_SEPARATOR)
+                    );
+                    assert_eq!(
+                        json_response["content"][0]["signature"],
+                        "opaque@reasoning-scalar"
+                    );
+                } else {
+                    assert_eq!(json_response["content"][0]["thinking"], THINKING_TEXT);
+                    assert_eq!(
+                        json_response["content"][0]["signature"],
+                        "cm1#opaque-compaction@"
+                    );
+                }
+            }
+            "gpt-scalar-tool-search-output-valid" => {
+                assert_eq!(json_response["content"], json!([]));
+                assert!(!events
+                    .iter()
+                    .any(|event| event["type"] == "content_block_start"));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_json_and_sse_reject_equivalent_malformed_outputs() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for model in [
+        "gpt-scalar-function-added-missing",
+        "gpt-scalar-custom-tool-malformed",
+        "gpt-scalar-tool-search-missing-execution",
+        "gpt-scalar-tool-search-empty-call-id",
+        "gpt-scalar-tool-search-wrong",
+        "gpt-scalar-tool-search-output-malformed",
+        "gpt-scalar-message-incomplete-on-completed",
+        "gpt-scalar-message-wrong-role",
+        "gpt-scalar-message-block-malformed",
+        "gpt-scalar-reasoning-missing-summary",
+        "gpt-scalar-reasoning-wrong-id",
+        "gpt-scalar-compaction-missing",
+        "gpt-scalar-metadata-wrong",
+        "gpt-contract-completed-empty-id",
+        "gpt-contract-created-wrong-model",
+        "gpt-contract-terminal-wrong-end-turn",
+        "gpt-contract-usage-wrong-input",
+        "gpt-contract-usage-total-mismatch",
+    ] {
+        let request = |stream| {
+            post_json(
+                "/v1/messages",
+                json!({
+                    "model":format!("responses-fixture/{model}"),
+                    "max_tokens":128,
+                    "messages":[{"role":"user","content":"paired malformed output"}],
+                    "stream":stream
+                }),
+                Some(CLIENT_KEY),
+            )
+        };
+        let (json_status, json_body_bytes) = send(request(false)).await;
+        assert!(
+            json_status.is_server_error(),
+            "{model}: malformed JSON result returned {json_status}: {}",
+            String::from_utf8_lossy(&json_body_bytes)
+        );
+        let json_error = json_body(&json_body_bytes);
+        assert_eq!(json_error["type"], "error", "{model}");
+
+        let (sse_status, sse_body) = send(request(true)).await;
+        assert_eq!(sse_status, StatusCode::OK, "{model}");
+        let events = data_events(&sse_body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}: {events:#?}"
+        );
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("message_delta" | "message_stop")
+            )
+        }));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_tool_search_late_identity_corruption_fails_once_after_closing_block() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, initial_call_id) in [
+        ("gpt-scalar-tool-search-conflicting-id", "search-call-a"),
+        ("gpt-scalar-tool-search-removed-id", "search-call-present"),
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"late identity corruption"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        let event_types: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        assert_eq!(
+            event_types,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_stop",
+                "error"
+            ],
+            "{model}: {events:#?}"
+        );
+        assert_eq!(events[1]["content_block"]["id"], initial_call_id, "{model}");
+        assert_eq!(events[3]["error"]["type"], "api_error", "{model}");
+    }
+}
+
+fn web_search_messages_request(stream: bool) -> Request<Body> {
+    post_json(
+        "/v1/messages",
+        json!({
+            "model":"responses-fixture/gpt-fixture",
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"Search for Rust async sources"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "max_uses":3
+            }],
+            "stream":stream
+        }),
+        Some(CLIENT_KEY),
+    )
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+
+    for model in [
+        "gpt-web-partial-completed",
+        "gpt-web-terminal-output-completed",
+    ] {
+        configure_with_web_search_model(&fixture, Some(&format!("responses-fixture/{model}")));
+        let (json_status, json_bytes) = send(web_search_messages_request(false)).await;
+        assert_eq!(
+            json_status,
+            StatusCode::OK,
+            "{model}: {}",
+            String::from_utf8_lossy(&json_bytes)
+        );
+        let json_response = json_body(&json_bytes);
+        assert_eq!(json_response["id"], "resp_web_partial", "{model}");
+        assert_eq!(json_response["stop_reason"], "end_turn", "{model}");
+        assert_eq!(json_response["usage"]["input_tokens"], 6, "{model}");
+        assert_eq!(json_response["usage"]["output_tokens"], 4, "{model}");
+        assert_eq!(
+            json_response["usage"]["server_tool_use"]["web_search_requests"], 1,
+            "{model}"
+        );
+        assert_eq!(json_response["content"].as_array().map(Vec::len), Some(3));
+        assert_eq!(json_response["content"][0]["type"], "server_tool_use");
+        assert_eq!(json_response["content"][0]["name"], "web_search");
+        assert_eq!(json_response["content"][0]["input"]["query"], "rust async");
+        assert_eq!(
+            json_response["content"][1]["type"],
+            "web_search_tool_result"
+        );
+        assert_eq!(
+            json_response["content"][1]["tool_use_id"],
+            json_response["content"][0]["id"]
+        );
+        assert_eq!(
+            json_response["content"][1]["content"][0]["url"],
+            "https://example.test/source"
+        );
+        assert_eq!(json_response["content"][2]["text"], "Grounded answer.");
+
+        let (sse_status, sse_bytes) = send(web_search_messages_request(true)).await;
+        assert_eq!(sse_status, StatusCode::OK, "{model}");
+        let events = data_events(&sse_bytes);
+        let event_types: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        assert_eq!(
+            event_types,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+            "{model}"
+        );
+        assert_eq!(events[0]["message"]["id"], json_response["id"], "{model}");
+        assert_eq!(
+            events[1]["content_block"]["id"], json_response["content"][0]["id"],
+            "{model}"
+        );
+        assert_eq!(
+            events[4]["content_block"]["tool_use_id"], json_response["content"][1]["tool_use_id"],
+            "{model}"
+        );
+        assert_eq!(
+            events[4]["content_block"]["content"][0]["url"], "https://example.test/source",
+            "{model}"
+        );
+        assert_eq!(events[7]["delta"]["text"], "Grounded answer.", "{model}");
+        assert_eq!(events[9]["delta"]["stop_reason"], "end_turn", "{model}");
+        assert_eq!(events[9]["usage"]["output_tokens"], 4, "{model}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_web_search_terminal_conflicts_fail_before_json_or_sse_success() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+
+    for model in [
+        "gpt-web-terminal-id-conflict",
+        "gpt-web-terminal-model-conflict",
+        "gpt-web-terminal-status-conflict",
+        "gpt-web-terminal-usage-conflict",
+        "gpt-web-terminal-output-malformed",
+        "gpt-web-late-text-conflict",
+        "gpt-web-delta-after-item-done",
+        "gpt-web-terminal-failed",
+        "gpt-web-terminal-incomplete",
+    ] {
+        configure_with_web_search_model(&fixture, Some(&format!("responses-fixture/{model}")));
+        for stream in [false, true] {
+            let (status, body) = send(web_search_messages_request(stream)).await;
+            assert!(
+                status.is_server_error(),
+                "{model}/{stream}: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+            let error = json_body(&body);
+            assert_eq!(error["type"], "error", "{model}/{stream}");
+            assert_eq!(error["error"]["type"], "api_error", "{model}/{stream}");
+            assert!(error.get("content").is_none(), "{model}/{stream}");
+            assert!(error.get("stop_reason").is_none(), "{model}/{stream}");
         }
     }
 }

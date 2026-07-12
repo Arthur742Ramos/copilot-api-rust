@@ -15,6 +15,8 @@
 //! id-less compactions; versioned reasoning JSON carriers and the compaction
 //! trailing-separator extension preserve those combinations across Messages.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Map, Value};
 
 use crate::libs::config::{get_extra_prompt_for_model, get_reasoning_effort_for_model};
@@ -36,8 +38,8 @@ use crate::services::copilot::create_responses::{
     ResponseFunctionCallOutputItem, ResponseFunctionToolCallItem, ResponseInputCompaction,
     ResponseInputContent, ResponseInputFile, ResponseInputImage, ResponseInputItem,
     ResponseInputMessage, ResponseInputReasoning, ResponseInputText, ResponseOutputContentBlock,
-    ResponseOutputItem, ResponseToolSearchCallItem, ResponseToolSearchOutputItem, ResponsesPayload,
-    ResponsesResult,
+    ResponseOutputItem, ResponseToolSearchCallItem, ResponseToolSearchOutputItem, ResponseUsage,
+    ResponsesPayload, ResponsesResult,
 };
 
 const MESSAGE_TYPE: &str = "message";
@@ -1103,31 +1105,688 @@ fn convert_anthropic_tool_choice(
 // Result translation: Responses output -> Anthropic message response
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputValidationPhase {
+    Added,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ValidatedResponsesUsage {
+    pub input_tokens: i64,
+    pub cached_input_tokens: Option<i64>,
+    pub output_tokens: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponsesTerminalKind {
+    Completed,
+    Incomplete,
+    Failed,
+}
+
+impl ResponsesTerminalKind {
+    pub fn from_event_type(event_type: &str) -> Option<Self> {
+        match event_type {
+            "response.completed" => Some(Self::Completed),
+            "response.incomplete" => Some(Self::Incomplete),
+            "response.failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    pub fn expected_status(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+pub(crate) fn validate_function_arguments(
+    arguments: &str,
+    phase: OutputValidationPhase,
+) -> Result<(), &'static str> {
+    if arguments.is_empty() && phase == OutputValidationPhase::Added {
+        return Ok(());
+    }
+    if arguments.is_empty()
+        || serde_json::from_str::<Value>(arguments)
+            .ok()
+            .is_none_or(|arguments| !arguments.is_object())
+    {
+        return Err("Function call arguments were empty or not a JSON object.");
+    }
+    Ok(())
+}
+
+fn validate_item_type(actual: &str, expected: &str) -> Result<(), &'static str> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("A typed Responses output item had an inconsistent type.")
+    }
+}
+
+fn validate_optional_item_status(
+    status: Option<&str>,
+    phase: OutputValidationPhase,
+) -> Result<(), &'static str> {
+    let Some(status) = status else {
+        return Ok(());
+    };
+    let valid = match phase {
+        OutputValidationPhase::Added => {
+            matches!(status, "in_progress" | "completed" | "incomplete")
+        }
+        OutputValidationPhase::Done => matches!(status, "completed" | "incomplete"),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("A Responses output item had an invalid status.")
+    }
+}
+
+fn validate_internal_metadata(extra: &Map<String, Value>) -> Result<(), &'static str> {
+    let Some(metadata) = extra.get("internal_chat_message_metadata_passthrough") else {
+        return Ok(());
+    };
+    if metadata.is_null() {
+        return Ok(());
+    }
+    let Some(metadata) = metadata.as_object() else {
+        return Err("Internal chat message metadata was not an object or null.");
+    };
+    if let Some(turn_id) = metadata.get("turn_id") {
+        if !turn_id.is_null() && !turn_id.is_string() {
+            return Err("Internal chat message metadata turn_id was not a string or null.");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_typed_output_item(
+    item: &ResponseOutputItem,
+    phase: OutputValidationPhase,
+) -> Result<(), &'static str> {
+    match item {
+        ResponseOutputItem::FunctionCall(call) => {
+            validate_item_type(&call.item_type, "function_call")?;
+            if call.call_id.trim().is_empty() {
+                return Err("A function_call item had a missing or empty call_id.");
+            }
+            if call.name.trim().is_empty() {
+                return Err("A function_call item had a missing or empty name.");
+            }
+            validate_function_arguments(&call.arguments, phase)?;
+            validate_optional_item_status(call.status.as_deref(), phase)?;
+            validate_internal_metadata(&call.extra)?;
+        }
+        ResponseOutputItem::CustomToolCall(call) => {
+            validate_item_type(&call.item_type, "custom_tool_call")?;
+            if call.call_id.trim().is_empty() || call.name.trim().is_empty() {
+                return Err("A custom_tool_call item had missing required identity.");
+            }
+            validate_optional_item_status(call.status.as_deref(), phase)?;
+            validate_internal_metadata(&call.extra)?;
+        }
+        ResponseOutputItem::ToolSearchCall(call) => {
+            validate_item_type(&call.item_type, "tool_search_call")?;
+            if call.execution.trim().is_empty() {
+                return Err("A tool_search_call item had a missing or empty execution.");
+            }
+            if call
+                .call_id
+                .as_deref()
+                .is_some_and(|call_id| call_id.trim().is_empty())
+            {
+                return Err("A tool_search_call item had an empty call_id.");
+            }
+            validate_optional_item_status(call.status.as_deref(), phase)?;
+            validate_internal_metadata(&call.extra)?;
+        }
+        ResponseOutputItem::ToolSearchOutput(output) => {
+            validate_item_type(&output.item_type, "tool_search_output")?;
+            if output.execution.trim().is_empty() || output.status.trim().is_empty() {
+                return Err("A tool_search_output item had missing required scalars.");
+            }
+            if !matches!(output.status.as_str(), "completed" | "incomplete") {
+                return Err("A tool_search_output item had an invalid status.");
+            }
+            validate_internal_metadata(&output.extra)?;
+        }
+        ResponseOutputItem::Message(message) => {
+            validate_item_type(&message.item_type, "message")?;
+            if message.role != "assistant" {
+                return Err("A streamed output message did not have the assistant role.");
+            }
+            validate_optional_item_status(message.status.as_deref(), phase)?;
+            if let Some(phase) = message.extra.get("phase") {
+                if !matches!(phase.as_str(), Some("commentary" | "final_answer"))
+                    && !phase.is_null()
+                {
+                    return Err("A message item had an invalid phase.");
+                }
+            }
+            validate_internal_metadata(&message.extra)?;
+            for block in &message.content {
+                match block {
+                    ResponseOutputContentBlock::Text(text) => {
+                        if !matches!(text.block_type.as_str(), "output_text" | "input_text") {
+                            return Err("A message text block had an unsupported type.");
+                        }
+                        if text
+                            .annotations
+                            .iter()
+                            .any(|annotation| !annotation.is_object())
+                        {
+                            return Err("An annotation entry was not an object.");
+                        }
+                    }
+                    ResponseOutputContentBlock::Refusal(_) => {
+                        return Err("A message content block had an unsupported type.");
+                    }
+                    ResponseOutputContentBlock::Other(_) => {
+                        return Err("A message content block had an unsupported type.");
+                    }
+                }
+            }
+        }
+        ResponseOutputItem::Reasoning(reasoning) => {
+            validate_item_type(&reasoning.item_type, "reasoning")?;
+            validate_optional_item_status(reasoning.status.as_deref(), phase)?;
+            validate_internal_metadata(&reasoning.extra)?;
+            for summary in &reasoning.summary {
+                if summary.block_type != "summary_text" {
+                    return Err("A reasoning summary block had an unsupported type.");
+                }
+            }
+            if let Some(content) = &reasoning.content {
+                for content in content {
+                    if !matches!(content.block_type.as_str(), "reasoning_text" | "text") {
+                        return Err("A reasoning content block had an unsupported type.");
+                    }
+                }
+            }
+        }
+        ResponseOutputItem::Compaction(compaction) => {
+            validate_item_type(&compaction.item_type, "compaction")?;
+            if compaction.encrypted_content.trim().is_empty() {
+                return Err("A compaction item had missing or empty encrypted_content.");
+            }
+            validate_internal_metadata(&compaction.extra)?;
+        }
+        ResponseOutputItem::Other(_) => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_and_validate_output_item(
+    value: &Value,
+    phase: OutputValidationPhase,
+) -> Result<ResponseOutputItem, &'static str> {
+    let item: ResponseOutputItem = serde_json::from_value(value.clone())
+        .map_err(|_| "A known output item did not match its typed Responses contract.")?;
+    validate_typed_output_item(&item, phase)?;
+    Ok(item)
+}
+
+fn required_nonnegative_usage_field(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<i64, &'static str> {
+    object
+        .get(field)
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or("A Responses usage object had a missing, wrong-typed, or negative token field.")
+}
+
+fn optional_usage_detail(
+    usage: &Map<String, Value>,
+    details_field: &str,
+    token_field: &str,
+) -> Result<Option<i64>, &'static str> {
+    let Some(details) = usage.get(details_field) else {
+        return Ok(None);
+    };
+    if details.is_null() {
+        return Ok(None);
+    }
+    let Some(details) = details.as_object() else {
+        return Err("A Responses usage details field was not an object or null.");
+    };
+    required_nonnegative_usage_field(details, token_field).map(Some)
+}
+
+fn validate_usage_counters(
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    cached_input_tokens: Option<i64>,
+    reasoning_output_tokens: Option<i64>,
+) -> Result<ValidatedResponsesUsage, &'static str> {
+    if input_tokens < 0 || output_tokens < 0 || total_tokens < 0 {
+        return Err("A Responses usage object contained a negative token field.");
+    }
+    let Some(expected_total) = input_tokens.checked_add(output_tokens) else {
+        return Err("A Responses usage total overflowed the supported integer range.");
+    };
+    if total_tokens != expected_total {
+        return Err("A Responses usage total did not equal input plus output tokens.");
+    }
+    if cached_input_tokens.is_some_and(|cached| cached < 0 || cached > input_tokens) {
+        return Err("A Responses cached token count exceeded its input token count.");
+    }
+    if reasoning_output_tokens.is_some_and(|reasoning| reasoning < 0 || reasoning > output_tokens) {
+        return Err("A Responses reasoning token count exceeded its output token count.");
+    }
+    Ok(ValidatedResponsesUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+    })
+}
+
+pub(crate) fn validate_raw_responses_usage(
+    response: &Value,
+) -> Result<ValidatedResponsesUsage, &'static str> {
+    let Some(usage) = response.get("usage") else {
+        return Ok(ValidatedResponsesUsage::default());
+    };
+    if usage.is_null() {
+        return Ok(ValidatedResponsesUsage::default());
+    }
+    let Some(usage) = usage.as_object() else {
+        return Err("A Responses usage field was not an object or null.");
+    };
+    let input_tokens = required_nonnegative_usage_field(usage, "input_tokens")?;
+    let output_tokens = required_nonnegative_usage_field(usage, "output_tokens")?;
+    let total_tokens = required_nonnegative_usage_field(usage, "total_tokens")?;
+    let cached_input_tokens =
+        optional_usage_detail(usage, "input_tokens_details", "cached_tokens")?;
+    let reasoning_output_tokens =
+        optional_usage_detail(usage, "output_tokens_details", "reasoning_tokens")?;
+    validate_usage_counters(
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cached_input_tokens,
+        reasoning_output_tokens,
+    )
+}
+
+pub(crate) fn validate_typed_responses_usage(
+    usage: Option<&ResponseUsage>,
+) -> Result<ValidatedResponsesUsage, &'static str> {
+    let Some(usage) = usage else {
+        return Ok(ValidatedResponsesUsage::default());
+    };
+    validate_usage_counters(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        usage
+            .input_tokens_details
+            .as_ref()
+            .map(|details| details.cached_tokens),
+        usage
+            .output_tokens_details
+            .as_ref()
+            .map(|details| details.reasoning_tokens),
+    )
+}
+
+pub(crate) fn validate_terminal_status(
+    response: &Value,
+    terminal_kind: ResponsesTerminalKind,
+) -> Result<(), &'static str> {
+    if response
+        .get("status")
+        .is_some_and(|status| status.as_str() != Some(terminal_kind.expected_status()))
+    {
+        return Err("A terminal Responses event had an inconsistent response status.");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_raw_response_fields(response: &Value) -> Result<(), &'static str> {
+    let Some(response) = response.as_object() else {
+        return Err("A Responses event had an invalid response object.");
+    };
+    if response
+        .get("object")
+        .is_some_and(|object| object.as_str() != Some("response"))
+    {
+        return Err("A Responses response object field was invalid.");
+    }
+    if response
+        .get("created_at")
+        .is_some_and(|created_at| created_at.as_i64().is_none_or(|created_at| created_at < 0))
+    {
+        return Err("A Responses response created_at field was invalid.");
+    }
+    if response
+        .get("model")
+        .is_some_and(|model| model.as_str().is_none_or(|model| model.trim().is_empty()))
+    {
+        return Err("A Responses response model field was invalid.");
+    }
+    if response
+        .get("output")
+        .is_some_and(|output| !output.is_array())
+    {
+        return Err("A Responses response output field was not an array.");
+    }
+    if response
+        .get("output_text")
+        .is_some_and(|output_text| !output_text.is_null() && !output_text.is_string())
+    {
+        return Err("A Responses response output_text field was invalid.");
+    }
+    if response
+        .get("metadata")
+        .is_some_and(|metadata| !metadata.is_null() && !metadata.is_object())
+    {
+        return Err("A Responses response metadata field was invalid.");
+    }
+    if response
+        .get("instructions")
+        .is_some_and(|instructions| !instructions.is_null() && !instructions.is_string())
+    {
+        return Err("A Responses response instructions field was invalid.");
+    }
+    if response
+        .get("parallel_tool_calls")
+        .is_some_and(|parallel| !parallel.is_null() && !parallel.is_boolean())
+    {
+        return Err("A Responses response parallel_tool_calls field was invalid.");
+    }
+    if response
+        .get("tools")
+        .is_some_and(|tools| !tools.is_null() && !tools.is_array())
+    {
+        return Err("A Responses response tools field was invalid.");
+    }
+    for field in ["temperature", "top_p"] {
+        if response
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_number())
+        {
+            return Err("A Responses response sampling field was invalid.");
+        }
+    }
+    for field in ["error", "incomplete_details"] {
+        if response
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_object())
+        {
+            return Err("A Responses response error/details field was invalid.");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_tool_search_call_id<'a>(
+    added: Option<&'a str>,
+    done: Option<&'a str>,
+) -> Result<Option<&'a str>, &'static str> {
+    match (
+        added.filter(|id| !id.is_empty()),
+        done.filter(|id| !id.is_empty()),
+    ) {
+        (Some(added), Some(done)) if added == done => Ok(Some(done)),
+        (Some(_), _) => Err("A completed tool_search_call changed or removed its call id."),
+        (None, done) => Ok(done),
+    }
+}
+
+fn raw_optional_string<'a>(item: &'a Value, field: &str) -> Option<&'a str> {
+    item.get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn raw_resolved_tool_name(item: &Value) -> Option<&str> {
+    raw_optional_string(item, "namespace")
+        .filter(|namespace| !namespace.trim().is_empty())
+        .or_else(|| raw_optional_string(item, "name"))
+}
+
+pub(crate) fn validate_output_item_reconciliation(
+    added: &Value,
+    done: &Value,
+) -> Result<(), &'static str> {
+    let added_type = added.get("type").and_then(Value::as_str);
+    let done_type = done.get("type").and_then(Value::as_str);
+    if added_type != done_type {
+        return Err("A completed output item changed its type.");
+    }
+    let Some(item_type) = done_type else {
+        return Err("A completed output item had an invalid type.");
+    };
+
+    if let (Some(added_id), Some(done_id)) = (
+        raw_optional_string(added, "id"),
+        raw_optional_string(done, "id"),
+    ) {
+        if added_id != done_id {
+            return Err("A completed output item changed its item id.");
+        }
+    }
+    if let (Some(added_metadata), Some(done_metadata)) = (
+        added.get("internal_chat_message_metadata_passthrough"),
+        done.get("internal_chat_message_metadata_passthrough"),
+    ) {
+        if !added_metadata.is_null() && !done_metadata.is_null() && added_metadata != done_metadata
+        {
+            return Err("A completed output item changed its internal metadata.");
+        }
+    }
+
+    match item_type {
+        "function_call" | "custom_tool_call" => {
+            if raw_optional_string(added, "call_id") != raw_optional_string(done, "call_id") {
+                return Err("A completed function/tool call changed its call id.");
+            }
+            if raw_resolved_tool_name(added) != raw_resolved_tool_name(done) {
+                return Err("A completed function/tool call changed its function name.");
+            }
+            if item_type == "custom_tool_call" {
+                if let (Some(added_input), Some(done_input)) = (
+                    added.get("input").and_then(Value::as_str),
+                    done.get("input").and_then(Value::as_str),
+                ) {
+                    if !added_input.is_empty() && added_input != done_input {
+                        return Err("A completed custom tool call changed its input.");
+                    }
+                }
+            }
+        }
+        "tool_search_call" => {
+            reconcile_tool_search_call_id(
+                added.get("call_id").and_then(Value::as_str),
+                done.get("call_id").and_then(Value::as_str),
+            )?;
+            if added.get("execution") != done.get("execution") {
+                return Err("A completed tool search changed its execution mode.");
+            }
+            if added.get("arguments") != done.get("arguments") {
+                return Err("A completed tool search changed its arguments.");
+            }
+        }
+        "tool_search_output" => {
+            if let (Some(added_call_id), Some(done_call_id)) = (
+                raw_optional_string(added, "call_id"),
+                raw_optional_string(done, "call_id"),
+            ) {
+                if added_call_id != done_call_id {
+                    return Err("A completed tool search output changed its call id.");
+                }
+            }
+            if added.get("execution") != done.get("execution")
+                || added.get("tools") != done.get("tools")
+            {
+                return Err("A completed tool search output changed its payload.");
+            }
+        }
+        "message" => {
+            if added.get("role") != done.get("role") {
+                return Err("A completed message changed its role.");
+            }
+        }
+        "reasoning" => {
+            if let (Some(added_encrypted), Some(done_encrypted)) = (
+                added.get("encrypted_content"),
+                done.get("encrypted_content"),
+            ) {
+                if !added_encrypted.is_null()
+                    && !done_encrypted.is_null()
+                    && added_encrypted != done_encrypted
+                {
+                    return Err("A completed reasoning item changed its encrypted content.");
+                }
+            }
+        }
+        "compaction" | "compaction_summary" => {
+            if added.get("encrypted_content") != done.get("encrypted_content") {
+                return Err("A completed compaction item changed its encrypted content.");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn stable_tool_use_id(
+    call_id: Option<&str>,
+    item_id: Option<&str>,
+    output_index: i64,
+) -> String {
+    call_id
+        .filter(|id| !id.is_empty())
+        .or_else(|| item_id.filter(|id| !id.is_empty()))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tool_call_{output_index}"))
+}
+
+fn output_item_id(item: &ResponseOutputItem) -> Option<&str> {
+    match item {
+        ResponseOutputItem::Message(item) => item.id.as_deref(),
+        ResponseOutputItem::FunctionCall(item) => item.id.as_deref(),
+        ResponseOutputItem::CustomToolCall(item) => item.id.as_deref(),
+        ResponseOutputItem::ToolSearchOutput(item) => item.id.as_deref(),
+        ResponseOutputItem::ToolSearchCall(item) => item.id.as_deref(),
+        ResponseOutputItem::Compaction(item) => item.id.as_deref(),
+        ResponseOutputItem::Reasoning(item) => item.id.as_deref(),
+        ResponseOutputItem::Other(_) => None,
+    }
+}
+
+fn output_tool_call_id(item: &ResponseOutputItem) -> Option<&str> {
+    match item {
+        ResponseOutputItem::FunctionCall(item) => Some(item.call_id.as_str()),
+        ResponseOutputItem::CustomToolCall(item) => Some(item.call_id.as_str()),
+        ResponseOutputItem::ToolSearchCall(item) => item.call_id.as_deref(),
+        ResponseOutputItem::Message(_)
+        | ResponseOutputItem::ToolSearchOutput(_)
+        | ResponseOutputItem::Compaction(_)
+        | ResponseOutputItem::Reasoning(_)
+        | ResponseOutputItem::Other(_) => None,
+    }
+}
+
+fn output_item_status(item: &ResponseOutputItem) -> Option<&str> {
+    match item {
+        ResponseOutputItem::Message(item) => item.status.as_deref(),
+        ResponseOutputItem::FunctionCall(item) => item.status.as_deref(),
+        ResponseOutputItem::CustomToolCall(item) => item.status.as_deref(),
+        ResponseOutputItem::ToolSearchOutput(item) => Some(item.status.as_str()),
+        ResponseOutputItem::ToolSearchCall(item) => item.status.as_deref(),
+        ResponseOutputItem::Reasoning(item) => item.status.as_deref(),
+        ResponseOutputItem::Compaction(_) | ResponseOutputItem::Other(_) => None,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn validate_complete_responses_result(
+    response: &ResponsesResult,
+) -> Result<(), AppError> {
+    if response.id.trim().is_empty()
+        || response.model.trim().is_empty()
+        || !matches!(response.status.as_str(), "completed" | "incomplete")
+    {
+        return Err(invalid_upstream_output(
+            "response id/model/status was missing or invalid",
+        ));
+    }
+    if !response.object.is_empty() && response.object != "response" {
+        return Err(invalid_upstream_output("response object was invalid"));
+    }
+    if response.created_at < 0 {
+        return Err(invalid_upstream_output("response created_at was negative"));
+    }
+    let raw_response = serde_json::to_value(response).map_err(|error| {
+        invalid_upstream_output(format_args!("response serialization: {error}"))
+    })?;
+    validate_raw_response_fields(&raw_response).map_err(invalid_upstream_output)?;
+
+    let mut item_ids = HashSet::new();
+    let mut tool_call_ids = HashSet::new();
+    for item in &response.output {
+        validate_typed_output_item(item, OutputValidationPhase::Done)
+            .map_err(invalid_upstream_output)?;
+        if response.status == "completed" && output_item_status(item) == Some("incomplete") {
+            return Err(invalid_upstream_output(
+                "a completed response contained an incomplete output item",
+            ));
+        }
+        if let Some(item_id) = output_item_id(item).filter(|id| !id.is_empty()) {
+            if !item_ids.insert(item_id) {
+                return Err(invalid_upstream_output("response output reused an item id"));
+            }
+        }
+        if let Some(call_id) = output_tool_call_id(item).filter(|id| !id.is_empty()) {
+            if !tool_call_ids.insert(call_id) {
+                return Err(invalid_upstream_output(
+                    "response output reused a tool call id",
+                ));
+            }
+        }
+    }
+    validate_typed_responses_usage(response.usage.as_ref()).map_err(invalid_upstream_output)?;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 pub fn translate_responses_result_to_anthropic(
     response: &ResponsesResult,
     tool_search_name: Option<&str>,
-) -> AnthropicResponse {
-    let content_blocks = map_output_to_anthropic_content(&response.output, tool_search_name);
-    let usage = map_responses_usage(response);
+) -> Result<AnthropicResponse, AppError> {
+    validate_complete_responses_result(response)?;
+    let content_blocks = map_output_to_anthropic_content(&response.output, tool_search_name)?;
+    let usage = map_responses_usage(response)?;
 
     let anthropic_content = if content_blocks.is_empty() {
-        fallback_content_blocks(&response.output_text)
+        match response.output_text.as_deref() {
+            Some(output_text) => fallback_content_blocks(output_text),
+            None => Vec::new(),
+        }
     } else {
         content_blocks
     };
 
-    // Derive `tool_use` stop_reason from whether a tool_use block was actually
-    // emitted, not from the mere presence of a FunctionCall/ToolSearchCall output
-    // item. A tool call whose id/name decoded to "" (e.g. upstream sent null,
-    // now coerced by `null_to_default`) is dropped by the block builders, so
-    // reporting `tool_use` here would leave stop_reason inconsistent with the
-    // content — a mismatch that can stall agent loops.
+    // Derive `tool_use` from the validated blocks actually emitted. Required
+    // tool identity and arguments have already been rejected rather than
+    // defaulted, so stop_reason cannot describe a silently dropped tool call.
     let has_tool_use = anthropic_content
         .iter()
         .any(|b| block_type(b) == Some("tool_use"));
-    let stop_reason = map_responses_stop_reason(response, has_tool_use);
+    let stop_reason = map_responses_stop_reason(response, has_tool_use)?;
 
-    AnthropicResponse {
+    Ok(AnthropicResponse {
         id: response.id.clone(),
         kind: "message".to_string(),
         role: "assistant".to_string(),
@@ -1137,16 +1796,19 @@ pub fn translate_responses_result_to_anthropic(
         stop_sequence: None,
         usage,
         extra: serde_json::Map::new(),
-    }
+    })
 }
 
+#[allow(clippy::result_large_err)]
 fn map_output_to_anthropic_content(
     output: &[ResponseOutputItem],
     tool_search_name: Option<&str>,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, AppError> {
     let mut content_blocks: Vec<Value> = Vec::new();
 
-    for item in output {
+    for (output_index, item) in output.iter().enumerate() {
+        validate_typed_output_item(item, OutputValidationPhase::Done)
+            .map_err(invalid_upstream_output)?;
         match item {
             ResponseOutputItem::Reasoning(reasoning) => {
                 if let Some(thinking_text) = extract_reasoning_text(reasoning) {
@@ -1162,88 +1824,43 @@ fn map_output_to_anthropic_content(
                 }
             }
             ResponseOutputItem::FunctionCall(call) => {
-                if let Some(block) = create_tool_use_content_block(call) {
-                    content_blocks.push(block);
-                }
+                content_blocks.push(create_tool_use_content_block(call)?);
+            }
+            ResponseOutputItem::CustomToolCall(call) => {
+                content_blocks.push(create_custom_tool_use_content_block(call));
             }
             ResponseOutputItem::ToolSearchCall(call) => {
-                if let Some(block) = create_tool_search_use_content_block(call, tool_search_name) {
-                    content_blocks.push(block);
-                }
+                let output_index = i64::try_from(output_index)
+                    .map_err(|_| invalid_upstream_output("output index exceeded i64"))?;
+                content_blocks.push(create_tool_search_use_content_block(
+                    call,
+                    tool_search_name,
+                    output_index,
+                )?);
             }
             ResponseOutputItem::ToolSearchOutput(_) => {}
             ResponseOutputItem::Message(message) => {
-                let combined = combine_message_text_content(message.content.as_deref());
+                let combined = combine_message_text_content(&message.content);
                 if !combined.is_empty() {
                     content_blocks.push(json!({ "type": "text", "text": combined }));
                 }
             }
             ResponseOutputItem::Compaction(compaction) => {
-                if let Some(block) = create_compaction_thinking_block(compaction) {
-                    content_blocks.push(block);
-                }
+                content_blocks.push(create_compaction_thinking_block(compaction));
             }
-            ResponseOutputItem::Other(value) => {
-                // Future compatibility: pull text out of an unknown `content` array.
-                let content = value
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(|arr| combine_message_text_content_value(arr));
-                if let Some(combined) = content {
-                    if !combined.is_empty() {
-                        content_blocks.push(json!({ "type": "text", "text": combined }));
-                    }
-                }
-            }
+            ResponseOutputItem::Other(_) => {}
         }
     }
 
-    content_blocks
+    Ok(content_blocks)
 }
 
-fn combine_message_text_content(content: Option<&[ResponseOutputContentBlock]>) -> String {
-    let Some(blocks) = content else {
-        return String::new();
-    };
-
+fn combine_message_text_content(blocks: &[ResponseOutputContentBlock]) -> String {
     let mut aggregated = String::new();
     for block in blocks {
         match block {
             ResponseOutputContentBlock::Text(t) => aggregated.push_str(&t.text),
-            ResponseOutputContentBlock::Refusal(r) => aggregated.push_str(&r.refusal),
-            ResponseOutputContentBlock::Other(value) => {
-                if let Some(text) = value.get("text").and_then(Value::as_str) {
-                    aggregated.push_str(text);
-                } else if let Some(reasoning) = value.get("reasoning").and_then(Value::as_str) {
-                    aggregated.push_str(reasoning);
-                }
-            }
-        }
-    }
-    aggregated
-}
-
-fn combine_message_text_content_value(blocks: &[Value]) -> String {
-    let mut aggregated = String::new();
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) == Some("output_text") {
-            if let Some(text) = block.get("text").and_then(Value::as_str) {
-                aggregated.push_str(text);
-                continue;
-            }
-        }
-        if block.get("type").and_then(Value::as_str) == Some("refusal") {
-            if let Some(refusal) = block.get("refusal").and_then(Value::as_str) {
-                aggregated.push_str(refusal);
-                continue;
-            }
-        }
-        if let Some(text) = block.get("text").and_then(Value::as_str) {
-            aggregated.push_str(text);
-            continue;
-        }
-        if let Some(reasoning) = block.get("reasoning").and_then(Value::as_str) {
-            aggregated.push_str(reasoning);
+            ResponseOutputContentBlock::Refusal(_) | ResponseOutputContentBlock::Other(_) => {}
         }
     }
     aggregated
@@ -1253,16 +1870,12 @@ fn extract_reasoning_text(
     item: &crate::services::copilot::create_responses::ResponseOutputReasoning,
 ) -> Option<String> {
     effective_reasoning_text(
-        item.summary
-            .iter()
-            .flatten()
-            .map(|block| block.text.as_deref().unwrap_or(""))
-            .chain(
-                item.content
-                    .iter()
-                    .flatten()
-                    .map(|block| block.text.as_deref().unwrap_or("")),
-            ),
+        item.summary.iter().map(|block| block.text.as_str()).chain(
+            item.content
+                .iter()
+                .flatten()
+                .map(|block| block.text.as_str()),
+        ),
         item.encrypted_content.as_deref(),
         item.id.as_deref(),
     )
@@ -1282,17 +1895,20 @@ pub(crate) fn effective_reasoning_text<'a>(
     has_opaque_carrier.then(|| THINKING_TEXT.to_string())
 }
 
+fn invalid_upstream_output(message: impl std::fmt::Display) -> AppError {
+    AppError::Other(anyhow::anyhow!(
+        "Invalid upstream Responses output: {message}"
+    ))
+}
+
+#[allow(clippy::result_large_err)]
 fn create_tool_use_content_block(
     call: &crate::services::copilot::create_responses::ResponseOutputFunctionCall,
-) -> Option<Value> {
+) -> Result<Value, AppError> {
     let tool_id = &call.call_id;
     let tool_name = resolve_tool_use_name(call.name.as_str(), call.namespace.as_deref());
-    if tool_name.is_empty() || tool_id.is_empty() {
-        return None;
-    }
-
-    let input = parse_function_call_arguments(&call.arguments);
-    Some(json!({
+    let input = parse_function_call_arguments(&call.arguments)?;
+    Ok(json!({
         "type": "tool_use",
         "id": tool_id,
         "name": tool_name,
@@ -1300,16 +1916,17 @@ fn create_tool_use_content_block(
     }))
 }
 
+#[allow(clippy::result_large_err)]
 fn create_tool_search_use_content_block(
     call: &crate::services::copilot::create_responses::ResponseOutputToolSearchCall,
     tool_search_name: Option<&str>,
-) -> Option<Value> {
-    let tool_id = call.call_id.as_deref().unwrap_or_default();
-    if tool_id.is_empty() {
-        return None;
-    }
-    let name = tool_search_name.unwrap_or(BRIDGE_TOOL_SEARCH_NAME);
-    Some(json!({
+    output_index: i64,
+) -> Result<Value, AppError> {
+    let tool_id = stable_tool_use_id(call.call_id.as_deref(), call.id.as_deref(), output_index);
+    let name = tool_search_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(BRIDGE_TOOL_SEARCH_NAME);
+    Ok(json!({
         "type": "tool_use",
         "id": tool_id,
         "name": name,
@@ -1317,47 +1934,45 @@ fn create_tool_search_use_content_block(
     }))
 }
 
+fn create_custom_tool_use_content_block(
+    call: &crate::services::copilot::create_responses::ResponseOutputCustomToolCall,
+) -> Value {
+    json!({
+        "type":"tool_use",
+        "id":call.call_id,
+        "name":resolve_tool_use_name(&call.name, call.namespace.as_deref()),
+        "input":{"input":call.input}
+    })
+}
+
 /// Mirrors `resolveToolUseName`: prefer a non-empty namespace, else the name.
 pub fn resolve_tool_use_name(name: &str, namespace: Option<&str>) -> String {
     match namespace {
-        Some(ns) if !ns.is_empty() => ns.to_string(),
+        Some(ns) if !ns.trim().is_empty() => ns.to_string(),
         _ => name.to_string(),
     }
 }
 
 fn create_compaction_thinking_block(
     item: &crate::services::copilot::create_responses::ResponseOutputCompaction,
-) -> Option<Value> {
-    if item.encrypted_content.is_empty() {
-        return None;
-    }
+) -> Value {
     let id = item.id.as_deref().unwrap_or_default();
 
-    Some(json!({
+    json!({
         "type": "thinking",
         "thinking": THINKING_TEXT,
         "signature": encode_compaction_carrier_signature(&item.encrypted_content, id),
-    }))
+    })
 }
 
-fn parse_function_call_arguments(raw_arguments: &str) -> Value {
-    if raw_arguments.trim().is_empty() {
-        return json!({});
-    }
-
+#[allow(clippy::result_large_err)]
+fn parse_function_call_arguments(raw_arguments: &str) -> Result<Value, AppError> {
     match serde_json::from_str::<Value>(raw_arguments) {
-        Ok(Value::Array(arr)) => json!({ "arguments": arr }),
-        Ok(parsed) if parsed.is_object() => parsed,
-        Ok(_) => json!({ "raw_arguments": raw_arguments }),
-        Err(_) => {
-            // Avoid logging the raw arguments — they may contain user data or
-            // secrets. Log only the length as a diagnostic.
-            tracing::warn!(
-                "Failed to parse function call arguments ({} bytes)",
-                raw_arguments.len()
-            );
-            json!({ "raw_arguments": raw_arguments })
-        }
+        Ok(parsed) => Ok(parsed),
+        Err(_) => Err(invalid_upstream_output(format_args!(
+            "function arguments were invalid JSON ({} bytes)",
+            raw_arguments.len()
+        ))),
     }
 }
 
@@ -1372,22 +1987,31 @@ fn fallback_content_blocks(output_text: &str) -> Vec<Value> {
     vec![json!({ "type": "text", "text": output_text })]
 }
 
-fn map_responses_stop_reason(response: &ResponsesResult, has_tool_call: bool) -> Option<String> {
+#[allow(clippy::result_large_err)]
+fn map_responses_stop_reason(
+    response: &ResponsesResult,
+    has_tool_call: bool,
+) -> Result<Option<String>, AppError> {
     let status = response.status.as_str();
 
     if status == "completed" {
-        // Consistent with the emitted content: `has_tool_call` reflects whether a
-        // tool_use block was actually produced (see caller), so a FunctionCall /
-        // ToolSearchCall item that was dropped for an empty id/name does not
-        // falsely yield `tool_use`.
-        return Some(
+        if response.extra.get("end_turn").and_then(Value::as_bool) == Some(false) && !has_tool_call
+        {
+            return Ok(Some("pause_turn".to_string()));
+        }
+        if let Some(end_turn) = response.extra.get("end_turn") {
+            if !end_turn.is_null() && !end_turn.is_boolean() {
+                return Err(invalid_upstream_output("end_turn was not boolean or null"));
+            }
+        }
+        return Ok(Some(
             if has_tool_call {
                 "tool_use"
             } else {
                 "end_turn"
             }
             .to_string(),
-        );
+        ));
     }
 
     if status == "incomplete" {
@@ -1396,31 +2020,29 @@ fn map_responses_stop_reason(response: &ResponsesResult, has_tool_call: bool) ->
             .get("reason")
             .and_then(Value::as_str);
         match reason {
-            Some("max_output_tokens") => return Some("max_tokens".to_string()),
-            Some("content_filter") => return Some("refusal".to_string()),
-            _ => {}
+            Some("max_output_tokens") => return Ok(Some("max_tokens".to_string())),
+            Some("content_filter") => return Ok(Some("refusal".to_string())),
+            _ => return Err(invalid_upstream_output("unsupported incomplete reason")),
         }
     }
 
-    None
+    Err(invalid_upstream_output("unsupported response status"))
 }
 
-fn map_responses_usage(response: &ResponsesResult) -> AnthropicUsage {
-    let usage = response.usage.as_ref();
-    let input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0);
-    let output_tokens = usage.and_then(|u| u.output_tokens).unwrap_or(0);
-    let cached_tokens = usage
-        .and_then(|u| u.input_tokens_details.as_ref())
-        .map(|d| d.cached_tokens);
+#[allow(clippy::result_large_err)]
+fn map_responses_usage(response: &ResponsesResult) -> Result<AnthropicUsage, AppError> {
+    let usage =
+        validate_typed_responses_usage(response.usage.as_ref()).map_err(invalid_upstream_output)?;
+    let cached_input_tokens = usage.cached_input_tokens.unwrap_or_default();
 
-    AnthropicUsage {
-        input_tokens: (input_tokens - cached_tokens.unwrap_or(0)).max(0),
-        output_tokens,
+    Ok(AnthropicUsage {
+        input_tokens: usage.input_tokens - cached_input_tokens,
+        output_tokens: usage.output_tokens,
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: cached_tokens,
+        cache_read_input_tokens: usage.cached_input_tokens,
         service_tier: None,
         extra: serde_json::Map::new(),
-    }
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -1565,7 +2187,7 @@ mod tests {
             encrypted_content: "enc_idless".to_string(),
             extra: Default::default(),
         };
-        let block = create_compaction_thinking_block(&output).expect("thinking carrier");
+        let block = create_compaction_thinking_block(&output);
         let signature = block["signature"].as_str().expect("signature");
         assert_eq!(signature, "cm1#enc_idless@");
 
@@ -1785,7 +2407,7 @@ mod tests {
         )
         .unwrap();
 
-        let anthropic = translate_responses_result_to_anthropic(&result, None);
+        let anthropic = translate_responses_result_to_anthropic(&result, None).unwrap();
         assert_eq!(anthropic.id, "resp_1");
         assert_eq!(anthropic.stop_reason.as_deref(), Some("tool_use"));
         // input_tokens net of cached: 30 - 10 = 20.
@@ -1814,16 +2436,16 @@ mod tests {
             id: "resp_2".to_string(),
             model: "gpt-5.4".to_string(),
             status: "completed".to_string(),
-            output_text: "ignored fallback".to_string(),
+            output_text: Some("ignored fallback".to_string()),
             output: vec![
                 ResponseOutputItem::Reasoning(ResponseOutputReasoning {
                     id: Some("rs_1".to_string()),
                     item_type: "reasoning".to_string(),
-                    summary: Some(vec![ResponseReasoningBlock {
+                    summary: vec![ResponseReasoningBlock {
                         block_type: "summary_text".to_string(),
-                        text: Some("pondering".to_string()),
+                        text: "pondering".to_string(),
                         extra: Default::default(),
-                    }]),
+                    }],
                     content: None,
                     encrypted_content: Some("ENC".to_string()),
                     status: None,
@@ -1833,22 +2455,22 @@ mod tests {
                     id: Some("msg_1".to_string()),
                     item_type: "message".to_string(),
                     role: "assistant".to_string(),
-                    status: "completed".to_string(),
-                    content: Some(vec![ResponseOutputContentBlock::Text(
+                    status: Some("completed".to_string()),
+                    content: vec![ResponseOutputContentBlock::Text(
                         crate::services::copilot::create_responses::ResponseOutputText {
                             block_type: "output_text".to_string(),
                             text: "the answer".to_string(),
                             annotations: vec![],
                             extra: Default::default(),
                         },
-                    )]),
+                    )],
                     extra: Default::default(),
                 }),
             ],
             ..Default::default()
         };
 
-        let anthropic = translate_responses_result_to_anthropic(&result, None);
+        let anthropic = translate_responses_result_to_anthropic(&result, None).unwrap();
         assert_eq!(anthropic.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(anthropic.content.len(), 2);
         assert_eq!(
@@ -1891,7 +2513,7 @@ mod tests {
         }))
         .unwrap();
 
-        let anthropic = translate_responses_result_to_anthropic(&result, None);
+        let anthropic = translate_responses_result_to_anthropic(&result, None).unwrap();
         let expected = [" summary ", "", " raw ", "second\n"].join(REASONING_SUMMARY_SEPARATOR);
         assert_eq!(anthropic.content[0]["thinking"], expected);
         assert_eq!(
@@ -1901,14 +2523,9 @@ mod tests {
     }
 
     #[test]
-    fn dropped_tool_call_keeps_stop_reason_consistent() {
+    fn malformed_tool_call_is_rejected_instead_of_dropped() {
         use crate::services::copilot::create_responses::ResponseOutputFunctionCall;
 
-        // A function_call whose call_id/name decoded to "" (upstream sent null,
-        // now coerced by null_to_default) is dropped by the tool_use block
-        // builder. stop_reason must then be `end_turn`, NOT `tool_use`, so the
-        // Anthropic response stays internally consistent (no tool_use stop with
-        // zero tool_use blocks). Regression for PR #83 Copilot review.
         let result = ResponsesResult {
             id: "resp_x".to_string(),
             model: "claude-opus-4-8".to_string(),
@@ -1928,15 +2545,7 @@ mod tests {
             ..Default::default()
         };
 
-        let anthropic = translate_responses_result_to_anthropic(&result, None);
-        assert!(
-            !anthropic
-                .content
-                .iter()
-                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")),
-            "empty-id tool call must not emit a tool_use block"
-        );
-        assert_eq!(anthropic.stop_reason.as_deref(), Some("end_turn"));
+        assert!(translate_responses_result_to_anthropic(&result, None).is_err());
     }
 
     #[test]
@@ -1945,6 +2554,7 @@ mod tests {
 
         let result = ResponsesResult {
             id: "resp_y".to_string(),
+            model: "gpt-5.4".to_string(),
             status: "completed".to_string(),
             output: vec![ResponseOutputItem::FunctionCall(
                 ResponseOutputFunctionCall {
@@ -1961,7 +2571,7 @@ mod tests {
             ..Default::default()
         };
 
-        let anthropic = translate_responses_result_to_anthropic(&result, None);
+        let anthropic = translate_responses_result_to_anthropic(&result, None).unwrap();
         assert!(anthropic
             .content
             .iter()
@@ -1981,7 +2591,7 @@ mod tests {
             output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
                 id: Some("rs".to_string()),
                 item_type: "reasoning".to_string(),
-                summary: None,
+                summary: vec![],
                 content: None,
                 encrypted_content: Some("E".to_string()),
                 status: None,
@@ -1990,7 +2600,7 @@ mod tests {
             ..Default::default()
         };
 
-        let anthropic = translate_responses_result_to_anthropic(&result, None);
+        let anthropic = translate_responses_result_to_anthropic(&result, None).unwrap();
         assert_eq!(anthropic.content.len(), 1);
         assert_eq!(
             anthropic.content[0].get("thinking").and_then(Value::as_str),
@@ -2011,29 +2621,31 @@ mod tests {
         };
 
         let summaries = vec![
-            None,
-            Some(vec![]),
-            Some(vec![ResponseReasoningBlock {
+            vec![],
+            vec![ResponseReasoningBlock {
                 block_type: "summary_text".to_string(),
-                text: Some(String::new()),
+                text: String::new(),
                 extra: Default::default(),
-            }]),
-            Some(vec![
+            }],
+            vec![
                 ResponseReasoningBlock {
                     block_type: "summary_text".to_string(),
-                    text: Some(" \n\t".to_string()),
+                    text: " \n\t".to_string(),
                     extra: Default::default(),
                 },
                 ResponseReasoningBlock {
                     block_type: "summary_text".to_string(),
-                    text: Some(String::new()),
+                    text: String::new(),
                     extra: Default::default(),
                 },
-            ]),
+            ],
         ];
 
         for summary in summaries {
             let carrier = ResponsesResult {
+                id: "resp_carrier".to_string(),
+                model: "gpt-5.4".to_string(),
+                status: "completed".to_string(),
                 output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
                     id: Some("reasoning-id".to_string()),
                     item_type: "reasoning".to_string(),
@@ -2045,13 +2657,16 @@ mod tests {
                 })],
                 ..Default::default()
             };
-            let anthropic = translate_responses_result_to_anthropic(&carrier, None);
+            let anthropic = translate_responses_result_to_anthropic(&carrier, None).unwrap();
             assert_eq!(anthropic.content.len(), 1, "summary: {summary:?}");
             assert_eq!(anthropic.content[0]["type"], "thinking");
             assert_eq!(anthropic.content[0]["thinking"], THINKING_TEXT);
             assert_eq!(anthropic.content[0]["signature"], "encrypted@reasoning-id");
 
             let carrier_free = ResponsesResult {
+                id: "resp_carrier_free".to_string(),
+                model: "gpt-5.4".to_string(),
+                status: "completed".to_string(),
                 output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
                     id: None,
                     item_type: "reasoning".to_string(),
@@ -2063,7 +2678,7 @@ mod tests {
                 })],
                 ..Default::default()
             };
-            let anthropic = translate_responses_result_to_anthropic(&carrier_free, None);
+            let anthropic = translate_responses_result_to_anthropic(&carrier_free, None).unwrap();
             assert!(
                 !anthropic
                     .content
@@ -2075,14 +2690,17 @@ mod tests {
 
         for (encrypted_content, id) in [(Some(""), None), (None, Some("")), (Some(""), Some(""))] {
             let result = ResponsesResult {
+                id: "resp_empty_values".to_string(),
+                model: "gpt-5.4".to_string(),
+                status: "completed".to_string(),
                 output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
                     id: id.map(str::to_string),
                     item_type: "reasoning".to_string(),
-                    summary: Some(vec![ResponseReasoningBlock {
+                    summary: vec![ResponseReasoningBlock {
                         block_type: "summary_text".to_string(),
-                        text: Some(" \n".to_string()),
+                        text: " \n".to_string(),
                         extra: Default::default(),
-                    }]),
+                    }],
                     content: None,
                     encrypted_content: encrypted_content.map(str::to_string),
                     status: None,
@@ -2090,7 +2708,7 @@ mod tests {
                 })],
                 ..Default::default()
             };
-            let anthropic = translate_responses_result_to_anthropic(&result, None);
+            let anthropic = translate_responses_result_to_anthropic(&result, None).unwrap();
             assert_eq!(anthropic.content.len(), 1);
             assert_eq!(anthropic.content[0]["thinking"], THINKING_TEXT);
             assert_eq!(
@@ -2108,19 +2726,20 @@ mod tests {
 
         for segments in [vec!["  analysis  "], vec!["  first ", "", "\tsecond\n", ""]] {
             let result = ResponsesResult {
+                id: "resp_segments".to_string(),
+                model: "gpt-5.4".to_string(),
+                status: "completed".to_string(),
                 output: vec![ResponseOutputItem::Reasoning(ResponseOutputReasoning {
                     id: Some("reasoning-id".to_string()),
                     item_type: "reasoning".to_string(),
-                    summary: Some(
-                        segments
-                            .iter()
-                            .map(|text| ResponseReasoningBlock {
-                                block_type: "summary_text".to_string(),
-                                text: Some((*text).to_string()),
-                                extra: Default::default(),
-                            })
-                            .collect(),
-                    ),
+                    summary: segments
+                        .iter()
+                        .map(|text| ResponseReasoningBlock {
+                            block_type: "summary_text".to_string(),
+                            text: (*text).to_string(),
+                            extra: Default::default(),
+                        })
+                        .collect(),
                     content: None,
                     encrypted_content: Some("encrypted".to_string()),
                     status: None,
@@ -2128,7 +2747,7 @@ mod tests {
                 })],
                 ..Default::default()
             };
-            let anthropic = translate_responses_result_to_anthropic(&result, None);
+            let anthropic = translate_responses_result_to_anthropic(&result, None).unwrap();
             let expected = segments.join(REASONING_SUMMARY_SEPARATOR);
             assert_eq!(anthropic.content[0]["thinking"], expected);
             assert_eq!(anthropic.content[0]["signature"], "encrypted@reasoning-id");

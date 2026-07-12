@@ -48,6 +48,10 @@ use super::utils::THINKING_TEXT;
 /// copy would silently corrupt them.
 use super::responses_translation::{
     effective_reasoning_text, encode_compaction_carrier_signature, encode_reasoning_signature,
+    parse_and_validate_output_item, stable_tool_use_id, validate_function_arguments,
+    validate_output_item_reconciliation, validate_raw_response_fields,
+    validate_raw_responses_usage, validate_terminal_status, OutputValidationPhase,
+    ResponsesTerminalKind, ValidatedResponsesUsage,
 };
 
 // ---------------------------------------------------------------------------
@@ -317,16 +321,6 @@ fn optional_array_field<'a>(
     }
 }
 
-fn validate_json_arguments(arguments: &str, allow_empty: bool) -> Result<(), &'static str> {
-    if arguments.is_empty() && allow_empty {
-        return Ok(());
-    }
-    if arguments.is_empty() || serde_json::from_str::<Value>(arguments).is_err() {
-        return Err("Function call arguments were empty or invalid JSON.");
-    }
-    Ok(())
-}
-
 fn required_nonnegative_index(
     event: &Value,
     key: &str,
@@ -340,80 +334,6 @@ fn required_nonnegative_index(
         return Err(negative_message);
     }
     Ok(index)
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ValidatedResponsesUsage {
-    input_tokens: i64,
-    cached_input_tokens: Option<i64>,
-    output_tokens: i64,
-}
-
-fn required_nonnegative_usage_field(
-    object: &serde_json::Map<String, Value>,
-    field: &str,
-) -> Result<i64, &'static str> {
-    object
-        .get(field)
-        .and_then(Value::as_i64)
-        .filter(|value| *value >= 0)
-        .ok_or("A Responses usage object had a missing, wrong-typed, or negative token field.")
-}
-
-fn optional_usage_detail(
-    usage: &serde_json::Map<String, Value>,
-    details_field: &str,
-    token_field: &str,
-) -> Result<Option<i64>, &'static str> {
-    let Some(details) = usage.get(details_field) else {
-        return Ok(None);
-    };
-    if details.is_null() {
-        return Ok(None);
-    }
-    let Some(details) = details.as_object() else {
-        return Err("A Responses usage details field was not an object or null.");
-    };
-    required_nonnegative_usage_field(details, token_field).map(Some)
-}
-
-fn validate_responses_usage(response: &Value) -> Result<ValidatedResponsesUsage, &'static str> {
-    let Some(usage) = response.get("usage") else {
-        return Ok(ValidatedResponsesUsage::default());
-    };
-    if usage.is_null() {
-        return Ok(ValidatedResponsesUsage::default());
-    }
-    let Some(usage) = usage.as_object() else {
-        return Err("A Responses usage field was not an object or null.");
-    };
-
-    let input_tokens = required_nonnegative_usage_field(usage, "input_tokens")?;
-    let output_tokens = required_nonnegative_usage_field(usage, "output_tokens")?;
-    let total_tokens = required_nonnegative_usage_field(usage, "total_tokens")?;
-    let cached_input_tokens =
-        optional_usage_detail(usage, "input_tokens_details", "cached_tokens")?;
-    let reasoning_output_tokens =
-        optional_usage_detail(usage, "output_tokens_details", "reasoning_tokens")?;
-
-    let Some(expected_total) = input_tokens.checked_add(output_tokens) else {
-        return Err("A Responses usage total overflowed the supported integer range.");
-    };
-    if total_tokens != expected_total {
-        return Err("A Responses usage total did not equal input plus output tokens.");
-    }
-    if cached_input_tokens.is_some_and(|cached| cached > input_tokens) {
-        return Err("A Responses cached token count exceeded its input token count.");
-    }
-    if reasoning_output_tokens.is_some_and(|reasoning| reasoning > output_tokens) {
-        return Err("A Responses reasoning token count exceeded its output token count.");
-    }
-
-    Ok(ValidatedResponsesUsage {
-        input_tokens,
-        cached_input_tokens,
-        output_tokens,
-    })
 }
 
 fn validate_event_sequence(
@@ -502,34 +422,6 @@ fn reserve_reasoning_part(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputItemPhase {
-    Added,
-    Done,
-}
-
-fn validate_optional_item_scalars(item: &Value) -> Result<(), &'static str> {
-    optional_string_field(item, "id", "An output item id was not a string or null.")?;
-    optional_string_field(
-        item,
-        "status",
-        "An output item status was not a string or null.",
-    )?;
-    if let Some(metadata) = item.get("internal_chat_message_metadata_passthrough") {
-        if !metadata.is_null() {
-            let Some(metadata) = metadata.as_object() else {
-                return Err("Internal chat message metadata was not an object or null.");
-            };
-            optional_string_field(
-                &Value::Object(metadata.clone()),
-                "turn_id",
-                "Internal chat message metadata turn_id was not a string or null.",
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn validate_annotations_field(value: &Value) -> Result<(), &'static str> {
     if optional_array_field(
         value,
@@ -561,35 +453,6 @@ fn reconciled_event_item_id(event: &Value, item: &Value) -> Result<Option<String
     Ok(inner.or(outer).map(str::to_string))
 }
 
-fn validate_message_content(content: &[Value]) -> Result<(), &'static str> {
-    for block in content {
-        let Some(block) = block.as_object() else {
-            return Err("A message content block was not an object.");
-        };
-        let block = Value::Object(block.clone());
-        let block_type = required_nonempty_string_field(
-            &block,
-            "type",
-            "A message content block had a missing or invalid type.",
-        )?;
-        match block_type {
-            "output_text" | "input_text" => {
-                required_string_field(
-                    &block,
-                    "text",
-                    "A text content block had a missing or invalid text field.",
-                )?;
-                validate_annotations_field(&block)?;
-            }
-            "input_image" => {
-                return Err("Image content is unsupported in a streamed assistant output message.");
-            }
-            _ => return Err("A message content block had an unsupported type."),
-        }
-    }
-    Ok(())
-}
-
 fn validate_reasoning_blocks(blocks: &[Value], summary: bool) -> Result<(), &'static str> {
     for block in blocks {
         let Some(block) = block.as_object() else {
@@ -617,125 +480,10 @@ fn validate_reasoning_blocks(blocks: &[Value], summary: bool) -> Result<(), &'st
 
 fn validate_known_output_item(
     item: &Value,
-    item_type: &str,
-    phase: OutputItemPhase,
+    _item_type: &str,
+    phase: OutputValidationPhase,
 ) -> Result<(), &'static str> {
-    match item_type {
-        "function_call" => {
-            validate_optional_item_scalars(item)?;
-            required_nonempty_string_field(
-                item,
-                "call_id",
-                "A function_call item had a missing, empty, or invalid call_id.",
-            )?;
-            required_nonempty_string_field(
-                item,
-                "name",
-                "A function_call item had a missing, empty, or invalid name.",
-            )?;
-            optional_string_field(
-                item,
-                "namespace",
-                "A function_call namespace was not a string or null.",
-            )?;
-            let arguments = required_string_field(
-                item,
-                "arguments",
-                "A function_call item had missing or invalid arguments.",
-            )?;
-            validate_json_arguments(arguments, phase == OutputItemPhase::Added)?;
-        }
-        "tool_search_call" => {
-            validate_optional_item_scalars(item)?;
-            optional_string_field(
-                item,
-                "call_id",
-                "A tool_search_call call_id was not a string or null.",
-            )?;
-            required_nonempty_string_field(
-                item,
-                "execution",
-                "A tool_search_call item had a missing, empty, or invalid execution.",
-            )?;
-            if item.get("arguments").is_none() {
-                return Err("A tool_search_call item was missing its arguments.");
-            }
-        }
-        "tool_search_output" => {
-            validate_optional_item_scalars(item)?;
-            optional_string_field(
-                item,
-                "call_id",
-                "A tool_search_output call_id was not a string or null.",
-            )?;
-            required_nonempty_string_field(
-                item,
-                "status",
-                "A tool_search_output item had a missing, empty, or invalid status.",
-            )?;
-            required_nonempty_string_field(
-                item,
-                "execution",
-                "A tool_search_output item had a missing, empty, or invalid execution.",
-            )?;
-            item.get("tools")
-                .and_then(Value::as_array)
-                .ok_or("A tool_search_output item had missing or invalid tools.")?;
-        }
-        "message" => {
-            validate_optional_item_scalars(item)?;
-            let role = required_nonempty_string_field(
-                item,
-                "role",
-                "A message item had a missing, empty, or invalid role.",
-            )?;
-            if role != "assistant" {
-                return Err("A streamed output message did not have the assistant role.");
-            }
-            let content = item
-                .get("content")
-                .and_then(Value::as_array)
-                .ok_or("A message item had missing or invalid content.")?;
-            validate_message_content(content)?;
-            if let Some(phase) =
-                optional_string_field(item, "phase", "A message phase was not a string or null.")?
-            {
-                if !matches!(phase, "commentary" | "final_answer") {
-                    return Err("A message item had an invalid phase.");
-                }
-            }
-        }
-        "reasoning" => {
-            validate_optional_item_scalars(item)?;
-            optional_string_field(
-                item,
-                "encrypted_content",
-                "A reasoning encrypted_content field was not a string or null.",
-            )?;
-            let summary = item
-                .get("summary")
-                .and_then(Value::as_array)
-                .ok_or("A reasoning item had missing or invalid summary.")?;
-            validate_reasoning_blocks(summary, true)?;
-            if let Some(content) = optional_array_field(
-                item,
-                "content",
-                "A reasoning content field was not an array or null.",
-            )? {
-                validate_reasoning_blocks(content, false)?;
-            }
-        }
-        "compaction" | "compaction_summary" => {
-            validate_optional_item_scalars(item)?;
-            required_nonempty_string_field(
-                item,
-                "encrypted_content",
-                "A compaction item had missing, empty, or invalid encrypted_content.",
-            )?;
-        }
-        _ => {}
-    }
-    Ok(())
+    parse_and_validate_output_item(item, phase).map(|_| ())
 }
 
 /// A non-empty namespace wins over the required function name.
@@ -755,59 +503,6 @@ fn resolve_tool_use_name(item: &Value) -> &str {
         )
         .expect("function item validated before name resolution")
     })
-}
-
-fn validate_done_item_identity(
-    added: &Value,
-    done: &Value,
-    item_type: &str,
-) -> Result<(), &'static str> {
-    let conflicts = |field: &str| {
-        let added = get_str(added, field).filter(|value| !value.is_empty());
-        let done = get_str(done, field).filter(|value| !value.is_empty());
-        added.is_some() && done.is_some() && added != done
-    };
-    let optional_changed = |field: &str| {
-        let added = optional_string_field(added, field, "An item identity field was invalid.")
-            .expect("known item validated before identity reconciliation");
-        let done = optional_string_field(done, field, "An item identity field was invalid.")
-            .expect("known item validated before identity reconciliation");
-        added.is_some() && done.is_some() && added != done
-    };
-    if matches!(item_type, "function_call" | "tool_search_call") && conflicts("call_id") {
-        return Err("A completed function/tool call changed its call id.");
-    }
-    if item_type == "function_call" {
-        let added_name = resolve_tool_use_name(added);
-        let done_name = resolve_tool_use_name(done);
-        if !added_name.is_empty() && !done_name.is_empty() && added_name != done_name {
-            return Err("A completed function call changed its function name.");
-        }
-    }
-    if item_type == "message" && conflicts("role") {
-        return Err("A completed message changed its role.");
-    }
-    if item_type == "tool_search_call" {
-        if conflicts("execution") {
-            return Err("A completed tool search changed its execution mode.");
-        }
-        if let (Some(added_arguments), Some(done_arguments)) =
-            (added.get("arguments"), done.get("arguments"))
-        {
-            if added_arguments != done_arguments {
-                return Err("A completed tool search changed its arguments.");
-            }
-        }
-    }
-    if item_type == "reasoning" && optional_changed("encrypted_content") {
-        return Err("A completed reasoning item changed its encrypted content.");
-    }
-    if matches!(item_type, "compaction" | "compaction_summary")
-        && optional_changed("encrypted_content")
-    {
-        return Err("A completed compaction item changed its encrypted content.");
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -955,9 +650,7 @@ fn open_function_call_block(
         let block_index = state.next_content_block_index;
         state.next_content_block_index += 1;
 
-        let resolved_tool_call_id = tool_call_id
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("tool_call_{block_index}"));
+        let resolved_tool_call_id = stable_tool_use_id(tool_call_id, None, output_index);
         let resolved_name = name
             .filter(|name| !name.trim().is_empty())
             .expect("function/tool-search item validated before block creation")
@@ -1180,6 +873,9 @@ fn handle_response_created(
             build_error_event("A response.created event had a missing or empty response id."),
         );
     };
+    if let Err(message) = validate_raw_response_fields(response) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     if let Some(status) = response.get("status") {
         if status.as_str() != Some("in_progress") {
             return terminate_responses_stream_with_error(
@@ -1208,7 +904,7 @@ fn handle_response_created(
             )
         }
     };
-    let usage = match validate_responses_usage(response) {
+    let usage = match validate_raw_responses_usage(response) {
         Ok(usage) => usage,
         Err(message) => {
             return terminate_responses_stream_with_error(state, build_error_event(message))
@@ -1285,7 +981,7 @@ fn handle_output_item_added(
         }
     };
     let item_id = match reconciled_event_item_id(event, item).and_then(|item_id| {
-        validate_known_output_item(item, item_type, OutputItemPhase::Added)?;
+        validate_known_output_item(item, item_type, OutputValidationPhase::Added)?;
         Ok(item_id)
     }) {
         Ok(item_id) => item_id,
@@ -1391,24 +1087,51 @@ fn extract_function_call_details(
     let item_type = item.get("type").and_then(Value::as_str)?;
 
     if item_type == "tool_search_call" {
-        let tool_call_id = optional_string_field(
+        let call_id = optional_string_field(
             item,
             "call_id",
             "A tool_search_call call_id was not a string or null.",
         )
-        .expect("tool search item validated before extraction")
-        .filter(|call_id| !call_id.is_empty())
-        .or_else(|| {
-            optional_string_field(item, "id", "A tool_search_call id was invalid.")
-                .expect("tool search item validated before extraction")
-                .filter(|id| !id.is_empty())
-        })
-        .map(str::to_string);
+        .expect("tool search item validated before extraction");
+        if call_id.is_none_or(str::is_empty) {
+            // `call_id` is source-optional and may first appear on the
+            // authoritative done item. Delay even when the provisional item has
+            // an `id`: JSON translation prefers a final call_id, so emitting the
+            // item id now would make the two transports disagree.
+            return None;
+        }
+        let tool_call_id = Some(stable_tool_use_id(call_id, None, output_index));
         return Some(FunctionCallDetails {
             output_index,
             tool_call_id,
             name: state.tool_search_name.clone(),
             initial_arguments: Some(String::new()),
+        });
+    }
+
+    if item_type == "custom_tool_call" {
+        let input = required_string_field(
+            item,
+            "input",
+            "A custom_tool_call item had missing or invalid input.",
+        )
+        .expect("custom tool item validated before extraction");
+        return Some(FunctionCallDetails {
+            output_index,
+            tool_call_id: Some(
+                required_nonempty_string_field(
+                    item,
+                    "call_id",
+                    "A custom_tool_call item had a missing or invalid call_id.",
+                )
+                .expect("custom tool item validated before extraction")
+                .to_string(),
+            ),
+            name: resolve_tool_use_name(item).to_string(),
+            initial_arguments: (!input.is_empty()).then(|| {
+                serde_json::to_string(&json!({"input":input}))
+                    .expect("serializing custom tool input cannot fail")
+            }),
         });
     }
 
@@ -1475,7 +1198,7 @@ fn handle_output_item_done(
         }
     };
     let item_id = match reconciled_event_item_id(event, item).and_then(|item_id| {
-        validate_known_output_item(item, item_type, OutputItemPhase::Done)?;
+        validate_known_output_item(item, item_type, OutputValidationPhase::Done)?;
         Ok(item_id)
     }) {
         Ok(item_id) => item_id,
@@ -1494,7 +1217,7 @@ fn handle_output_item_done(
             );
         }
         if let Some(added) = existing.added_item.as_ref() {
-            if let Err(message) = validate_done_item_identity(added, item, item_type) {
+            if let Err(message) = validate_output_item_reconciliation(added, item) {
                 return terminate_responses_stream_with_error(state, build_error_event(message));
             }
         }
@@ -1579,7 +1302,10 @@ fn handle_output_item_done(
         return events;
     }
 
-    if matches!(item_type, "function_call" | "tool_search_call") {
+    if matches!(
+        item_type,
+        "function_call" | "custom_tool_call" | "tool_search_call"
+    ) {
         let tool_search_arguments = if item_type == "tool_search_call" {
             match stringify_tool_search_arguments(
                 item.get("arguments")
@@ -1595,21 +1321,43 @@ fn handle_output_item_done(
         };
         let (call_id, name, final_arguments) = if item_type == "tool_search_call" {
             (
-                optional_string_field(
-                    item,
-                    "call_id",
-                    "A tool_search_call call_id was not a string or null.",
-                )
-                .expect("tool search item validated above")
-                .filter(|call_id| !call_id.is_empty())
-                .or_else(|| {
+                Some(stable_tool_use_id(
+                    optional_string_field(
+                        item,
+                        "call_id",
+                        "A tool_search_call call_id was not a string or null.",
+                    )
+                    .expect("tool search item validated above"),
                     optional_string_field(item, "id", "A tool_search_call id was invalid.")
-                        .expect("tool search item validated above")
-                        .filter(|id| !id.is_empty())
-                })
-                .map(str::to_string),
+                        .expect("tool search item validated above"),
+                    output_index,
+                )),
                 state.tool_search_name.clone(),
                 tool_search_arguments,
+            )
+        } else if item_type == "custom_tool_call" {
+            (
+                Some(
+                    required_nonempty_string_field(
+                        item,
+                        "call_id",
+                        "A custom_tool_call item had a missing or invalid call_id.",
+                    )
+                    .expect("custom tool item validated above")
+                    .to_string(),
+                ),
+                resolve_tool_use_name(item).to_string(),
+                Some(
+                    serde_json::to_string(&json!({
+                        "input":required_string_field(
+                            item,
+                            "input",
+                            "A custom_tool_call item had missing or invalid input.",
+                        )
+                        .expect("custom tool item validated above")
+                    }))
+                    .expect("serializing custom tool input cannot fail"),
+                ),
             )
         } else {
             (
@@ -1970,13 +1718,12 @@ fn handle_function_call_arguments_delta(
     state: &mut ResponsesStreamState,
 ) -> Vec<AnthropicStreamEventData> {
     let mut events = Vec::new();
-    let output_index =
-        match validate_active_output_item(event, state, &["function_call", "tool_search_call"]) {
-            Ok(index) => index,
-            Err(message) => {
-                return terminate_responses_stream_with_error(state, build_error_event(message))
-            }
-        };
+    let output_index = match validate_active_output_item(event, state, &["function_call"]) {
+        Ok(index) => index,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
     let Some(delta_text) = get_str(event, "delta") else {
         return terminate_responses_stream_with_error(
             state,
@@ -2040,13 +1787,12 @@ fn handle_function_call_arguments_done(
     state: &mut ResponsesStreamState,
 ) -> Vec<AnthropicStreamEventData> {
     let mut events = Vec::new();
-    let output_index =
-        match validate_active_output_item(event, state, &["function_call", "tool_search_call"]) {
-            Ok(index) => index,
-            Err(message) => {
-                return terminate_responses_stream_with_error(state, build_error_event(message))
-            }
-        };
+    let output_index = match validate_active_output_item(event, state, &["function_call"]) {
+        Ok(index) => index,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
     let Some(final_arguments) = get_str(event, "arguments") else {
         return terminate_responses_stream_with_error(
             state,
@@ -2055,7 +1801,8 @@ fn handle_function_call_arguments_done(
             ),
         );
     };
-    if let Err(message) = validate_json_arguments(final_arguments, false) {
+    if let Err(message) = validate_function_arguments(final_arguments, OutputValidationPhase::Done)
+    {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     if state
@@ -2516,34 +2263,16 @@ fn handle_output_text_done(
     events
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponsesTerminalKind {
-    Completed,
-    Incomplete,
-}
-
-impl ResponsesTerminalKind {
-    fn from_event(event: &Value) -> Option<Self> {
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.completed") => Some(Self::Completed),
-            Some("response.incomplete") => Some(Self::Incomplete),
-            _ => None,
-        }
-    }
-
-    fn expected_status(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Incomplete => "incomplete",
-        }
-    }
-}
-
 fn handle_response_completed(
     event: &Value,
     state: &mut ResponsesStreamState,
 ) -> Vec<AnthropicStreamEventData> {
-    let Some(terminal_kind) = ResponsesTerminalKind::from_event(event) else {
+    let Some(terminal_kind) = event
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(ResponsesTerminalKind::from_event_type)
+        .filter(|kind| *kind != ResponsesTerminalKind::Failed)
+    else {
         return terminate_responses_stream_with_error(
             state,
             build_error_event("An unrecognized Responses event reached terminal handling."),
@@ -2566,6 +2295,9 @@ fn handle_response_completed(
             build_error_event("A terminal Responses event had a missing or empty response id."),
         );
     };
+    if let Err(message) = validate_raw_response_fields(response) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     if state.created_response_id.as_deref() != Some(terminal_id) {
         return terminate_responses_stream_with_error(
             state,
@@ -2575,15 +2307,8 @@ fn handle_response_completed(
         );
     }
 
-    if let Some(status) = response.get("status") {
-        if status.as_str() != Some(terminal_kind.expected_status()) {
-            return terminate_responses_stream_with_error(
-                state,
-                build_error_event(
-                    "A terminal Responses event had an inconsistent response status.",
-                ),
-            );
-        }
+    if let Err(message) = validate_terminal_status(response, terminal_kind) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     if let Some(end_turn) = response.get("end_turn") {
         if !end_turn.is_null() && !end_turn.is_boolean() {
@@ -2595,7 +2320,7 @@ fn handle_response_completed(
             );
         }
     }
-    let validated_usage = match validate_responses_usage(response) {
+    let validated_usage = match validate_raw_responses_usage(response) {
         Ok(usage) => usage,
         Err(message) => {
             return terminate_responses_stream_with_error(state, build_error_event(message))
@@ -2629,11 +2354,21 @@ fn handle_response_completed(
         }
         Some(_) => true,
     };
+    let terminal_item_status_mismatch = terminal_kind == ResponsesTerminalKind::Completed
+        && state.output_items_by_index.values().any(|lifecycle| {
+            lifecycle
+                .done_item
+                .as_ref()
+                .and_then(|item| item.get("status"))
+                .and_then(Value::as_str)
+                == Some("incomplete")
+        });
     if pending_output_item
         || pending_function_call
         || !state.reasoning_state_by_output_index.is_empty()
         || !output_indices_contiguous
         || terminal_output_mismatch
+        || terminal_item_status_mismatch
     {
         return terminate_responses_stream_with_error(
             state,
@@ -2687,6 +2422,9 @@ fn handle_response_failed(
             build_error_event("A response.failed event had a missing or empty response id."),
         );
     };
+    if let Err(message) = validate_raw_response_fields(response) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     if state
         .created_response_id
         .as_deref()
@@ -2782,12 +2520,13 @@ fn map_responses_stop_reason(
                 ));
             }
             Some(items) => {
-                let has_call = items.iter().any(|item| {
-                    matches!(
-                        item.get("type").and_then(Value::as_str),
-                        Some("function_call") | Some("tool_search_call")
-                    )
-                });
+                let has_call = has_tool_call
+                    || items.iter().any(|item| {
+                        matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("function_call" | "custom_tool_call" | "tool_search_call")
+                        )
+                    });
                 return Ok(Some(
                     if has_call { "tool_use" } else { "end_turn" }.to_string(),
                 ));
