@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 5,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -26,6 +26,11 @@
       "iteration": 4,
       "verdict": "FAIL",
       "summary": "Aggregate-empty carrier cases pass, but stream/non-stream reasoning diverges on leading whitespace and multi-summary separators."
+    },
+    {
+      "iteration": 5,
+      "verdict": "FAIL",
+      "summary": "Framing equivalence passes, but reasoning_text.delta is dropped and missing/duplicate output-item lifecycle can lose or duplicate reasoning while reporting success."
     }
   ]
 }
