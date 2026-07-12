@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-code-api-compat",
-  "status": "inspecting",
+  "status": "completed",
   "iteration": 6,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
