@@ -1,0 +1,10 @@
+{
+  "goal_id": "claude-code-api-compat",
+  "status": "building",
+  "iteration": 1,
+  "builder_model": "OpenAI:GPT-5.6-Sol",
+  "inspector_model": "OpenAI:GPT-5.6-Luna",
+  "initial_sha": "2c8a37436462c808830c62c11ea367cd9f53817b",
+  "created_at": "2026-07-11T23:53:02.517-04:00",
+  "history": []
+}

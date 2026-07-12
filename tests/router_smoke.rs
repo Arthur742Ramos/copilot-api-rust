@@ -87,6 +87,7 @@ async fn malformed_json_returns_invalid_request_error_shape() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let json: serde_json::Value =
         serde_json::from_slice(&body).expect("error body must be JSON, not plain text");
+    assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "invalid_request_error");
     assert!(json["error"]["message"]
         .as_str()
@@ -112,6 +113,32 @@ async fn empty_model_returns_invalid_request_error() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
     assert_eq!(json["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn generation_requires_positive_max_tokens_before_upstream_dispatch() {
+    set_config(&[], None);
+    for body in [
+        r#"{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"claude-sonnet-4.6","max_tokens":0,"messages":[{"role":"user","content":"hi"}]}"#,
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body) = send(request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max_tokens"));
+    }
 }
 
 #[tokio::test]

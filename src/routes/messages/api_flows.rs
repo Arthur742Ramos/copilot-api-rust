@@ -43,14 +43,16 @@ use crate::routes::messages::non_stream_translation::{
     translate_to_anthropic, translate_to_openai,
 };
 use crate::routes::messages::responses_stream_translation::{
-    build_error_event, translate_responses_stream_event, ResponsesStreamState,
+    build_error_event, terminate_responses_stream_with_error, translate_responses_stream_event,
+    ResponsesStreamState,
 };
 use crate::routes::messages::responses_translation::{
     translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
 };
 use crate::routes::messages::stream_translation::{
-    flush_pending_anthropic_stream_events, translate_chunk_to_anthropic_events,
-    translate_error_to_anthropic_error_event,
+    flush_pending_anthropic_stream_events, malformed_stream_error_events,
+    translate_chunk_to_anthropic_events, translate_error_to_anthropic_error_event,
+    transport_stream_error_events,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
@@ -130,9 +132,9 @@ fn emit_event(event: &AnthropicStreamEventData) -> Option<Bytes> {
 /// only signal that an SSE-reassembly bug or upstream corruption occurred. The
 /// parse error is logged (as a structured field) to aid diagnosis, but the raw
 /// chunk is never logged so user content can't leak.
-fn record_stream_chunk_parse_failure(flow: &'static str, error: &serde_json::Error) {
+pub(crate) fn record_stream_chunk_parse_failure(flow: &'static str, error: &serde_json::Error) {
     metrics::counter!("proxy_stream_chunk_parse_failures_total", "flow" => flow).increment(1);
-    tracing::warn!(error = %error, "dropped unparseable upstream SSE chunk on {flow} stream");
+    tracing::warn!(error = %error, "unparseable upstream SSE chunk terminated {flow} stream");
 }
 
 /// Build a `text/event-stream` response over a byte stream, with the same header
@@ -256,10 +258,10 @@ pub async fn handle_with_chat_completions(
                         Err(e) => {
                             tracing::warn!("chat-completions stream error: {e}; sending terminal error event");
                             timer.mark_error();
-                            if let Some(frame) =
-                                emit_event(&translate_error_to_anthropic_error_event(Some(&e)))
-                            {
-                                yield Ok(frame);
+                            for event in transport_stream_error_events(&mut state, Some(&e)) {
+                                if let Some(frame) = emit_event(&event) {
+                                    yield Ok(frame);
+                                }
                             }
                             // Record whatever usage was sniffed before the error so
                             // partial-stream accounting isn't silently dropped.
@@ -269,7 +271,6 @@ pub async fn handle_with_chat_completions(
                     };
 
                     if raw_event.data == "[DONE]" {
-                        timer.mark_finished();
                         break;
                     }
                     if raw_event.data.is_empty() {
@@ -280,7 +281,14 @@ pub async fn handle_with_chat_completions(
                         Ok(c) => c,
                         Err(e) => {
                             record_stream_chunk_parse_failure("chat_completions", &e);
-                            continue;
+                            timer.mark_error();
+                            for event in malformed_stream_error_events(&mut state) {
+                                if let Some(frame) = emit_event(&event) {
+                                    yield Ok(frame);
+                                }
+                            }
+                            recorder.record(usage);
+                            return;
                         }
                     };
                     if let Some(u) = chunk.get("usage") {
@@ -307,12 +315,11 @@ pub async fn handle_with_chat_completions(
                 // `pending_message_delta` guard avoids flagging the legitimate
                 // deferred-usage path where a finish_reason was received but its
                 // usage arrived on a later/absent chunk.
-                let truncated = state.message_start_sent
-                    && !state.message_stop_emitted
-                    && state.pending_message_delta.is_none();
+                let truncated =
+                    !state.terminal_event_emitted && state.pending_message_delta.is_none();
                 if truncated {
                     tracing::warn!(
-                        "chat-completions stream ended after message start without emitting message_stop (truncated)"
+                        "chat-completions stream ended without a finish reason (truncated or empty)"
                     );
                     timer.mark_error();
                 }
@@ -324,6 +331,9 @@ pub async fn handle_with_chat_completions(
                     }
                 }
 
+                if state.message_stop_emitted {
+                    timer.mark_finished();
+                }
                 recorder.record(usage);
             };
             Ok(sse_response(stream))
@@ -441,10 +451,11 @@ pub async fn handle_with_responses_api(
                         Err(e) => {
                             tracing::warn!("responses stream error: {e}; sending terminal error event");
                             timer.mark_error();
-                            let error_event =
-                                build_error_event("An unexpected error occurred during streaming.");
-                            if let Some(frame) = emit_event(&error_event) {
-                                yield Ok(frame);
+                            let error_event = translate_error_to_anthropic_error_event(Some(&e));
+                            for event in terminate_responses_stream_with_error(&mut state, error_event) {
+                                if let Some(frame) = emit_event(&event) {
+                                    yield Ok(frame);
+                                }
                             }
                             recorder.record(usage);
                             return;
@@ -460,12 +471,26 @@ pub async fn handle_with_responses_api(
                     if chunk.data.is_empty() {
                         continue;
                     }
+                    if chunk.data == "[DONE]" {
+                        break;
+                    }
 
                     let response_event: Value = match serde_json::from_str(&chunk.data) {
                         Ok(v) => v,
                         Err(e) => {
                             record_stream_chunk_parse_failure("responses", &e);
-                            continue;
+                            timer.mark_error();
+                            let error_event =
+                                build_error_event("The upstream Responses stream returned a malformed event.");
+                            for event in
+                                terminate_responses_stream_with_error(&mut state, error_event)
+                            {
+                                if let Some(frame) = emit_event(&event) {
+                                    yield Ok(frame);
+                                }
+                            }
+                            recorder.record(usage);
+                            return;
                         }
                     };
                     match response_event.get("type").and_then(Value::as_str) {
@@ -496,10 +521,15 @@ pub async fn handle_with_responses_api(
                         "Responses stream ended without completion; sending error event"
                     );
                     timer.mark_error();
-                    let error_event =
-                        build_error_event("Responses stream ended without completion");
-                    if let Some(frame) = emit_event(&error_event) {
-                        yield Ok(frame);
+                    let error_event = build_error_event(
+                        "The upstream Responses stream ended without a completion event.",
+                    );
+                    for event in
+                        terminate_responses_stream_with_error(&mut state, error_event)
+                    {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok(frame);
+                        }
                     }
                 }
 
@@ -565,12 +595,10 @@ pub async fn handle_with_messages_api(
                 let mut timer = StreamTimer::new("messages", stream_transport::TRANSLATED)
                     .with_request_context(req_ctx);
                 let mut usage = UsageTokens::default();
-                // Track terminal framing so a passthrough upstream that ends
-                // without a `message_stop` (clean end / [DONE]) doesn't leave the
-                // client hanging. We only synthesize a close if a message was
-                // actually started.
-                let mut message_started = false;
-                let mut message_stopped = false;
+                // Native Anthropic streams must explicitly terminate with either
+                // message_stop or error. Never turn a truncated stream into a
+                // synthetic success.
+                let mut terminal_event_seen = false;
 
                 let heartbeat = crate::libs::sse::sse_heartbeat_interval();
                 let sse = crate::libs::sse::events(upstream);
@@ -611,51 +639,62 @@ pub async fn handle_with_messages_api(
                     let event_name = event.event.clone();
                     let data = event.data;
                     if data == "[DONE]" {
-                        timer.mark_finished();
                         break;
                     }
                     if data.is_empty() {
                         continue;
                     }
 
-                    // Only message_start/message_delta/message_stop can affect
-                    // accounting or terminal state. Avoid a JSON parse for the
-                    // overwhelmingly common content-block token deltas.
-                    if native_message_event_needs_inspection(event_name.as_deref(), &data) {
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-                            match parsed.get("type").and_then(Value::as_str) {
-                                Some("message_start") => {
-                                    message_started = true;
-                                    let next = normalize_anthropic_usage(
-                                        parsed.get("message").and_then(|m| m.get("usage")),
-                                    );
-                                    usage = merge_anthropic_usage(usage, next);
-                                }
-                                Some("message_delta") => {
-                                    let next = normalize_anthropic_usage(parsed.get("usage"));
-                                    usage = merge_anthropic_usage(usage, next);
-                                }
-                                Some("message_stop") => {
-                                    message_stopped = true;
-                                }
-                                _ => {}
+                    let parsed = match serde_json::from_str::<Value>(&data) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            record_stream_chunk_parse_failure("messages", &e);
+                            timer.mark_error();
+                            if let Some(frame) = emit_event(&build_error_event(
+                                "The upstream Messages stream returned a malformed event.",
+                            )) {
+                                yield Ok(frame);
                             }
+                            recorder.record(usage);
+                            return;
                         }
+                    };
+                    match parsed.get("type").and_then(Value::as_str) {
+                        Some("message_start") => {
+                            let next = normalize_anthropic_usage(
+                                parsed.get("message").and_then(|m| m.get("usage")),
+                            );
+                            usage = merge_anthropic_usage(usage, next);
+                        }
+                        Some("message_delta") => {
+                            let next = normalize_anthropic_usage(parsed.get("usage"));
+                            usage = merge_anthropic_usage(usage, next);
+                        }
+                        Some("message_stop" | "error") => {
+                            terminal_event_seen = true;
+                        }
+                        _ => {}
                     }
 
                     timer.on_content_frame();
                     yield Ok(native_message_frame(event_name.as_deref(), &data));
+                    if terminal_event_seen {
+                        break;
+                    }
                 }
 
-                // Upstream ended without terminating a started message: synthesize
-                // a message_stop so the client's SSE consumer doesn't hang.
-                if message_started && !message_stopped {
+                if !terminal_event_seen {
                     tracing::warn!(
-                        "messages stream ended without message_stop; synthesizing terminal event"
+                        "messages stream ended without message_stop/error; sending terminal error"
                     );
-                    if let Some(frame) = emit_event(&AnthropicStreamEventData::MessageStop) {
+                    timer.mark_error();
+                    if let Some(frame) = emit_event(&build_error_event(
+                        "The upstream Messages stream ended before a terminal event.",
+                    )) {
                         yield Ok(frame);
                     }
+                } else {
+                    timer.mark_finished();
                 }
 
                 recorder.record(usage);
@@ -663,15 +702,6 @@ pub async fn handle_with_messages_api(
             Ok(sse_response(stream))
         }
     }
-}
-
-fn native_message_event_needs_inspection(event_name: Option<&str>, data: &str) -> bool {
-    matches!(
-        event_name,
-        Some("message_start" | "message_delta" | "message_stop")
-    ) || ["\"message_start\"", "\"message_delta\"", "\"message_stop\""]
-        .iter()
-        .any(|kind| data.contains(kind))
 }
 
 fn native_message_frame(event_name: Option<&str>, data: &str) -> Bytes {
@@ -898,18 +928,6 @@ mod tests {
                 }
             })
         );
-    }
-
-    #[test]
-    fn native_message_inspection_skips_token_deltas() {
-        assert!(!native_message_event_needs_inspection(
-            Some("content_block_delta"),
-            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}"#
-        ));
-        assert!(native_message_event_needs_inspection(
-            Some("message_delta"),
-            r#"{"type":"message_delta","usage":{"output_tokens":1}}"#
-        ));
     }
 
     #[test]

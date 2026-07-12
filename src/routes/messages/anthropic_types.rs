@@ -413,6 +413,11 @@ pub struct AnthropicStreamToolCall {
     pub id: String,
     pub name: String,
     pub anthropic_block_index: i64,
+    /// Argument fragments for calls that cannot be emitted yet because another
+    /// tool block is active. Anthropic content blocks are strictly sequential,
+    /// while OpenAI may interleave parallel tool-call indices.
+    pub buffered_arguments: Vec<String>,
+    pub started: bool,
 }
 
 /// `AnthropicStreamState` — plain mutable scratch state for the streaming
@@ -427,10 +432,16 @@ pub struct AnthropicStreamState {
     pub deferred_content: Option<String>,
     /// openAIToolIndex -> { id, name, anthropic_block_index }
     pub tool_calls: std::collections::HashMap<i64, AnthropicStreamToolCall>,
+    /// First-seen order for deterministic serialization of parallel calls.
+    pub tool_call_order: Vec<i64>,
+    /// The one tool call whose Anthropic content block is currently streaming.
+    pub active_tool_call_index: Option<i64>,
     /// Set once a terminal `message_stop` has been emitted, so the end-of-stream
-    /// flush can detect an upstream that ended without a `finish_reason` and
-    /// synthesize a well-formed close instead of leaving the stream dangling.
+    /// flush can distinguish success from an upstream that ended without a
+    /// `finish_reason` and emit a terminal error instead of silently truncating.
     pub message_stop_emitted: bool,
+    /// Set after either a successful `message_stop` or a terminal `error`.
+    pub terminal_event_emitted: bool,
 }
 
 #[cfg(test)]

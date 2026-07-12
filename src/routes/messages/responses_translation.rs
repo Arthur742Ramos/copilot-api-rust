@@ -1337,7 +1337,7 @@ fn map_responses_stop_reason(response: &ResponsesResult, has_tool_call: bool) ->
             .and_then(Value::as_str);
         match reason {
             Some("max_output_tokens") => return Some("max_tokens".to_string()),
-            Some("content_filter") => return Some("end_turn".to_string()),
+            Some("content_filter") => return Some("refusal".to_string()),
             _ => {}
         }
     }

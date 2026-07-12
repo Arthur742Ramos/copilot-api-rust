@@ -56,6 +56,10 @@ pub struct FunctionCallStreamState {
     pub tool_call_id: String,
     pub name: String,
     pub consecutive_whitespace_count: i64,
+    pub buffered_arguments: Vec<String>,
+    pub received_argument_delta: bool,
+    pub started: bool,
+    pub done: bool,
 }
 
 /// Mirrors the TS `ResponsesStreamState`.
@@ -69,6 +73,8 @@ pub struct ResponsesStreamState {
     pub open_blocks: Vec<i64>,
     pub block_has_delta: HashSet<i64>,
     pub function_call_state_by_output_index: HashMap<i64, FunctionCallStreamState>,
+    pub function_call_order: Vec<i64>,
+    pub active_function_call_output_index: Option<i64>,
     pub tool_search_name: String,
     pub has_tool_call: bool,
 }
@@ -84,6 +90,8 @@ impl ResponsesStreamState {
             open_blocks: Vec::new(),
             block_has_delta: HashSet::new(),
             function_call_state_by_output_index: HashMap::new(),
+            function_call_order: Vec::new(),
+            active_function_call_output_index: None,
             tool_search_name: tool_search_name
                 .unwrap_or_else(|| BRIDGE_TOOL_SEARCH_NAME.to_string()),
             has_tool_call: false,
@@ -106,7 +114,30 @@ pub fn translate_responses_stream_event(
     event: &Value,
     state: &mut ResponsesStreamState,
 ) -> Vec<AnthropicStreamEventData> {
-    match event.get("type").and_then(Value::as_str) {
+    if state.message_completed {
+        return Vec::new();
+    }
+
+    let event_type = event.get("type").and_then(Value::as_str);
+    if event_type == Some("response.created") && state.message_start_sent {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event("The Responses stream emitted more than one response.created event."),
+        );
+    }
+    if !state.message_start_sent
+        && !matches!(
+            event_type,
+            Some("response.created" | "response.failed" | "error")
+        )
+    {
+        return terminate_responses_stream_with_error(
+            state,
+            build_error_event("The Responses stream emitted an event before response.created."),
+        );
+    }
+
+    match event_type {
         Some("response.created") => handle_response_created(event, state),
         Some("response.output_item.added") => handle_output_item_added(event, state),
         Some("response.reasoning_summary_text.delta") => {
@@ -141,6 +172,22 @@ pub fn build_error_event(message: &str) -> AnthropicStreamEventData {
             message: message.to_string(),
         },
     }
+}
+
+/// Close any open content block and emit one terminal error. Used by stream
+/// drivers for transport failures, malformed SSE records, and premature EOF.
+pub fn terminate_responses_stream_with_error(
+    state: &mut ResponsesStreamState,
+    error: AnthropicStreamEventData,
+) -> Vec<AnthropicStreamEventData> {
+    if state.message_completed {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    close_all_open_blocks(state, &mut events);
+    events.push(error);
+    state.message_completed = true;
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +272,8 @@ fn close_all_open_blocks(
 ) {
     close_open_blocks(state, events);
     state.function_call_state_by_output_index.clear();
+    state.function_call_order.clear();
+    state.active_function_call_output_index = None;
 }
 
 /// Mirrors `openTextBlockIfNeeded`.
@@ -319,19 +368,42 @@ fn open_function_call_block(
                 tool_call_id: resolved_tool_call_id,
                 name: resolved_name,
                 consecutive_whitespace_count: 0,
+                buffered_arguments: Vec::new(),
+                received_argument_delta: false,
+                started: false,
+                done: false,
             },
         );
+        state.function_call_order.push(output_index);
+    } else if let Some(fc) = state
+        .function_call_state_by_output_index
+        .get_mut(&output_index)
+    {
+        // An arguments event can arrive before output_item.added. Replace the
+        // temporary defaults once authoritative metadata appears.
+        if let Some(id) = tool_call_id.filter(|id| !id.is_empty()) {
+            fc.tool_call_id = id.to_string();
+        }
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            fc.name = name.to_string();
+        }
     }
 
+    if state.active_function_call_output_index.is_none() {
+        state.active_function_call_output_index = Some(output_index);
+    }
+
+    let is_active = state.active_function_call_output_index == Some(output_index);
     let fc = state
         .function_call_state_by_output_index
         .get(&output_index)
         .expect("function call state just inserted");
     let block_index = fc.block_index;
+    let should_start = is_active && !fc.started;
     let tool_call_id = fc.tool_call_id.clone();
     let name = fc.name.clone();
 
-    if !open_blocks_has(state, block_index) {
+    if should_start {
         close_open_blocks(state, events);
         events.push(AnthropicStreamEventData::ContentBlockStart {
             index: block_index,
@@ -343,9 +415,89 @@ fn open_function_call_block(
             }),
         });
         state.open_blocks.push(block_index);
+        if let Some(fc) = state
+            .function_call_state_by_output_index
+            .get_mut(&output_index)
+        {
+            fc.started = true;
+        }
     }
 
     block_index
+}
+
+fn function_call_is_active(state: &ResponsesStreamState, output_index: i64) -> bool {
+    state.active_function_call_output_index == Some(output_index)
+}
+
+/// Finish the active call and activate buffered parallel calls in first-seen
+/// order. Calls already marked done are emitted completely and drained; the
+/// first unfinished call remains active for future deltas.
+fn advance_function_call_queue(
+    state: &mut ResponsesStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) {
+    if let Some(active) = state.active_function_call_output_index.take() {
+        if let Some(fc) = state.function_call_state_by_output_index.remove(&active) {
+            if open_blocks_has(state, fc.block_index) {
+                events.push(AnthropicStreamEventData::ContentBlockStop {
+                    index: fc.block_index,
+                });
+                state.open_blocks.retain(|index| *index != fc.block_index);
+                state.block_has_delta.remove(&fc.block_index);
+            }
+        }
+    }
+
+    loop {
+        let next = state.function_call_order.iter().copied().find(|index| {
+            state
+                .function_call_state_by_output_index
+                .contains_key(index)
+        });
+        let Some(next) = next else {
+            return;
+        };
+
+        state.active_function_call_output_index = Some(next);
+        let block_index = open_function_call_block(state, next, None, None, events);
+        let (fragments, done) = {
+            let fc = state
+                .function_call_state_by_output_index
+                .get_mut(&next)
+                .expect("queued function call exists");
+            (std::mem::take(&mut fc.buffered_arguments), fc.done)
+        };
+        for partial_json in fragments {
+            events.push(AnthropicStreamEventData::ContentBlockDelta {
+                index: block_index,
+                delta: AnthropicContentBlockDelta::InputJsonDelta { partial_json },
+            });
+            state.block_has_delta.insert(block_index);
+        }
+        if !done {
+            return;
+        }
+        if open_blocks_has(state, block_index) {
+            events.push(AnthropicStreamEventData::ContentBlockStop { index: block_index });
+            state.open_blocks.retain(|index| *index != block_index);
+            state.block_has_delta.remove(&block_index);
+        }
+        state.function_call_state_by_output_index.remove(&next);
+        state.active_function_call_output_index = None;
+    }
+}
+
+fn finish_all_function_calls(
+    state: &mut ResponsesStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) {
+    for fc in state.function_call_state_by_output_index.values_mut() {
+        fc.done = true;
+    }
+    while !state.function_call_state_by_output_index.is_empty() {
+        advance_function_call_queue(state, events);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,13 +576,21 @@ fn handle_output_item_added(
 
     if let Some(initial) = details.initial_arguments {
         if !initial.is_empty() {
-            events.push(AnthropicStreamEventData::ContentBlockDelta {
-                index: block_index,
-                delta: AnthropicContentBlockDelta::InputJsonDelta {
-                    partial_json: initial,
-                },
-            });
-            state.block_has_delta.insert(block_index);
+            if function_call_is_active(state, details.output_index) {
+                events.push(AnthropicStreamEventData::ContentBlockDelta {
+                    index: block_index,
+                    delta: AnthropicContentBlockDelta::InputJsonDelta {
+                        partial_json: initial,
+                    },
+                });
+                state.block_has_delta.insert(block_index);
+            } else if let Some(fc) = state
+                .function_call_state_by_output_index
+                .get_mut(&details.output_index)
+            {
+                fc.buffered_arguments.push(initial);
+                fc.received_argument_delta = true;
+            }
         }
     }
 
@@ -497,21 +657,42 @@ fn handle_output_item_done(
         let final_arguments =
             stringify_tool_search_arguments(item.get("arguments").unwrap_or(&Value::Null));
 
-        if !state.block_has_delta.contains(&block_index) {
+        let active = function_call_is_active(state, output_index);
+        let received_delta = state
+            .function_call_state_by_output_index
+            .get(&output_index)
+            .map(|fc| fc.received_argument_delta)
+            .unwrap_or(false);
+        if !state.block_has_delta.contains(&block_index) && !received_delta {
             if let Some(args) = final_arguments {
                 if !args.is_empty() {
-                    events.push(AnthropicStreamEventData::ContentBlockDelta {
-                        index: block_index,
-                        delta: AnthropicContentBlockDelta::InputJsonDelta { partial_json: args },
-                    });
-                    state.block_has_delta.insert(block_index);
+                    if active {
+                        events.push(AnthropicStreamEventData::ContentBlockDelta {
+                            index: block_index,
+                            delta: AnthropicContentBlockDelta::InputJsonDelta {
+                                partial_json: args,
+                            },
+                        });
+                        state.block_has_delta.insert(block_index);
+                    } else if let Some(fc) = state
+                        .function_call_state_by_output_index
+                        .get_mut(&output_index)
+                    {
+                        fc.buffered_arguments.push(args);
+                    }
                 }
             }
         }
 
-        state
+        if let Some(fc) = state
             .function_call_state_by_output_index
-            .remove(&output_index);
+            .get_mut(&output_index)
+        {
+            fc.done = true;
+        }
+        if active {
+            advance_function_call_queue(state, &mut events);
+        }
         return events;
     }
 
@@ -620,13 +801,21 @@ fn handle_function_call_arguments_delta(
         fc.consecutive_whitespace_count = next_count;
     }
 
-    events.push(AnthropicStreamEventData::ContentBlockDelta {
-        index: block_index,
-        delta: AnthropicContentBlockDelta::InputJsonDelta {
-            partial_json: delta_text.to_string(),
-        },
-    });
-    state.block_has_delta.insert(block_index);
+    if function_call_is_active(state, output_index) {
+        events.push(AnthropicStreamEventData::ContentBlockDelta {
+            index: block_index,
+            delta: AnthropicContentBlockDelta::InputJsonDelta {
+                partial_json: delta_text.to_string(),
+            },
+        });
+        state.block_has_delta.insert(block_index);
+    } else if let Some(fc) = state
+        .function_call_state_by_output_index
+        .get_mut(&output_index)
+    {
+        fc.buffered_arguments.push(delta_text.to_string());
+        fc.received_argument_delta = true;
+    }
 
     events
 }
@@ -641,21 +830,40 @@ fn handle_function_call_arguments_done(
 
     let final_arguments = get_str(event, "arguments").filter(|s| !s.is_empty());
 
-    if !state.block_has_delta.contains(&block_index) {
+    let active = function_call_is_active(state, output_index);
+    let received_delta = state
+        .function_call_state_by_output_index
+        .get(&output_index)
+        .map(|fc| fc.received_argument_delta)
+        .unwrap_or(false);
+    if !state.block_has_delta.contains(&block_index) && !received_delta {
         if let Some(args) = final_arguments {
-            events.push(AnthropicStreamEventData::ContentBlockDelta {
-                index: block_index,
-                delta: AnthropicContentBlockDelta::InputJsonDelta {
-                    partial_json: args.to_string(),
-                },
-            });
-            state.block_has_delta.insert(block_index);
+            if active {
+                events.push(AnthropicStreamEventData::ContentBlockDelta {
+                    index: block_index,
+                    delta: AnthropicContentBlockDelta::InputJsonDelta {
+                        partial_json: args.to_string(),
+                    },
+                });
+                state.block_has_delta.insert(block_index);
+            } else if let Some(fc) = state
+                .function_call_state_by_output_index
+                .get_mut(&output_index)
+            {
+                fc.buffered_arguments.push(args.to_string());
+            }
         }
     }
 
-    state
+    if let Some(fc) = state
         .function_call_state_by_output_index
-        .remove(&output_index);
+        .get_mut(&output_index)
+    {
+        fc.done = true;
+    }
+    if active {
+        advance_function_call_queue(state, &mut events);
+    }
     events
 }
 
@@ -757,6 +965,7 @@ fn handle_response_completed(
     let response = event.get("response").unwrap_or(&empty);
     let mut events = Vec::new();
 
+    finish_all_function_calls(state, &mut events);
     close_all_open_blocks(state, &mut events);
 
     let stop_reason = map_responses_stop_reason(response, state.has_tool_call);
@@ -803,8 +1012,7 @@ fn handle_error_event(
     let message =
         get_str(event, "message").unwrap_or("An unexpected error occurred during streaming.");
 
-    state.message_completed = true;
-    vec![build_error_event(message)]
+    terminate_responses_stream_with_error(state, build_error_event(message))
 }
 
 /// Mirrors `handleFunctionCallArgumentsValidationError`. The already-accumulated
@@ -872,7 +1080,7 @@ fn map_responses_stop_reason(response: &Value, has_tool_call: bool) -> Option<St
             return Some("max_tokens".to_string());
         }
         if reason == Some("content_filter") {
-            return Some("end_turn".to_string());
+            return Some("refusal".to_string());
         }
     }
 
@@ -915,6 +1123,22 @@ fn stringify_tool_search_arguments(arguments_value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn started_state() -> ResponsesStreamState {
+        let mut state = create_responses_stream_state(None);
+        let events = translate_responses_stream_event(
+            &json!({
+                "type": "response.created",
+                "response": {"id": "resp_test", "model": "gpt-5"}
+            }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [AnthropicStreamEventData::MessageStart { .. }]
+        ));
+        state
+    }
 
     fn delta_text(ev: &AnthropicStreamEventData) -> Option<String> {
         match ev {
@@ -1018,7 +1242,7 @@ mod tests {
 
     #[test]
     fn whitespace_guard_trips_at_21_consecutive_whitespace() {
-        let mut state = create_responses_stream_state(None);
+        let mut state = started_state();
 
         // open a function-call block
         let added = json!({
@@ -1113,7 +1337,7 @@ mod tests {
 
     #[test]
     fn function_call_arguments_delta_emits_input_json() {
-        let mut state = create_responses_stream_state(None);
+        let mut state = started_state();
         let added = json!({
             "type": "response.output_item.added",
             "output_index": 0,
@@ -1137,8 +1361,124 @@ mod tests {
     }
 
     #[test]
+    fn parallel_function_calls_keep_anthropic_blocks_sequential() {
+        let mut state = started_state();
+        let mut all = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call", "call_id": "c0",
+                    "name": "first", "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call", "call_id": "c1",
+                    "name": "second", "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": "{\"b\":"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"a\":1}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 1,
+                "arguments": "{\"b\":2}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": "2}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{\"a\":1}"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {"type": "function_call"},
+                        {"type": "function_call"}
+                    ],
+                    "usage": {"input_tokens": 3, "output_tokens": 2}
+                }
+            }),
+        ] {
+            all.extend(
+                translate_responses_stream_event(&event, &mut state)
+                    .into_iter()
+                    .map(|event| serde_json::to_value(event).unwrap()),
+            );
+        }
+
+        let mut open = None;
+        for event in &all {
+            match event["type"].as_str() {
+                Some("content_block_start") => {
+                    assert!(open.is_none(), "started a block while {open:?} was open");
+                    open = event["index"].as_i64();
+                }
+                Some("content_block_delta") => {
+                    assert_eq!(open, event["index"].as_i64());
+                }
+                Some("content_block_stop") => {
+                    assert_eq!(open, event["index"].as_i64());
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_none());
+
+        let starts: Vec<_> = all
+            .iter()
+            .filter(|event| event["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["content_block"]["id"], "c0");
+        assert_eq!(starts[1]["content_block"]["id"], "c1");
+        assert_eq!(all.last().unwrap()["type"], "message_stop");
+    }
+
+    #[test]
+    fn content_filter_incomplete_maps_to_refusal() {
+        let mut state = started_state();
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "usage": {"input_tokens": 1, "output_tokens": 0}
+            }
+        });
+        let events = translate_responses_stream_event(&event, &mut state);
+        let delta = events
+            .iter()
+            .find_map(|event| match event {
+                AnthropicStreamEventData::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(delta.stop_reason.as_deref(), Some("refusal"));
+    }
+
+    #[test]
     fn reasoning_done_emits_default_thinking_and_signature() {
-        let mut state = create_responses_stream_state(None);
+        let mut state = started_state();
         let done = json!({
             "type": "response.output_item.done",
             "output_index": 0,
@@ -1164,5 +1504,45 @@ mod tests {
             }) => assert_eq!(signature, "enc@r1"),
             other => panic!("expected signature_delta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn completion_before_created_terminates_with_error() {
+        let mut state = create_responses_stream_state(None);
+        let events = translate_responses_stream_event(
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }
+            }),
+            &mut state,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [AnthropicStreamEventData::Error { .. }]
+        ));
+        assert!(state.message_completed);
+        assert!(!state.message_start_sent);
+    }
+
+    #[test]
+    fn duplicate_created_terminates_with_error_without_second_start() {
+        let mut state = started_state();
+        let events = translate_responses_stream_event(
+            &json!({
+                "type": "response.created",
+                "response": {"id": "resp_duplicate", "model": "gpt-5"}
+            }),
+            &mut state,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [AnthropicStreamEventData::Error { .. }]
+        ));
+        assert!(state.message_completed);
     }
 }

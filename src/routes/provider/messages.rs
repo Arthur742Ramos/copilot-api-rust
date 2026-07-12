@@ -35,13 +35,16 @@ use crate::routes::messages::non_stream_translation::{
 };
 use crate::routes::messages::preprocess::normalize_system_messages;
 use crate::routes::messages::responses_stream_translation::{
-    build_error_event, translate_responses_stream_event, ResponsesStreamState,
+    build_error_event, terminate_responses_stream_with_error, translate_responses_stream_event,
+    ResponsesStreamState,
 };
 use crate::routes::messages::responses_translation::{
     translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
 };
 use crate::routes::messages::stream_translation::{
-    flush_pending_anthropic_stream_events, translate_chunk_to_anthropic_events,
+    flush_pending_anthropic_stream_events, malformed_stream_error_events,
+    translate_chunk_to_anthropic_events, translate_error_to_anthropic_error_event,
+    transport_stream_error_events,
 };
 use crate::routes::messages::web_search::fulfill::{
     build_synthetic_stream_events, collect_web_search_responses_stream_result,
@@ -77,15 +80,25 @@ pub async fn post_provider_messages(
     let payload: AnthropicMessagesPayload = match serde_json::from_value(value) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": { "message": format!("Invalid request payload: {e}"), "type": "invalid_request_error" }
-                })),
-            )
-                .into_response()
+            return AppError::BadRequest(format!("Invalid request payload: {e}")).into_response()
         }
     };
+    if payload.model.trim().is_empty() {
+        return AppError::BadRequest(
+            "model: field required and must be a non-empty string".to_string(),
+        )
+        .into_response();
+    }
+    if payload.messages.is_empty() {
+        return AppError::BadRequest("messages: must contain at least one message".to_string())
+            .into_response();
+    }
+    if !matches!(payload.max_tokens, Some(value) if value > 0) {
+        return AppError::BadRequest(
+            "max_tokens: field required and must be a positive integer".to_string(),
+        )
+        .into_response();
+    }
     // Internal provider dispatches (model aliases / web search) already pass
     // through the public route's shared gate. This direct provider endpoint does
     // not, so gate it here before resolving or contacting the provider.
@@ -400,7 +413,15 @@ fn stream_responses_provider_messages(
                 Ok(ev) => ev,
                 Err(err) => {
                     timer.mark_error();
-                    yield Err(err);
+                    let error_event = translate_error_to_anthropic_error_event(Some(&err));
+                    for event in
+                        terminate_responses_stream_with_error(&mut state, error_event)
+                    {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
@@ -421,7 +442,25 @@ fn stream_responses_provider_messages(
 
             let parsed: Value = match serde_json::from_str(&chunk.data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(error) => {
+                    crate::routes::messages::api_flows::record_stream_chunk_parse_failure(
+                        "provider_responses",
+                        &error,
+                    );
+                    timer.mark_error();
+                    let error_event = build_error_event(
+                        "The upstream Responses stream returned a malformed event.",
+                    );
+                    for event in
+                        terminate_responses_stream_with_error(&mut state, error_event)
+                    {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
+                    return;
+                }
             };
 
             // Codex: log `codex.rate_limits` events (mirrors
@@ -449,14 +488,19 @@ fn stream_responses_provider_messages(
         }
 
         if !state.message_completed {
-            let error_event =
-                build_error_event(&format!("{provider_label} stream ended without a completion event"));
-            if let Some(frame) = emit_event(&error_event) {
-                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            timer.mark_error();
+            let error_event = build_error_event(&format!(
+                "{provider_label} stream ended without a completion event"
+            ));
+            for event in terminate_responses_stream_with_error(&mut state, error_event) {
+                if let Some(frame) = emit_event(&event) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
             }
+        } else {
+            timer.mark_finished();
         }
 
-        timer.mark_finished();
         recorder.record(usage);
     });
 
@@ -935,6 +979,7 @@ fn stream_provider_messages(
         let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)
             .with_request_context(crate::libs::request_context::request_context_store());
         let mut usage = UsageTokens::default();
+        let mut terminal_event_seen = false;
         futures_util::pin_mut!(event_stream);
 
         while let Some(item) = event_stream.next().await {
@@ -942,7 +987,12 @@ fn stream_provider_messages(
                 Ok(ev) => ev,
                 Err(err) => {
                     timer.mark_error();
-                    yield Err(err);
+                    if let Some(frame) =
+                        emit_event(&translate_error_to_anthropic_error_event(Some(&err)))
+                    {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
@@ -962,10 +1012,26 @@ fn stream_provider_messages(
                 break;
             }
 
-            let mut data = chunk.data.clone();
-            if let Some(parsed) = parse_provider_stream_event(&chunk.data, adjust) {
-                usage = merge_anthropic_usage(usage, parsed.usage);
-                data = parsed.data;
+            let parsed = match parse_provider_stream_event(&chunk.data, adjust) {
+                Some(parsed) => parsed,
+                None => {
+                    timer.mark_error();
+                    if let Some(frame) = emit_event(&build_error_event(
+                        "The upstream provider Messages stream returned a malformed event.",
+                    )) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
+            usage = merge_anthropic_usage(usage, parsed.usage);
+            let data = parsed.data;
+            if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                terminal_event_seen = matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("message_stop" | "error")
+                );
             }
 
             let frame = match event_name {
@@ -974,9 +1040,21 @@ fn stream_provider_messages(
             };
             timer.on_content_frame();
             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            if terminal_event_seen {
+                break;
+            }
         }
 
-        timer.mark_finished();
+        if terminal_event_seen {
+            timer.mark_finished();
+        } else {
+            timer.mark_error();
+            if let Some(frame) = emit_event(&build_error_event(
+                "The upstream provider Messages stream ended before a terminal event.",
+            )) {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            }
+        }
         recorder.record(usage);
     });
 
@@ -1047,7 +1125,12 @@ fn stream_openai_compatible_provider_messages(
                 Ok(ev) => ev,
                 Err(err) => {
                     timer.mark_error();
-                    yield Err(err);
+                    for event in transport_stream_error_events(&mut state, Some(&err)) {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
@@ -1068,7 +1151,20 @@ fn stream_openai_compatible_provider_messages(
 
             let parsed: Value = match serde_json::from_str(&chunk.data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(error) => {
+                    crate::routes::messages::api_flows::record_stream_chunk_parse_failure(
+                        "provider_chat_completions",
+                        &error,
+                    );
+                    timer.mark_error();
+                    for event in malformed_stream_error_events(&mut state) {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
+                    return;
+                }
             };
 
             if let Some(u) = parsed.get("usage") {
@@ -1085,13 +1181,19 @@ fn stream_openai_compatible_provider_messages(
             }
         }
 
+        let incomplete = !state.terminal_event_emitted && state.pending_message_delta.is_none();
+        if incomplete {
+            timer.mark_error();
+        }
         for event in flush_pending_anthropic_stream_events(&mut state) {
             if let Some(frame) = emit_event(&event) {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
             }
         }
 
-        timer.mark_finished();
+        if state.message_stop_emitted {
+            timer.mark_finished();
+        }
         recorder.record(usage);
     });
 

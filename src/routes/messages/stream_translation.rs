@@ -115,16 +115,9 @@ pub fn translate_chunk_to_anthropic_events(
     events
 }
 
-/// `flushPendingAnthropicStreamEvents` — emit any queued `message_delta` plus
-/// `message_stop` when the upstream stream ends without a usage-bearing chunk.
-///
-/// Also handles the degenerate case where the upstream ended (clean end, a
-/// `[DONE]` with no prior `finish_reason`, or a finishing chunk that failed to
-/// parse and was dropped) WITHOUT ever queueing a `message_delta`: a content
-/// block may still be open and no `message_stop` was emitted, which leaves a
-/// client like Claude Code waiting forever. In that case we synthesize a
-/// well-formed terminal close (close any open block, then `message_delta` +
-/// `message_stop`) so every stream is terminated.
+/// Flush a successful finish that was waiting for a final usage chunk. If the
+/// upstream reaches EOF/[DONE] without any `finish_reason`, terminate with an
+/// Anthropic `error` event instead of fabricating a successful `end_turn`.
 pub fn flush_pending_anthropic_stream_events(
     state: &mut AnthropicStreamState,
 ) -> Vec<AnthropicStreamEventData> {
@@ -135,39 +128,56 @@ pub fn flush_pending_anthropic_stream_events(
         return events;
     }
 
-    // Nothing queued. If we already emitted a terminal message_stop the stream is
-    // well-formed and there is nothing to do. Likewise, if message_start was never
-    // sent there is no open message to close — emitting a bare message_delta would
-    // itself be malformed, so leave the (empty) stream as-is.
-    if state.message_stop_emitted || !state.message_start_sent {
+    if state.terminal_event_emitted {
         return events;
     }
 
-    // Upstream ended without a finishing chunk. Close any block left open
-    // (thinking or content/tool) so the stream stays well-formed, then synthesize
-    // the terminal message_delta + message_stop.
-    close_thinking_block_if_open(state, &mut events);
-    if state.content_block_open {
-        events.push(AnthropicStreamEventData::ContentBlockStop {
-            index: state.content_block_index,
-        });
-        state.content_block_open = false;
-        state.content_block_index += 1;
-    }
-
-    events.push(AnthropicStreamEventData::MessageDelta {
-        delta: AnthropicMessageDeltaBody {
-            // No finish_reason was delivered; "end_turn" is the safe Anthropic
-            // default for a normally-terminated turn.
-            stop_reason: Some("end_turn".to_string()),
-            stop_sequence: None,
-        },
-        usage: None,
-    });
-    events.push(AnthropicStreamEventData::MessageStop);
-    state.message_stop_emitted = true;
-
+    close_stream_for_error(state, &mut events);
+    events.push(protocol_error_event(
+        "The upstream model stream ended before a finish reason was received.",
+    ));
+    state.terminal_event_emitted = true;
     events
+}
+
+/// Terminate a translated stream after malformed upstream SSE data.
+pub fn malformed_stream_error_events(
+    state: &mut AnthropicStreamState,
+) -> Vec<AnthropicStreamEventData> {
+    if state.terminal_event_emitted {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    close_stream_for_error(state, &mut events);
+    events.push(protocol_error_event(
+        "The upstream model stream returned a malformed event.",
+    ));
+    state.terminal_event_emitted = true;
+    events
+}
+
+/// Terminate a translated stream after its transport fails.
+pub fn transport_stream_error_events(
+    state: &mut AnthropicStreamState,
+    cause: Option<&std::io::Error>,
+) -> Vec<AnthropicStreamEventData> {
+    if state.terminal_event_emitted {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    close_stream_for_error(state, &mut events);
+    events.push(translate_error_to_anthropic_error_event(cause));
+    state.terminal_event_emitted = true;
+    events
+}
+
+fn protocol_error_event(message: &str) -> AnthropicStreamEventData {
+    AnthropicStreamEventData::Error {
+        error: super::anthropic_types::AnthropicErrorBody {
+            kind: "api_error".to_string(),
+            message: message.to_string(),
+        },
+    }
 }
 
 /// `translateErrorToAnthropicErrorEvent` — the terminal `error` event.
@@ -212,7 +222,7 @@ pub fn translate_error_to_anthropic_error_event(
 /// and so is correctly treated as non-transient. As a fallback for any non-
 /// reqwest source, a `TimedOut`/`ConnectionReset`/`UnexpectedEof` `ErrorKind`
 /// also counts as transient.
-fn is_transient_transport_error(err: &std::io::Error) -> bool {
+pub fn is_transient_transport_error(err: &std::io::Error) -> bool {
     use std::error::Error as _;
     if let Some(re) = err
         .source()
@@ -268,6 +278,26 @@ fn complete_pending_message(
     events.push(pending);
     events.push(AnthropicStreamEventData::MessageStop);
     state.message_stop_emitted = true;
+    state.terminal_event_emitted = true;
+}
+
+fn close_stream_for_error(
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) {
+    close_thinking_block_if_open(state, events);
+    if state.content_block_open {
+        events.push(AnthropicStreamEventData::ContentBlockStop {
+            index: state.content_block_index,
+        });
+        state.content_block_open = false;
+        state.content_block_index += 1;
+    }
+    state.active_tool_call_index = None;
+    state.tool_calls.clear();
+    state.tool_call_order.clear();
+    state.deferred_content = None;
+    state.pending_message_delta = None;
 }
 
 /// `handleFinish` — on a finishing chunk, close the open block, flush deferred
@@ -302,11 +332,15 @@ fn handle_finish(
         });
         state.content_block_open = false;
         state.content_block_index += 1;
+        if tool_block_open {
+            state.active_tool_call_index = None;
+        }
         if !tool_block_open {
             handle_reasoning_opaque(delta, events, state);
         }
     }
 
+    flush_buffered_tool_calls(state, events);
     flush_deferred_content(state, events);
 
     state.pending_message_delta = Some(AnthropicStreamEventData::MessageDelta {
@@ -384,36 +418,47 @@ fn handle_tool_calls(
             .filter(|s| !s.is_empty());
 
         if let (Some(id), Some(name)) = (id, name) {
-            // New tool call starting.
-            if state.content_block_open {
-                // Close any previously open block.
-                events.push(AnthropicStreamEventData::ContentBlockStop {
-                    index: state.content_block_index,
-                });
-                state.content_block_index += 1;
-                state.content_block_open = false;
+            if !state.tool_calls.contains_key(&index) {
+                state.tool_call_order.push(index);
+                state.tool_calls.insert(
+                    index,
+                    AnthropicStreamToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        anthropic_block_index: -1,
+                        buffered_arguments: Vec::new(),
+                        started: false,
+                    },
+                );
             }
 
-            let anthropic_block_index = state.content_block_index;
-            state.tool_calls.insert(
-                index,
-                AnthropicStreamToolCall {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    anthropic_block_index,
-                },
-            );
-
-            events.push(AnthropicStreamEventData::ContentBlockStart {
-                index: anthropic_block_index,
-                content_block: serde_json::json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": {},
-                }),
-            });
-            state.content_block_open = true;
+            // Anthropic allows only one content block to be active at a time.
+            // Stream the first OpenAI tool call immediately; later parallel
+            // indices are buffered and serialized at finish.
+            if state.active_tool_call_index.is_none() {
+                if state.content_block_open {
+                    events.push(AnthropicStreamEventData::ContentBlockStop {
+                        index: state.content_block_index,
+                    });
+                    state.content_block_index += 1;
+                    state.content_block_open = false;
+                }
+                if let Some(info) = state.tool_calls.get_mut(&index) {
+                    info.anthropic_block_index = state.content_block_index;
+                    info.started = true;
+                    events.push(AnthropicStreamEventData::ContentBlockStart {
+                        index: info.anthropic_block_index,
+                        content_block: serde_json::json!({
+                            "type": "tool_use",
+                            "id": info.id,
+                            "name": info.name,
+                            "input": {},
+                        }),
+                    });
+                }
+                state.active_tool_call_index = Some(index);
+                state.content_block_open = true;
+            }
         }
 
         let arguments = tool_call
@@ -423,14 +468,59 @@ fn handle_tool_calls(
             .filter(|s| !s.is_empty());
 
         if let Some(arguments) = arguments {
-            if let Some(info) = state.tool_calls.get(&index) {
-                events.push(AnthropicStreamEventData::ContentBlockDelta {
-                    index: info.anthropic_block_index,
-                    delta: AnthropicContentBlockDelta::InputJsonDelta {
-                        partial_json: arguments.to_string(),
-                    },
-                });
+            if state.active_tool_call_index == Some(index) {
+                if let Some(info) = state.tool_calls.get(&index) {
+                    events.push(AnthropicStreamEventData::ContentBlockDelta {
+                        index: info.anthropic_block_index,
+                        delta: AnthropicContentBlockDelta::InputJsonDelta {
+                            partial_json: arguments.to_string(),
+                        },
+                    });
+                }
+            } else if let Some(info) = state.tool_calls.get_mut(&index) {
+                info.buffered_arguments.push(arguments.to_string());
             }
+        }
+    }
+}
+
+/// Serialize tool calls that OpenAI streamed in parallel after the active call.
+/// Their argument fragment boundaries are preserved, but their Anthropic blocks
+/// are emitted one-at-a-time in first-seen tool-index order.
+fn flush_buffered_tool_calls(
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) {
+    let order = state.tool_call_order.clone();
+    for index in order {
+        let Some(snapshot) = state.tool_calls.get(&index).cloned() else {
+            continue;
+        };
+        if snapshot.started {
+            continue;
+        }
+
+        let block_index = state.content_block_index;
+        state.content_block_index += 1;
+        events.push(AnthropicStreamEventData::ContentBlockStart {
+            index: block_index,
+            content_block: serde_json::json!({
+                "type": "tool_use",
+                "id": snapshot.id,
+                "name": snapshot.name,
+                "input": {},
+            }),
+        });
+        for partial_json in snapshot.buffered_arguments {
+            events.push(AnthropicStreamEventData::ContentBlockDelta {
+                index: block_index,
+                delta: AnthropicContentBlockDelta::InputJsonDelta { partial_json },
+            });
+        }
+        events.push(AnthropicStreamEventData::ContentBlockStop { index: block_index });
+        if let Some(info) = state.tool_calls.get_mut(&index) {
+            info.anthropic_block_index = block_index;
+            info.started = true;
         }
     }
 }
@@ -935,6 +1025,78 @@ mod tests {
     }
 
     #[test]
+    fn parallel_fragmented_tool_calls_are_serialized_into_valid_blocks() {
+        let mut state = AnthropicStreamState::default();
+        let mut all = Vec::new();
+
+        let announced = json!({
+            "id": "chatcmpl-parallel",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_a",
+                        "function": { "name": "first", "arguments": "{\"a\":" }
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_b",
+                        "function": { "name": "second", "arguments": "{\"b\":" }
+                    }
+                ]},
+                "finish_reason": null
+            }]
+        });
+        all.extend(to_values(&translate_chunk_to_anthropic_events(
+            &announced, &mut state,
+        )));
+
+        let interleaved = json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [
+                    { "index": 1, "function": { "arguments": "2}" } },
+                    { "index": 0, "function": { "arguments": "1}" } }
+                ]},
+                "finish_reason": null
+            }]
+        });
+        all.extend(to_values(&translate_chunk_to_anthropic_events(
+            &interleaved,
+            &mut state,
+        )));
+
+        let finish = json!({
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+        all.extend(to_values(&translate_chunk_to_anthropic_events(
+            &finish, &mut state,
+        )));
+
+        assert_single_open_block_invariant(&all);
+        let starts: Vec<_> = all
+            .iter()
+            .filter(|event| event["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["content_block"]["id"], "call_a");
+        assert_eq!(starts[1]["content_block"]["id"], "call_b");
+
+        let second_fragments: String = all
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta" && event["index"].as_i64() == Some(1)
+            })
+            .filter_map(|event| event.pointer("/delta/partial_json").and_then(Value::as_str))
+            .collect();
+        assert_eq!(second_fragments, "{\"b\":2}");
+        assert_eq!(all.last().unwrap()["type"], "message_stop");
+    }
+
+    #[test]
     fn content_during_tool_block_is_deferred_then_flushed() {
         let mut state = AnthropicStreamState::default();
 
@@ -1117,6 +1279,23 @@ mod tests {
     }
 
     #[test]
+    fn malformed_event_closes_open_block_and_errors_once() {
+        let mut state = AnthropicStreamState::default();
+        let chunk = json!({
+            "id": "x", "model": "m",
+            "choices": [{ "index": 0, "delta": { "content": "partial" }, "finish_reason": null }]
+        });
+        let _ = translate_chunk_to_anthropic_events(&chunk, &mut state);
+
+        let events = to_values(&malformed_stream_error_events(&mut state));
+        assert_eq!(events[0], json!({"type":"content_block_stop","index":0}));
+        assert_eq!(events[1]["type"], "error");
+        assert_eq!(events[1]["error"]["type"], "api_error");
+        assert!(malformed_stream_error_events(&mut state).is_empty());
+        assert!(flush_pending_anthropic_stream_events(&mut state).is_empty());
+    }
+
+    #[test]
     fn classifies_transient_error_kinds() {
         for kind in [
             std::io::ErrorKind::TimedOut,
@@ -1132,11 +1311,12 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_stream_synthesizes_close_with_open_block() {
+    fn unterminated_stream_closes_block_then_errors() {
         // Upstream sends content then ends WITHOUT a finish_reason (e.g. dropped
         // the finishing chunk or sent [DONE] early). A content block is left open
         // and no message_stop was emitted; the flush must close the block and
-        // synthesize message_delta + message_stop so the client doesn't hang.
+        // report a terminal error rather than misrepresenting partial output as
+        // a successful end_turn.
         let mut state = AnthropicStreamState::default();
         let mut all: Vec<Value> = Vec::new();
 
@@ -1158,23 +1338,34 @@ mod tests {
             vec![
                 json!({ "type": "content_block_stop", "index": 0 }),
                 json!({
-                    "type": "message_delta",
-                    "delta": { "stop_reason": "end_turn" }
-                }),
-                json!({ "type": "message_stop" }),
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream ended before a finish reason was received."
+                    }
+                })
             ]
         );
-        assert!(state.message_stop_emitted);
+        assert!(!state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
         assert_single_open_block_invariant(&all);
     }
 
     #[test]
-    fn unterminated_empty_stream_synthesizes_nothing() {
-        // A stream that never even sent message_start has no open message to
-        // close; the flush must emit nothing rather than a bare message_delta.
+    fn unterminated_empty_stream_emits_terminal_error() {
         let mut state = AnthropicStreamState::default();
         let got = to_values(&flush_pending_anthropic_stream_events(&mut state));
-        assert!(got.is_empty());
+        assert_eq!(
+            got,
+            vec![json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "The upstream model stream ended before a finish reason was received."
+                }
+            })]
+        );
+        assert!(state.terminal_event_emitted);
     }
 
     #[test]
