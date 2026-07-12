@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 3,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -16,6 +16,11 @@
       "iteration": 2,
       "verdict": "FAIL",
       "summary": "Codex optional fields and id-less compaction continuation pass, but rs1 optional-reasoning carriers are silently dropped by Claude request translation."
+    },
+    {
+      "iteration": 3,
+      "verdict": "FAIL",
+      "summary": "All four rs1 request carriers pass, but non-stream Responses reasoning with an empty summary text still loses its opaque carrier."
     }
   ]
 }
