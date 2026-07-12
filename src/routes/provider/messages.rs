@@ -1333,6 +1333,8 @@ fn sse_response(body: Body) -> Response {
 mod tests {
     use super::*;
     use crate::services::copilot::create_chat_completions::Message;
+    use http_body_util::BodyExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn msg(role: &str, content: Value) -> Message {
         Message {
@@ -1340,6 +1342,44 @@ mod tests {
             content: Some(content),
             extra: serde_json::Map::new(),
         }
+    }
+
+    async fn upstream_sse_response(body: &str) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider SSE test server");
+        let addr = listener
+            .local_addr()
+            .expect("provider SSE test server address");
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("accept provider SSE request");
+            let mut request = [0u8; 1024];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read provider SSE request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write provider SSE response");
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .expect("receive provider SSE response");
+        server.await.expect("provider SSE test server task");
+        response
     }
 
     #[test]
@@ -1421,5 +1461,50 @@ mod tests {
         let value: Value = serde_json::from_str(&parsed.data).unwrap();
         assert_eq!(value["message"]["usage"]["input_tokens"], 60);
         assert_eq!(parsed.usage.input_tokens, Some(60));
+    }
+
+    #[tokio::test]
+    async fn provider_translated_driver_stops_after_malformed_choices() {
+        let upstream = upstream_sse_response(concat!(
+            "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":\"not-an-array\"}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: {\"error\":{\"type\":\"server_error\",\"message\":\"late error\"}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let payload = AnthropicMessagesPayload {
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let response =
+            stream_openai_compatible_provider_messages(upstream, &payload, "test-provider");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect translated provider stream")
+            .to_bytes();
+        let body = std::str::from_utf8(&body).expect("translated provider stream is UTF-8");
+
+        assert_eq!(body.matches("event: error\n").count(), 1);
+        assert!(body.contains("The upstream model stream returned a malformed event."));
+        assert!(body.contains("\"type\":\"tool_use\",\"id\":\"call_1\""));
+        assert!(body.contains(
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}"
+        ));
+        assert!(!body.contains("deferred"));
+        assert!(!body.contains("event: message_delta"));
+        assert!(!body.contains("event: message_stop"));
+        assert!(!body.contains("late success"));
+        assert!(!body.contains("late error"));
+        assert!(
+            body.ends_with(
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"The upstream model stream returned a malformed event.\"}}\n\n"
+            ),
+            "terminal malformed error must be the final provider frame: {body}"
+        );
     }
 }

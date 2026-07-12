@@ -126,6 +126,76 @@ fn safe_upstream_error_message(value: Option<&Value>) -> Option<String> {
     Some(value.to_string())
 }
 
+struct ValidatedChoice<'a> {
+    choice: &'a Value,
+    delta: &'a Value,
+}
+
+enum ValidatedChatChunk<'a> {
+    Choice(ValidatedChoice<'a>),
+    UsageOnly,
+}
+
+/// Validate the structural fields that drive the translated stream state
+/// machine. Missing data and a value of the wrong JSON type must not collapse
+/// into the same branch as a legitimate empty array: doing so can turn upstream
+/// corruption into a successful Anthropic completion.
+fn validate_chat_chunk(chunk: &Value) -> Result<ValidatedChatChunk<'_>, ()> {
+    let object = chunk.as_object().ok_or(())?;
+    let choices = object.get("choices").and_then(Value::as_array).ok_or(())?;
+
+    if choices.is_empty() {
+        // OpenAI's final include_usage record has an explicitly empty choices
+        // array and a usage object. A bare `choices: []`, null usage, or a usage
+        // value of another type is not that record.
+        return object
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .map(|_| ValidatedChatChunk::UsageOnly)
+            .ok_or(());
+    }
+
+    // Usage is optional/null on ordinary chunks, but a present non-null value
+    // must retain the object shape consumed by the accounting helpers.
+    if object
+        .get("usage")
+        .is_some_and(|usage| !usage.is_null() && !usage.is_object())
+    {
+        return Err(());
+    }
+
+    for choice in choices {
+        if !choice.is_object() {
+            return Err(());
+        }
+        if choice.get("delta").and_then(Value::as_object).is_none() {
+            return Err(());
+        }
+        if choice
+            .get("finish_reason")
+            .is_some_and(|reason| !reason.is_null() && !reason.is_string())
+        {
+            return Err(());
+        }
+
+        let delta = choice.get("delta").ok_or(())?;
+        if delta.get("tool_calls").is_some_and(|tool_calls| {
+            !tool_calls.is_null()
+                && tool_calls
+                    .as_array()
+                    .is_none_or(|calls| calls.iter().any(|call| !call.is_object()))
+        }) {
+            return Err(());
+        }
+    }
+
+    let choice = &choices[0];
+    Ok(ValidatedChatChunk::Choice(ValidatedChoice {
+        choice,
+        delta: choice.get("delta").ok_or(())?,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -150,20 +220,28 @@ pub fn translate_chunk_to_anthropic_events(
         return terminal_stream_error_events(state, error);
     }
 
-    let mut events: Vec<AnthropicStreamEventData> = Vec::new();
+    let validated = match validate_chat_chunk(chunk) {
+        Ok(validated) => validated,
+        Err(()) => return malformed_stream_error_events(state),
+    };
 
-    let choices = chunk.get("choices").and_then(|v| v.as_array());
-    let choice = match choices {
-        Some(arr) if !arr.is_empty() => &arr[0],
-        _ => {
-            // `chunk.choices.length === 0`
+    let mut events: Vec<AnthropicStreamEventData> = Vec::new();
+    let ValidatedChatChunk::Choice(ValidatedChoice {
+        choice,
+        delta: delta_value,
+    }) = validated
+    else {
+        // An include_usage chunk is only valid after a finish_reason queued the
+        // terminal message delta. An orphan usage record would otherwise be
+        // silently ignored and allow the malformed stream to continue.
+        if state.pending_message_delta.is_some() {
             complete_pending_message(state, &mut events, Some(chunk));
             return events;
         }
+        return malformed_stream_error_events(state);
     };
 
-    let delta_value = choice.get("delta").cloned().unwrap_or(Value::Null);
-    let mut delta = DeltaView::from_delta(&delta_value);
+    let mut delta = DeltaView::from_delta(delta_value);
 
     handle_message_start(state, &mut events, chunk);
 
@@ -845,9 +923,9 @@ fn close_thinking_block_if_open(
 // Usage helpers over the dynamic chunk Value
 // ---------------------------------------------------------------------------
 
-/// `chunk?.usage` is present and truthy (an object).
+/// `chunk?.usage` is present and is an object.
 fn has_usage(chunk: &Value) -> bool {
-    chunk.get("usage").is_some_and(|u| !u.is_null())
+    chunk.get("usage").is_some_and(Value::is_object)
 }
 
 /// Navigate `path` and read an integer with a `?? 0` default.
@@ -1555,6 +1633,229 @@ mod tests {
             .filter(|event| matches!(event["type"].as_str(), Some("error" | "message_stop")))
             .count();
         assert_eq!(terminal_count, 1);
+    }
+
+    #[test]
+    fn malformed_choices_discards_pending_success_and_suppresses_followups() {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        let finish = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            finish,
+            vec![json!({ "type": "content_block_stop", "index": 0 })]
+        );
+        assert!(state.pending_message_delta.is_some());
+
+        // A valid JSON object with usage but no choices is not OpenAI's
+        // `choices: []` usage-only record. It must discard the queued success
+        // instead of flushing message_delta/message_stop.
+        let terminal = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            terminal,
+            vec![json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "The upstream model stream returned a malformed event."
+                }
+            })]
+        );
+        assert!(state.pending_message_delta.is_none());
+        assert!(!state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
+
+        // Later success, upstream-error, and valid usage-only records are all
+        // suppressed, and EOF cannot flush the discarded success.
+        for late_chunk in [
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "late success" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+            }),
+            json!({
+                "error": {
+                    "type": "server_error",
+                    "message": "late upstream error"
+                }
+            }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+            }),
+        ] {
+            assert!(translate_chunk_to_anthropic_events(&late_chunk, &mut state).is_empty());
+        }
+        assert!(flush_pending_anthropic_stream_events(&mut state).is_empty());
+    }
+
+    #[test]
+    fn malformed_choices_closes_open_blocks_and_clears_tool_state() {
+        let mut thinking_state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "reasoning_text": "partial thought" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut thinking_state,
+        );
+        assert!(thinking_state.thinking_block_open);
+
+        let thinking_terminal = to_values(&translate_chunk_to_anthropic_events(
+            &json!({ "choices": {} }),
+            &mut thinking_state,
+        ));
+        assert_eq!(
+            thinking_terminal,
+            vec![
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream returned a malformed event."
+                    }
+                }),
+            ]
+        );
+        assert!(!thinking_state.thinking_block_open);
+        assert!(thinking_state.terminal_event_emitted);
+
+        let mut tool_state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": { "name": "lookup", "arguments": "{\"q\":" }
+                    }] },
+                    "finish_reason": null
+                }]
+            }),
+            &mut tool_state,
+        );
+        let deferred = translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "deferred" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut tool_state,
+        );
+        assert!(deferred.is_empty());
+        assert!(tool_state.content_block_open);
+        assert_eq!(tool_state.deferred_content.as_deref(), Some("deferred"));
+        assert!(!tool_state.tool_calls.is_empty());
+
+        let tool_terminal = to_values(&translate_chunk_to_anthropic_events(
+            &json!({ "choices": null }),
+            &mut tool_state,
+        ));
+        assert_eq!(
+            tool_terminal,
+            vec![
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream returned a malformed event."
+                    }
+                }),
+            ]
+        );
+        assert!(!tool_state.content_block_open);
+        assert!(tool_state.active_tool_call_index.is_none());
+        assert!(tool_state.tool_calls.is_empty());
+        assert!(tool_state.tool_call_order.is_empty());
+        assert!(tool_state.deferred_content.is_none());
+        assert!(tool_state.pending_message_delta.is_none());
+        assert!(tool_state.terminal_event_emitted);
+    }
+
+    #[test]
+    fn malformed_choice_and_neighboring_shapes_are_terminal() {
+        let malformed_chunks = [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({ "choices": null }),
+            json!({ "choices": "not-an-array" }),
+            json!({ "choices": [null] }),
+            json!({ "choices": [{}] }),
+            json!({ "choices": [{ "delta": null, "finish_reason": null }] }),
+            json!({ "choices": [{ "delta": {}, "finish_reason": 42 }] }),
+            json!({ "choices": [{ "delta": { "tool_calls": {} } }] }),
+            json!({ "choices": [{ "delta": {} }], "usage": [] }),
+            json!({ "choices": [] }),
+            json!({ "choices": [], "usage": null }),
+            json!({ "choices": [], "usage": [] }),
+            // Even a structurally valid usage-only record is out of order when
+            // no finish_reason has queued a pending message delta.
+            json!({ "choices": [], "usage": {} }),
+        ];
+
+        for chunk in malformed_chunks {
+            let mut state = AnthropicStreamState::default();
+            let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut state));
+            assert_eq!(
+                got,
+                vec![json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream returned a malformed event."
+                    }
+                })],
+                "chunk should terminate as malformed: {chunk}"
+            );
+            assert!(state.terminal_event_emitted);
+            assert!(!state.message_stop_emitted);
+            assert!(flush_pending_anthropic_stream_events(&mut state).is_empty());
+        }
     }
 
     #[test]
