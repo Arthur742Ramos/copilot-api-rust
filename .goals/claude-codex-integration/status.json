@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 4,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -21,6 +21,11 @@
       "iteration": 3,
       "verdict": "FAIL",
       "summary": "All four rs1 request carriers pass, but non-stream Responses reasoning with an empty summary text still loses its opaque carrier."
+    },
+    {
+      "iteration": 4,
+      "verdict": "FAIL",
+      "summary": "Aggregate-empty carrier cases pass, but stream/non-stream reasoning diverges on leading whitespace and multi-summary separators."
     }
   ]
 }
