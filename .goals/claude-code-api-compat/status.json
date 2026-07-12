@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-code-api-compat",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 3,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -16,6 +16,11 @@
       "iteration": 2,
       "verdict": "FAIL",
       "summary": "Provider-scoped count-token unknown/malformed failures still bypass complete Anthropic error envelopes; matrix and regression coverage overstate support."
+    },
+    {
+      "iteration": 3,
+      "verdict": "FAIL",
+      "summary": "Translated Chat Completions upstream error objects are still treated as empty-choice chunks; streaming matrix and regression coverage overstate failure compatibility."
     }
   ]
 }
