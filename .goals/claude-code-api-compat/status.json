@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-code-api-compat",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 2,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -11,6 +11,11 @@
       "iteration": 1,
       "verdict": "FAIL",
       "summary": "Nested-only upstream and unknown-provider errors omit the required top-level Anthropic error type; tests and matrix do not catch this."
+    },
+    {
+      "iteration": 2,
+      "verdict": "FAIL",
+      "summary": "Provider-scoped count-token unknown/malformed failures still bypass complete Anthropic error envelopes; matrix and regression coverage overstate support."
     }
   ]
 }
