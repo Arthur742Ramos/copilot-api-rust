@@ -288,21 +288,16 @@ fn is_loopback_origin(origin: &[u8]) -> bool {
 /// Render a handler panic as a 500 JSON error (instead of dropping the
 /// connection). The panic is still logged by the default panic hook.
 fn handle_panic(_err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> {
-    (
+    crate::libs::error::anthropic_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": {
-                "message": "Internal server error.",
-                "type": "internal_error",
-            }
-        })),
+        "api_error",
+        "Internal server error.",
     )
-        .into_response()
 }
 
 /// Rewrite a `413 Payload Too Large` whose body is not already JSON (the
 /// plain-text rejection axum's body-limit layer / `Bytes` extractor emits) into
-/// the Anthropic `invalid_request_error` envelope, so clients that parse error
+/// the complete Anthropic `request_too_large` envelope, so clients that parse error
 /// JSON get a consistent shape. Other responses pass through untouched.
 async fn normalize_oversize_response(req: Request, next: Next) -> Response {
     let response = next.run(req).await;
@@ -317,16 +312,11 @@ async fn normalize_oversize_response(req: Request, next: Next) -> Response {
     if is_json {
         return response;
     }
-    (
+    crate::libs::error::anthropic_error_response(
         StatusCode::PAYLOAD_TOO_LARGE,
-        Json(json!({
-            "error": {
-                "message": "Request body is too large.",
-                "type": "invalid_request_error",
-            }
-        })),
+        "request_too_large",
+        "Request body is too large.",
     )
-        .into_response()
 }
 
 async fn trace_middleware(req: Request, next: Next) -> Response {

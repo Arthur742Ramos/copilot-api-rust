@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use crate::libs::error::AppError;
+use crate::libs::error::{anthropic_error_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::services::codex::get_models::get_codex_models;
 use crate::services::providers::provider_proxy::{
@@ -34,16 +34,11 @@ pub async fn handle_provider_models(
     provider: String,
 ) -> Result<Response, AppError> {
     let Some(provider_config) = resolve_provider_config(&provider).await else {
-        return Ok((
+        return Ok(anthropic_error_response(
             StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {
-                    "message": format!("Provider '{provider}' not found or disabled"),
-                    "type": "invalid_request_error",
-                }
-            })),
-        )
-            .into_response());
+            "invalid_request_error",
+            format!("Provider '{provider}' not found or disabled"),
+        ));
     };
 
     if provider_config.name == "codex" {

@@ -73,7 +73,12 @@ pub fn normalize_openai_usage(usage: Option<&Value>) -> UsageTokens {
     UsageTokens {
         cache_creation_input_tokens: Some(cache_creation),
         cache_read_input_tokens: Some(cached),
-        input_tokens: Some((prompt - cached - cache_creation).max(0)),
+        input_tokens: Some(
+            prompt
+                .saturating_sub(cached)
+                .saturating_sub(cache_creation)
+                .max(0),
+        ),
         output_tokens: Some(normalize_token(top_f64(usage, "completion_tokens"))),
         total_tokens: normalize_optional_token(top_f64(usage, "total_tokens")),
     }
@@ -1349,6 +1354,21 @@ mod tests {
     use crate::libs::request_context::{
         run_with_context, set_request_api_key_label, RequestContext,
     };
+
+    #[test]
+    fn normalize_openai_usage_handles_extreme_cache_counts_without_overflow() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 0,
+            "completion_tokens": 1,
+            "prompt_tokens_details": {
+                "cached_tokens": i64::MAX,
+                "cache_creation_input_tokens": i64::MAX
+            }
+        });
+        let normalized = normalize_openai_usage(Some(&usage));
+        assert_eq!(normalized.input_tokens, Some(0));
+        assert_eq!(normalized.output_tokens, Some(1));
+    }
 
     #[test]
     fn migration_adds_api_key_label_column() {

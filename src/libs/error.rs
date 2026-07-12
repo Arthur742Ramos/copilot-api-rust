@@ -15,6 +15,10 @@ pub struct HttpError {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: String,
+    /// Whether `message` is safe to expose when there is no upstream response
+    /// body. Synthetic transport/parse failures keep their detailed diagnostic
+    /// in logs but return only an opaque reference to clients.
+    pub expose_message: bool,
 }
 
 impl HttpError {
@@ -29,18 +33,21 @@ impl HttpError {
             status,
             headers,
             body,
+            expose_message: true,
         }
     }
 
     /// A synthetic 500 with no upstream headers/body — used when a request fails
     /// before we have a response (network errors, JSON parse failures).
     pub fn internal(message: impl Into<String>) -> Self {
-        HttpError::new(
+        let mut error = HttpError::new(
             message,
             StatusCode::INTERNAL_SERVER_ERROR,
             HeaderMap::new(),
             String::new(),
-        )
+        );
+        error.expose_message = false;
+        error
     }
 }
 
@@ -51,6 +58,29 @@ impl std::fmt::Display for HttpError {
 }
 
 impl std::error::Error for HttpError {}
+
+/// Render a locally generated failure in the complete Anthropic error envelope.
+///
+/// Use this helper for local route and middleware failures that do not have an
+/// upstream response to normalize. Anthropic SDKs require the top-level
+/// `type: "error"` discriminator in addition to the nested error type.
+pub fn anthropic_error_response(
+    status: StatusCode,
+    error_type: impl Into<String>,
+    message: impl Into<String>,
+) -> Response {
+    (
+        status,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": error_type.into(),
+                "message": message.into(),
+            }
+        })),
+    )
+        .into_response()
+}
 
 /// Build an HttpError from a non-OK reqwest response, consuming its body.
 pub async fn http_error_from_response(
@@ -117,18 +147,24 @@ impl std::fmt::Display for AppError {
     }
 }
 
-/// If `body` is a JSON object that already looks like an error envelope, return
-/// it parsed so it can be forwarded to the client verbatim (avoids the
-/// double-encoding where a JSON error body is stringified into our `message`).
-/// Recognizes both `{"error": {...}}` and `{"type":"error","error":{...}}`.
+/// If `body` is a JSON object that looks like an error envelope, normalize it to
+/// the complete Anthropic shape and return it parsed (avoids the double-encoding
+/// where a JSON error body is stringified into our `message`).
+///
+/// Upstreams commonly omit the top-level discriminator and return only
+/// `{"error": {...}}`. Anthropic SDKs require
+/// `{"type":"error","error":{...}}`, so add or correct that discriminator while
+/// preserving the nested error and any other upstream fields. An already
+/// complete Anthropic envelope is unchanged.
 fn parse_upstream_error_envelope(body: &str) -> Option<serde_json::Value> {
-    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-    let obj = value.as_object()?;
-    if obj.get("error").map(|e| e.is_object()).unwrap_or(false) {
-        Some(value)
-    } else {
-        None
-    }
+    let mut value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let obj = value.as_object_mut()?;
+    obj.get("error").filter(|error| error.is_object())?;
+    obj.insert(
+        "type".to_string(),
+        serde_json::Value::String("error".to_string()),
+    );
+    Some(value)
 }
 
 /// Best-effort extraction of a human-readable message from a non-envelope JSON
@@ -141,6 +177,41 @@ fn lift_upstream_error_message(body: &str) -> Option<String> {
         .and_then(|m| m.as_str())
         .or_else(|| value.pointer("/error/message").and_then(|m| m.as_str()))
         .map(|s| s.to_string())
+}
+
+/// Headers that are useful to a client diagnosing or retrying a failed request.
+///
+/// Never forward arbitrary `x-*` headers: upstreams frequently attach internal
+/// routing/debug metadata that is neither stable nor intended for callers.
+fn should_forward_error_header(name: &str, retryable_status: bool) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let correlation = matches!(
+        lower.as_str(),
+        "request-id"
+            | "x-request-id"
+            | "x-correlation-id"
+            | "x-github-request-id"
+            | "x-ms-request-id"
+            | "x-vss-e2eid"
+            | "x-azure-ref"
+            | "openai-request-id"
+    );
+    if correlation {
+        return true;
+    }
+    retryable_status
+        && (lower == "retry-after"
+            || lower.starts_with("x-ratelimit-")
+            || lower.starts_with("x-usage-")
+            || lower.starts_with("anthropic-ratelimit-")
+            || lower.starts_with("ratelimit-"))
+}
+
+fn internal_reference_message() -> String {
+    let trace_id = crate::libs::request_context::request_context_store()
+        .map(|ctx| ctx.trace_id.clone())
+        .unwrap_or_else(crate::libs::request_context::generate_trace_id);
+    format!("An internal error occurred. Reference: {trace_id}")
 }
 
 /// Map an upstream HTTP status to the Anthropic-recognized `error.type` string,
@@ -173,16 +244,13 @@ impl IntoResponse for AppError {
                 // 529 (overloaded) is not a named StatusCode constant.
                 let is_overloaded = e.status.as_u16() == 529;
                 let mut out_headers = HeaderMap::new();
-                if is_rate_limit || is_overloaded {
-                    // Forward Copilot's retry-after (so the SDK backs off the
-                    // right amount) plus any x-ratelimit-* headers. We do NOT
-                    // synthesize a retry-after if absent — Anthropic clients
-                    // apply their own default backoff in that case.
-                    for (name, value) in e.headers.iter() {
-                        let lower = name.as_str().to_lowercase();
-                        if lower == "retry-after" || lower.starts_with("x-") {
-                            out_headers.insert(name.clone(), value.clone());
-                        }
+                let retryable_status = is_rate_limit || is_overloaded;
+                // Correlation IDs are useful on every status. Retry/backoff
+                // metadata is additionally forwarded for 429/529. We do NOT
+                // synthesize retry-after when it is absent.
+                for (name, value) in e.headers.iter() {
+                    if should_forward_error_header(name.as_str(), retryable_status) {
+                        out_headers.insert(name.clone(), value.clone());
                     }
                 }
                 // The upstream error body (when present) is forwarded to the
@@ -191,11 +259,15 @@ impl IntoResponse for AppError {
                 // surface it directly: if the upstream already sent an Anthropic-
                 // style error envelope, forward it verbatim; if it's some other
                 // JSON, lift a human message out of it; otherwise use the raw text.
-                let fallback_message = if e.body.is_empty() {
+                let fallback_message = if e.body.is_empty() && !e.expose_message {
+                    internal_reference_message()
+                } else if e.body.is_empty() {
                     e.message.clone()
                 } else {
                     e.body.clone()
                 };
+                let safe_message =
+                    lift_upstream_error_message(&e.body).unwrap_or(fallback_message.clone());
                 let body = if is_rate_limit || is_overloaded {
                     // Reshape rate-limit/overload errors into the Anthropic shape
                     // the Claude Code SDK recognizes as retryable: top-level
@@ -210,12 +282,12 @@ impl IntoResponse for AppError {
                         "type": "error",
                         "error": {
                             "type": error_type,
-                            "message": fallback_message,
+                            "message": safe_message,
                         }
                     }))
                 } else if let Some(envelope) = parse_upstream_error_envelope(&e.body) {
-                    // Upstream sent a recognizable error envelope — forward it
-                    // verbatim so the client sees the real structured error.
+                    // Preserve the real structured upstream error while ensuring
+                    // the top-level discriminator required by Anthropic SDKs.
                     Json(envelope)
                 } else {
                     // Non-envelope JSON or plain text: synthesize the Anthropic
@@ -235,31 +307,15 @@ impl IntoResponse for AppError {
             }
             AppError::BadRequest(message) => {
                 tracing::warn!("Bad request: {message}");
-                let body = Json(json!({
-                    "error": {
-                        "message": message,
-                        "type": "invalid_request_error",
-                    }
-                }));
-                (StatusCode::BAD_REQUEST, body).into_response()
+                anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
             }
             AppError::Other(e) => {
-                let trace_id = crate::libs::request_context::request_context_store()
-                    .map(|ctx| ctx.trace_id.clone())
-                    .unwrap_or_else(crate::libs::request_context::generate_trace_id);
+                let message = internal_reference_message();
                 tracing::error!(
-                    trace_id = %trace_id,
                     error = ?e,
                     "internal error"
                 );
-                let body = Json(json!({
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": format!("An internal error occurred. Reference: {trace_id}"),
-                    }
-                }));
-                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+                anthropic_error_response(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message)
             }
         }
     }
@@ -309,11 +365,8 @@ mod tests {
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "rate_limit_error");
-        assert_eq!(
-            body["error"]["message"],
-            r#"{"message":"rate limited by copilot"}"#
-        );
-        // retry-after and x-* headers are forwarded so the SDK backs off.
+        assert_eq!(body["error"]["message"], "rate limited by copilot");
+        // Retry and rate-limit headers are forwarded so the SDK backs off.
         assert_eq!(out_headers.get("retry-after").unwrap(), "30");
         assert_eq!(
             out_headers.get("x-usage-ratelimit-session").unwrap(),
@@ -425,6 +478,7 @@ mod tests {
         let (status, _headers, body) = render(err).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(
             body["error"]["message"],
@@ -436,6 +490,7 @@ mod tests {
     async fn upstream_json_error_envelope_is_forwarded_verbatim() {
         // A JSON error envelope from upstream must be forwarded as structured
         // JSON, not stringified into our `message` (the double-encoding bug).
+        // A nested-only envelope must also gain the SDK-required discriminator.
         let err = AppError::Http(HttpError::new(
             "Failed",
             status(400),
@@ -444,6 +499,7 @@ mod tests {
         ));
         let (status, _headers, body) = render(err).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(
             body["error"]["message"],
@@ -451,6 +507,29 @@ mod tests {
         );
         // The message must be a string, not escaped JSON.
         assert!(body["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn complete_upstream_error_envelope_is_preserved() {
+        let upstream = json!({
+            "type": "error",
+            "error": {
+                "type": "permission_error",
+                "message": "Access denied",
+                "upstream_code": "forbidden",
+            },
+            "request_id": "req-upstream",
+        });
+        let err = AppError::Http(HttpError::new(
+            "Failed",
+            StatusCode::FORBIDDEN,
+            HeaderMap::new(),
+            upstream.to_string(),
+        ));
+
+        let (status, _headers, body) = render(err).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, upstream);
     }
 
     #[tokio::test]
@@ -469,9 +548,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_rate_limit_does_not_forward_headers() {
+    async fn error_headers_use_explicit_allowlist() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", "30".parse().unwrap());
+        headers.insert("x-request-id", "req-123".parse().unwrap());
+        headers.insert("x-internal-secret", "do-not-leak".parse().unwrap());
         let err = AppError::Http(HttpError::new(
             "forbidden",
             status(403),
@@ -482,7 +563,39 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         // Only 429/529 forward retry-after; other errors do not.
         assert!(out_headers.get("retry-after").is_none());
+        // Correlation headers are useful on every failure status.
+        assert_eq!(out_headers.get("x-request-id").unwrap(), "req-123");
+        // Arbitrary x-* metadata must never be reflected.
+        assert!(out_headers.get("x-internal-secret").is_none());
         // 403 maps to permission_error.
         assert_eq!(body["error"]["type"], "permission_error");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_does_not_forward_arbitrary_x_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-internal-secret", "do-not-leak".parse().unwrap());
+        let err = AppError::Http(HttpError::new(
+            "limited",
+            status(429),
+            headers,
+            String::new(),
+        ));
+        let (_status, out_headers, _body) = render(err).await;
+        assert_eq!(out_headers.get("x-ratelimit-remaining").unwrap(), "0");
+        assert!(out_headers.get("x-internal-secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn synthetic_internal_http_error_hides_diagnostic() {
+        let err = AppError::Http(HttpError::internal(
+            "connection to private-host.internal:443 failed with token abc",
+        ));
+        let (_status, _headers, body) = render(err).await;
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("An internal error occurred. Reference:"));
+        assert!(!message.contains("private-host"));
+        assert!(!message.contains("token abc"));
     }
 }

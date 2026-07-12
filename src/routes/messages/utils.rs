@@ -13,14 +13,14 @@ pub const THINKING_TEXT: &str = "Thinking...";
 /// - `stop`           -> `end_turn`
 /// - `length`         -> `max_tokens`
 /// - `tool_calls`     -> `tool_use`
-/// - `content_filter` -> `end_turn`
+/// - `content_filter` -> `refusal`
 /// - `null` / unknown -> `None`
 pub fn map_openai_stop_reason_to_anthropic(finish_reason: Option<&str>) -> Option<&'static str> {
     match finish_reason {
         Some("stop") => Some("end_turn"),
         Some("length") => Some("max_tokens"),
         Some("tool_calls") => Some("tool_use"),
-        Some("content_filter") => Some("end_turn"),
+        Some("content_filter") => Some("refusal"),
         _ => None,
     }
 }
@@ -45,7 +45,7 @@ mod tests {
         );
         assert_eq!(
             map_openai_stop_reason_to_anthropic(Some("content_filter")),
-            Some("end_turn")
+            Some("refusal")
         );
         assert_eq!(map_openai_stop_reason_to_anthropic(None), None);
         assert_eq!(map_openai_stop_reason_to_anthropic(Some("other")), None);

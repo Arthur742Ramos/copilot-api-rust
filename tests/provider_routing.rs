@@ -1,8 +1,6 @@
-//! Exercises the `/:provider/v1/messages` route through the real router. We only
-//! lock the resilient behavior: an unknown provider resolves to a 404
-//! "not found" before any upstream call. We deliberately avoid asserting the
-//! `openai-responses` 501 status, since a parallel branch is wiring that path to
-//! working — coupling to 501 would break when that lands.
+//! Exercises the direct provider routes and public provider/model aliases through
+//! the real router. All failure regressions stop before an upstream request, so
+//! they are deterministic and credential-free.
 //!
 //! Config is installed via the seam (no api keys -> auth allows the route), so
 //! these tests run serially against the process-global config.
@@ -29,21 +27,204 @@ fn post_provider_messages(provider: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn post_count_tokens(path: &str, body: impl Into<Body>) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(body.into())
+        .unwrap()
+}
+
+fn count_tokens_body(model: &str) -> String {
+    json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "hi" }],
+    })
+    .to_string()
+}
+
+fn assert_anthropic_error(body: &[u8], error_type: &str, message_fragment: &str) {
+    let value = json_body(body);
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], error_type);
+    let message = value["error"]["message"]
+        .as_str()
+        .expect("error message is a string");
+    assert!(
+        message.contains(message_fragment),
+        "expected message containing {message_fragment:?}, got {message:?}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
-async fn unknown_provider_returns_404() {
+async fn unknown_provider_returns_complete_anthropic_404() {
     // No keys configured -> general auth allows the request to reach the handler.
     set_config(&[], None);
 
     let (status, body) = send(post_provider_messages("definitely-not-a-real-provider")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let value = json_body(&body);
-    let message = value["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("not found") || message.contains("disabled"),
-        "expected a not-found/disabled error, got: {message}"
+    assert_eq!(
+        json_body(&body),
+        json!({
+            "type": "error",
+            "error": {
+                "message": "Provider 'definitely-not-a-real-provider' not found or disabled",
+                "type": "invalid_request_error",
+            },
+        })
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unknown_provider_count_tokens_returns_complete_anthropic_404() {
+    set_config(&[], None);
+
+    let provider = "definitely-not-a-real-provider";
+    let (status, body) = send(post_count_tokens(
+        &format!("/{provider}/v1/messages/count_tokens"),
+        count_tokens_body("some-model"),
+    ))
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&body),
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Provider 'definitely-not-a-real-provider' not found or disabled",
+            },
+        })
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn provider_model_alias_count_tokens_returns_complete_anthropic_404() {
+    set_config(&[], None);
+
+    let (status, body) = send(post_count_tokens(
+        "/v1/messages/count_tokens",
+        count_tokens_body("definitely-not-a-real-provider/some-model"),
+    ))
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&body),
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Provider 'definitely-not-a-real-provider' not found or disabled",
+            },
+        })
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn provider_count_tokens_auth_failure_is_a_complete_anthropic_401() {
+    // A synthetic configured key enables auth without relying on any real
+    // credential. Omitting it from the request must fail before provider lookup.
+    set_config(&["test-only-api-key"], None);
+
+    let (status, body) = send(post_count_tokens(
+        "/some-provider/v1/messages/count_tokens",
+        count_tokens_body("some-model"),
+    ))
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_body(&body),
+        json!({
+            "type": "error",
+            "error": {
+                "type": "authentication_error",
+                "message": "Unauthorized",
+            },
+        })
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn direct_and_alias_count_tokens_malformed_json_returns_anthropic_400() {
+    set_config(&[], None);
+
+    for path in [
+        "/some-provider/v1/messages/count_tokens",
+        "/v1/messages/count_tokens",
+    ] {
+        let (status, body) = send(post_count_tokens(path, "{not valid json")).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_anthropic_error(&body, "invalid_request_error", "Invalid JSON");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn direct_and_alias_count_tokens_invalid_payloads_return_anthropic_400() {
+    set_config(&[], None);
+
+    for (path, model) in [
+        ("/some-provider/v1/messages/count_tokens", "some-model"),
+        ("/v1/messages/count_tokens", "some-provider/some-model"),
+    ] {
+        // Valid JSON, but the required `messages` field is absent.
+        let (status, body) = send(post_count_tokens(
+            path,
+            json!({ "model": model }).to_string(),
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_anthropic_error(&body, "invalid_request_error", "Invalid request payload");
+        assert!(
+            json_body(&body)["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("messages"),
+            "{path} should identify the invalid field"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn direct_and_alias_count_tokens_body_limits_return_anthropic_413() {
+    set_config(&[], None);
+
+    for (path, model) in [
+        ("/some-provider/v1/messages/count_tokens", "some-model"),
+        ("/v1/messages/count_tokens", "some-provider/some-model"),
+    ] {
+        let padding = "x".repeat(copilot_api::libs::http::MAX_REQUEST_BODY_BYTES);
+        let body = format!(r#"{{"model":"{model}","messages":[],"padding":"{padding}"}}"#);
+        assert!(body.len() > copilot_api::libs::http::MAX_REQUEST_BODY_BYTES);
+
+        let (status, body) = send(post_count_tokens(path, body)).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        assert_eq!(
+            json_body(&body),
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "request_too_large",
+                    "message": "Request body is too large.",
+                },
+            }),
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -64,6 +64,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
             "model: field required and must be a non-empty string".to_string(),
         ));
     }
+    validate_generation_request(&payload)?;
 
     // 1. Resolve configured model mappings.
     let requested_model = model_of(&payload);
@@ -257,6 +258,34 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     handle_with_chat_completions(&typed, options).await
 }
 
+/// Validate fields whose optional Rust representation is shared with
+/// `/count_tokens` but which are required for generation. Rejecting here keeps
+/// invalid requests from consuming admission/premium budgets or silently
+/// acquiring transport-specific defaults.
+#[allow(clippy::result_large_err)]
+fn validate_generation_request(payload: &Value) -> Result<(), AppError> {
+    match payload.get("messages") {
+        Some(Value::Array(messages)) if !messages.is_empty() => {}
+        Some(Value::Array(_)) => {
+            return Err(AppError::BadRequest(
+                "messages: must contain at least one message".to_string(),
+            ));
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "messages: field required and must be an array".to_string(),
+            ));
+        }
+    }
+
+    match payload.get("max_tokens").and_then(Value::as_u64) {
+        Some(value) if value > 0 => Ok(()),
+        _ => Err(AppError::BadRequest(
+            "max_tokens: field required and must be a positive integer".to_string(),
+        )),
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn deserialize_payload(payload: &Value) -> Result<AnthropicMessagesPayload, AppError> {
     serde_json::from_value(payload.clone())
@@ -350,5 +379,32 @@ mod tests {
     fn context_1m_beta_is_idempotent() {
         let already = format!("foo,{CONTEXT_1M_BETA}");
         assert_eq!(merge_context_1m_beta(Some(&already)), already);
+    }
+
+    #[test]
+    fn generation_validation_requires_messages_and_positive_max_tokens() {
+        assert!(validate_generation_request(&serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        }))
+        .is_ok());
+
+        for invalid in [
+            serde_json::json!({"messages": [], "max_tokens": 1}),
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}),
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 0
+            }),
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1.5
+            }),
+        ] {
+            assert!(matches!(
+                validate_generation_request(&invalid),
+                Err(AppError::BadRequest(_))
+            ));
+        }
     }
 }

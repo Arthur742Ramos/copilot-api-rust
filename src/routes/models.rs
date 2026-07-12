@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
-use crate::libs::error::AppError;
+use crate::libs::error::{anthropic_error_response, AppError};
 use crate::libs::models::{is_context_1m_model, strip_context_1m_suffix, to_client_model_id};
 use crate::libs::state;
 use crate::libs::utils::cache_models;
@@ -63,16 +63,11 @@ pub async fn get_model_route(Path(requested): Path<String>) -> Response {
 }
 
 fn model_not_found(id: &str) -> Response {
-    (
+    anthropic_error_response(
         StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": {
-                "message": format!("The model `{id}` does not exist."),
-                "type": "not_found_error",
-            }
-        })),
+        "not_found_error",
+        format!("The model `{id}` does not exist."),
     )
-        .into_response()
 }
 
 /// Shape one upstream [`Model`] into the OpenAI/Anthropic client model object.

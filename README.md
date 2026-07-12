@@ -23,6 +23,10 @@ into GitHub Copilot requests, using your own Copilot subscription. It exposes:
 This lets you point existing OpenAI or Anthropic clients (including Claude Code)
 at a local endpoint backed by GitHub Copilot.
 
+See the [Claude Code / Anthropic API compatibility
+matrix](./docs/claude-code-api-compatibility.md) for audited behaviors,
+intentional divergences, and explicit scope limits.
+
 ## Install / build
 
 This is a Rust project. Build from source with Cargo:

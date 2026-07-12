@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use crate::libs::error::AppError;
+use crate::libs::error::{anthropic_error_response, AppError};
 use crate::libs::provider_model::create_fallback_model;
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::tokenizer::get_token_count;
@@ -33,16 +33,11 @@ pub async fn handle_provider_count_tokens_for_provider(
     let model_id = payload.model.trim().to_string();
 
     let Some(provider_config) = resolve_provider_config(&provider).await else {
-        return Ok((
+        return Ok(anthropic_error_response(
             StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {
-                    "message": format!("Provider '{provider}' not found or disabled"),
-                    "type": "invalid_request_error",
-                }
-            })),
-        )
-            .into_response());
+            "invalid_request_error",
+            format!("Provider '{provider}' not found or disabled"),
+        ));
     };
 
     // Mirror the TS: only the openai-compatible / openai-responses providers
@@ -98,21 +93,16 @@ pub async fn handle_provider_count_tokens_for_provider(
 /// `handleProviderCountTokens`.
 pub async fn post_provider_count_tokens(
     axum::extract::Path(provider): axum::extract::Path<String>,
-    body: Json<serde_json::Value>,
+    body: axum::body::Bytes,
 ) -> Response {
-    let payload: AnthropicMessagesPayload = match serde_json::from_value(body.0) {
+    let value = match crate::routes::parse_json_body(&body) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let payload: AnthropicMessagesPayload = match serde_json::from_value(value) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": format!("Invalid request payload: {e}"),
-                        "type": "invalid_request_error",
-                    }
-                })),
-            )
-                .into_response()
+            return AppError::BadRequest(format!("Invalid request payload: {e}")).into_response()
         }
     };
     match handle_provider_count_tokens_for_provider(payload, provider).await {

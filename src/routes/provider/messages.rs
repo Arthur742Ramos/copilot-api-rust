@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::libs::config::{ModelConfig, ResolvedProviderConfig};
-use crate::libs::error::{http_error_from_response, AppError};
+use crate::libs::error::{anthropic_error_response, http_error_from_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{
     create_provider_token_usage_recorder, merge_anthropic_usage, normalize_anthropic_usage,
@@ -35,13 +35,16 @@ use crate::routes::messages::non_stream_translation::{
 };
 use crate::routes::messages::preprocess::normalize_system_messages;
 use crate::routes::messages::responses_stream_translation::{
-    build_error_event, translate_responses_stream_event, ResponsesStreamState,
+    build_error_event, terminate_responses_stream_with_error, translate_responses_stream_event,
+    ResponsesStreamState,
 };
 use crate::routes::messages::responses_translation::{
     translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
 };
 use crate::routes::messages::stream_translation::{
-    flush_pending_anthropic_stream_events, translate_chunk_to_anthropic_events,
+    flush_pending_anthropic_stream_events, malformed_stream_error_events,
+    translate_chunk_to_anthropic_events, translate_error_to_anthropic_error_event,
+    transport_stream_error_events,
 };
 use crate::routes::messages::web_search::fulfill::{
     build_synthetic_stream_events, collect_web_search_responses_stream_result,
@@ -77,15 +80,25 @@ pub async fn post_provider_messages(
     let payload: AnthropicMessagesPayload = match serde_json::from_value(value) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": { "message": format!("Invalid request payload: {e}"), "type": "invalid_request_error" }
-                })),
-            )
-                .into_response()
+            return AppError::BadRequest(format!("Invalid request payload: {e}")).into_response()
         }
     };
+    if payload.model.trim().is_empty() {
+        return AppError::BadRequest(
+            "model: field required and must be a non-empty string".to_string(),
+        )
+        .into_response();
+    }
+    if payload.messages.is_empty() {
+        return AppError::BadRequest("messages: must contain at least one message".to_string())
+            .into_response();
+    }
+    if !matches!(payload.max_tokens, Some(value) if value > 0) {
+        return AppError::BadRequest(
+            "max_tokens: field required and must be a positive integer".to_string(),
+        )
+        .into_response();
+    }
     // Internal provider dispatches (model aliases / web search) already pass
     // through the public route's shared gate. This direct provider endpoint does
     // not, so gate it here before resolving or contacting the provider.
@@ -106,16 +119,11 @@ pub async fn handle_provider_messages_for_provider(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let Some(provider_config) = resolve_provider_config(&provider).await else {
-        return Ok((
+        return Ok(anthropic_error_response(
             StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {
-                    "message": format!("Provider '{provider}' not found or disabled"),
-                    "type": "invalid_request_error",
-                }
-            })),
-        )
-            .into_response());
+            "invalid_request_error",
+            format!("Provider '{provider}' not found or disabled"),
+        ));
     };
 
     let model_config = provider_config
@@ -400,7 +408,15 @@ fn stream_responses_provider_messages(
                 Ok(ev) => ev,
                 Err(err) => {
                     timer.mark_error();
-                    yield Err(err);
+                    let error_event = translate_error_to_anthropic_error_event(Some(&err));
+                    for event in
+                        terminate_responses_stream_with_error(&mut state, error_event)
+                    {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
@@ -421,7 +437,25 @@ fn stream_responses_provider_messages(
 
             let parsed: Value = match serde_json::from_str(&chunk.data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(error) => {
+                    crate::routes::messages::api_flows::record_stream_chunk_parse_failure(
+                        "provider_responses",
+                        &error,
+                    );
+                    timer.mark_error();
+                    let error_event = build_error_event(
+                        "The upstream Responses stream returned a malformed event.",
+                    );
+                    for event in
+                        terminate_responses_stream_with_error(&mut state, error_event)
+                    {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
+                    return;
+                }
             };
 
             // Codex: log `codex.rate_limits` events (mirrors
@@ -449,14 +483,19 @@ fn stream_responses_provider_messages(
         }
 
         if !state.message_completed {
-            let error_event =
-                build_error_event(&format!("{provider_label} stream ended without a completion event"));
-            if let Some(frame) = emit_event(&error_event) {
-                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            timer.mark_error();
+            let error_event = build_error_event(&format!(
+                "{provider_label} stream ended without a completion event"
+            ));
+            for event in terminate_responses_stream_with_error(&mut state, error_event) {
+                if let Some(frame) = emit_event(&event) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
             }
+        } else {
+            timer.mark_finished();
         }
 
-        timer.mark_finished();
         recorder.record(usage);
     });
 
@@ -935,6 +974,7 @@ fn stream_provider_messages(
         let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)
             .with_request_context(crate::libs::request_context::request_context_store());
         let mut usage = UsageTokens::default();
+        let mut terminal_event_seen = false;
         futures_util::pin_mut!(event_stream);
 
         while let Some(item) = event_stream.next().await {
@@ -942,7 +982,12 @@ fn stream_provider_messages(
                 Ok(ev) => ev,
                 Err(err) => {
                     timer.mark_error();
-                    yield Err(err);
+                    if let Some(frame) =
+                        emit_event(&translate_error_to_anthropic_error_event(Some(&err)))
+                    {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
@@ -962,10 +1007,26 @@ fn stream_provider_messages(
                 break;
             }
 
-            let mut data = chunk.data.clone();
-            if let Some(parsed) = parse_provider_stream_event(&chunk.data, adjust) {
-                usage = merge_anthropic_usage(usage, parsed.usage);
-                data = parsed.data;
+            let parsed = match parse_provider_stream_event(&chunk.data, adjust) {
+                Some(parsed) => parsed,
+                None => {
+                    timer.mark_error();
+                    if let Some(frame) = emit_event(&build_error_event(
+                        "The upstream provider Messages stream returned a malformed event.",
+                    )) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
+            usage = merge_anthropic_usage(usage, parsed.usage);
+            let data = parsed.data;
+            if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                terminal_event_seen = matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("message_stop" | "error")
+                );
             }
 
             let frame = match event_name {
@@ -974,9 +1035,21 @@ fn stream_provider_messages(
             };
             timer.on_content_frame();
             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            if terminal_event_seen {
+                break;
+            }
         }
 
-        timer.mark_finished();
+        if terminal_event_seen {
+            timer.mark_finished();
+        } else {
+            timer.mark_error();
+            if let Some(frame) = emit_event(&build_error_event(
+                "The upstream provider Messages stream ended before a terminal event.",
+            )) {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            }
+        }
         recorder.record(usage);
     });
 
@@ -1047,7 +1120,12 @@ fn stream_openai_compatible_provider_messages(
                 Ok(ev) => ev,
                 Err(err) => {
                     timer.mark_error();
-                    yield Err(err);
+                    for event in transport_stream_error_events(&mut state, Some(&err)) {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
@@ -1068,30 +1146,66 @@ fn stream_openai_compatible_provider_messages(
 
             let parsed: Value = match serde_json::from_str(&chunk.data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(error) => {
+                    crate::routes::messages::api_flows::record_stream_chunk_parse_failure(
+                        "provider_chat_completions",
+                        &error,
+                    );
+                    timer.mark_error();
+                    for event in malformed_stream_error_events(&mut state) {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
+                    return;
+                }
             };
 
-            if let Some(u) = parsed.get("usage") {
-                if !u.is_null() {
+            let was_terminal = state.terminal_event_emitted;
+            let translated = translate_chunk_to_anthropic_events(&parsed, &mut state);
+            let terminal_error = translated
+                .iter()
+                .any(|event| matches!(event, AnthropicStreamEventData::Error { .. }));
+            // The translator validates every usage field this flow consumes.
+            // Account only a chunk it accepted, and never let trailing records
+            // mutate usage after success or failure became terminal.
+            if !was_terminal && !terminal_error {
+                if let Some(u) = parsed.get("usage").filter(|usage| !usage.is_null()) {
                     usage = normalize_openai_usage(Some(u));
                 }
             }
-
-            for event in translate_chunk_to_anthropic_events(&parsed, &mut state) {
+            for event in translated {
                 if let Some(frame) = emit_event(&event) {
-                    timer.on_content_frame();
+                    if !matches!(&event, AnthropicStreamEventData::Error { .. }) {
+                        timer.on_content_frame();
+                    }
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
             }
+            if terminal_error {
+                tracing::warn!(
+                    "provider chat-completions stream reported a terminal upstream error"
+                );
+                timer.mark_error();
+                recorder.record(usage);
+                return;
+            }
         }
 
+        let incomplete = !state.terminal_event_emitted && state.pending_message_delta.is_none();
+        if incomplete {
+            timer.mark_error();
+        }
         for event in flush_pending_anthropic_stream_events(&mut state) {
             if let Some(frame) = emit_event(&event) {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
             }
         }
 
-        timer.mark_finished();
+        if state.message_stop_emitted {
+            timer.mark_finished();
+        }
         recorder.record(usage);
     });
 
@@ -1222,6 +1336,8 @@ fn sse_response(body: Body) -> Response {
 mod tests {
     use super::*;
     use crate::services::copilot::create_chat_completions::Message;
+    use http_body_util::BodyExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn msg(role: &str, content: Value) -> Message {
         Message {
@@ -1229,6 +1345,44 @@ mod tests {
             content: Some(content),
             extra: serde_json::Map::new(),
         }
+    }
+
+    async fn upstream_sse_response(body: &str) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider SSE test server");
+        let addr = listener
+            .local_addr()
+            .expect("provider SSE test server address");
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("accept provider SSE request");
+            let mut request = [0u8; 1024];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read provider SSE request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write provider SSE response");
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .expect("receive provider SSE response");
+        server.await.expect("provider SSE test server task");
+        response
     }
 
     #[test]
@@ -1310,5 +1464,127 @@ mod tests {
         let value: Value = serde_json::from_str(&parsed.data).unwrap();
         assert_eq!(value["message"]["usage"]["input_tokens"], 60);
         assert_eq!(parsed.usage.input_tokens, Some(60));
+    }
+
+    #[tokio::test]
+    async fn provider_translated_driver_stops_after_malformed_choices() {
+        let upstream = upstream_sse_response(concat!(
+            "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":\"not-an-array\"}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: {\"error\":{\"type\":\"server_error\",\"message\":\"late error\"}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let payload = AnthropicMessagesPayload {
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let response =
+            stream_openai_compatible_provider_messages(upstream, &payload, "test-provider");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect translated provider stream")
+            .to_bytes();
+        let body = std::str::from_utf8(&body).expect("translated provider stream is UTF-8");
+
+        assert_eq!(body.matches("event: error\n").count(), 1);
+        assert!(body.contains("The upstream model stream returned a malformed event."));
+        assert!(body.contains("\"type\":\"tool_use\",\"id\":\"call_1\""));
+        assert!(body.contains(
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}"
+        ));
+        assert!(!body.contains("deferred"));
+        assert!(!body.contains("event: message_delta"));
+        assert!(!body.contains("event: message_stop"));
+        assert!(!body.contains("late success"));
+        assert!(!body.contains("late error"));
+        assert!(
+            body.ends_with(
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"The upstream model stream returned a malformed event.\"}}\n\n"
+            ),
+            "terminal malformed error must be the final provider frame: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_translated_driver_stops_after_malformed_nested_fields() {
+        let cases = [
+            (
+                "delta/reasoning",
+                concat!(
+                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"partial thought\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_opaque\":[]},\"finish_reason\":null}]}\n\n",
+                ),
+            ),
+            (
+                "tool/function",
+                concat!(
+                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":\"bad\",\"function\":{\"arguments\":\"late fragment\"}}]},\"finish_reason\":null}]}\n\n",
+                ),
+            ),
+            (
+                "usage/details",
+                concat!(
+                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\"bad\",\"completion_tokens\":[]}}\n\n",
+                ),
+            ),
+        ];
+
+        for (class, prefix) in cases {
+            let stream = format!(
+                "{}{}",
+                prefix,
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: {\"error\":{\"type\":\"server_error\",\"message\":\"late error\"}}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: [DONE]\n\n",
+                )
+            );
+            let upstream = upstream_sse_response(&stream).await;
+            let payload = AnthropicMessagesPayload {
+                model: "m".to_string(),
+                ..Default::default()
+            };
+            let response =
+                stream_openai_compatible_provider_messages(upstream, &payload, "test-provider");
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect translated provider stream")
+                .to_bytes();
+            let body = std::str::from_utf8(&body).expect("translated provider stream is UTF-8");
+
+            assert_eq!(body.matches("event: error\n").count(), 1, "{class}: {body}");
+            assert!(
+                body.contains("The upstream model stream returned a malformed event."),
+                "{class}: {body}"
+            );
+            assert!(
+                body.contains("event: content_block_stop\n"),
+                "{class}: an open block or pending finish must close before error: {body}"
+            );
+            assert!(!body.contains("event: message_delta"), "{class}: {body}");
+            assert!(!body.contains("event: message_stop"), "{class}: {body}");
+            assert!(!body.contains("late success"), "{class}: {body}");
+            assert!(!body.contains("late error"), "{class}: {body}");
+            assert!(!body.contains("deferred"), "{class}: {body}");
+            assert!(
+                body.ends_with(
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"The upstream model stream returned a malformed event.\"}}\n\n"
+                ),
+                "{class}: terminal malformed error must be the final provider frame: {body}"
+            );
+        }
     }
 }

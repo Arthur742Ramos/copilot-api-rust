@@ -77,6 +77,193 @@ fn opt_string(v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// The translated stream treats omitted and explicit-null optional strings the
+/// same way, but any other present JSON type is malformed. Keep this predicate
+/// shared with the `opt_string` projection so validation and extraction cannot
+/// drift apart.
+fn validate_optional_string(v: Option<&Value>) -> Result<(), ()> {
+    match v {
+        None | Some(Value::Null | Value::String(_)) => Ok(()),
+        Some(_) => Err(()),
+    }
+}
+
+/// OpenAI tool indices and token counts are JSON integers in the range this
+/// state machine stores. In particular, do not accept a floating-point number
+/// and truncate it while extracting the value.
+fn nonnegative_i64(v: &Value) -> Option<i64> {
+    v.as_i64().filter(|value| *value >= 0)
+}
+
+fn validate_optional_nonnegative_i64(v: Option<&Value>) -> Result<(), ()> {
+    match v {
+        None | Some(Value::Null) => Ok(()),
+        Some(value) if nonnegative_i64(value).is_some() => Ok(()),
+        Some(_) => Err(()),
+    }
+}
+
+const DEFAULT_UPSTREAM_ERROR_TYPE: &str = "api_error";
+const DEFAULT_UPSTREAM_ERROR_MESSAGE: &str = "The upstream model stream reported an error.";
+const MAX_UPSTREAM_ERROR_TYPE_BYTES: usize = 64;
+const MAX_UPSTREAM_ERROR_MESSAGE_BYTES: usize = 1024;
+
+/// Extract the only two upstream error fields that are safe and useful to an
+/// Anthropic client. A present, non-null top-level `error` always terminates the
+/// stream, even when its value is malformed; treating it as an empty-choice
+/// usage chunk could otherwise fabricate a successful completion.
+fn top_level_upstream_error_event(chunk: &Value) -> Option<AnthropicStreamEventData> {
+    let error = chunk.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+
+    let kind = safe_upstream_error_type(error.get("type"))
+        .unwrap_or_else(|| DEFAULT_UPSTREAM_ERROR_TYPE.to_string());
+    let message = safe_upstream_error_message(error.get("message"))
+        .unwrap_or_else(|| DEFAULT_UPSTREAM_ERROR_MESSAGE.to_string());
+
+    Some(AnthropicStreamEventData::Error {
+        error: super::anthropic_types::AnthropicErrorBody { kind, message },
+    })
+}
+
+fn safe_upstream_error_type(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty()
+        || value.len() > MAX_UPSTREAM_ERROR_TYPE_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn safe_upstream_error_message(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty()
+        || value.len() > MAX_UPSTREAM_ERROR_MESSAGE_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+struct ValidatedChoice<'a> {
+    choice: &'a Value,
+    delta: &'a Value,
+}
+
+enum ValidatedChatChunk<'a> {
+    Choice(ValidatedChoice<'a>),
+    UsageOnly,
+}
+
+fn validate_tool_call(tool_call: &Value) -> Result<(), ()> {
+    let tool_call = tool_call.as_object().ok_or(())?;
+    validate_optional_nonnegative_i64(tool_call.get("index"))?;
+    validate_optional_string(tool_call.get("id"))?;
+
+    let Some(function) = tool_call.get("function") else {
+        return Ok(());
+    };
+    if function.is_null() {
+        return Ok(());
+    }
+    let function = function.as_object().ok_or(())?;
+    validate_optional_string(function.get("name"))?;
+    validate_optional_string(function.get("arguments"))
+}
+
+fn validate_delta(delta: &Value) -> Result<(), ()> {
+    for field in [
+        "content",
+        "reasoning_text",
+        "reasoning_content",
+        "reasoning_opaque",
+    ] {
+        validate_optional_string(delta.get(field))?;
+    }
+
+    match delta.get("tool_calls") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(tool_calls)) => tool_calls.iter().try_for_each(validate_tool_call),
+        Some(_) => Err(()),
+    }
+}
+
+/// Validate every OpenAI Chat Completions usage field consumed by either the
+/// Anthropic wire translator or the translated-flow token recorder. Unknown
+/// usage fields remain allowed. Omitted/null optional counts retain the
+/// existing zero/default semantics, while present counts must be non-negative
+/// JSON integers.
+fn validate_usage(usage: &Value) -> Result<(), ()> {
+    let usage = usage.as_object().ok_or(())?;
+    for field in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+        validate_optional_nonnegative_i64(usage.get(field))?;
+    }
+
+    let Some(prompt_details) = usage.get("prompt_tokens_details") else {
+        return Ok(());
+    };
+    if prompt_details.is_null() {
+        return Ok(());
+    }
+    let prompt_details = prompt_details.as_object().ok_or(())?;
+    for field in ["cached_tokens", "cache_creation_input_tokens"] {
+        validate_optional_nonnegative_i64(prompt_details.get(field))?;
+    }
+    Ok(())
+}
+
+/// Validate the structural fields that drive the translated stream state
+/// machine. Missing data and a value of the wrong JSON type must not collapse
+/// into the same branch as a legitimate empty array: doing so can turn upstream
+/// corruption into a successful Anthropic completion.
+fn validate_chat_chunk(chunk: &Value) -> Result<ValidatedChatChunk<'_>, ()> {
+    let object = chunk.as_object().ok_or(())?;
+    let choices = object.get("choices").and_then(Value::as_array).ok_or(())?;
+
+    if choices.is_empty() {
+        // OpenAI's final include_usage record has an explicitly empty choices
+        // array and a usage object. A bare `choices: []`, null usage, or a usage
+        // value of another type is not that record.
+        let usage = object.get("usage").ok_or(())?;
+        validate_usage(usage)?;
+        return Ok(ValidatedChatChunk::UsageOnly);
+    }
+
+    // Usage is optional/null on ordinary chunks, but a present non-null value
+    // must retain the object shape consumed by the accounting helpers.
+    if let Some(usage) = object.get("usage").filter(|usage| !usage.is_null()) {
+        validate_usage(usage)?;
+    }
+
+    for choice in choices {
+        let choice = choice.as_object().ok_or(())?;
+        let delta = choice
+            .get("delta")
+            .filter(|delta| delta.is_object())
+            .ok_or(())?;
+        validate_delta(delta)?;
+        if choice
+            .get("finish_reason")
+            .is_some_and(|reason| !reason.is_null() && !reason.is_string())
+        {
+            return Err(());
+        }
+    }
+
+    let choice = &choices[0];
+    Ok(ValidatedChatChunk::Choice(ValidatedChoice {
+        choice,
+        delta: choice.get("delta").ok_or(())?,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -87,20 +274,42 @@ pub fn translate_chunk_to_anthropic_events(
     chunk: &Value,
     state: &mut AnthropicStreamState,
 ) -> Vec<AnthropicStreamEventData> {
-    let mut events: Vec<AnthropicStreamEventData> = Vec::new();
+    // Once success or failure has terminated the stream, every later chunk is
+    // ignored. This prevents an upstream aggregator from turning a terminal
+    // error into a later success or producing a second terminal event.
+    if state.terminal_event_emitted {
+        return Vec::new();
+    }
 
-    let choices = chunk.get("choices").and_then(|v| v.as_array());
-    let choice = match choices {
-        Some(arr) if !arr.is_empty() => &arr[0],
-        _ => {
-            // `chunk.choices.length === 0`
+    // OpenAI-compatible providers commonly send failures as a valid JSON SSE
+    // record with a top-level `error`. Detect it before the empty-choice usage
+    // path, which is also a valid Chat Completions record shape.
+    if let Some(error) = top_level_upstream_error_event(chunk) {
+        return terminal_stream_error_events(state, error);
+    }
+
+    let validated = match validate_chat_chunk(chunk) {
+        Ok(validated) => validated,
+        Err(()) => return malformed_stream_error_events(state),
+    };
+
+    let mut events: Vec<AnthropicStreamEventData> = Vec::new();
+    let ValidatedChatChunk::Choice(ValidatedChoice {
+        choice,
+        delta: delta_value,
+    }) = validated
+    else {
+        // An include_usage chunk is only valid after a finish_reason queued the
+        // terminal message delta. An orphan usage record would otherwise be
+        // silently ignored and allow the malformed stream to continue.
+        if state.pending_message_delta.is_some() {
             complete_pending_message(state, &mut events, Some(chunk));
             return events;
         }
+        return malformed_stream_error_events(state);
     };
 
-    let delta_value = choice.get("delta").cloned().unwrap_or(Value::Null);
-    let mut delta = DeltaView::from_delta(&delta_value);
+    let mut delta = DeltaView::from_delta(delta_value);
 
     handle_message_start(state, &mut events, chunk);
 
@@ -115,19 +324,20 @@ pub fn translate_chunk_to_anthropic_events(
     events
 }
 
-/// `flushPendingAnthropicStreamEvents` — emit any queued `message_delta` plus
-/// `message_stop` when the upstream stream ends without a usage-bearing chunk.
-///
-/// Also handles the degenerate case where the upstream ended (clean end, a
-/// `[DONE]` with no prior `finish_reason`, or a finishing chunk that failed to
-/// parse and was dropped) WITHOUT ever queueing a `message_delta`: a content
-/// block may still be open and no `message_stop` was emitted, which leaves a
-/// client like Claude Code waiting forever. In that case we synthesize a
-/// well-formed terminal close (close any open block, then `message_delta` +
-/// `message_stop`) so every stream is terminated.
+/// Flush a successful finish that was waiting for a final usage chunk. If the
+/// upstream reaches EOF/[DONE] without any `finish_reason`, terminate with an
+/// Anthropic `error` event instead of fabricating a successful `end_turn`.
 pub fn flush_pending_anthropic_stream_events(
     state: &mut AnthropicStreamState,
 ) -> Vec<AnthropicStreamEventData> {
+    // Terminal failure takes precedence over any stale deferred success state.
+    // The normal error path clears the pending delta, but this ordering makes
+    // EOF flushing safe even if a future caller constructs state manually.
+    if state.terminal_event_emitted {
+        state.pending_message_delta = None;
+        return Vec::new();
+    }
+
     let mut events: Vec<AnthropicStreamEventData> = Vec::new();
 
     if state.pending_message_delta.is_some() {
@@ -135,39 +345,53 @@ pub fn flush_pending_anthropic_stream_events(
         return events;
     }
 
-    // Nothing queued. If we already emitted a terminal message_stop the stream is
-    // well-formed and there is nothing to do. Likewise, if message_start was never
-    // sent there is no open message to close — emitting a bare message_delta would
-    // itself be malformed, so leave the (empty) stream as-is.
-    if state.message_stop_emitted || !state.message_start_sent {
-        return events;
+    terminal_stream_error_events(
+        state,
+        protocol_error_event(
+            "The upstream model stream ended before a finish reason was received.",
+        ),
+    )
+}
+
+/// Terminate a translated stream after malformed upstream SSE data.
+pub fn malformed_stream_error_events(
+    state: &mut AnthropicStreamState,
+) -> Vec<AnthropicStreamEventData> {
+    terminal_stream_error_events(
+        state,
+        protocol_error_event("The upstream model stream returned a malformed event."),
+    )
+}
+
+/// Terminate a translated stream after its transport fails.
+pub fn transport_stream_error_events(
+    state: &mut AnthropicStreamState,
+    cause: Option<&std::io::Error>,
+) -> Vec<AnthropicStreamEventData> {
+    terminal_stream_error_events(state, translate_error_to_anthropic_error_event(cause))
+}
+
+fn terminal_stream_error_events(
+    state: &mut AnthropicStreamState,
+    error: AnthropicStreamEventData,
+) -> Vec<AnthropicStreamEventData> {
+    if state.terminal_event_emitted {
+        return Vec::new();
     }
-
-    // Upstream ended without a finishing chunk. Close any block left open
-    // (thinking or content/tool) so the stream stays well-formed, then synthesize
-    // the terminal message_delta + message_stop.
-    close_thinking_block_if_open(state, &mut events);
-    if state.content_block_open {
-        events.push(AnthropicStreamEventData::ContentBlockStop {
-            index: state.content_block_index,
-        });
-        state.content_block_open = false;
-        state.content_block_index += 1;
-    }
-
-    events.push(AnthropicStreamEventData::MessageDelta {
-        delta: AnthropicMessageDeltaBody {
-            // No finish_reason was delivered; "end_turn" is the safe Anthropic
-            // default for a normally-terminated turn.
-            stop_reason: Some("end_turn".to_string()),
-            stop_sequence: None,
-        },
-        usage: None,
-    });
-    events.push(AnthropicStreamEventData::MessageStop);
-    state.message_stop_emitted = true;
-
+    let mut events = Vec::new();
+    close_stream_for_error(state, &mut events);
+    events.push(error);
+    state.terminal_event_emitted = true;
     events
+}
+
+fn protocol_error_event(message: &str) -> AnthropicStreamEventData {
+    AnthropicStreamEventData::Error {
+        error: super::anthropic_types::AnthropicErrorBody {
+            kind: "api_error".to_string(),
+            message: message.to_string(),
+        },
+    }
 }
 
 /// `translateErrorToAnthropicErrorEvent` — the terminal `error` event.
@@ -212,7 +436,7 @@ pub fn translate_error_to_anthropic_error_event(
 /// and so is correctly treated as non-transient. As a fallback for any non-
 /// reqwest source, a `TimedOut`/`ConnectionReset`/`UnexpectedEof` `ErrorKind`
 /// also counts as transient.
-fn is_transient_transport_error(err: &std::io::Error) -> bool {
+pub fn is_transient_transport_error(err: &std::io::Error) -> bool {
     use std::error::Error as _;
     if let Some(re) = err
         .source()
@@ -250,6 +474,11 @@ fn complete_pending_message(
     events: &mut Vec<AnthropicStreamEventData>,
     chunk: Option<&Value>,
 ) {
+    if state.terminal_event_emitted {
+        state.pending_message_delta = None;
+        return;
+    }
+
     let Some(pending) = state.pending_message_delta.take() else {
         return;
     };
@@ -268,6 +497,26 @@ fn complete_pending_message(
     events.push(pending);
     events.push(AnthropicStreamEventData::MessageStop);
     state.message_stop_emitted = true;
+    state.terminal_event_emitted = true;
+}
+
+fn close_stream_for_error(
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) {
+    close_thinking_block_if_open(state, events);
+    if state.content_block_open {
+        events.push(AnthropicStreamEventData::ContentBlockStop {
+            index: state.content_block_index,
+        });
+        state.content_block_open = false;
+        state.content_block_index += 1;
+    }
+    state.active_tool_call_index = None;
+    state.tool_calls.clear();
+    state.tool_call_order.clear();
+    state.deferred_content = None;
+    state.pending_message_delta = None;
 }
 
 /// `handleFinish` — on a finishing chunk, close the open block, flush deferred
@@ -302,11 +551,15 @@ fn handle_finish(
         });
         state.content_block_open = false;
         state.content_block_index += 1;
+        if tool_block_open {
+            state.active_tool_call_index = None;
+        }
         if !tool_block_open {
             handle_reasoning_opaque(delta, events, state);
         }
     }
 
+    flush_buffered_tool_calls(state, events);
     flush_deferred_content(state, events);
 
     state.pending_message_delta = Some(AnthropicStreamEventData::MessageDelta {
@@ -353,7 +606,10 @@ fn get_openai_chunk_usage_tokens(chunk: &Value) -> (i64, i64, i64) {
     (
         cache_creation_tokens,
         cached_tokens,
-        (prompt_tokens - cached_tokens - cache_creation_tokens).max(0),
+        prompt_tokens
+            .saturating_sub(cached_tokens)
+            .saturating_sub(cache_creation_tokens)
+            .max(0),
     )
 }
 
@@ -372,65 +628,121 @@ fn handle_tool_calls(
     handle_reasoning_opaque_in_tool_calls(state, events, delta);
 
     for tool_call in &delta.tool_calls {
-        let index = tool_call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-        let id = tool_call
-            .get("id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
+        let index = tool_call
+            .get("index")
+            .and_then(nonnegative_i64)
+            .unwrap_or(0);
+        let id = opt_string(tool_call.get("id")).filter(|s| !s.is_empty());
         let name = tool_call
             .get("function")
             .and_then(|f| f.get("name"))
-            .and_then(|v| v.as_str())
+            .and_then(|v| opt_string(Some(v)))
             .filter(|s| !s.is_empty());
 
         if let (Some(id), Some(name)) = (id, name) {
-            // New tool call starting.
-            if state.content_block_open {
-                // Close any previously open block.
-                events.push(AnthropicStreamEventData::ContentBlockStop {
-                    index: state.content_block_index,
-                });
-                state.content_block_index += 1;
-                state.content_block_open = false;
+            if !state.tool_calls.contains_key(&index) {
+                state.tool_call_order.push(index);
+                state.tool_calls.insert(
+                    index,
+                    AnthropicStreamToolCall {
+                        id,
+                        name,
+                        anthropic_block_index: -1,
+                        buffered_arguments: Vec::new(),
+                        started: false,
+                    },
+                );
             }
 
-            let anthropic_block_index = state.content_block_index;
-            state.tool_calls.insert(
-                index,
-                AnthropicStreamToolCall {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    anthropic_block_index,
-                },
-            );
-
-            events.push(AnthropicStreamEventData::ContentBlockStart {
-                index: anthropic_block_index,
-                content_block: serde_json::json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": {},
-                }),
-            });
-            state.content_block_open = true;
+            // Anthropic allows only one content block to be active at a time.
+            // Stream the first OpenAI tool call immediately; later parallel
+            // indices are buffered and serialized at finish.
+            if state.active_tool_call_index.is_none() {
+                if state.content_block_open {
+                    events.push(AnthropicStreamEventData::ContentBlockStop {
+                        index: state.content_block_index,
+                    });
+                    state.content_block_index += 1;
+                    state.content_block_open = false;
+                }
+                if let Some(info) = state.tool_calls.get_mut(&index) {
+                    info.anthropic_block_index = state.content_block_index;
+                    info.started = true;
+                    events.push(AnthropicStreamEventData::ContentBlockStart {
+                        index: info.anthropic_block_index,
+                        content_block: serde_json::json!({
+                            "type": "tool_use",
+                            "id": info.id,
+                            "name": info.name,
+                            "input": {},
+                        }),
+                    });
+                }
+                state.active_tool_call_index = Some(index);
+                state.content_block_open = true;
+            }
         }
 
         let arguments = tool_call
             .get("function")
             .and_then(|f| f.get("arguments"))
-            .and_then(|v| v.as_str())
+            .and_then(|v| opt_string(Some(v)))
             .filter(|s| !s.is_empty());
 
         if let Some(arguments) = arguments {
-            if let Some(info) = state.tool_calls.get(&index) {
-                events.push(AnthropicStreamEventData::ContentBlockDelta {
-                    index: info.anthropic_block_index,
-                    delta: AnthropicContentBlockDelta::InputJsonDelta {
-                        partial_json: arguments.to_string(),
-                    },
-                });
+            if state.active_tool_call_index == Some(index) {
+                if let Some(info) = state.tool_calls.get(&index) {
+                    events.push(AnthropicStreamEventData::ContentBlockDelta {
+                        index: info.anthropic_block_index,
+                        delta: AnthropicContentBlockDelta::InputJsonDelta {
+                            partial_json: arguments,
+                        },
+                    });
+                }
+            } else if let Some(info) = state.tool_calls.get_mut(&index) {
+                info.buffered_arguments.push(arguments);
             }
+        }
+    }
+}
+
+/// Serialize tool calls that OpenAI streamed in parallel after the active call.
+/// Their argument fragment boundaries are preserved, but their Anthropic blocks
+/// are emitted one-at-a-time in first-seen tool-index order.
+fn flush_buffered_tool_calls(
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) {
+    let order = state.tool_call_order.clone();
+    for index in order {
+        let Some(snapshot) = state.tool_calls.get(&index).cloned() else {
+            continue;
+        };
+        if snapshot.started {
+            continue;
+        }
+
+        let block_index = state.content_block_index;
+        state.content_block_index += 1;
+        events.push(AnthropicStreamEventData::ContentBlockStart {
+            index: block_index,
+            content_block: serde_json::json!({
+                "type": "tool_use",
+                "id": snapshot.id,
+                "name": snapshot.name,
+                "input": {},
+            }),
+        });
+        for partial_json in snapshot.buffered_arguments {
+            events.push(AnthropicStreamEventData::ContentBlockDelta {
+                index: block_index,
+                delta: AnthropicContentBlockDelta::InputJsonDelta { partial_json },
+            });
+        }
+        events.push(AnthropicStreamEventData::ContentBlockStop { index: block_index });
+        if let Some(info) = state.tool_calls.get_mut(&index) {
+            info.anthropic_block_index = block_index;
+            info.started = true;
         }
     }
 }
@@ -682,12 +994,13 @@ fn close_thinking_block_if_open(
 // Usage helpers over the dynamic chunk Value
 // ---------------------------------------------------------------------------
 
-/// `chunk?.usage` is present and truthy (an object).
+/// `chunk?.usage` is present and is an object.
 fn has_usage(chunk: &Value) -> bool {
-    chunk.get("usage").is_some_and(|u| !u.is_null())
+    chunk.get("usage").is_some_and(Value::is_object)
 }
 
-/// Navigate `path` and read an integer with a `?? 0` default.
+/// Navigate a previously validated usage path and read its non-negative integer
+/// value, retaining the existing `?? 0` behavior for omitted/null fields.
 fn usage_num(chunk: &Value, path: &[&str]) -> i64 {
     let mut cur = chunk;
     for key in path {
@@ -696,9 +1009,7 @@ fn usage_num(chunk: &Value, path: &[&str]) -> i64 {
             None => return 0,
         }
     }
-    cur.as_i64()
-        .or_else(|| cur.as_f64().map(|f| f as i64))
-        .unwrap_or(0)
+    nonnegative_i64(cur).unwrap_or(0)
 }
 
 /// `chunk.usage?.prompt_tokens_details?.<key> !== undefined` — the key exists
@@ -753,6 +1064,213 @@ mod tests {
             }
         }
         assert!(open.is_none(), "stream ended with an open content block");
+    }
+
+    fn malformed_error_event() -> Value {
+        json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "The upstream model stream returned a malformed event."
+            }
+        })
+    }
+
+    fn pending_success_state() -> AnthropicStreamState {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "pending",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        let finish = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            finish,
+            vec![json!({ "type": "content_block_stop", "index": 0 })]
+        );
+        assert!(state.pending_message_delta.is_some());
+        state
+    }
+
+    fn open_thinking_state() -> AnthropicStreamState {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "thinking",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "reasoning_text": "partial thought" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        assert!(state.thinking_block_open);
+        state
+    }
+
+    fn open_tool_state() -> AnthropicStreamState {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "tool",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"q\":"
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        let deferred = translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "deferred" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        assert!(deferred.is_empty());
+        assert!(state.content_block_open);
+        assert_eq!(state.active_tool_call_index, Some(0));
+        assert_eq!(state.deferred_content.as_deref(), Some("deferred"));
+        assert!(!state.tool_calls.is_empty());
+        state
+    }
+
+    fn assert_terminal_followups_are_suppressed(state: &mut AnthropicStreamState) {
+        for late_chunk in [
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "late success" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }),
+            json!({
+                "error": {
+                    "type": "server_error",
+                    "message": "late upstream error"
+                }
+            }),
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }),
+        ] {
+            assert!(translate_chunk_to_anthropic_events(&late_chunk, state).is_empty());
+        }
+        assert!(flush_pending_anthropic_stream_events(state).is_empty());
+    }
+
+    fn assert_malformed_events_and_cleanup(
+        got: Vec<Value>,
+        expected_before_error: Vec<Value>,
+        state: &mut AnthropicStreamState,
+        chunk: &Value,
+        context: &str,
+    ) {
+        let mut expected = expected_before_error;
+        expected.push(malformed_error_event());
+        assert_eq!(
+            got, expected,
+            "{context} state should terminate for malformed nested chunk: {chunk}"
+        );
+        assert_eq!(
+            got.iter()
+                .filter(|event| matches!(event["type"].as_str(), Some("error" | "message_stop")))
+                .count(),
+            1,
+            "{context} state emitted more than one terminal event for: {chunk}"
+        );
+        assert!(!state.content_block_open);
+        assert!(!state.thinking_block_open);
+        assert!(state.active_tool_call_index.is_none());
+        assert!(state.tool_calls.is_empty());
+        assert!(state.tool_call_order.is_empty());
+        assert!(state.deferred_content.is_none());
+        assert!(state.pending_message_delta.is_none());
+        assert!(state.terminal_event_emitted);
+        assert!(!state.message_stop_emitted);
+        assert_terminal_followups_are_suppressed(state);
+    }
+
+    /// Exercise each malformed nested field in every state that previously
+    /// allowed corruption to become a later success: fresh/non-pending,
+    /// deferred-success pending, open thinking, and open tool/deferred content.
+    fn assert_malformed_nested_chunk_is_terminal(chunk: Value) {
+        let mut fresh = AnthropicStreamState::default();
+        let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut fresh));
+        assert_malformed_events_and_cleanup(got, vec![], &mut fresh, &chunk, "fresh");
+
+        let mut pending = pending_success_state();
+        let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut pending));
+        assert_malformed_events_and_cleanup(got, vec![], &mut pending, &chunk, "pending");
+
+        let mut thinking = open_thinking_state();
+        let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut thinking));
+        assert_malformed_events_and_cleanup(
+            got,
+            vec![
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ],
+            &mut thinking,
+            &chunk,
+            "open-thinking",
+        );
+
+        let mut tool = open_tool_state();
+        let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut tool));
+        assert_malformed_events_and_cleanup(
+            got,
+            vec![json!({ "type": "content_block_stop", "index": 0 })],
+            &mut tool,
+            &chunk,
+            "open-tool",
+        );
     }
 
     #[test]
@@ -932,6 +1450,78 @@ mod tests {
         );
 
         assert_single_open_block_invariant(&all);
+    }
+
+    #[test]
+    fn parallel_fragmented_tool_calls_are_serialized_into_valid_blocks() {
+        let mut state = AnthropicStreamState::default();
+        let mut all = Vec::new();
+
+        let announced = json!({
+            "id": "chatcmpl-parallel",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_a",
+                        "function": { "name": "first", "arguments": "{\"a\":" }
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_b",
+                        "function": { "name": "second", "arguments": "{\"b\":" }
+                    }
+                ]},
+                "finish_reason": null
+            }]
+        });
+        all.extend(to_values(&translate_chunk_to_anthropic_events(
+            &announced, &mut state,
+        )));
+
+        let interleaved = json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": [
+                    { "index": 1, "function": { "arguments": "2}" } },
+                    { "index": 0, "function": { "arguments": "1}" } }
+                ]},
+                "finish_reason": null
+            }]
+        });
+        all.extend(to_values(&translate_chunk_to_anthropic_events(
+            &interleaved,
+            &mut state,
+        )));
+
+        let finish = json!({
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+        all.extend(to_values(&translate_chunk_to_anthropic_events(
+            &finish, &mut state,
+        )));
+
+        assert_single_open_block_invariant(&all);
+        let starts: Vec<_> = all
+            .iter()
+            .filter(|event| event["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["content_block"]["id"], "call_a");
+        assert_eq!(starts[1]["content_block"]["id"], "call_b");
+
+        let second_fragments: String = all
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta" && event["index"].as_i64() == Some(1)
+            })
+            .filter_map(|event| event.pointer("/delta/partial_json").and_then(Value::as_str))
+            .collect();
+        assert_eq!(second_fragments, "{\"b\":2}");
+        assert_eq!(all.last().unwrap()["type"], "message_stop");
     }
 
     #[test]
@@ -1117,6 +1707,716 @@ mod tests {
     }
 
     #[test]
+    fn malformed_event_closes_open_block_and_errors_once() {
+        let mut state = AnthropicStreamState::default();
+        let chunk = json!({
+            "id": "x", "model": "m",
+            "choices": [{ "index": 0, "delta": { "content": "partial" }, "finish_reason": null }]
+        });
+        let _ = translate_chunk_to_anthropic_events(&chunk, &mut state);
+
+        let events = to_values(&malformed_stream_error_events(&mut state));
+        assert_eq!(events[0], json!({"type":"content_block_stop","index":0}));
+        assert_eq!(events[1]["type"], "error");
+        assert_eq!(events[1]["error"]["type"], "api_error");
+        assert!(malformed_stream_error_events(&mut state).is_empty());
+        assert!(flush_pending_anthropic_stream_events(&mut state).is_empty());
+    }
+
+    #[test]
+    fn top_level_upstream_error_closes_open_block_before_safe_error() {
+        let mut state = AnthropicStreamState::default();
+        let mut all = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        ));
+        assert!(state.content_block_open);
+        assert!(state.pending_message_delta.is_none());
+
+        let got = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "error": {
+                    "type": "server_error",
+                    "message": " upstream boom ",
+                    "internal": { "request_body": "must-not-leak" }
+                },
+                "choices": [],
+                "usage": { "prompt_tokens": 99, "completion_tokens": 99 }
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            got,
+            vec![
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "server_error",
+                        "message": "upstream boom"
+                    }
+                }),
+            ]
+        );
+
+        all.extend(got);
+        assert_single_open_block_invariant(&all);
+        assert!(!state.content_block_open);
+        assert!(!state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
+        assert!(state.pending_message_delta.is_none());
+    }
+
+    #[test]
+    fn top_level_upstream_error_closes_thinking_block_in_protocol_order() {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "reasoning_text": "partial thought" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        assert!(state.thinking_block_open);
+
+        let got = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "capacity unavailable"
+                }
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            got,
+            vec![
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": "capacity unavailable"
+                    }
+                }),
+            ]
+        );
+        assert!(!state.thinking_block_open);
+        assert!(state.terminal_event_emitted);
+    }
+
+    #[test]
+    fn top_level_upstream_error_discards_pending_success_and_terminates_once() {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        let finish = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            finish,
+            vec![json!({ "type": "content_block_stop", "index": 0 })]
+        );
+        assert!(state.pending_message_delta.is_some());
+        assert!(!state.terminal_event_emitted);
+
+        let error_chunk = json!({
+            "error": {
+                "type": "server_error",
+                "message": "upstream failed after finish"
+            },
+            "choices": []
+        });
+        let terminal = to_values(&translate_chunk_to_anthropic_events(
+            &error_chunk,
+            &mut state,
+        ));
+        assert_eq!(
+            terminal,
+            vec![json!({
+                "type": "error",
+                "error": {
+                    "type": "server_error",
+                    "message": "upstream failed after finish"
+                }
+            })]
+        );
+        assert!(state.pending_message_delta.is_none());
+        assert!(state.terminal_event_emitted);
+        assert!(!state.message_stop_emitted);
+
+        // Neither a duplicate upstream error, a complete success chunk, a
+        // usage-only chunk, nor EOF may produce success or a second terminal.
+        assert!(translate_chunk_to_anthropic_events(&error_chunk, &mut state).is_empty());
+        assert!(translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "late success" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert!(translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert!(flush_pending_anthropic_stream_events(&mut state).is_empty());
+
+        let terminal_count = terminal
+            .iter()
+            .filter(|event| matches!(event["type"].as_str(), Some("error" | "message_stop")))
+            .count();
+        assert_eq!(terminal_count, 1);
+    }
+
+    #[test]
+    fn malformed_choices_discards_pending_success_and_suppresses_followups() {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        );
+        let finish = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            finish,
+            vec![json!({ "type": "content_block_stop", "index": 0 })]
+        );
+        assert!(state.pending_message_delta.is_some());
+
+        // A valid JSON object with usage but no choices is not OpenAI's
+        // `choices: []` usage-only record. It must discard the queued success
+        // instead of flushing message_delta/message_stop.
+        let terminal = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            terminal,
+            vec![json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "The upstream model stream returned a malformed event."
+                }
+            })]
+        );
+        assert!(state.pending_message_delta.is_none());
+        assert!(!state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
+
+        // Later success, upstream-error, and valid usage-only records are all
+        // suppressed, and EOF cannot flush the discarded success.
+        for late_chunk in [
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "late success" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+            }),
+            json!({
+                "error": {
+                    "type": "server_error",
+                    "message": "late upstream error"
+                }
+            }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+            }),
+        ] {
+            assert!(translate_chunk_to_anthropic_events(&late_chunk, &mut state).is_empty());
+        }
+        assert!(flush_pending_anthropic_stream_events(&mut state).is_empty());
+    }
+
+    #[test]
+    fn malformed_choices_closes_open_blocks_and_clears_tool_state() {
+        let mut thinking_state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "reasoning_text": "partial thought" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut thinking_state,
+        );
+        assert!(thinking_state.thinking_block_open);
+
+        let thinking_terminal = to_values(&translate_chunk_to_anthropic_events(
+            &json!({ "choices": {} }),
+            &mut thinking_state,
+        ));
+        assert_eq!(
+            thinking_terminal,
+            vec![
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "" }
+                }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream returned a malformed event."
+                    }
+                }),
+            ]
+        );
+        assert!(!thinking_state.thinking_block_open);
+        assert!(thinking_state.terminal_event_emitted);
+
+        let mut tool_state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": { "name": "lookup", "arguments": "{\"q\":" }
+                    }] },
+                    "finish_reason": null
+                }]
+            }),
+            &mut tool_state,
+        );
+        let deferred = translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "deferred" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut tool_state,
+        );
+        assert!(deferred.is_empty());
+        assert!(tool_state.content_block_open);
+        assert_eq!(tool_state.deferred_content.as_deref(), Some("deferred"));
+        assert!(!tool_state.tool_calls.is_empty());
+
+        let tool_terminal = to_values(&translate_chunk_to_anthropic_events(
+            &json!({ "choices": null }),
+            &mut tool_state,
+        ));
+        assert_eq!(
+            tool_terminal,
+            vec![
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream returned a malformed event."
+                    }
+                }),
+            ]
+        );
+        assert!(!tool_state.content_block_open);
+        assert!(tool_state.active_tool_call_index.is_none());
+        assert!(tool_state.tool_calls.is_empty());
+        assert!(tool_state.tool_call_order.is_empty());
+        assert!(tool_state.deferred_content.is_none());
+        assert!(tool_state.pending_message_delta.is_none());
+        assert!(tool_state.terminal_event_emitted);
+    }
+
+    #[test]
+    fn malformed_delta_and_reasoning_fields_are_terminal_in_every_state() {
+        for chunk in [
+            json!({
+                "choices": [{
+                    "delta": { "content": 42 },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "content": [] },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "reasoning_text": {} },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "reasoning_content": 1.5 },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": { "reasoning_opaque": false },
+                    "finish_reason": null
+                }]
+            }),
+        ] {
+            assert_malformed_nested_chunk_is_terminal(chunk);
+        }
+    }
+
+    #[test]
+    fn malformed_tool_call_fields_are_terminal_in_every_state() {
+        for tool_call in [
+            json!({ "index": "bad" }),
+            json!({ "index": 0.5 }),
+            json!({ "index": -1 }),
+            json!({ "index": 0, "id": 123 }),
+            json!({ "index": 0, "function": [] }),
+            json!({ "index": 0, "function": { "name": 99 } }),
+            json!({ "index": 0, "function": { "arguments": {} } }),
+        ] {
+            assert_malformed_nested_chunk_is_terminal(json!({
+                "choices": [{
+                    "delta": { "tool_calls": [tool_call] },
+                    "finish_reason": null
+                }]
+            }));
+        }
+    }
+
+    #[test]
+    fn malformed_usage_fields_are_terminal_in_every_state() {
+        for chunk in [
+            json!({
+                "choices": [{ "delta": {}, "finish_reason": null }],
+                "usage": { "prompt_tokens": "bad" }
+            }),
+            json!({
+                "choices": [{ "delta": {}, "finish_reason": null }],
+                "usage": { "completion_tokens": [] }
+            }),
+            json!({
+                "choices": [{ "delta": {}, "finish_reason": null }],
+                "usage": { "total_tokens": {} }
+            }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 1.5 }
+            }),
+            json!({
+                "choices": [],
+                "usage": { "completion_tokens": -1 }
+            }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens_details": [] }
+            }),
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens_details": { "cached_tokens": "bad" }
+                }
+            }),
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens_details": {
+                        "cache_creation_input_tokens": 0.25
+                    }
+                }
+            }),
+        ] {
+            assert_malformed_nested_chunk_is_terminal(chunk);
+        }
+    }
+
+    #[test]
+    fn legitimate_null_omitted_and_fragmented_nested_fields_remain_valid() {
+        let mut state = AnthropicStreamState::default();
+        let announced = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "null-and-fragmented",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": null,
+                        "reasoning_text": null,
+                        "reasoning_content": null,
+                        "reasoning_opaque": null,
+                        "tool_calls": [{
+                            "index": null,
+                            "id": "call_1",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": null
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }],
+                "usage": null
+            }),
+            &mut state,
+        ));
+        assert_eq!(announced.len(), 2);
+        assert_eq!(announced[0]["type"], "message_start");
+        assert_eq!(announced[1]["type"], "content_block_start");
+        assert_eq!(announced[1]["content_block"]["id"], "call_1");
+        assert_eq!(state.active_tool_call_index, Some(0));
+
+        // Later argument fragments may omit index, id, and name. Explicit nulls
+        // carry the same optional-field meaning and must not be rejected.
+        for (fragment, expected) in [
+            (
+                json!({ "function": { "arguments": "{\"city\":" } }),
+                "{\"city\":",
+            ),
+            (
+                json!({
+                    "index": null,
+                    "id": null,
+                    "function": { "name": null, "arguments": "\"Paris\"}" }
+                }),
+                "\"Paris\"}",
+            ),
+        ] {
+            let got = to_values(&translate_chunk_to_anthropic_events(
+                &json!({
+                    "choices": [{
+                        "delta": { "tool_calls": [fragment] },
+                        "finish_reason": null
+                    }]
+                }),
+                &mut state,
+            ));
+            assert_eq!(
+                got,
+                vec![json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": expected
+                    }
+                })]
+            );
+        }
+
+        for no_op in [
+            json!({
+                "choices": [{
+                    "delta": {
+                        "content": null,
+                        "reasoning_text": null,
+                        "reasoning_content": null,
+                        "reasoning_opaque": null,
+                        "tool_calls": null
+                    },
+                    "finish_reason": null
+                }],
+                "usage": { "prompt_tokens_details": null }
+            }),
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": null,
+                            "id": null,
+                            "function": null
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+        ] {
+            assert!(translate_chunk_to_anthropic_events(&no_op, &mut state).is_empty());
+        }
+
+        let finish = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": null,
+                    "completion_tokens": null,
+                    "total_tokens": null,
+                    "prompt_tokens_details": {
+                        "cached_tokens": null,
+                        "cache_creation_input_tokens": null
+                    }
+                }
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            finish,
+            vec![
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0
+                    }
+                }),
+                json!({ "type": "message_stop" }),
+            ]
+        );
+        assert!(state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
+    }
+
+    #[test]
+    fn malformed_choice_and_neighboring_shapes_are_terminal() {
+        let malformed_chunks = [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({ "choices": null }),
+            json!({ "choices": "not-an-array" }),
+            json!({ "choices": [null] }),
+            json!({ "choices": [{}] }),
+            json!({ "choices": [{ "delta": null, "finish_reason": null }] }),
+            json!({ "choices": [{ "delta": {}, "finish_reason": 42 }] }),
+            json!({ "choices": [{ "delta": { "tool_calls": {} } }] }),
+            json!({ "choices": [{ "delta": {} }], "usage": [] }),
+            json!({ "choices": [] }),
+            json!({ "choices": [], "usage": null }),
+            json!({ "choices": [], "usage": [] }),
+            // Even a structurally valid usage-only record is out of order when
+            // no finish_reason has queued a pending message delta.
+            json!({ "choices": [], "usage": {} }),
+        ];
+
+        for chunk in malformed_chunks {
+            let mut state = AnthropicStreamState::default();
+            let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut state));
+            assert_eq!(
+                got,
+                vec![json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream returned a malformed event."
+                    }
+                })],
+                "chunk should terminate as malformed: {chunk}"
+            );
+            assert!(state.terminal_event_emitted);
+            assert!(!state.message_stop_emitted);
+            assert!(flush_pending_anthropic_stream_events(&mut state).is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_or_unsafe_top_level_error_uses_opaque_fallback() {
+        for chunk in [
+            json!({
+                "error": {
+                    "type": "server error",
+                    "message": "unsafe\u{0000}diagnostic",
+                    "internal": "must-not-leak"
+                },
+                "choices": []
+            }),
+            json!({
+                "error": ["opaque", "provider", "details"],
+                "choices": []
+            }),
+        ] {
+            let mut state = AnthropicStreamState::default();
+            let got = to_values(&translate_chunk_to_anthropic_events(&chunk, &mut state));
+            assert_eq!(
+                got,
+                vec![json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream reported an error."
+                    }
+                })]
+            );
+            assert!(!serde_json::to_string(&got)
+                .unwrap()
+                .contains("must-not-leak"));
+            assert!(state.terminal_event_emitted);
+        }
+    }
+
+    #[test]
     fn classifies_transient_error_kinds() {
         for kind in [
             std::io::ErrorKind::TimedOut,
@@ -1132,11 +2432,12 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_stream_synthesizes_close_with_open_block() {
+    fn unterminated_stream_closes_block_then_errors() {
         // Upstream sends content then ends WITHOUT a finish_reason (e.g. dropped
         // the finishing chunk or sent [DONE] early). A content block is left open
         // and no message_stop was emitted; the flush must close the block and
-        // synthesize message_delta + message_stop so the client doesn't hang.
+        // report a terminal error rather than misrepresenting partial output as
+        // a successful end_turn.
         let mut state = AnthropicStreamState::default();
         let mut all: Vec<Value> = Vec::new();
 
@@ -1158,23 +2459,34 @@ mod tests {
             vec![
                 json!({ "type": "content_block_stop", "index": 0 }),
                 json!({
-                    "type": "message_delta",
-                    "delta": { "stop_reason": "end_turn" }
-                }),
-                json!({ "type": "message_stop" }),
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The upstream model stream ended before a finish reason was received."
+                    }
+                })
             ]
         );
-        assert!(state.message_stop_emitted);
+        assert!(!state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
         assert_single_open_block_invariant(&all);
     }
 
     #[test]
-    fn unterminated_empty_stream_synthesizes_nothing() {
-        // A stream that never even sent message_start has no open message to
-        // close; the flush must emit nothing rather than a bare message_delta.
+    fn unterminated_empty_stream_emits_terminal_error() {
         let mut state = AnthropicStreamState::default();
         let got = to_values(&flush_pending_anthropic_stream_events(&mut state));
-        assert!(got.is_empty());
+        assert_eq!(
+            got,
+            vec![json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "The upstream model stream ended before a finish reason was received."
+                }
+            })]
+        );
+        assert!(state.terminal_event_emitted);
     }
 
     #[test]
@@ -1267,6 +2579,7 @@ mod tests {
 
         let chunk = json!({
             "choices": [],
+            "error": null,
             "usage": { "prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6 },
         });
         let ev = translate_chunk_to_anthropic_events(&chunk, &mut state);
@@ -1283,5 +2596,7 @@ mod tests {
             ]
         );
         assert!(state.pending_message_delta.is_none());
+        assert!(state.message_stop_emitted);
+        assert!(state.terminal_event_emitted);
     }
 }
