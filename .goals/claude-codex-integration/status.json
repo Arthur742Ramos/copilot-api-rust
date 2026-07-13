@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 10,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -51,6 +51,11 @@
       "iteration": 9,
       "verdict": "FAIL",
       "summary": "Stream scalar validation passes, but non-stream tool-search optional IDs are dropped and malformed function outputs become end_turn success."
+    },
+    {
+      "iteration": 10,
+      "verdict": "FAIL",
+      "summary": "Scalar parity and web fixtures pass, but nullable terminal status is over-rejected, full-created web-search snapshots are not reconciled, and raw output variants become empty end_turn success."
     }
   ]
 }
