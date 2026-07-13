@@ -297,14 +297,26 @@ or extension conflicts, and partial usage terminate once with an Anthropic
 error and suppress every later success.
 
 Streamed function calls require a non-negative index on every fragment. A first
-index is contiguous and establishes non-empty id, `function` type/name, and
-optional first arguments; continuation fragments cannot repeat or change
-identity. Argument fragments retain wire order, and every call must end as a
-JSON object before `tool_calls` can succeed. First-delta tool/function extras
-are retained on the generated `tool_use`; unrepresentable choice/delta or late
-chunk extras fail explicitly. If the entire stream omits/nulls usage, the final
-Anthropic delta reports zero usage; any present usage object uses the same
-strict parser and preserves usage/detail extras as non-streaming.
+index is contiguous; `id`, `type`, `function`, `name`, and `arguments` are
+independently optional on every fragment, matching the official schema. The
+first present id/name become stable authority, `type` must be `function` when
+present, extras merge without conflict until the tool block starts, and argument
+fragments retain wire order. At `tool_calls` finish every index must have a
+non-empty id/name and complete object-valued JSON. Gaps, conflicts, late
+unemittable extras, missing terminal identity, scalar JSON, and size/count bound
+violations fail once.
+
+Chat refusal text maps to an Anthropic assistant text block and retains the
+`content_filter`/`refusal` terminal signal; separately streamed content/refusal
+must agree and is never duplicated. Non-null Chat logprobs have no lossless
+Anthropic Messages target and are rejected consistently in JSON and SSE, while
+absent/null values are no assertion. Top-level and nested usage `service_tier`
+share the official `{auto,default,flex,scale,priority}` enum, and late
+first-present values are retained in terminal usage while conflicts fail.
+Unrepresentable choice/delta extras fail explicitly. If the entire stream
+omits/nulls usage, the final Anthropic delta reports zero usage; any present
+usage object uses the same strict parser and preserves usage/detail extras as
+non-streaming.
 
 `stop_sequences` has no field in either the audited Codex 0.144.1
 [`ResponsesApiRequest`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/common.rs)

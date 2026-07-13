@@ -1347,7 +1347,7 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
         "response.system_fingerprint",
     )?;
     let top_service_tier =
-        optional_chat_string(object.get("service_tier"), "response.service_tier")?;
+        parse_chat_service_tier(object.get("service_tier"), "response.service_tier")?;
 
     let choices = object
         .get("choices")
@@ -1366,12 +1366,9 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
             "response.choices[0].index was not zero",
         ));
     }
-    if choice
-        .get("logprobs")
-        .is_some_and(|value| !value.is_null() && !value.is_object())
-    {
+    if choice.get("logprobs").is_some_and(|value| !value.is_null()) {
         return Err(malformed_chat_response(
-            "response.choices[0].logprobs was malformed",
+            "response.choices[0].logprobs cannot be represented by Anthropic Messages",
         ));
     }
 
@@ -1394,10 +1391,30 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
     }
     validate_chat_message_known_extras(message)?;
 
-    let text_content = translate_chat_response_content(
+    let mut text_content = translate_chat_response_content(
         message.get("content"),
         "response.choices[0].message.content",
     )?;
+    let refusal = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if let Some(refusal) = refusal {
+        if text_content.is_empty() {
+            text_content.push(json!({"type":"text","text":refusal}));
+        } else if text_content.len() != 1
+            || text_content[0].get("text").and_then(Value::as_str) != Some(refusal)
+        {
+            return Err(malformed_chat_response(
+                "message refusal conflicted with assistant content",
+            ));
+        }
+        if finish_reason != "content_filter" {
+            return Err(malformed_chat_response(
+                "message refusal conflicted with finish_reason",
+            ));
+        }
+    }
     let mut content = translate_chat_reasoning(message)?;
     content.extend(text_content);
     let tool_blocks = translate_chat_tool_calls(message.get("tool_calls"))?;
@@ -1414,10 +1431,7 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
             "tool calls conflicted with finish_reason",
         ));
     }
-    let refusal_present = message
-        .get("refusal")
-        .and_then(Value::as_str)
-        .is_some_and(|refusal| !refusal.is_empty());
+    let refusal_present = refusal.is_some();
     if content.is_empty() && !(finish_reason == "content_filter" && refusal_present) {
         return Err(malformed_chat_response(
             "completed choice contained no representable output",
@@ -1435,7 +1449,7 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
     debug_assert_eq!(extra.get("created").and_then(Value::as_i64), Some(created));
     let choice_extensions = collect_open_object_extensions(
         choice,
-        &["index", "message", "finish_reason"],
+        &["index", "message", "finish_reason", "logprobs"],
         &[],
         "response.choices[0]",
     )
@@ -1539,6 +1553,20 @@ fn validate_optional_chat_string(value: Option<&Value>, detail: &str) -> Result<
 fn optional_chat_string(value: Option<&Value>, detail: &str) -> Result<Option<String>, HttpError> {
     validate_optional_chat_string(value, detail)?;
     Ok(value.and_then(Value::as_str).map(str::to_string))
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn parse_chat_service_tier(
+    value: Option<&Value>,
+    detail: &str,
+) -> Result<Option<String>, HttpError> {
+    let tier = optional_chat_string(value, detail)?;
+    if let Some(tier) = tier.as_deref() {
+        if !matches!(tier, "auto" | "default" | "flex" | "scale" | "priority") {
+            return Err(malformed_chat_response(detail));
+        }
+    }
+    Ok(tier)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1868,7 +1896,7 @@ pub(crate) fn map_openai_chat_completion_usage(
         }
     }
 
-    let usage_service_tier = optional_chat_string(
+    let usage_service_tier = parse_chat_service_tier(
         source.get("service_tier"),
         "usage.service_tier was malformed",
     )?;

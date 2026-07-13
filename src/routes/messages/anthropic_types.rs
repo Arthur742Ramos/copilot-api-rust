@@ -437,8 +437,8 @@ impl AnthropicStreamEventData {
 /// keyed by the OpenAI tool index.
 #[derive(Debug, Clone, Default)]
 pub struct AnthropicStreamToolCall {
-    pub id: String,
-    pub name: String,
+    pub id: Option<String>,
+    pub name: Option<String>,
     pub anthropic_block_index: i64,
     /// Argument fragments for calls that cannot be emitted yet because another
     /// tool block is active. Anthropic content blocks are strictly sequential,
@@ -465,6 +465,9 @@ pub struct AnthropicStreamState {
     pub chat_usage: Option<AnthropicUsage>,
     pub chat_usage_source: Option<Value>,
     pub chat_output_seen: bool,
+    pub chat_refusal_seen: bool,
+    pub chat_refusal_text: Option<String>,
+    pub chat_text_output: String,
     pub chat_finish_reason: Option<String>,
     pub message_start_sent: bool,
     pub content_block_index: i64,
