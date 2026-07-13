@@ -186,7 +186,7 @@ async fn direct_and_alias_count_tokens_invalid_payloads_return_anthropic_400() {
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
-        assert_anthropic_error(&body, "invalid_request_error", "Invalid request payload");
+        assert_anthropic_error(&body, "invalid_request_error", "messages: field required");
         assert!(
             json_body(&body)["error"]["message"]
                 .as_str()

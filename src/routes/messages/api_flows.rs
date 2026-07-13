@@ -107,6 +107,7 @@ pub struct FlowOptions {
     pub compact_type: Option<i32>,
     pub selected_model: Option<Model>,
     pub anthropic_beta_header: Option<String>,
+    pub anthropic_version_header: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +639,7 @@ pub async fn handle_with_messages_api(
             request_id: &opts.request_id,
             session_id: opts.session_id.as_deref(),
             compact_type: opts.compact_type,
+            anthropic_version_header: opts.anthropic_version_header.as_deref(),
         },
     )
     .await?;

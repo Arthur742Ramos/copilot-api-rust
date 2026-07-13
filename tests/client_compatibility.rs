@@ -1784,6 +1784,68 @@ fn anthropic_fixture(body: &Value) -> Response {
         )
             .into_response();
     }
+    if model == "claude-cli-smoke" {
+        if body["stream"] == true {
+            return sse_response(render_sse(&[
+                (
+                    "message_start",
+                    json!({
+                        "type":"message_start",
+                        "message":{
+                            "id":"msg_cli_smoke",
+                            "type":"message",
+                            "role":"assistant",
+                            "model":model,
+                            "content":[],
+                            "stop_reason":Value::Null,
+                            "stop_sequence":Value::Null,
+                            "usage":{"input_tokens":1,"output_tokens":0}
+                        }
+                    }),
+                ),
+                (
+                    "content_block_start",
+                    json!({
+                        "type":"content_block_start",
+                        "index":0,
+                        "content_block":{"type":"text","text":""}
+                    }),
+                ),
+                (
+                    "content_block_delta",
+                    json!({
+                        "type":"content_block_delta",
+                        "index":0,
+                        "delta":{"type":"text_delta","text":"OK"}
+                    }),
+                ),
+                (
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":0}),
+                ),
+                (
+                    "message_delta",
+                    json!({
+                        "type":"message_delta",
+                        "delta":{"stop_reason":"end_turn","stop_sequence":Value::Null},
+                        "usage":{"output_tokens":1}
+                    }),
+                ),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]));
+        }
+        return Json(json!({
+            "id":"msg_cli_smoke",
+            "type":"message",
+            "role":"assistant",
+            "model":model,
+            "content":[{"type":"text","text":"OK"}],
+            "stop_reason":"end_turn",
+            "stop_sequence":Value::Null,
+            "usage":{"input_tokens":1,"output_tokens":1}
+        }))
+        .into_response();
+    }
     if body["stream"] == true {
         let mut frames = vec![
             (
@@ -8616,6 +8678,27 @@ fn configure_direct_copilot(fixture: &Fixture) {
     });
 }
 
+fn configure_direct_claude_canary(fixture: &Fixture) {
+    configure(fixture);
+    let models = ModelsResponse {
+        object: "list".to_string(),
+        data: vec![Model {
+            id: "claude-cli-smoke".to_string(),
+            name: "claude-cli-smoke".to_string(),
+            supported_endpoints: Some(vec!["/v1/messages".to_string()]),
+            ..Default::default()
+        }],
+    };
+    copilot_api::libs::state::with_state_mut(|state| {
+        state.provider_only = None;
+        state.copilot_token = Some("direct-copilot-token".to_string());
+        state.copilot_api_url = Some(fixture.base_url.clone());
+        state.account_type = "individual".to_string();
+        state.models = Some(Arc::new(models));
+        state.premium_interactions = None;
+    });
+}
+
 fn configure_direct_web_search(fixture: &Fixture, model: &str) {
     configure_direct_copilot(fixture);
     let mut config = (*copilot_api::libs::config::get_config()).clone();
@@ -8634,6 +8717,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "claude-malformed-stream",
         "claude-premature-eof",
         "claude-rate-limit",
+        "claude-cli-smoke",
     ]
     .into_iter()
     .map(|model| (model.to_string(), ModelConfig::default()))
@@ -9615,6 +9699,250 @@ async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
         .unwrap()
         .contains("prompt-caching"));
     assert!(first.headers.get("authorization").is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_inline_system_role_is_normalized_before_provider_dispatch() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let (status, body) = send(post_json(
+        "/v1/messages",
+        json!({
+            "model":"anthropic-fixture/claude-sonnet-4-6",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"Hello"}]},
+                {
+                    "role":"system",
+                    "content":[{
+                        "type":"text",
+                        "text":"Keep the response concise.",
+                        "cache_control":{"type":"ephemeral"}
+                    }]
+                }
+            ],
+            "stream":false
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let captured = fixture
+        .requests()
+        .into_iter()
+        .find(|capture| capture.path == "/v1/messages")
+        .expect("captured normalized Messages request");
+    let messages = captured.body["messages"]
+        .as_array()
+        .expect("captured messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert!(messages[0]["content"][0]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("Keep the response concise.")));
+    assert_eq!(
+        messages[0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(messages[0]["content"][1]["text"], "Hello");
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_code_2_1_207_controls_cross_responses_bridge() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let current_controls = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":32000,
+        "system":[
+            {"type":"text","text":"system one"},
+            {"type":"text","text":"system two"}
+        ],
+        "messages":[
+            {"role":"user","content":[{"type":"text","text":"Hello"}]},
+            {"role":"system","content":"Keep the response concise."}
+        ],
+        "tools":[{
+            "name":"read",
+            "description":"Read a file",
+            "input_schema":{
+                "type":"object",
+                "properties":{"path":{"type":"string"}},
+                "required":["path"]
+            }
+        }],
+        "thinking":{"type":"adaptive","display":"omitted"},
+        "output_config":{"effort":"high"},
+        "context_management":{
+            "edits":[{"type":"clear_thinking_20251015","keep":"all"}]
+        },
+        "metadata":{"user_id":"session_fixture"},
+        "stream":false
+    });
+    let mut request = post_json("/v1/messages?beta=true", current_controls, Some(CLIENT_KEY));
+    request
+        .headers_mut()
+        .insert("anthropic-version", "2023-06-01".parse().unwrap());
+    request.headers_mut().insert(
+        "anthropic-beta",
+        "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,mid-conversation-system-2026-04-07,effort-2025-11-24"
+            .parse()
+            .unwrap(),
+    );
+    request.headers_mut().insert(
+        "x-claude-code-session-id",
+        "session-fixture".parse().unwrap(),
+    );
+    let (status, response) = send(request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/responses")
+        .expect("captured translated Responses request");
+    assert_eq!(capture.body["reasoning"]["effort"], "high");
+    assert!(capture.body["reasoning"].get("summary").is_none());
+    assert!(capture.body.get("context_management").is_none());
+    assert!(capture.body["input"]
+        .as_array()
+        .expect("Responses input")
+        .iter()
+        .all(|item| item["role"] != "system"));
+
+    let before = fixture.requests().len();
+    let (status, response) = send(post_json(
+        "/v1/messages",
+        json!({
+            "model":"responses-fixture/gpt-fixture",
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"Hello"}],
+            "context_management":{
+                "edits":[{"type":"clear_tool_uses_20250919"}]
+            }
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_anthropic_invalid_request(&response, "unrepresentable context management");
+    assert_eq!(fixture.requests().len(), before);
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_special_history_blocks_are_native_only_and_fail_closed_when_translated() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let blocks = json!([
+        {"type":"redacted_thinking","data":"opaque-thinking"},
+        {
+            "type":"server_tool_use",
+            "id":"srvtoolu_fixture",
+            "name":"web_search",
+            "input":{"query":"rust async"}
+        },
+        {
+            "type":"web_search_tool_result",
+            "tool_use_id":"srvtoolu_fixture",
+            "content":[{
+                "type":"web_search_result",
+                "url":"https://example.test/result",
+                "title":"Result",
+                "encrypted_content":"opaque-search-result",
+                "page_age":"July 13, 2026"
+            }]
+        }
+    ]);
+    let (status, _) = send(post_json(
+        "/v1/messages",
+        json!({
+            "model":"anthropic-fixture/claude-sonnet-4-6",
+            "max_tokens":128,
+            "messages":[{"role":"assistant","content":blocks.clone()}],
+            "stream":false
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let native = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/messages")
+        .expect("captured native Messages history");
+    assert_eq!(native.body["messages"][0]["content"], blocks);
+
+    for (label, block) in [
+        (
+            "redacted_thinking",
+            json!({"type":"redacted_thinking","data":"opaque-thinking"}),
+        ),
+        (
+            "server_tool_use",
+            json!({
+                "type":"server_tool_use",
+                "id":"srvtoolu_fixture",
+                "name":"web_search",
+                "input":{"query":"rust async"}
+            }),
+        ),
+        (
+            "web_search_tool_result",
+            json!({
+                "type":"web_search_tool_result",
+                "tool_use_id":"srvtoolu_fixture",
+                "content":[{
+                    "type":"web_search_result",
+                    "url":"https://example.test/result",
+                    "title":"Result",
+                    "encrypted_content":"opaque-search-result"
+                }]
+            }),
+        ),
+    ] {
+        for model in [
+            "responses-fixture/gpt-fixture",
+            "chat-fixture/gpt-chat-fixture",
+        ] {
+            let before = fixture.requests().len();
+            let (status, response) = send(post_json(
+                "/v1/messages",
+                json!({
+                    "model":model,
+                    "max_tokens":128,
+                    "messages":[{"role":"assistant","content":[block.clone()]}],
+                    "stream":false
+                }),
+                Some(CLIENT_KEY),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{model}: {label}");
+            assert_anthropic_invalid_request(&response, &format!("{model}: {label}"));
+            assert!(json_body(&response)["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(label)));
+            assert_eq!(
+                fixture.requests().len(),
+                before,
+                "{model}: {label} reached upstream"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -11930,6 +12258,21 @@ async fn claude_known_request_collections_fail_closed_before_provider_dispatch()
     body["messages"][0]["content"] = json!({"type":"text","text":"wrong container"});
     invalid.push(("message content object", body));
     let mut body = base_provider_messages_body();
+    body["messages"][0]["role"] = json!("developer");
+    invalid.push(("unsupported message role", body));
+    let mut body = base_provider_messages_body();
+    body["messages"] = json!([
+        {"role":"user","content":"hello"},
+        {"role":"system","content":{"type":"text","text":"wrong container"}}
+    ]);
+    invalid.push(("inline system content object", body));
+    let mut body = base_provider_messages_body();
+    body["messages"] = json!([
+        {"role":"user","content":"hello"},
+        {"role":"system","content":[{"type":"tool_use","id":"call","name":"tool","input":{}}]}
+    ]);
+    invalid.push(("inline system non-text block", body));
+    let mut body = base_provider_messages_body();
     body["messages"][0]["content"] = json!([1]);
     invalid.push(("content block scalar", body));
     let mut body = base_provider_messages_body();
@@ -12015,6 +12358,119 @@ async fn claude_known_request_collections_fail_closed_before_provider_dispatch()
         );
         assert_anthropic_invalid_request(&response, label);
         assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
+fn representative_invalid_message_shapes() -> Vec<(&'static str, Value)> {
+    let mut invalid = Vec::new();
+
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["role"] = json!("developer");
+    invalid.push(("unsupported message role", body));
+
+    let mut body = base_provider_messages_body();
+    body["messages"] = json!([
+        {"role":"user","content":"hello"},
+        {"role":"system","content":{"type":"text","text":"wrong container"}}
+    ]);
+    invalid.push(("inline system content object", body));
+
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["content"] = json!([{
+        "type":"text",
+        "text":"cache",
+        "cache_control":{"type":"wrong"}
+    }]);
+    invalid.push(("malformed cache control", body));
+
+    let mut body = base_provider_messages_body();
+    body["messages"] = json!([{
+        "role":"user",
+        "content":[{
+            "type":"tool_result",
+            "tool_use_id":"missing",
+            "content":"result"
+        }]
+    }]);
+    invalid.push(("dangling tool result", body));
+
+    let mut body = base_provider_messages_body();
+    body["messages"] = json!([{
+        "role":"assistant",
+        "content":[
+            {"type":"tool_use","id":"duplicate","name":"tool","input":{}},
+            {"type":"tool_use","id":"duplicate","name":"tool","input":{}}
+        ]
+    }]);
+    invalid.push(("duplicate tool-use id", body));
+
+    invalid
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_direct_provider_and_count_tokens_share_request_shape_validation() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (label, body) in representative_invalid_message_shapes() {
+        for path in [
+            "/v1/messages/count_tokens",
+            "/responses-fixture/v1/messages",
+            "/responses-fixture/v1/messages/count_tokens",
+        ] {
+            let mut routed_body = body.clone();
+            if path.starts_with("/responses-fixture/") {
+                routed_body["model"] = json!("gpt-fixture");
+            }
+            let before = fixture.requests().len();
+            let (status, response) = send(post_json(path, routed_body, Some(CLIENT_KEY))).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{path} accepted {label}: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert_anthropic_invalid_request(&response, &format!("{path}: {label}"));
+            assert_eq!(
+                fixture.requests().len(),
+                before,
+                "{path}: {label} reached upstream"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_all_system_generation_history_fails_after_normalization() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (path, model) in [
+        ("/v1/messages", "responses-fixture/gpt-fixture"),
+        ("/responses-fixture/v1/messages", "gpt-fixture"),
+    ] {
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json(
+            path,
+            json!({
+                "model":model,
+                "max_tokens":128,
+                "messages":[{"role":"system","content":"instructions only"}],
+                "stream":false
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_anthropic_invalid_request(&response, path);
+        assert!(json_body(&response)["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("messages")));
+        assert_eq!(fixture.requests().len(), before, "{path} reached upstream");
     }
 }
 
@@ -17244,7 +17700,154 @@ async fn protocol_native_failures_are_deterministic_at_public_boundary() {
     assert_eq!(error["error"]["code"], "request_too_large");
 }
 
-/// Opt-in installed-client canary. It is ignored in normal CI and uses only two
+async fn run_claude_code_canary(
+    addr: std::net::SocketAddr,
+    claude_home: &std::path::Path,
+    model: &str,
+) -> std::process::Output {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new("claude")
+            .arg("-p")
+            .arg("--safe-mode")
+            .arg("--no-session-persistence")
+            .arg("--output-format")
+            .arg("json")
+            .arg("--model")
+            .arg(model)
+            .arg("--max-budget-usd")
+            .arg("0.01")
+            .arg("Reply with exactly OK")
+            .current_dir(claude_home)
+            .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
+            .env("ANTHROPIC_API_KEY", CLIENT_KEY)
+            .env("CLAUDE_CONFIG_DIR", claude_home.join("config"))
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("DISABLE_TELEMETRY", "1")
+            .env("DISABLE_ERROR_REPORTING", "1")
+            .env("DISABLE_AUTOUPDATER", "1")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("CLAUDE_CODE_USE_BEDROCK")
+            .env_remove("CLAUDE_CODE_USE_VERTEX")
+            .env_remove("CLAUDE_CODE_USE_FOUNDRY")
+            .env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("ALL_PROXY")
+            .output(),
+    )
+    .await
+    .expect("Claude Code local canary timed out")
+    .expect("run Claude Code local canary")
+}
+
+fn assert_claude_code_canary_success(output: &std::process::Output, label: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{label} failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let result: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("invalid {label} JSON output: {error}\n{stdout}"));
+    assert_eq!(result["type"], "result", "{label}");
+    assert_eq!(result["subtype"], "success", "{label}");
+    assert_eq!(result["result"], "OK", "{label}");
+}
+
+/// Opt-in installed Claude Code canary. It is ignored in normal CI and uses only
+/// two loopback listeners plus fake credentials. Run exactly with:
+///
+/// `cargo test --test client_compatibility installed_claude_code_cli_smoke -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "requires Claude Code 2.1.207 installed; loopback-only opt-in canary"]
+#[serial_test::serial(client_compatibility)]
+async fn installed_claude_code_cli_smoke() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure_direct_claude_canary(&fixture);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind public proxy canary");
+    let addr = listener.local_addr().expect("public proxy address");
+    let (shutdown, receiver) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, copilot_api::server::build_router())
+            .with_graceful_shutdown(async {
+                let _ = receiver.await;
+            })
+            .await
+            .expect("serve public proxy canary");
+    });
+
+    let version = tokio::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .await
+        .expect("Claude Code CLI must be installed");
+    assert!(
+        String::from_utf8_lossy(&version.stdout).contains("2.1.207"),
+        "this canary is pinned to Claude Code 2.1.207"
+    );
+
+    let claude_home =
+        std::env::temp_dir().join(format!("copilot-api-claude-smoke-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&claude_home).expect("create isolated Claude config directory");
+    let output = run_claude_code_canary(addr, &claude_home, "claude-cli-smoke").await;
+    assert_claude_code_canary_success(&output, "native Claude Code canary");
+
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/messages")
+        .expect("Claude Code request reached native Messages upstream");
+    assert_eq!(capture.body["model"], "claude-cli-smoke");
+    assert_eq!(capture.body["thinking"]["type"], "adaptive");
+    assert!(capture.body.get("context_management").is_some());
+    assert!(capture.body["system"].is_array());
+    assert!(capture.body["metadata"]["user_id"].is_string());
+    let messages = capture.body["messages"]
+        .as_array()
+        .expect("forwarded Claude messages");
+    assert!(messages.iter().all(|message| message["role"] != "system"));
+    assert!(messages.iter().any(|message| {
+        message["content"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("<system-reminder>"))
+            })
+        })
+    }));
+    assert_eq!(capture.headers["anthropic-version"], "2023-06-01");
+    let beta = capture.headers["anthropic-beta"]
+        .to_str()
+        .expect("forwarded anthropic-beta");
+    assert!(beta.contains("interleaved-thinking-2025-05-14"));
+    assert!(beta.contains("context-management-2025-06-27"));
+
+    let output =
+        run_claude_code_canary(addr, &claude_home, "responses-fixture/gpt-cli-smoke").await;
+    assert_claude_code_canary_success(&output, "Responses-bridge Claude Code canary");
+    let responses_capture = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/responses" && request.body["model"] == "gpt-cli-smoke")
+        .expect("Claude Code request reached Responses provider");
+    assert_eq!(responses_capture.body["reasoning"]["effort"], "high");
+    assert!(responses_capture.body["reasoning"].get("summary").is_none());
+    assert!(responses_capture.body.get("context_management").is_none());
+    assert!(responses_capture.body["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty()));
+
+    let _ = shutdown.send(());
+    let _ = server.await;
+    let _ = std::fs::remove_dir_all(claude_home);
+}
+
+/// Opt-in installed Codex canary. It is ignored in normal CI and uses only two
 /// loopback listeners plus fake credentials. Run exactly with:
 ///
 /// `cargo test --test client_compatibility installed_codex_cli_smoke -- --ignored --nocapture`

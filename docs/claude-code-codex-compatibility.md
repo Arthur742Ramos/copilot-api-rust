@@ -7,7 +7,7 @@ OpenAI endpoint.
 
 ## Audit identity and reproducible evidence
 
-Audited on **2026-07-12**:
+Audited on **2026-07-13**:
 
 | Client/reference | Exact identity | Evidence |
 |---|---|---|
@@ -64,7 +64,7 @@ match one of them. The gateway accepts the resulting bearer token as well as
 
 Claude Code exercises:
 
-- `POST /v1/messages` with `anthropic-version`, `anthropic-beta`,
+- `POST /v1/messages?beta=true` with `anthropic-version`, `anthropic-beta`,
   `content-type`, client identity/subagent headers, and streaming or JSON bodies.
 - `POST /v1/messages/count_tokens` for context budgeting.
 - `GET /v1/models` for gateway-backed model discovery in current Claude Code.
@@ -239,6 +239,21 @@ An extension on a tool-call/result-only message is rejected because moving it
 onto the non-message item would change its scope.
 Canonical request/message collisions (`input`, `phase`, `status`, and similar)
 and the unsafe `stop` bypass fail explicitly before provider dispatch.
+
+Claude Code 2.1.207 also sends adaptive thinking with `display: "omitted"`,
+`output_config.effort`, and
+`context_management.edits=[{type:"clear_thinking_20251015",keep:"all"}]`.
+The Responses bridge maps effort, suppresses reasoning summaries when display is
+omitted, and treats that exact keep-all context edit as the documented no-op it
+is. Other Anthropic context-edit strategies have no equivalent Responses
+semantics and fail before provider dispatch.
+
+Assistant-history `redacted_thinking`, `server_tool_use`, and
+`web_search_tool_result` blocks remain byte-preserved on native Anthropic
+Messages transports. Responses and Chat cannot losslessly preserve Anthropic
+opaque thinking/search payload provenance, so those histories receive an
+explicit Anthropic 400 before translated upstream dispatch rather than being
+dropped or converted to ordinary text.
 
 The supported Messages-to-Chat bridge follows the same preserve-or-reject rule:
 
@@ -909,16 +924,19 @@ This implementation intentionally differs where client correctness is stronger:
 
 ## Optional installed-client canary
 
-Normal CI does not execute installed CLIs. A loopback-only Codex canary is
-available when **exactly Codex 0.144.1** is installed:
+Normal CI does not execute installed CLIs. Loopback-only canaries are available
+when **exactly Claude Code 2.1.207** or **Codex 0.144.1** is installed:
 
 ```sh
+cargo test --test client_compatibility installed_claude_code_cli_smoke \
+  -- --ignored --nocapture
+
 cargo test --test client_compatibility installed_codex_cli_smoke \
   -- --ignored --nocapture
 ```
 
-It uses an isolated `CODEX_HOME`, a fake key, an ephemeral public proxy listener,
-and an ephemeral upstream fixture. It does not use port 4141 or an external
-provider. Claude Code's long-lived process/environment behavior makes an equally
-strong opt-in binary canary less deterministic; the credential-free Axum
-boundary harness is the maintained Claude evidence.
+Each uses an isolated client home, a fake key, an ephemeral public proxy
+listener, and an ephemeral upstream fixture. The Claude canary runs one-shot safe mode and verifies its `?beta=true`,
+24 built-in tool schemas, adaptive thinking, context management, inline-system
+normalization, and version/beta headers through both native Messages and the
+Responses bridge. Neither canary uses port 4141 or an external provider.
