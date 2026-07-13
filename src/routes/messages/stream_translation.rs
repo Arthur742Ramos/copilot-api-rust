@@ -91,7 +91,7 @@ fn validate_optional_string(v: Option<&Value>) -> Result<(), ()> {
 /// OpenAI tool indices and token counts are JSON integers in the range this
 /// state machine stores. In particular, do not accept a floating-point number
 /// and truncate it while extracting the value.
-fn nonnegative_i64(v: &Value) -> Option<i64> {
+pub(crate) fn nonnegative_i64(v: &Value) -> Option<i64> {
     v.as_i64().filter(|value| *value >= 0)
 }
 
@@ -128,7 +128,7 @@ fn top_level_upstream_error_event(chunk: &Value) -> Option<AnthropicStreamEventD
     })
 }
 
-fn safe_upstream_error_type(value: Option<&Value>) -> Option<String> {
+pub(crate) fn safe_upstream_error_type(value: Option<&Value>) -> Option<String> {
     let value = value?.as_str()?.trim();
     if value.is_empty()
         || value.len() > MAX_UPSTREAM_ERROR_TYPE_BYTES
@@ -141,7 +141,7 @@ fn safe_upstream_error_type(value: Option<&Value>) -> Option<String> {
     Some(value.to_string())
 }
 
-fn safe_upstream_error_message(value: Option<&Value>) -> Option<String> {
+pub(crate) fn safe_upstream_error_message(value: Option<&Value>) -> Option<String> {
     let value = value?.as_str()?.trim();
     if value.is_empty()
         || value.len() > MAX_UPSTREAM_ERROR_MESSAGE_BYTES

@@ -12,7 +12,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::libs::error::AppError;
+use crate::libs::error::{AppError, HttpError};
 use crate::libs::state::with_state;
 use crate::routes::messages::anthropic_types::{
     AnthropicInputMessage, AnthropicMessagesPayload, AnthropicResponse, AnthropicThinkingConfig,
@@ -20,6 +20,9 @@ use crate::routes::messages::anthropic_types::{
 };
 use crate::routes::messages::request_validation::{
     collect_open_object_extensions, merge_open_object_extensions,
+};
+use crate::routes::messages::stream_translation::{
+    nonnegative_i64, safe_upstream_error_message, safe_upstream_error_type,
 };
 use crate::routes::messages::utils::map_openai_stop_reason_to_anthropic;
 use crate::services::copilot::create_chat_completions::{ChatCompletionsPayload, Message};
@@ -71,6 +74,28 @@ const CHAT_MESSAGE_CANONICAL_FIELDS: &[&str] = &[
     "reasoning_opaque",
     "copilot_cache_control",
 ];
+const ANTHROPIC_RESPONSE_CANONICAL_FIELDS: &[&str] = &[
+    "id",
+    "type",
+    "role",
+    "content",
+    "model",
+    "stop_reason",
+    "stop_sequence",
+    "usage",
+    "chat_choice_extensions",
+    "chat_message_extensions",
+];
+const ANTHROPIC_USAGE_CANONICAL_FIELDS: &[&str] = &[
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "service_tier",
+    "chat_prompt_tokens_details",
+];
+const ANTHROPIC_TOOL_USE_CANONICAL_FIELDS: &[&str] =
+    &["type", "id", "name", "input", "chat_function_extensions"];
 
 // ---------------------------------------------------------------------------
 // Capability flags (mirror TranslationCapabilities).
@@ -1294,206 +1319,619 @@ fn translate_anthropic_tool_choice_to_openai(
 // DIRECTION B: OpenAI ChatCompletion response -> Anthropic response
 // ---------------------------------------------------------------------------
 
-/// Mirrors `translateToAnthropic`. The OpenAI response is dynamic, so it is read
-/// from a `serde_json::Value` (matching the existing crate style).
-pub fn translate_to_anthropic(response: &Value) -> AnthropicResponse {
-    let empty: Vec<Value> = Vec::new();
-    let choices = response
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .unwrap_or(&empty);
-
-    let mut assistant_content_blocks: Vec<Value> = Vec::new();
-    // stopReason = response.choices[0]?.finish_reason ?? null
-    let mut stop_reason: Option<String> = choices
-        .first()
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(|f| f.as_str())
-        .map(|s| s.to_string());
-
-    for choice in choices {
-        let message = choice.get("message").unwrap_or(&Value::Null);
-
-        let text_blocks = get_anthropic_text_blocks(message.get("content"));
-        let reasoning_text = get_openai_reasoning_text(message);
-        let reasoning_opaque = message
-            .get("reasoning_opaque")
-            .and_then(|r| r.as_str())
-            .map(|s| s.to_string());
-        let think_blocks =
-            get_anthropic_think_blocks(reasoning_text.as_deref(), reasoning_opaque.as_deref());
-        let tool_use_blocks = get_anthropic_tool_use_blocks(message.get("tool_calls"));
-
-        assistant_content_blocks.extend(think_blocks);
-        assistant_content_blocks.extend(text_blocks);
-        assistant_content_blocks.extend(tool_use_blocks);
-
-        // Use the finish_reason from the first choice, or prioritize tool_calls.
-        let finish_reason = choice
-            .get("finish_reason")
-            .and_then(|f| f.as_str())
-            .map(|s| s.to_string());
-        if finish_reason.as_deref() == Some("tool_calls") || stop_reason.as_deref() == Some("stop")
-        {
-            stop_reason = finish_reason;
-        }
+/// Strictly translate one completed OpenAI Chat Completion into an Anthropic
+/// message. Any malformed consumed field is an upstream protocol failure, never
+/// an empty/defaulted success.
+#[allow(clippy::result_large_err)]
+pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, HttpError> {
+    let object = response
+        .as_object()
+        .ok_or_else(|| malformed_chat_response("response was not an object"))?;
+    if let Some(error) = object.get("error").filter(|error| !error.is_null()) {
+        return Err(chat_body_error(error));
     }
 
-    AnthropicResponse {
-        id: response
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+    let id = required_nonempty_chat_string(object, "id", "response.id")?;
+    let model = required_nonempty_chat_string(object, "model", "response.model")?;
+    match object.get("object") {
+        Some(Value::String(value)) if value == "chat.completion" => {}
+        _ => return Err(malformed_chat_response("response.object was invalid")),
+    }
+    let created = object
+        .get("created")
+        .and_then(nonnegative_i64)
+        .ok_or_else(|| malformed_chat_response("response.created was invalid"))?;
+
+    validate_optional_chat_string(
+        object.get("system_fingerprint"),
+        "response.system_fingerprint",
+    )?;
+    let top_service_tier =
+        optional_chat_string(object.get("service_tier"), "response.service_tier")?;
+
+    let choices = object
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed_chat_response("response.choices was not an array"))?;
+    if choices.len() != 1 {
+        return Err(malformed_chat_response(
+            "response.choices must contain exactly one choice",
+        ));
+    }
+    let choice = choices[0]
+        .as_object()
+        .ok_or_else(|| malformed_chat_response("response.choices[0] was not an object"))?;
+    if choice.get("index").and_then(nonnegative_i64) != Some(0) {
+        return Err(malformed_chat_response(
+            "response.choices[0].index was not zero",
+        ));
+    }
+    if choice
+        .get("logprobs")
+        .is_some_and(|value| !value.is_null() && !value.is_object())
+    {
+        return Err(malformed_chat_response(
+            "response.choices[0].logprobs was malformed",
+        ));
+    }
+
+    let finish_reason = required_nonempty_chat_string(
+        choice,
+        "finish_reason",
+        "response.choices[0].finish_reason",
+    )?;
+    let stop_reason = map_openai_stop_reason_to_anthropic(Some(finish_reason))
+        .ok_or_else(|| malformed_chat_response("finish_reason was unsupported"))?
+        .to_string();
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed_chat_response("response.choices[0].message was malformed"))?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err(malformed_chat_response(
+            "response.choices[0].message.role was not assistant",
+        ));
+    }
+    validate_chat_message_known_extras(message)?;
+
+    let text_content = translate_chat_response_content(
+        message.get("content"),
+        "response.choices[0].message.content",
+    )?;
+    let mut content = translate_chat_reasoning(message)?;
+    content.extend(text_content);
+    let tool_blocks = translate_chat_tool_calls(message.get("tool_calls"))?;
+    let has_tool_calls = !tool_blocks.is_empty();
+    content.extend(tool_blocks);
+
+    if finish_reason == "tool_calls" && !has_tool_calls {
+        return Err(malformed_chat_response(
+            "tool_calls finish_reason had no tool calls",
+        ));
+    }
+    if finish_reason != "tool_calls" && has_tool_calls {
+        return Err(malformed_chat_response(
+            "tool calls conflicted with finish_reason",
+        ));
+    }
+    let refusal_present = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .is_some_and(|refusal| !refusal.is_empty());
+    if content.is_empty() && !(finish_reason == "content_filter" && refusal_present) {
+        return Err(malformed_chat_response(
+            "completed choice contained no representable output",
+        ));
+    }
+
+    let mut extra = collect_open_object_extensions(
+        object,
+        &["id", "model", "choices", "usage", "error"],
+        ANTHROPIC_RESPONSE_CANONICAL_FIELDS,
+        "response",
+    )
+    .map_err(chat_extension_error)?;
+    // `created` was validated above and remains in source order in `extra`.
+    debug_assert_eq!(extra.get("created").and_then(Value::as_i64), Some(created));
+    let choice_extensions = collect_open_object_extensions(
+        choice,
+        &["index", "message", "finish_reason"],
+        &[],
+        "response.choices[0]",
+    )
+    .map_err(chat_extension_error)?;
+    if !choice_extensions.is_empty() {
+        extra.insert(
+            "chat_choice_extensions".to_string(),
+            Value::Object(choice_extensions),
+        );
+    }
+    let message_extensions = collect_open_object_extensions(
+        message,
+        &[
+            "role",
+            "content",
+            "tool_calls",
+            "reasoning_text",
+            "reasoning_content",
+            "reasoning_opaque",
+            "function_call",
+        ],
+        &[],
+        "response.choices[0].message",
+    )
+    .map_err(chat_extension_error)?;
+    if !message_extensions.is_empty() {
+        extra.insert(
+            "chat_message_extensions".to_string(),
+            Value::Object(message_extensions),
+        );
+    }
+
+    let usage = map_openai_chat_completion_usage(
+        object
+            .get("usage")
+            .ok_or_else(|| malformed_chat_response("response.usage was missing"))?,
+        top_service_tier.as_deref(),
+    )?;
+    Ok(AnthropicResponse {
+        id: id.to_string(),
         kind: "message".to_string(),
         role: "assistant".to_string(),
-        model: response
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        content: assistant_content_blocks,
-        stop_reason: map_openai_stop_reason_to_anthropic(stop_reason.as_deref())
-            .map(|s| s.to_string()),
+        model: model.to_string(),
+        content,
+        stop_reason: Some(stop_reason),
         stop_sequence: None,
-        usage: map_openai_chat_completion_usage(response),
-        extra: serde_json::Map::new(),
+        usage,
+        extra,
+    })
+}
+
+fn malformed_chat_response(detail: &str) -> HttpError {
+    tracing::warn!(detail, "malformed upstream Chat Completions response");
+    HttpError::bad_gateway("The upstream Chat Completions response was malformed.")
+}
+
+fn chat_extension_error(error: AppError) -> HttpError {
+    tracing::warn!(error = %error, "unsafe upstream Chat extension");
+    HttpError::bad_gateway("The upstream Chat Completions response contained conflicting fields.")
+}
+
+fn chat_body_error(error: &Value) -> HttpError {
+    let upstream_type =
+        safe_upstream_error_type(error.get("type")).unwrap_or_else(|| "api_error".to_string());
+    let message = safe_upstream_error_message(error.get("message"))
+        .unwrap_or_else(|| "The upstream Chat Completions service reported an error.".to_string());
+    let mut result =
+        HttpError::bad_gateway("The upstream Chat Completions service reported an error.");
+    result.body = json!({
+        "type":"error",
+        "error":{
+            "type":"api_error",
+            "message":message,
+            "upstream_type":upstream_type
+        }
+    })
+    .to_string();
+    result
+}
+
+#[allow(clippy::result_large_err)]
+fn required_nonempty_chat_string<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+    detail: &str,
+) -> Result<&'a str, HttpError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| malformed_chat_response(detail))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_optional_chat_string(value: Option<&Value>, detail: &str) -> Result<(), HttpError> {
+    match value {
+        None | Some(Value::Null | Value::String(_)) => Ok(()),
+        Some(_) => Err(malformed_chat_response(detail)),
     }
 }
 
-/// Mirrors `mapOpenAIChatCompletionUsage`.
-fn map_openai_chat_completion_usage(response: &Value) -> AnthropicUsage {
-    let usage = response.get("usage");
-    let prompt_details = usage.and_then(|u| u.get("prompt_tokens_details"));
-    let prompt_tokens = usage
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cached_tokens = prompt_details
-        .and_then(|p| p.get("cached_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cache_creation_tokens = prompt_details
-        .and_then(|p| p.get("cache_creation_input_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+#[allow(clippy::result_large_err)]
+fn optional_chat_string(value: Option<&Value>, detail: &str) -> Result<Option<String>, HttpError> {
+    validate_optional_chat_string(value, detail)?;
+    Ok(value.and_then(Value::as_str).map(str::to_string))
+}
 
-    let mut usage_out = AnthropicUsage {
-        input_tokens: std::cmp::max(0, prompt_tokens - cached_tokens - cache_creation_tokens),
-        output_tokens: usage
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-        service_tier: None,
-        extra: serde_json::Map::new(),
-    };
-
-    // `!== undefined` checks: present (even if 0) -> emit.
-    if prompt_details
-        .and_then(|p| p.get("cache_creation_input_tokens"))
-        .is_some()
+#[allow(clippy::result_large_err)]
+fn validate_chat_message_known_extras(message: &Map<String, Value>) -> Result<(), HttpError> {
+    for (field, expected_object) in [("annotations", false), ("audio", true)] {
+        if let Some(value) = message.get(field).filter(|value| !value.is_null()) {
+            let valid = if expected_object {
+                value.is_object()
+            } else {
+                value
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_object))
+            };
+            if !valid {
+                return Err(malformed_chat_response(&format!(
+                    "response.choices[0].message.{field} was malformed"
+                )));
+            }
+        }
+    }
+    validate_optional_chat_string(
+        message.get("refusal"),
+        "response.choices[0].message.refusal was malformed",
+    )?;
+    validate_optional_chat_string(
+        message.get("name"),
+        "response.choices[0].message.name was malformed",
+    )?;
+    if message
+        .get("function_call")
+        .is_some_and(|value| !value.is_null())
     {
-        usage_out.cache_creation_input_tokens = Some(cache_creation_tokens);
+        return Err(malformed_chat_response(
+            "legacy message.function_call is unsupported",
+        ));
     }
-    if prompt_details
-        .and_then(|p| p.get("cached_tokens"))
-        .is_some()
-    {
-        usage_out.cache_read_input_tokens = Some(cached_tokens);
-    }
-
-    usage_out
+    Ok(())
 }
 
-/// Mirrors `getOpenAIReasoningText`: `reasoning_text ?? reasoning_content`.
-fn get_openai_reasoning_text(message: &Value) -> Option<String> {
-    if let Some(s) = message.get("reasoning_text").and_then(|v| v.as_str()) {
-        return Some(s.to_string());
-    }
-    message
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-/// Mirrors `getAnthropicTextBlocks`.
-fn get_anthropic_text_blocks(message_content: Option<&Value>) -> Vec<Value> {
-    match message_content {
-        Some(Value::String(s)) if !s.is_empty() => {
-            vec![json!({ "type": "text", "text": s })]
+#[allow(clippy::result_large_err)]
+fn translate_chat_response_content(
+    content: Option<&Value>,
+    path: &str,
+) -> Result<Vec<Value>, HttpError> {
+    match content {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(text)) => {
+            if text.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![json!({"type":"text","text":text})])
+            }
         }
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter(|part| part.get("type").and_then(|t| t.as_str()) == Some("text"))
-            .map(|part| {
-                json!({
-                    "type": "text",
-                    "text": part.get("text").and_then(|t| t.as_str()).unwrap_or(""),
-                })
-            })
-            .collect(),
-        _ => Vec::new(),
+        Some(Value::Array(parts)) => {
+            let mut blocks = Vec::with_capacity(parts.len());
+            for (index, part) in parts.iter().enumerate() {
+                let part_path = format!("{path}[{index}]");
+                let source = part.as_object().ok_or_else(|| {
+                    malformed_chat_response(&format!("{part_path} was not an object"))
+                })?;
+                if source.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err(malformed_chat_response(&format!(
+                        "{part_path}.type was unsupported"
+                    )));
+                }
+                let text = source.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    malformed_chat_response(&format!("{part_path}.text was invalid"))
+                })?;
+                if text.is_empty() {
+                    return Err(malformed_chat_response(&format!(
+                        "{part_path}.text was empty"
+                    )));
+                }
+                let extensions = collect_open_object_extensions(
+                    source,
+                    &["type", "text"],
+                    &["type", "text"],
+                    &part_path,
+                )
+                .map_err(chat_extension_error)?;
+                let mut target = Map::from_iter([
+                    ("type".to_string(), json!("text")),
+                    ("text".to_string(), json!(text)),
+                ]);
+                target.extend(extensions);
+                blocks.push(Value::Object(target));
+            }
+            Ok(blocks)
+        }
+        Some(_) => Err(malformed_chat_response(&format!(
+            "{path} had an unsupported type"
+        ))),
     }
 }
 
-/// Mirrors `getAnthropicThinkBlocks`.
-fn get_anthropic_think_blocks(
-    reasoning_text: Option<&str>,
-    reasoning_opaque: Option<&str>,
-) -> Vec<Value> {
-    if let Some(rt) = reasoning_text {
-        if !rt.is_empty() {
-            return vec![json!({
-                "type": "thinking",
-                "thinking": rt,
-                "signature": reasoning_opaque.unwrap_or(""),
-            })];
+#[allow(clippy::result_large_err)]
+fn translate_chat_reasoning(message: &Map<String, Value>) -> Result<Vec<Value>, HttpError> {
+    let reasoning_text = optional_chat_string(
+        message.get("reasoning_text"),
+        "reasoning_text was malformed",
+    )?;
+    let reasoning_content = optional_chat_string(
+        message.get("reasoning_content"),
+        "reasoning_content was malformed",
+    )?;
+    if let (Some(left), Some(right)) = (&reasoning_text, &reasoning_content) {
+        if left != right {
+            return Err(malformed_chat_response(
+                "reasoning_text and reasoning_content conflicted",
+            ));
         }
     }
-    if let Some(ro) = reasoning_opaque {
-        if !ro.is_empty() {
-            return vec![json!({
-                "type": "thinking",
-                // Compatible with opencode (filters empty thinking text).
-                "thinking": THINKING_TEXT,
-                "signature": ro,
-            })];
-        }
+    let reasoning = reasoning_text.or(reasoning_content);
+    let opaque = optional_chat_string(
+        message.get("reasoning_opaque"),
+        "reasoning_opaque was malformed",
+    )?;
+    match (
+        reasoning.filter(|value| !value.is_empty()),
+        opaque.filter(|value| !value.is_empty()),
+    ) {
+        (Some(thinking), Some(signature)) => Ok(vec![json!({
+            "type":"thinking",
+            "thinking":thinking,
+            "signature":signature
+        })]),
+        (None, Some(signature)) => Ok(vec![json!({
+            "type":"thinking",
+            "thinking":THINKING_TEXT,
+            "signature":signature
+        })]),
+        (Some(_), None) => Err(malformed_chat_response(
+            "reasoning text was missing its opaque signature",
+        )),
+        (None, None) => Ok(Vec::new()),
     }
-    Vec::new()
 }
 
-/// Mirrors `getAnthropicToolUseBlocks`.
-fn get_anthropic_tool_use_blocks(tool_calls: Option<&Value>) -> Vec<Value> {
-    let calls = match tool_calls.and_then(|v| v.as_array()) {
-        Some(c) => c,
-        None => return Vec::new(),
+#[allow(clippy::result_large_err)]
+fn translate_chat_tool_calls(tool_calls: Option<&Value>) -> Result<Vec<Value>, HttpError> {
+    let calls = match tool_calls {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(calls)) => calls,
+        Some(_) => {
+            return Err(malformed_chat_response(
+                "message.tool_calls was not an array",
+            ))
+        }
     };
-    calls
-        .iter()
-        .map(|tool_call| {
-            let id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let name = tool_call
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            let arguments = tool_call
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(|a| a.as_str())
-                .unwrap_or("");
-            let input: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-            json!({
-                "type": "tool_use",
-                "id": id,
-                "name": name,
-                "input": input,
-            })
-        })
-        .collect()
+    let mut blocks = Vec::with_capacity(calls.len());
+    for (index, tool_call) in calls.iter().enumerate() {
+        let path = format!("response.choices[0].message.tool_calls[{index}]");
+        let source = tool_call
+            .as_object()
+            .ok_or_else(|| malformed_chat_response(&format!("{path} was not an object")))?;
+        if source.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(malformed_chat_response(&format!(
+                "{path}.type was not function"
+            )));
+        }
+        let id = required_nonempty_chat_string(source, "id", &format!("{path}.id was invalid"))?;
+        if let Some(value) = source.get("index") {
+            nonnegative_i64(value)
+                .ok_or_else(|| malformed_chat_response(&format!("{path}.index was invalid")))?;
+        }
+        let function = source
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| malformed_chat_response(&format!("{path}.function was malformed")))?;
+        let name = required_nonempty_chat_string(
+            function,
+            "name",
+            &format!("{path}.function.name was invalid"),
+        )?;
+        let arguments = required_nonempty_chat_string(
+            function,
+            "arguments",
+            &format!("{path}.function.arguments was invalid"),
+        )?;
+        let input: Value = serde_json::from_str(arguments)
+            .map_err(|_| malformed_chat_response("tool arguments were not valid JSON"))?;
+        if !input.is_object() {
+            return Err(malformed_chat_response(
+                "tool arguments JSON was not an object",
+            ));
+        }
+        let function_extensions = collect_open_object_extensions(
+            function,
+            &["name", "arguments"],
+            &[],
+            &format!("{path}.function"),
+        )
+        .map_err(chat_extension_error)?;
+        let extensions = collect_open_object_extensions(
+            source,
+            &["type", "id", "function"],
+            ANTHROPIC_TOOL_USE_CANONICAL_FIELDS,
+            &path,
+        )
+        .map_err(chat_extension_error)?;
+        let mut target = Map::from_iter([
+            ("type".to_string(), json!("tool_use")),
+            ("id".to_string(), json!(id)),
+            ("name".to_string(), json!(name)),
+            ("input".to_string(), input),
+        ]);
+        if !function_extensions.is_empty() {
+            target.insert(
+                "chat_function_extensions".to_string(),
+                Value::Object(function_extensions),
+            );
+        }
+        target.extend(extensions);
+        blocks.push(Value::Object(target));
+    }
+    Ok(blocks)
+}
+
+#[allow(clippy::result_large_err)]
+fn map_openai_chat_completion_usage(
+    usage: &Value,
+    top_service_tier: Option<&str>,
+) -> Result<AnthropicUsage, HttpError> {
+    let source = usage
+        .as_object()
+        .ok_or_else(|| malformed_chat_response("response.usage was not an object"))?;
+    let prompt_tokens = required_chat_count(source, "prompt_tokens", "usage.prompt_tokens")?;
+    let completion_tokens =
+        required_chat_count(source, "completion_tokens", "usage.completion_tokens")?;
+    let total_tokens = required_chat_count(source, "total_tokens", "usage.total_tokens")?;
+    if prompt_tokens.checked_add(completion_tokens) != Some(total_tokens) {
+        return Err(malformed_chat_response(
+            "usage.total_tokens was inconsistent",
+        ));
+    }
+
+    let mut cached_tokens = None;
+    let mut cache_creation_tokens = None;
+    let mut prompt_detail_extension = None;
+    if let Some(details) = source.get("prompt_tokens_details") {
+        match details {
+            Value::Null => prompt_detail_extension = Some(Value::Null),
+            Value::Object(details) => {
+                cached_tokens = optional_chat_count(details.get("cached_tokens"), "cached_tokens")?;
+                cache_creation_tokens = optional_chat_count(
+                    details.get("cache_creation_input_tokens"),
+                    "cache_creation_input_tokens",
+                )?;
+                for field in ["audio_tokens"] {
+                    if let Some(value) =
+                        optional_chat_count(details.get(field), &format!("prompt {field}"))?
+                    {
+                        if value > prompt_tokens {
+                            return Err(malformed_chat_response(
+                                "prompt token details exceeded prompt_tokens",
+                            ));
+                        }
+                    }
+                }
+                let detail_total = cached_tokens
+                    .unwrap_or(0)
+                    .checked_add(cache_creation_tokens.unwrap_or(0))
+                    .ok_or_else(|| malformed_chat_response("prompt token details overflowed"))?;
+                if detail_total > prompt_tokens {
+                    return Err(malformed_chat_response(
+                        "cache token details exceeded prompt_tokens",
+                    ));
+                }
+                let extensions = collect_open_object_extensions(
+                    details,
+                    &["cached_tokens", "cache_creation_input_tokens"],
+                    &[],
+                    "response.usage.prompt_tokens_details",
+                )
+                .map_err(chat_extension_error)?;
+                if !extensions.is_empty() {
+                    prompt_detail_extension = Some(Value::Object(extensions));
+                }
+            }
+            _ => {
+                return Err(malformed_chat_response(
+                    "usage.prompt_tokens_details was malformed",
+                ))
+            }
+        }
+    }
+    if let Some(details) = source
+        .get("completion_tokens_details")
+        .filter(|details| !details.is_null())
+    {
+        let details = details.as_object().ok_or_else(|| {
+            malformed_chat_response("usage.completion_tokens_details was malformed")
+        })?;
+        for field in [
+            "reasoning_tokens",
+            "audio_tokens",
+            "accepted_prediction_tokens",
+            "rejected_prediction_tokens",
+        ] {
+            if let Some(value) =
+                optional_chat_count(details.get(field), &format!("completion {field}"))?
+            {
+                if value > completion_tokens {
+                    return Err(malformed_chat_response(
+                        "completion token details exceeded completion_tokens",
+                    ));
+                }
+            }
+        }
+        let accepted = optional_chat_count(
+            details.get("accepted_prediction_tokens"),
+            "accepted_prediction_tokens",
+        )?
+        .unwrap_or(0);
+        let rejected = optional_chat_count(
+            details.get("rejected_prediction_tokens"),
+            "rejected_prediction_tokens",
+        )?
+        .unwrap_or(0);
+        if accepted
+            .checked_add(rejected)
+            .is_none_or(|sum| sum > completion_tokens)
+        {
+            return Err(malformed_chat_response(
+                "prediction token details were inconsistent",
+            ));
+        }
+    }
+
+    let usage_service_tier = optional_chat_string(
+        source.get("service_tier"),
+        "usage.service_tier was malformed",
+    )?;
+    if let (Some(top), Some(nested)) = (top_service_tier, usage_service_tier.as_deref()) {
+        if top != nested {
+            return Err(malformed_chat_response("service_tier values conflicted"));
+        }
+    }
+    let mut extra = collect_open_object_extensions(
+        source,
+        &[
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "prompt_tokens_details",
+            "service_tier",
+        ],
+        ANTHROPIC_USAGE_CANONICAL_FIELDS,
+        "response.usage",
+    )
+    .map_err(chat_extension_error)?;
+    if let Some(details) = prompt_detail_extension {
+        extra.insert("chat_prompt_tokens_details".to_string(), details);
+    }
+    let cache_total = cached_tokens
+        .unwrap_or(0)
+        .checked_add(cache_creation_tokens.unwrap_or(0))
+        .ok_or_else(|| malformed_chat_response("cache token details overflowed"))?;
+    let input_tokens = prompt_tokens
+        .checked_sub(cache_total)
+        .ok_or_else(|| malformed_chat_response("cache token details were inconsistent"))?;
+    Ok(AnthropicUsage {
+        input_tokens,
+        output_tokens: completion_tokens,
+        cache_creation_input_tokens: cache_creation_tokens,
+        cache_read_input_tokens: cached_tokens,
+        service_tier: usage_service_tier.or_else(|| top_service_tier.map(str::to_string)),
+        extra,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn required_chat_count(
+    object: &Map<String, Value>,
+    field: &str,
+    detail: &str,
+) -> Result<i64, HttpError> {
+    object
+        .get(field)
+        .and_then(nonnegative_i64)
+        .ok_or_else(|| malformed_chat_response(detail))
+}
+
+#[allow(clippy::result_large_err)]
+fn optional_chat_count(value: Option<&Value>, detail: &str) -> Result<Option<i64>, HttpError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => nonnegative_i64(value)
+            .map(Some)
+            .ok_or_else(|| malformed_chat_response(detail)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1784,6 +2222,8 @@ mod tests {
     fn translate_to_anthropic_with_tool_use_response() {
         let response = json!({
             "id": "chatcmpl-1",
+            "object":"chat.completion",
+            "created":1,
             "model": "gpt-4o",
             "choices": [
                 {
@@ -1805,7 +2245,7 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
         });
 
-        let out = translate_to_anthropic(&response);
+        let out = translate_to_anthropic(&response).unwrap();
         assert_eq!(out.id, "chatcmpl-1");
         assert_eq!(out.model, "gpt-4o");
         assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));

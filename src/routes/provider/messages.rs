@@ -1268,11 +1268,13 @@ async fn respond_openai_compatible_provider_messages_json(
     payload: &AnthropicMessagesPayload,
     provider: &str,
 ) -> Result<Response, AppError> {
-    let body: Value = read_json(upstream).await?;
+    let (body, headers) = read_chat_json(upstream).await?;
     let recorder = create_provider_messages_usage_recorder(payload, provider);
+    let anthropic_response = translate_to_anthropic(&body).map_err(|mut error| {
+        error.headers = headers;
+        AppError::Http(error)
+    })?;
     recorder.record(normalize_openai_usage(body.get("usage")));
-
-    let anthropic_response = translate_to_anthropic(&body);
     Ok(Json(anthropic_response).into_response())
 }
 
@@ -1338,6 +1340,21 @@ async fn read_json(response: reqwest::Response) -> Result<Value, AppError> {
                 "Failed to read or parse provider response body: {e}"
             ))
         })
+}
+
+async fn read_chat_json(response: reqwest::Response) -> Result<(Value, HeaderMap), AppError> {
+    let headers = crate::libs::error::upstream_response_headers(&response);
+    let value = crate::libs::http::read_json_capped(response)
+        .await
+        .map_err(|error| {
+            tracing::warn!(?error, "invalid provider Chat Completions response body");
+            let mut error = crate::libs::error::HttpError::bad_gateway(
+                "The upstream Chat Completions response body was malformed.",
+            );
+            error.headers = headers.clone();
+            AppError::Http(error)
+        })?;
+    Ok((value, headers))
 }
 
 /// Render one translated Anthropic event as an SSE frame (`event: {type}\ndata:

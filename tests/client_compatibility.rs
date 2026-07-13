@@ -134,7 +134,76 @@ async fn fixture_handler(
 }
 
 fn chat_completions_fixture(body: &Value) -> Response {
-    Json(json!({
+    let model = body["model"].as_str().unwrap_or_default();
+    if matches!(
+        model,
+        "gpt-chat-response-malformed-json" | "gpt-direct-chat-malformed-json"
+    ) {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "chat-malformed-json")
+            .header("retry-after", "2")
+            .header("x-ratelimit-remaining", "9")
+            .header("x-unsafe-secret", "must-not-propagate")
+            .body(Body::from("{not-json"))
+            .expect("malformed Chat fixture");
+    }
+    if model == "gpt-chat-response-oversized" {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "chat-oversized")
+            .header("retry-after", "2")
+            .header("x-ratelimit-remaining", "9")
+            .header(
+                "content-length",
+                (copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES + 1).to_string(),
+            )
+            .body(Body::from(vec![
+                b'x';
+                copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+                    + 1
+            ]))
+            .expect("oversized Chat fixture");
+    }
+    if matches!(model, "gpt-chat-response-429" | "gpt-direct-chat-429") {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("content-type", "application/json"),
+                ("x-request-id", "chat-rate-limit"),
+                ("retry-after", "4"),
+                ("x-unsafe-secret", "must-not-propagate"),
+            ],
+            Json(json!({
+                "error":{
+                    "type":"rate_limit_error",
+                    "message":"chat rate limited"
+                }
+            })),
+        )
+            .into_response();
+    }
+    if model == "gpt-chat-response-503" {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("content-type", "application/json"),
+                ("x-request-id", "chat-unavailable"),
+                ("x-unsafe-secret", "must-not-propagate"),
+            ],
+            Json(json!({
+                "error":{
+                    "type":"server_error",
+                    "message":"chat unavailable"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let mut response = json!({
         "id":"chatcmpl-fixture",
         "object":"chat.completion",
         "created":1,
@@ -149,8 +218,224 @@ fn chat_completions_fixture(body: &Value) -> Response {
             "completion_tokens":2,
             "total_tokens":5
         }
-    }))
-    .into_response()
+    });
+    match model {
+        "gpt-chat-response-extras" | "gpt-direct-chat-response-extras" => {
+            response = json!({
+                "id":"chatcmpl-extras",
+                "object":"chat.completion",
+                "created":7,
+                "model":model,
+                "future_before":null,
+                "choices":[{
+                    "index":0,
+                    "finish_reason":"tool_calls",
+                    "logprobs":null,
+                    "future_choice":{"keep":true,"null":null},
+                    "message":{
+                        "role":"assistant",
+                        "content":[{
+                            "type":"text",
+                            "text":"chat text",
+                            "future_content":{"keep":true,"null":null}
+                        }],
+                        "reasoning_text":"reason",
+                        "reasoning_content":"reason",
+                        "reasoning_opaque":"opaque",
+                        "annotations":[{
+                            "type":"url_citation",
+                            "url":"https://example.test"
+                        }],
+                        "refusal":null,
+                        "audio":null,
+                        "future_message":{"keep":true,"null":null},
+                        "tool_calls":[{
+                            "index":0,
+                            "id":"call-extra",
+                            "type":"function",
+                            "future_tool":{"keep":true,"null":null},
+                            "function":{
+                                "name":"actual",
+                                "arguments":"{\"value\":1}",
+                                "future_function":{"keep":true,"null":null}
+                            }
+                        }]
+                    }
+                }],
+                "usage":{
+                    "prompt_tokens":10,
+                    "completion_tokens":5,
+                    "total_tokens":15,
+                    "prompt_tokens_details":{
+                        "cached_tokens":2,
+                        "cache_creation_input_tokens":1,
+                        "audio_tokens":0,
+                        "future_prompt":null
+                    },
+                    "completion_tokens_details":{
+                        "reasoning_tokens":2,
+                        "future_completion":{"keep":true}
+                    },
+                    "future_usage":{"keep":true,"null":null},
+                    "service_tier":"default"
+                },
+                "service_tier":"default",
+                "system_fingerprint":null,
+                "future_after":{"keep":true,"null":null}
+            });
+        }
+        "gpt-chat-response-no-choices" => {
+            response.as_object_mut().unwrap().remove("choices");
+        }
+        "gpt-chat-response-no-id" => {
+            response.as_object_mut().unwrap().remove("id");
+        }
+        "gpt-chat-response-model-null" => response["model"] = Value::Null,
+        "gpt-chat-response-object" => response["object"] = json!("wrong"),
+        "gpt-chat-response-created" => response["created"] = json!(-1),
+        "gpt-chat-response-choices-wrong" => response["choices"] = json!({}),
+        "gpt-chat-response-choices-empty" => response["choices"] = json!([]),
+        "gpt-chat-response-choices-multiple" => {
+            let choice = response["choices"][0].clone();
+            response["choices"] = json!([choice.clone(), choice]);
+        }
+        "gpt-chat-response-choice-wrong" => response["choices"][0] = json!("wrong"),
+        "gpt-chat-response-choice-index" => response["choices"][0]["index"] = json!(1),
+        "gpt-chat-response-no-message" => {
+            response["choices"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("message");
+        }
+        "gpt-chat-response-role" => response["choices"][0]["message"]["role"] = json!("user"),
+        "gpt-chat-response-content-wrong" => {
+            response["choices"][0]["message"]["content"] = json!({})
+        }
+        "gpt-chat-response-content-part" => {
+            response["choices"][0]["message"]["content"] =
+                json!([{"type":"image_url","image_url":{"url":"x"}}])
+        }
+        "gpt-chat-response-no-finish" => {
+            response["choices"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("finish_reason");
+        }
+        "gpt-chat-response-finish-unknown" => {
+            response["choices"][0]["finish_reason"] = json!("unknown")
+        }
+        "gpt-chat-response-tool-type"
+        | "gpt-chat-response-tool-id"
+        | "gpt-chat-response-tool-function"
+        | "gpt-chat-response-tool-name"
+        | "gpt-chat-response-tool-arguments-type"
+        | "gpt-chat-response-tool-arguments-json"
+        | "gpt-chat-response-tool-arguments-scalar"
+        | "gpt-chat-response-tool-collision" => {
+            response["choices"][0]["finish_reason"] = json!("tool_calls");
+            response["choices"][0]["message"]["content"] = Value::Null;
+            response["choices"][0]["message"]["tool_calls"] = json!([{
+                "id":"call",
+                "type":"function",
+                "function":{"name":"actual","arguments":"{}"}
+            }]);
+            match model {
+                "gpt-chat-response-tool-type" => {
+                    response["choices"][0]["message"]["tool_calls"][0]["type"] = json!("custom")
+                }
+                "gpt-chat-response-tool-id" => {
+                    response["choices"][0]["message"]["tool_calls"][0]["id"] = Value::Null
+                }
+                "gpt-chat-response-tool-function" => {
+                    response["choices"][0]["message"]["tool_calls"][0]["function"] = json!("wrong")
+                }
+                "gpt-chat-response-tool-name" => {
+                    response["choices"][0]["message"]["tool_calls"][0]["function"]["name"] =
+                        json!("")
+                }
+                "gpt-chat-response-tool-arguments-type" => {
+                    response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+                        json!({})
+                }
+                "gpt-chat-response-tool-arguments-json" => {
+                    response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+                        json!("{not-json")
+                }
+                "gpt-chat-response-tool-arguments-scalar" => {
+                    response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+                        json!("[]")
+                }
+                "gpt-chat-response-tool-collision" => {
+                    response["choices"][0]["message"]["tool_calls"][0]["input"] =
+                        json!({"override":true})
+                }
+                _ => unreachable!(),
+            }
+        }
+        "gpt-chat-response-no-usage" => {
+            response.as_object_mut().unwrap().remove("usage");
+        }
+        "gpt-chat-response-usage-wrong" => response["usage"] = json!([]),
+        "gpt-chat-response-usage-negative" => response["usage"]["prompt_tokens"] = json!(-1),
+        "gpt-chat-response-usage-total" => response["usage"]["total_tokens"] = json!(99),
+        "gpt-chat-response-usage-details" => {
+            response["usage"]["prompt_tokens_details"] =
+                json!({"cached_tokens":3,"cache_creation_input_tokens":2})
+        }
+        "gpt-chat-response-usage-overflow" => response["usage"]["prompt_tokens"] = json!(u64::MAX),
+        "gpt-chat-response-top-collision" => response["content"] = json!("override"),
+        "gpt-chat-response-usage-collision" => response["usage"]["input_tokens"] = json!(99),
+        "gpt-chat-response-function-call" => {
+            response["choices"][0]["message"]["function_call"] =
+                json!({"name":"legacy","arguments":"{}"})
+        }
+        "gpt-chat-response-reasoning-conflict" => {
+            response["choices"][0]["message"]["reasoning_text"] = json!("one");
+            response["choices"][0]["message"]["reasoning_content"] = json!("two");
+            response["choices"][0]["message"]["reasoning_opaque"] = json!("opaque");
+        }
+        "gpt-chat-response-reasoning-no-signature" => {
+            response["choices"][0]["message"]["reasoning_content"] = json!("reason");
+        }
+        "gpt-chat-response-refusal" => {
+            response["choices"][0]["finish_reason"] = json!("content_filter");
+            response["choices"][0]["message"]["content"] = Value::Null;
+            response["choices"][0]["message"]["refusal"] = json!("blocked");
+        }
+        "gpt-chat-response-body-error" => {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-request-id", "chat-body-error")
+                .header("retry-after", "2")
+                .header("x-ratelimit-remaining", "9")
+                .header("x-unsafe-secret", "must-not-propagate")
+                .body(Body::from(
+                    json!({
+                        "error":{
+                            "type":"provider_error",
+                            "message":"safe upstream failure"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("Chat body error fixture");
+        }
+        "gpt-direct-chat-bad-choices" => response["choices"] = json!([]),
+        _ => {}
+    }
+    if model.starts_with("gpt-chat-response-") || model.starts_with("gpt-direct-chat-") {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "chat-response-request")
+            .header("retry-after", "2")
+            .header("x-ratelimit-remaining", "9")
+            .header("x-unsafe-secret", "must-not-propagate")
+            .body(Body::from(response.to_string()))
+            .expect("Chat response fixture");
+    }
+    Json(response).into_response()
 }
 
 fn compact_fixture(body: &Value) -> Response {
@@ -6708,6 +6993,10 @@ fn configure_direct_copilot(fixture: &Fixture) {
         "gpt-direct-response-400",
         "gpt-direct-response-500",
         "gpt-direct-chat-extensions",
+        "gpt-direct-chat-response-extras",
+        "gpt-direct-chat-malformed-json",
+        "gpt-direct-chat-bad-choices",
+        "gpt-direct-chat-429",
     ];
     let models = ModelsResponse {
         object: "list".to_string(),
@@ -6716,7 +7005,7 @@ fn configure_direct_copilot(fixture: &Fixture) {
             .map(|id| Model {
                 id: id.to_string(),
                 name: id.to_string(),
-                supported_endpoints: Some(vec![if id == "gpt-direct-chat-extensions" {
+                supported_endpoints: Some(vec![if id.starts_with("gpt-direct-chat-") {
                     "/chat/completions".to_string()
                 } else {
                     "/responses".to_string()
@@ -7070,19 +7359,63 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
     .map(|model| (model.to_string(), ModelConfig::default()))
     .collect();
     let chat_models = [
-        (
-            "gpt-chat-fixture".to_string(),
+        "gpt-chat-fixture",
+        "gpt-chat-scalar-fixture",
+        "gpt-chat-response-extras",
+        "gpt-chat-response-malformed-json",
+        "gpt-chat-response-oversized",
+        "gpt-chat-response-429",
+        "gpt-chat-response-503",
+        "gpt-chat-response-body-error",
+        "gpt-chat-response-no-choices",
+        "gpt-chat-response-no-id",
+        "gpt-chat-response-model-null",
+        "gpt-chat-response-object",
+        "gpt-chat-response-created",
+        "gpt-chat-response-choices-wrong",
+        "gpt-chat-response-choices-empty",
+        "gpt-chat-response-choices-multiple",
+        "gpt-chat-response-choice-wrong",
+        "gpt-chat-response-choice-index",
+        "gpt-chat-response-no-message",
+        "gpt-chat-response-role",
+        "gpt-chat-response-content-wrong",
+        "gpt-chat-response-content-part",
+        "gpt-chat-response-no-finish",
+        "gpt-chat-response-finish-unknown",
+        "gpt-chat-response-tool-type",
+        "gpt-chat-response-tool-id",
+        "gpt-chat-response-tool-function",
+        "gpt-chat-response-tool-name",
+        "gpt-chat-response-tool-arguments-type",
+        "gpt-chat-response-tool-arguments-json",
+        "gpt-chat-response-tool-arguments-scalar",
+        "gpt-chat-response-tool-collision",
+        "gpt-chat-response-no-usage",
+        "gpt-chat-response-usage-wrong",
+        "gpt-chat-response-usage-negative",
+        "gpt-chat-response-usage-total",
+        "gpt-chat-response-usage-details",
+        "gpt-chat-response-usage-overflow",
+        "gpt-chat-response-top-collision",
+        "gpt-chat-response-usage-collision",
+        "gpt-chat-response-function-call",
+        "gpt-chat-response-reasoning-conflict",
+        "gpt-chat-response-reasoning-no-signature",
+        "gpt-chat-response-refusal",
+    ]
+    .into_iter()
+    .map(|model| {
+        let config = if model == "gpt-chat-fixture" {
             ModelConfig {
                 tool_content_support_type: Some(vec!["array".to_string(), "image".to_string()]),
                 ..Default::default()
-            },
-        ),
-        (
-            "gpt-chat-scalar-fixture".to_string(),
-            ModelConfig::default(),
-        ),
-    ]
-    .into_iter()
+            }
+        } else {
+            ModelConfig::default()
+        };
+        (model.to_string(), config)
+    })
     .collect();
     let providers = BTreeMap::from([
         (
@@ -9479,6 +9812,20 @@ fn assert_anthropic_invalid_request(body: &[u8], label: &str) {
         .is_some_and(|message| !message.is_empty()));
 }
 
+fn assert_anthropic_upstream_error(body: &[u8], label: &str) {
+    let error = json_body(body);
+    assert_eq!(error["type"], "error", "{label}");
+    assert_eq!(error["error"]["type"], "api_error", "{label}");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "{label}"
+    );
+    assert!(error.get("id").is_none(), "{label} fabricated success");
+    assert!(error.get("content").is_none(), "{label} fabricated content");
+}
+
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
 async fn claude_web_search_request_policy_rejects_malformed_before_dispatch() {
@@ -11337,6 +11684,333 @@ async fn claude_chat_extensions_reject_collisions_and_unrepresentable_scopes() {
         assert_anthropic_invalid_request(&response, label);
         assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
     }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_chat_response_extensions_and_usage_survive_provider_boundary() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let body = json!({
+        "model":"chat-fixture/gpt-chat-response-extras",
+        "max_tokens":128,
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[{"role":"user","content":"respond with extras"}]
+    });
+    let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let response = json_body(&response);
+    assert_eq!(response["id"], "chatcmpl-extras");
+    assert_eq!(response["type"], "message");
+    assert_eq!(response["stop_reason"], "tool_use");
+    assert_eq!(response["object"], "chat.completion");
+    assert_eq!(response["created"], 7);
+    assert_eq!(response["future_before"], Value::Null);
+    assert_eq!(response["service_tier"], "default");
+    assert_eq!(response["system_fingerprint"], Value::Null);
+    assert_eq!(response["future_after"], json!({"keep":true,"null":null}));
+    assert_eq!(
+        response["chat_choice_extensions"],
+        json!({
+            "logprobs":null,
+            "future_choice":{"keep":true,"null":null}
+        })
+    );
+    assert_eq!(
+        response["chat_message_extensions"],
+        json!({
+            "annotations":[{
+                "type":"url_citation",
+                "url":"https://example.test"
+            }],
+            "refusal":null,
+            "audio":null,
+            "future_message":{"keep":true,"null":null}
+        })
+    );
+    let keys: Vec<&str> = response
+        .as_object()
+        .expect("Anthropic Chat response object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        keys.iter().position(|key| *key == "object")
+            < keys.iter().position(|key| *key == "future_after")
+    );
+    assert!(
+        keys.iter().position(|key| *key == "future_after")
+            < keys.iter().position(|key| *key == "chat_choice_extensions")
+    );
+
+    assert_eq!(response["content"][0]["type"], "thinking");
+    assert_eq!(response["content"][0]["thinking"], "reason");
+    assert_eq!(response["content"][0]["signature"], "opaque");
+    assert_eq!(response["content"][1]["type"], "text");
+    assert_eq!(response["content"][1]["text"], "chat text");
+    assert_eq!(
+        response["content"][1]["future_content"],
+        json!({"keep":true,"null":null})
+    );
+    assert_eq!(response["content"][2]["type"], "tool_use");
+    assert_eq!(response["content"][2]["id"], "call-extra");
+    assert_eq!(response["content"][2]["name"], "actual");
+    assert_eq!(response["content"][2]["input"], json!({"value":1}));
+    assert_eq!(response["content"][2]["index"], 0);
+    assert_eq!(
+        response["content"][2]["future_tool"],
+        json!({"keep":true,"null":null})
+    );
+    assert_eq!(
+        response["content"][2]["chat_function_extensions"],
+        json!({"future_function":{"keep":true,"null":null}})
+    );
+
+    assert_eq!(response["usage"]["input_tokens"], 7);
+    assert_eq!(response["usage"]["output_tokens"], 5);
+    assert_eq!(response["usage"]["cache_read_input_tokens"], 2);
+    assert_eq!(response["usage"]["cache_creation_input_tokens"], 1);
+    assert_eq!(response["usage"]["service_tier"], "default");
+    assert_eq!(
+        response["usage"]["completion_tokens_details"],
+        json!({
+            "reasoning_tokens":2,
+            "future_completion":{"keep":true}
+        })
+    );
+    assert_eq!(
+        response["usage"]["future_usage"],
+        json!({"keep":true,"null":null})
+    );
+    assert_eq!(
+        response["usage"]["chat_prompt_tokens_details"],
+        json!({"audio_tokens":0,"future_prompt":null})
+    );
+
+    let refusal_body = json!({
+        "model":"chat-fixture/gpt-chat-response-refusal",
+        "max_tokens":128,
+        "messages":[{"role":"user","content":"blocked"}]
+    });
+    let (status, refusal) = send(post_json("/v1/messages", refusal_body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let refusal = json_body(&refusal);
+    assert_eq!(refusal["stop_reason"], "refusal");
+    assert_eq!(refusal["content"], json!([]));
+    assert_eq!(refusal["chat_message_extensions"]["refusal"], "blocked");
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_chat_malformed_provider_responses_fail_as_sanitized_bad_gateway() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let cases = [
+        "gpt-chat-response-malformed-json",
+        "gpt-chat-response-oversized",
+        "gpt-chat-response-body-error",
+        "gpt-chat-response-no-choices",
+        "gpt-chat-response-no-id",
+        "gpt-chat-response-model-null",
+        "gpt-chat-response-object",
+        "gpt-chat-response-created",
+        "gpt-chat-response-choices-wrong",
+        "gpt-chat-response-choices-empty",
+        "gpt-chat-response-choices-multiple",
+        "gpt-chat-response-choice-wrong",
+        "gpt-chat-response-choice-index",
+        "gpt-chat-response-no-message",
+        "gpt-chat-response-role",
+        "gpt-chat-response-content-wrong",
+        "gpt-chat-response-content-part",
+        "gpt-chat-response-no-finish",
+        "gpt-chat-response-finish-unknown",
+        "gpt-chat-response-tool-type",
+        "gpt-chat-response-tool-id",
+        "gpt-chat-response-tool-function",
+        "gpt-chat-response-tool-name",
+        "gpt-chat-response-tool-arguments-type",
+        "gpt-chat-response-tool-arguments-json",
+        "gpt-chat-response-tool-arguments-scalar",
+        "gpt-chat-response-tool-collision",
+        "gpt-chat-response-no-usage",
+        "gpt-chat-response-usage-wrong",
+        "gpt-chat-response-usage-negative",
+        "gpt-chat-response-usage-total",
+        "gpt-chat-response-usage-details",
+        "gpt-chat-response-usage-overflow",
+        "gpt-chat-response-top-collision",
+        "gpt-chat-response-usage-collision",
+        "gpt-chat-response-function-call",
+        "gpt-chat-response-reasoning-conflict",
+        "gpt-chat-response-reasoning-no-signature",
+    ];
+    for model in cases {
+        let body = json!({
+            "model":format!("chat-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"malformed response"}]
+        });
+        let (status, headers, response) =
+            send_full(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}");
+        assert_anthropic_upstream_error(&response, model);
+        let expected_request_id = match model {
+            "gpt-chat-response-malformed-json" => "chat-malformed-json",
+            "gpt-chat-response-oversized" => "chat-oversized",
+            "gpt-chat-response-body-error" => "chat-body-error",
+            _ => "chat-response-request",
+        };
+        assert_eq!(
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_request_id),
+            "{model}"
+        );
+        assert_eq!(
+            headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("2"),
+            "{model}"
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok()),
+            Some("9"),
+            "{model}"
+        );
+        assert!(headers.get("x-unsafe-secret").is_none(), "{model}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_chat_upstream_status_and_direct_failures_preserve_safe_semantics() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, expected_status, request_id, retry_after) in [
+        (
+            "gpt-chat-response-429",
+            StatusCode::TOO_MANY_REQUESTS,
+            "chat-rate-limit",
+            Some("4"),
+        ),
+        (
+            "gpt-chat-response-503",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "chat-unavailable",
+            None,
+        ),
+    ] {
+        let body = json!({
+            "model":format!("chat-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"upstream status"}]
+        });
+        let (status, headers, response) =
+            send_full(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, expected_status, "{model}");
+        let error = json_body(&response);
+        assert_eq!(error["type"], "error", "{model}");
+        assert_eq!(
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id),
+            "{model}"
+        );
+        assert_eq!(
+            headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            retry_after,
+            "{model}"
+        );
+        assert!(headers.get("x-unsafe-secret").is_none(), "{model}");
+    }
+
+    configure_direct_copilot(&fixture);
+    let extras = json!({
+        "model":"gpt-direct-chat-response-extras",
+        "max_tokens":128,
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[{"role":"user","content":"direct extras"}]
+    });
+    let (status, response) = send(post_json("/v1/messages", extras, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = json_body(&response);
+    assert_eq!(response["id"], "chatcmpl-extras");
+    assert_eq!(response["future_after"], json!({"keep":true,"null":null}));
+    assert_eq!(
+        response["content"][2]["future_tool"],
+        json!({"keep":true,"null":null})
+    );
+
+    for model in [
+        "gpt-direct-chat-malformed-json",
+        "gpt-direct-chat-bad-choices",
+    ] {
+        let body = json!({
+            "model":model,
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"direct malformed"}]
+        });
+        let (status, headers, response) =
+            send_full(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}");
+        assert_anthropic_upstream_error(&response, model);
+        assert!(headers.get("x-request-id").is_some(), "{model}");
+        assert_eq!(
+            headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("2"),
+            "{model}"
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok()),
+            Some("9"),
+            "{model}"
+        );
+        assert!(headers.get("x-unsafe-secret").is_none(), "{model}");
+    }
+
+    let rate_limit = json!({
+        "model":"gpt-direct-chat-429",
+        "max_tokens":128,
+        "messages":[{"role":"user","content":"direct rate limit"}]
+    });
+    let (status, headers, response) =
+        send_full(post_json("/v1/messages", rate_limit, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json_body(&response)["error"]["type"], "rate_limit_error");
+    assert_eq!(
+        headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("4")
+    );
+    assert!(headers.get("x-unsafe-secret").is_none());
 }
 
 fn binary_schema(depth: usize) -> Value {

@@ -115,7 +115,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     .await?;
 
     match result {
-        ChatCompletionsResult::NonStreaming(response) => {
+        ChatCompletionsResult::NonStreaming { response, .. } => {
             // Native non-streaming responses never pass through a StreamTimer, so
             // record the flow/model/transport headline here. This lets the
             // trace middleware's `has_flow` guard emit the single

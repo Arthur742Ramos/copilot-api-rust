@@ -49,6 +49,17 @@ impl HttpError {
         error.expose_message = false;
         error
     }
+
+    /// A sanitized synthetic failure for a successful upstream HTTP response
+    /// whose body violates the selected protocol contract.
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
+        HttpError::new(
+            message,
+            StatusCode::BAD_GATEWAY,
+            HeaderMap::new(),
+            String::new(),
+        )
+    }
 }
 
 impl std::fmt::Display for HttpError {
@@ -136,6 +147,15 @@ pub async fn http_error_from_response(
 ) -> HttpError {
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let headers = upstream_response_headers(&response);
+    let body = crate::libs::http::read_text_capped(response).await;
+    HttpError::new(message, status, headers, body)
+}
+
+/// Copy upstream headers into Axum's HTTP types. Error rendering applies the
+/// final correlation/retry allowlist, so callers can retain diagnostic headers
+/// even when a successful HTTP response later fails body validation.
+pub fn upstream_response_headers(response: &reqwest::Response) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in response.headers().iter() {
         if let (Ok(n), Ok(v)) = (
@@ -145,8 +165,7 @@ pub async fn http_error_from_response(
             headers.insert(n, v);
         }
     }
-    let body = crate::libs::http::read_text_capped(response).await;
-    HttpError::new(message, status, headers, body)
+    headers
 }
 
 /// The crate-wide error type that route handlers return. Mirrors `forwardError`.
@@ -341,10 +360,10 @@ impl IntoResponse for AppError {
                 // 529 (overloaded) is not a named StatusCode constant.
                 let is_overloaded = e.status.as_u16() == 529;
                 let mut out_headers = HeaderMap::new();
-                let retryable_status = is_rate_limit || is_overloaded;
+                let retryable_status = is_rate_limit || is_overloaded || e.status.is_server_error();
                 // Correlation IDs are useful on every status. Retry/backoff
-                // metadata is additionally forwarded for 429/529. We do NOT
-                // synthesize retry-after when it is absent.
+                // metadata is additionally forwarded for retryable 429/529/5xx
+                // failures. We do NOT synthesize retry-after when it is absent.
                 for (name, value) in e.headers.iter() {
                     if should_forward_error_header(name.as_str(), retryable_status) {
                         out_headers.insert(name.clone(), value.clone());

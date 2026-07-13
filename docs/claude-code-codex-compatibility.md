@@ -263,6 +263,27 @@ The supported Messages-to-Chat bridge follows the same preserve-or-reject rule:
   collisions fail before upstream dispatch. Provider-added cache markers never
   overwrite an existing client cache-control object.
 
+The reverse non-streaming Chat boundary is fail-closed. A successful response
+must be a `chat.completion` object with non-empty `id`/`model`, one choice at
+index zero, an assistant message, a supported finish reason, representable
+content, valid function tool calls with object-valued JSON arguments, and a
+strict usage object whose non-negative counters and totals agree. Extra choices,
+legacy function calls, unsupported structured parts, conflicting reasoning,
+malformed details, negative/overflowing counters, and empty fabricated output
+become one sanitized Anthropic `502 api_error`. A top-level Chat `error` in an
+HTTP-200 body follows the same path. Real upstream status codes remain intact;
+allowlisted request IDs and retry/rate-limit headers survive, while unsafe
+headers and malformed bodies do not.
+
+Representable reverse fields remain lossless: top-level extras flatten into
+`AnthropicResponse.extra`; choice and assistant-message extras use ordered
+`chat_choice_extensions` / `chat_message_extensions` objects; structured text
+extras remain on text blocks; usage and prompt-detail extras remain in
+`AnthropicUsage.extra`; and tool-call/function extras remain on the generated
+`tool_use` block (function scope uses `chat_function_extensions`). Canonical
+target collisions fail rather than overriding response authority. Explicit
+nulls, nested values, and source order are retained.
+
 `stop_sequences` has no field in either the audited Codex 0.144.1
 [`ResponsesApiRequest`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/common.rs)
 or the current generated OpenAI
@@ -315,6 +336,9 @@ allowed. Exact public evidence is in
 `claude_chat_extensions_preserve_scope_nulls_order_and_split_messages`,
 `claude_direct_chat_preprocessing_keeps_split_message_extension_carrier`,
 `claude_chat_extensions_reject_collisions_and_unrepresentable_scopes`,
+`claude_chat_response_extensions_and_usage_survive_provider_boundary`,
+`claude_chat_malformed_provider_responses_fail_as_sanitized_bad_gateway`,
+`claude_chat_upstream_status_and_direct_failures_preserve_safe_semantics`,
 `claude_stop_sequences_reject_responses_but_preserve_native_anthropic_support`,
 `claude_responses_controls_preserve_supported_and_reject_unrepresentable_values`,
 and `claude_unsupported_source_types_fail_before_admission_or_dispatch`.
@@ -682,7 +706,7 @@ Status means deterministic, credential-free evidence exists.
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
 | Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss | native Responses web-search output | request-policy, paired partial/terminal-only output, and conflict fixtures |
-| Chat Completions | lossless open request/message/system/content extensions when representable; explicit native 400 otherwise | not Codex 0.144.1's wire API | public Chat provider/direct captures, split-carrier and no-dispatch fixtures |
+| Chat Completions | lossless representable request/response extensions; explicit request 400 or malformed-upstream 502; strict one-choice/tool/usage validation | not Codex 0.144.1's wire API | public provider/direct captures, split-carrier, malformed-body, status/header, and collision fixtures |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
 The detailed Claude-specific matrix remains in
@@ -701,7 +725,7 @@ authentication, body limits, admission, and JSON parsing:
 | request too large | Anthropic `request_too_large` | OpenAI `request_too_large` code |
 | rate limit/overload | Anthropic retryable error + `Retry-After` | OpenAI rate/server error + retry metadata |
 | upstream 4xx/5xx | status preserved, sanitized native envelope | status preserved, sanitized native envelope |
-| malformed/oversized successful upstream JSON | Anthropic `api_error` | sanitized OpenAI `502 server_error`; no upstream body leakage |
+| malformed/oversized successful upstream JSON | sanitized Anthropic `502 api_error`; no fabricated success | sanitized OpenAI `502 server_error`; no upstream body leakage |
 | malformed stream frame | one terminal Anthropic `error`; no `message_stop` | one terminal OpenAI `error` or `response.failed`; no completion |
 | premature EOF/transport reset | one retryable terminal error | one terminal OpenAI error; no completion |
 | incomplete/conflicting output-item lifecycle | one terminal Anthropic `error`; open blocks close; later events ignored | native Responses stream is forwarded unchanged |

@@ -220,9 +220,12 @@ pub async fn handle_with_chat_completions(
     .await?;
 
     match result {
-        ChatCompletionsResult::NonStreaming(response) => {
+        ChatCompletionsResult::NonStreaming { response, headers } => {
+            let anthropic_response = translate_to_anthropic(&response).map_err(|mut error| {
+                error.headers = headers;
+                AppError::Http(error)
+            })?;
             recorder.record(normalize_openai_usage(response.get("usage")));
-            let anthropic_response = translate_to_anthropic(&response);
             Ok(Json(anthropic_response).into_response())
         }
         ChatCompletionsResult::Streaming(upstream) => Ok(stream_chat_completions_response(
