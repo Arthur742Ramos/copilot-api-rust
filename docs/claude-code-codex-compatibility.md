@@ -226,7 +226,7 @@ Open-object extensions use a per-target policy rather than blanket dropping:
 - Extensions that collide with a canonical target key (`parameters`, namespace
   `tools`, bridge `execution`, web `filters`, and analogous content/item keys)
   fail with a path-specific Anthropic 400 before provider dispatch.
-- Metadata extras already serialize directly. Representable text, media,
+- On Responses, metadata extras serialize directly. Representable text, media,
   tool-use/result, thinking, source, thinking-config, and output-config extras
   are retained on their open target objects; unrepresentable structured-system
   extras fail explicitly. Large base64 data is not duplicated.
@@ -239,6 +239,29 @@ An extension on a tool-call/result-only message is rejected because moving it
 onto the non-message item would change its scope.
 Canonical request/message collisions (`input`, `phase`, `status`, and similar)
 and the unsafe `stop` bypass fail explicitly before provider dispatch.
+
+The supported Messages-to-Chat bridge follows the same preserve-or-reject rule:
+
+- Top-level request extensions append after canonical Chat controls without
+  overriding `model`, `messages`, token/stream controls, tools, choice, cache,
+  or reasoning fields. Nested values, explicit nulls, and source key order stay
+  intact.
+- A user/assistant wrapper extension is attached exactly once to its
+  corresponding Chat message. In a mixed tool-result/user turn it belongs only
+  to the ordinary user message, never the generated tool message. A
+  tool-result-only wrapper fails unless exactly one rich-content fallback
+  creates an unambiguous moved user carrier.
+- Extension-bearing structured system text stays structured as Chat text
+  content instead of being flattened. Ordinary structured system text without
+  extensions retains the established joined-string behavior. Text/image/file
+  parts, tool calls/results, custom tools, and object-form choices retain
+  representable extensions on their corresponding open objects.
+- Scalar tool choices, deferred/server-tool controls, scalar tool-content
+  fallbacks, non-PDF document fallbacks, thinking-block extras, and nested
+  metadata/thinking/output-config extras have no lossless Chat target and
+  return a path-specific Anthropic 400. Canonical request/message/content/tool
+  collisions fail before upstream dispatch. Provider-added cache markers never
+  overwrite an existing client cache-control object.
 
 `stop_sequences` has no field in either the audited Codex 0.144.1
 [`ResponsesApiRequest`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/common.rs)
@@ -289,6 +312,9 @@ allowed. Exact public evidence is in
 `claude_open_object_extension_collisions_fail_before_provider_dispatch`,
 `claude_payload_and_message_extensions_survive_split_responses_translation`,
 `claude_payload_and_message_extension_collisions_fail_without_dispatch`,
+`claude_chat_extensions_preserve_scope_nulls_order_and_split_messages`,
+`claude_direct_chat_preprocessing_keeps_split_message_extension_carrier`,
+`claude_chat_extensions_reject_collisions_and_unrepresentable_scopes`,
 `claude_stop_sequences_reject_responses_but_preserve_native_anthropic_support`,
 `claude_responses_controls_preserve_supported_and_reject_unrepresentable_values`,
 and `claude_unsupported_source_types_fail_before_admission_or_dispatch`.
@@ -647,7 +673,7 @@ Status means deterministic, credential-free evidence exists.
 | Text and structured input | Messages content blocks | string/array input; images with optional `detail` | typed audit and provider-boundary captures |
 | Tool definitions/results | tool use/result, multi-turn; explicit choices bind to one compatible catalog entry; recursive object/boolean schemas are shape/bound validated; deferred references preserve explicit order/duplicates; malformed definitions, identities, arguments, and result collections fail before dispatch | function/custom/tool-search calls and outputs, including optional IDs | catalog choice, recursive schema, request collection, deferred reference, optional-item, and paired JSON/SSE boundary audits |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
-| Prompt caching | `cache_control` and beta headers on native transports; top-level cache control is rejected for Responses | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
+| Prompt caching | `cache_control` and beta headers on native transports; top-level cache control is rejected for translated Responses/Chat transports | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
 | Usage | strict nonnegative input/output/cache mapping; malformed Responses usage errors once | OpenAI cached/reasoning token details | public valid/absent/partial/type/range/overflow usage fixtures |
 | Model routing | aliases, `[1m]`, provider models; model-less created events use validated request context | aliases and `provider/model` | model helpers and public model-less-created boundary tests |
@@ -656,7 +682,7 @@ Status means deterministic, credential-free evidence exists.
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
 | Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss | native Responses web-search output | request-policy, paired partial/terminal-only output, and conflict fixtures |
-| Chat Completions | translation fallback retained | not Codex 0.144.1's wire API | existing Chat Completions suite |
+| Chat Completions | lossless open request/message/system/content extensions when representable; explicit native 400 otherwise | not Codex 0.144.1's wire API | public Chat provider/direct captures, split-carrier and no-dispatch fixtures |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
 The detailed Claude-specific matrix remains in

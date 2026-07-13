@@ -15,8 +15,11 @@ use serde_json::{json, Map, Value};
 use crate::libs::error::AppError;
 use crate::libs::state::with_state;
 use crate::routes::messages::anthropic_types::{
-    AnthropicMessagesPayload, AnthropicResponse, AnthropicThinkingConfig, AnthropicTool,
-    AnthropicToolChoice, AnthropicUsage,
+    AnthropicInputMessage, AnthropicMessagesPayload, AnthropicResponse, AnthropicThinkingConfig,
+    AnthropicTool, AnthropicToolChoice, AnthropicUsage,
+};
+use crate::routes::messages::request_validation::{
+    collect_open_object_extensions, merge_open_object_extensions,
 };
 use crate::routes::messages::utils::map_openai_stop_reason_to_anthropic;
 use crate::services::copilot::create_chat_completions::{ChatCompletionsPayload, Message};
@@ -38,6 +41,36 @@ pub const RICH_TOOL_RESULT_MOVED_TEXT: &str =
 
 /// `COPILOT_TOOL_CONTENT_SUPPORT_TYPE = ["array", "image"]`.
 const COPILOT_TOOL_CONTENT_SUPPORT_TYPE: [&str; 2] = ["array", "image"];
+const CHAT_REQUEST_CANONICAL_FIELDS: &[&str] = &[
+    "messages",
+    "model",
+    "max_tokens",
+    "stream",
+    "stop",
+    "temperature",
+    "top_p",
+    "top_k",
+    "user",
+    "tools",
+    "tool_choice",
+    "thinking_budget",
+    "reasoning_effort",
+    "service_tier",
+    "parallel_tool_calls",
+    "stream_options",
+    "cache_control",
+];
+const CHAT_MESSAGE_CANONICAL_FIELDS: &[&str] = &[
+    "role",
+    "content",
+    "name",
+    "tool_call_id",
+    "tool_calls",
+    "reasoning_text",
+    "reasoning_content",
+    "reasoning_opaque",
+    "copilot_cache_control",
+];
 
 // ---------------------------------------------------------------------------
 // Capability flags (mirror TranslationCapabilities).
@@ -120,6 +153,7 @@ pub fn translate_to_openai_with_options(
     payload: &AnthropicMessagesPayload,
     options: &TranslateToOpenAiOptions,
 ) -> Result<ChatCompletionsPayload, AppError> {
+    validate_chat_config_extensions(payload)?;
     let model_id = payload.model.clone();
     let thinking_budget = get_thinking_budget(payload);
     let capabilities = TranslationCapabilities {
@@ -142,20 +176,40 @@ pub fn translate_to_openai_with_options(
     if let Some(top_p) = payload.top_p {
         extra.insert("top_p".to_string(), json!(top_p));
     }
+    if let Some(top_k) = payload.top_k {
+        extra.insert("top_k".to_string(), json!(top_k));
+    }
     if let Some(user) = payload.metadata.as_ref().and_then(|m| m.user_id.clone()) {
         extra.insert("user".to_string(), json!(user));
     }
-    if let Some(tools) = translate_anthropic_tools_to_openai(payload.tools.as_ref()) {
+    if let Some(tools) = translate_anthropic_tools_to_openai(payload.tools.as_ref())? {
         extra.insert("tools".to_string(), Value::Array(tools));
     }
     if let Some(tool_choice) =
-        translate_anthropic_tool_choice_to_openai(payload.tool_choice.as_ref())
+        translate_anthropic_tool_choice_to_openai(payload.tool_choice.as_ref())?
     {
         extra.insert("tool_choice".to_string(), tool_choice);
     }
     if let Some(budget) = thinking_budget {
         extra.insert("thinking_budget".to_string(), json!(budget));
     }
+    if let Some(effort) = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.as_ref())
+    {
+        extra.insert("reasoning_effort".to_string(), json!(effort));
+    }
+    if let Some(service_tier) = &payload.service_tier {
+        extra.insert("service_tier".to_string(), json!(service_tier));
+    }
+    let request_extensions = collect_open_object_extensions(
+        &payload.extra,
+        &[],
+        CHAT_REQUEST_CANONICAL_FIELDS,
+        "request",
+    )?;
+    extra.extend(request_extensions);
 
     Ok(ChatCompletionsPayload {
         messages,
@@ -164,6 +218,57 @@ pub fn translate_to_openai_with_options(
         stream: payload.stream,
         extra,
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_chat_config_extensions(payload: &AnthropicMessagesPayload) -> Result<(), AppError> {
+    if payload.cache_control.is_some() {
+        return Err(AppError::BadRequest(
+            "cache_control cannot be represented by the Chat Completions request object"
+                .to_string(),
+        ));
+    }
+    if let Some(metadata) = &payload.metadata {
+        reject_unrepresentable_extensions(
+            &metadata.extra,
+            "metadata",
+            "the scalar Chat user field",
+        )?;
+    }
+    if let Some(thinking) = &payload.thinking {
+        if thinking.display.is_some() {
+            return Err(AppError::BadRequest(
+                "thinking.display cannot be represented by Chat Completions".to_string(),
+            ));
+        }
+        reject_unrepresentable_extensions(
+            &thinking.extra,
+            "thinking",
+            "the scalar Chat thinking_budget field",
+        )?;
+    }
+    if let Some(output_config) = &payload.output_config {
+        reject_unrepresentable_extensions(
+            &output_config.extra,
+            "output_config",
+            "the scalar Chat reasoning_effort field",
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn reject_unrepresentable_extensions(
+    source: &Map<String, Value>,
+    path: &str,
+    target: &str,
+) -> Result<(), AppError> {
+    if let Some((key, _)) = source.iter().next() {
+        return Err(AppError::BadRequest(format!(
+            "{path}.{key} cannot be represented by {target}"
+        )));
+    }
+    Ok(())
 }
 
 /// Mirrors `getThinkingBudget`, reading `state.models` to find the model by id.
@@ -217,15 +322,17 @@ fn translate_anthropic_messages_to_openai(
     model_id: &str,
     capabilities: &TranslationCapabilities,
 ) -> Result<Vec<Message>, AppError> {
-    let mut out = handle_system_prompt(payload.system.as_ref());
-    for message in &payload.messages {
+    let mut out = handle_system_prompt(payload.system.as_ref())?;
+    for (message_index, message) in payload.messages.iter().enumerate() {
+        let path = format!("messages[{message_index}]");
         if message.role == "user" {
-            out.extend(handle_user_message(&message.content, capabilities)?);
+            out.extend(handle_user_message(message, capabilities, &path)?);
         } else {
             out.extend(handle_assistant_message(
-                &message.content,
+                message,
                 model_id,
                 capabilities,
+                &path,
             )?);
         }
     }
@@ -233,21 +340,51 @@ fn translate_anthropic_messages_to_openai(
 }
 
 /// Mirrors `handleSystemPrompt`.
-fn handle_system_prompt(system: Option<&Value>) -> Vec<Message> {
+#[allow(clippy::result_large_err)]
+fn handle_system_prompt(system: Option<&Value>) -> Result<Vec<Message>, AppError> {
     let system = match system {
         Some(v) if !v.is_null() => v,
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
 
     match system {
         Value::String(s) => {
             // Empty string is falsy in the TS `if (!system)` check.
             if s.is_empty() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
-            vec![text_message("system", s.clone())]
+            Ok(vec![text_message("system", s.clone())])
         }
         Value::Array(blocks) => {
+            let mut preserve_parts = false;
+            for (index, block) in blocks.iter().enumerate() {
+                let path = format!("system[{index}]");
+                let object = block
+                    .as_object()
+                    .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+                let extensions = collect_open_object_extensions(
+                    object,
+                    &["type", "text", "cache_control"],
+                    &["type", "text"],
+                    &path,
+                )?;
+                preserve_parts |= !extensions.is_empty()
+                    || object
+                        .get("cache_control")
+                        .is_some_and(|value| !value.is_null());
+            }
+            if preserve_parts {
+                let parts = blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, block)| create_chat_text_part(block, &format!("system[{index}]")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(vec![Message {
+                    role: "system".to_string(),
+                    content: Some(Value::Array(parts)),
+                    extra: Map::new(),
+                }]);
+            }
             let system_text = blocks
                 .iter()
                 .map(|block| {
@@ -259,55 +396,107 @@ fn handle_system_prompt(system: Option<&Value>) -> Vec<Message> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            vec![text_message("system", system_text)]
+            Ok(vec![text_message("system", system_text)])
         }
-        _ => Vec::new(),
+        _ => Err(AppError::BadRequest(
+            "system must be a string, array, or null".to_string(),
+        )),
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn create_chat_text_part(block: &Value, path: &str) -> Result<Value, AppError> {
+    let source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    let text = source
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest(format!("{path}.text must be a string")))?;
+    let extensions = collect_open_object_extensions(
+        source,
+        &["type", "text", "cache_control"],
+        &["type", "text"],
+        path,
+    )?;
+    let mut target = Map::from_iter([
+        ("type".to_string(), json!("text")),
+        ("text".to_string(), json!(text)),
+    ]);
+    if let Some(cache_control) = source.get("cache_control").filter(|value| !value.is_null()) {
+        target.insert("cache_control".to_string(), cache_control.clone());
+    }
+    target.extend(extensions);
+    Ok(Value::Object(target))
 }
 
 /// Mirrors `handleUserMessage`. Tool results MUST come first to maintain the
 /// protocol ordering: tool_use -> tool_result -> user.
 #[allow(clippy::result_large_err)]
 fn handle_user_message(
-    content: &Value,
+    message: &AnthropicInputMessage,
     capabilities: &TranslationCapabilities,
+    path: &str,
 ) -> Result<Vec<Message>, AppError> {
+    let message_extensions =
+        collect_open_object_extensions(&message.extra, &[], CHAT_MESSAGE_CANONICAL_FIELDS, path)?;
     let mut new_messages: Vec<Message> = Vec::new();
 
-    if let Value::Array(blocks) = content {
-        let tool_result_blocks: Vec<&Value> = blocks
+    if let Value::Array(blocks) = &message.content {
+        let tool_result_blocks: Vec<(usize, &Value)> = blocks
             .iter()
-            .filter(|b| block_type(b) == Some("tool_result"))
+            .enumerate()
+            .filter(|(_, block)| block_type(block) == Some("tool_result"))
             .collect();
-        let other_blocks: Vec<Value> = blocks
+        let other_blocks: Vec<(usize, &Value)> = blocks
             .iter()
-            .filter(|b| block_type(b) != Some("tool_result"))
-            .cloned()
+            .enumerate()
+            .filter(|(_, block)| block_type(block) != Some("tool_result"))
             .collect();
 
         let mut moved_tool_result_user_messages: Vec<Message> = Vec::new();
-        for block in tool_result_blocks {
-            let result = handle_tool_result_block(block, capabilities)?;
+        for (block_index, block) in tool_result_blocks {
+            let result = handle_tool_result_block(
+                block,
+                capabilities,
+                &format!("{path}.content[{block_index}]"),
+            )?;
             new_messages.push(result.tool_message);
             if let Some(moved) = result.moved_user_message {
                 moved_tool_result_user_messages.push(moved);
             }
         }
-        new_messages.extend(moved_tool_result_user_messages);
-
         if !other_blocks.is_empty() {
-            let mapped = map_content(&Value::Array(other_blocks), capabilities.support_pdf)?;
+            new_messages.extend(moved_tool_result_user_messages);
+            let mapped = map_content_blocks(
+                other_blocks.into_iter(),
+                capabilities.support_pdf,
+                &format!("{path}.content"),
+            )?;
             new_messages.push(Message {
                 role: "user".to_string(),
                 content: mapped,
-                extra: Map::new(),
+                extra: message_extensions,
             });
+        } else if !message_extensions.is_empty() {
+            if moved_tool_result_user_messages.len() != 1 {
+                return Err(AppError::BadRequest(format!(
+                    "{path}: message extensions cannot be represented unambiguously when a user message contains only tool results"
+                )));
+            }
+            let mut moved = moved_tool_result_user_messages
+                .pop()
+                .expect("one moved user message");
+            moved.extra.extend(message_extensions);
+            new_messages.push(moved);
+        } else {
+            new_messages.extend(moved_tool_result_user_messages);
         }
     } else {
         new_messages.push(Message {
             role: "user".to_string(),
-            content: map_content(content, false)?,
-            extra: Map::new(),
+            content: map_content(&message.content, false, &format!("{path}.content"))?,
+            extra: message_extensions,
         });
     }
 
@@ -319,19 +508,15 @@ fn handle_user_message(
 fn handle_tool_result_block(
     block: &Value,
     capabilities: &TranslationCapabilities,
+    path: &str,
 ) -> Result<ToolResultMessages, AppError> {
-    let tool_use_id = block
-        .get("tool_use_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
     let content = block.get("content");
 
     // String content -> straight tool message.
     if let Some(Value::String(s)) = content {
         return Ok(ToolResultMessages {
             moved_user_message: None,
-            tool_message: create_tool_message(&tool_use_id, Some(Value::String(s.clone()))),
+            tool_message: create_tool_message(block, Some(Value::String(s.clone())), path)?,
         });
     }
 
@@ -341,7 +526,7 @@ fn handle_tool_result_block(
         _ => {
             return Ok(ToolResultMessages {
                 moved_user_message: None,
-                tool_message: create_tool_message(&tool_use_id, Some(Value::String(String::new()))),
+                tool_message: create_tool_message(block, Some(Value::String(String::new())), path)?,
             });
         }
     };
@@ -349,7 +534,11 @@ fn handle_tool_result_block(
     let support = get_tool_content_support(capabilities);
     let has_image = blocks.iter().any(|b| block_type(b) == Some("image"));
     let has_document = blocks.iter().any(|b| block_type(b) == Some("document"));
-    let content_value = map_content(&Value::Array(blocks.clone()), capabilities.support_pdf)?;
+    let content_value = map_content(
+        &Value::Array(blocks.clone()),
+        capabilities.support_pdf,
+        &format!("{path}.content"),
+    )?;
 
     let has_pdf_file = has_document && capabilities.support_pdf;
     let should_move_image_to_user_message = has_image && !support.image;
@@ -366,8 +555,9 @@ fn handle_tool_result_block(
             moved_user_message: Some(create_tool_result_user_message(
                 block,
                 capabilities.support_pdf,
+                path,
             )?),
-            tool_message: create_tool_message(&tool_use_id, Some(Value::String(tool_text))),
+            tool_message: create_tool_message(block, Some(Value::String(tool_text)), path)?,
         });
     }
 
@@ -375,16 +565,34 @@ fn handle_tool_result_block(
     if support.array || has_rich_content {
         return Ok(ToolResultMessages {
             moved_user_message: None,
-            tool_message: create_tool_message(&tool_use_id, content_value),
+            tool_message: create_tool_message(block, content_value, path)?,
         });
+    }
+    if chat_text_content_has_extensions(&content_value) {
+        return Err(AppError::BadRequest(format!(
+            "{path}.content: extensions cannot be represented when this Chat provider requires scalar tool content"
+        )));
     }
 
     Ok(ToolResultMessages {
         moved_user_message: None,
         tool_message: create_tool_message(
-            &tool_use_id,
+            block,
             Some(Value::String(get_text_tool_content(&content_value))),
-        ),
+            path,
+        )?,
+    })
+}
+
+fn chat_text_content_has_extensions(content: &Option<Value>) -> bool {
+    let Some(Value::Array(parts)) = content else {
+        return false;
+    };
+    parts.iter().any(|part| {
+        part.as_object().is_some_and(|part| {
+            part.keys()
+                .any(|key| !matches!(key.as_str(), "type" | "text"))
+        })
     })
 }
 
@@ -426,19 +634,54 @@ fn get_tool_content_support(capabilities: &TranslationCapabilities) -> ToolConte
 }
 
 /// Mirrors `createToolMessage`.
-fn create_tool_message(tool_call_id: &str, content: Option<Value>) -> Message {
+#[allow(clippy::result_large_err)]
+fn create_tool_message(
+    block: &Value,
+    content: Option<Value>,
+    path: &str,
+) -> Result<Message, AppError> {
+    let source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    let tool_call_id = source
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest(format!("{path}.tool_use_id must be a string")))?;
     let mut extra = Map::new();
     extra.insert("tool_call_id".to_string(), json!(tool_call_id));
-    Message {
+    if let Some(is_error) = source.get("is_error").filter(|value| !value.is_null()) {
+        extra.insert("is_error".to_string(), is_error.clone());
+    }
+    if let Some(cache_control) = source.get("cache_control").filter(|value| !value.is_null()) {
+        extra.insert("cache_control".to_string(), cache_control.clone());
+    }
+    let extensions = collect_open_object_extensions(
+        source,
+        &[
+            "type",
+            "tool_use_id",
+            "content",
+            "is_error",
+            "cache_control",
+        ],
+        CHAT_MESSAGE_CANONICAL_FIELDS,
+        path,
+    )?;
+    extra.extend(extensions);
+    Ok(Message {
         role: "tool".to_string(),
         content,
         extra,
-    }
+    })
 }
 
 /// Mirrors `createToolResultUserMessage`.
 #[allow(clippy::result_large_err)]
-fn create_tool_result_user_message(block: &Value, support_pdf: bool) -> Result<Message, AppError> {
+fn create_tool_result_user_message(
+    block: &Value,
+    support_pdf: bool,
+    path: &str,
+) -> Result<Message, AppError> {
     let tool_use_id = block
         .get("tool_use_id")
         .and_then(|v| v.as_str())
@@ -447,7 +690,11 @@ fn create_tool_result_user_message(block: &Value, support_pdf: bool) -> Result<M
         "type": "text",
         "text": format!("Tool result for {tool_use_id}:"),
     });
-    let content = map_content(block.get("content").unwrap_or(&Value::Null), support_pdf)?;
+    let content = map_content(
+        block.get("content").unwrap_or(&Value::Null),
+        support_pdf,
+        &format!("{path}.content"),
+    )?;
 
     let parts = match content {
         Some(Value::Array(mut arr)) => {
@@ -472,33 +719,42 @@ fn create_tool_result_user_message(block: &Value, support_pdf: bool) -> Result<M
 /// Mirrors `handleAssistantMessage`.
 #[allow(clippy::result_large_err)]
 fn handle_assistant_message(
-    content: &Value,
+    message: &AnthropicInputMessage,
     model_id: &str,
     capabilities: &TranslationCapabilities,
+    path: &str,
 ) -> Result<Vec<Message>, AppError> {
-    let blocks = match content {
+    let message_extensions =
+        collect_open_object_extensions(&message.extra, &[], CHAT_MESSAGE_CANONICAL_FIELDS, path)?;
+    let blocks = match &message.content {
         Value::Array(a) => a,
         _ => {
             return Ok(vec![Message {
                 role: "assistant".to_string(),
-                content: map_content(content, false)?,
-                extra: Map::new(),
+                content: map_content(&message.content, false, &format!("{path}.content"))?,
+                extra: message_extensions,
             }]);
         }
     };
 
-    let tool_use_blocks: Vec<&Value> = blocks
+    let tool_use_blocks: Vec<(usize, &Value)> = blocks
         .iter()
-        .filter(|b| block_type(b) == Some("tool_use"))
+        .enumerate()
+        .filter(|(_, block)| block_type(block) == Some("tool_use"))
         .collect();
 
-    let mut thinking_blocks: Vec<&Value> = blocks
+    let mut thinking_blocks: Vec<(usize, &Value)> = blocks
         .iter()
-        .filter(|b| block_type(b) == Some("thinking"))
+        .enumerate()
+        .filter(|(_, block)| block_type(block) == Some("thinking"))
         .collect();
+    for (block_index, block) in &thinking_blocks {
+        validate_chat_thinking_block_extensions(block, &format!("{path}.content[{block_index}]"))?;
+    }
 
     if model_id.starts_with("claude") {
-        thinking_blocks.retain(|b| {
+        thinking_blocks.retain(|(_, block)| {
+            let b = *block;
             let thinking = b.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
             let signature = b.get("signature").and_then(|s| s.as_str()).unwrap_or("");
             !thinking.is_empty()
@@ -511,7 +767,8 @@ fn handle_assistant_message(
 
     let thinking_contents: Vec<String> = thinking_blocks
         .iter()
-        .filter_map(|b| {
+        .filter_map(|(_, block)| {
+            let b = *block;
             let thinking = b.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
             if !thinking.is_empty() && thinking != THINKING_TEXT {
                 Some(thinking.to_string())
@@ -527,7 +784,8 @@ fn handle_assistant_message(
         None
     };
 
-    let signature = thinking_blocks.iter().find_map(|b| {
+    let signature = thinking_blocks.iter().find_map(|(_, block)| {
+        let b = *block;
         let s = b.get("signature").and_then(|s| s.as_str()).unwrap_or("");
         if !s.is_empty() {
             Some(s.to_string())
@@ -546,35 +804,90 @@ fn handle_assistant_message(
     if !tool_use_blocks.is_empty() {
         let tool_calls: Vec<Value> = tool_use_blocks
             .iter()
-            .map(|tool_use| {
-                let id = tool_use.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let name = tool_use.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let input = tool_use.get("input").cloned().unwrap_or_else(|| json!({}));
-                let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
-                json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": arguments,
-                    },
-                })
+            .map(|(block_index, tool_use)| {
+                create_chat_tool_call(tool_use, &format!("{path}.content[{block_index}]"))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
+    merge_open_object_extensions(&message.extra, &[], &mut extra, path)?;
 
     Ok(vec![Message {
         role: "assistant".to_string(),
-        content: map_content(content, capabilities.support_pdf)?,
+        content: map_content(
+            &message.content,
+            capabilities.support_pdf,
+            &format!("{path}.content"),
+        )?,
         extra,
     }])
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_chat_thinking_block_extensions(block: &Value, path: &str) -> Result<(), AppError> {
+    let source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    if source
+        .get("cache_control")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(AppError::BadRequest(format!(
+            "{path}.cache_control cannot be represented by a Chat assistant message"
+        )));
+    }
+    let extensions = collect_open_object_extensions(
+        source,
+        &["type", "thinking", "signature", "cache_control"],
+        &["reasoning_text", "reasoning_opaque"],
+        path,
+    )?;
+    reject_unrepresentable_extensions(&extensions, path, "the scalar Chat reasoning fields")
+}
+
+#[allow(clippy::result_large_err)]
+fn create_chat_tool_call(block: &Value, path: &str) -> Result<Value, AppError> {
+    let source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    let id = source
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest(format!("{path}.id must be a string")))?;
+    let name = source
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest(format!("{path}.name must be a string")))?;
+    let input = source
+        .get("input")
+        .ok_or_else(|| AppError::BadRequest(format!("{path}.input is required")))?;
+    let arguments = serde_json::to_string(input)
+        .map_err(|error| AppError::Other(anyhow::anyhow!("{error}")))?;
+    let function = Map::from_iter([
+        ("name".to_string(), json!(name)),
+        ("arguments".to_string(), json!(arguments)),
+    ]);
+    let mut target = Map::from_iter([
+        ("id".to_string(), json!(id)),
+        ("type".to_string(), json!("function")),
+        ("function".to_string(), Value::Object(function)),
+    ]);
+    if let Some(cache_control) = source.get("cache_control").filter(|value| !value.is_null()) {
+        target.insert("cache_control".to_string(), cache_control.clone());
+    }
+    merge_open_object_extensions(
+        source,
+        &["type", "id", "name", "input", "cache_control"],
+        &mut target,
+        path,
+    )?;
+    Ok(Value::Object(target))
 }
 
 /// Mirrors `mapContent`. Returns `Some(string)` / `Some(array)` / `None`,
 /// matching the TS `string | Array<ContentPart> | null`.
 #[allow(clippy::result_large_err)]
-fn map_content(content: &Value, support_pdf: bool) -> Result<Option<Value>, AppError> {
+fn map_content(content: &Value, support_pdf: bool, path: &str) -> Result<Option<Value>, AppError> {
     if let Value::String(s) = content {
         return Ok(Some(Value::String(s.clone())));
     }
@@ -582,32 +895,30 @@ fn map_content(content: &Value, support_pdf: bool) -> Result<Option<Value>, AppE
         Value::Array(a) => a,
         _ => return Ok(None),
     };
+    map_content_blocks(blocks.iter().enumerate(), support_pdf, path)
+}
 
+#[allow(clippy::result_large_err)]
+fn map_content_blocks<'a>(
+    blocks: impl IntoIterator<Item = (usize, &'a Value)>,
+    support_pdf: bool,
+    path: &str,
+) -> Result<Option<Value>, AppError> {
     let mut content_parts: Vec<Value> = Vec::new();
-    for block in blocks {
+    for (block_index, block) in blocks {
+        let block_path = format!("{path}[{block_index}]");
         match block_type(block) {
             Some("text") => {
-                content_parts.push(json!({
-                    "type": "text",
-                    "text": block.get("text").and_then(|t| t.as_str()).unwrap_or(""),
-                }));
+                content_parts.push(create_chat_text_part(block, &block_path)?);
             }
             Some("image") => {
-                content_parts.push(json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_url_from_source(block.get("source"))?,
-                    },
-                }));
+                content_parts.push(create_chat_image_part(block, &block_path)?);
             }
             Some("document") => {
-                if support_pdf {
-                    content_parts.push(create_document_file_part(block));
-                } else {
-                    content_parts.push(create_document_text_part());
-                }
+                content_parts.push(create_chat_document_part(block, support_pdf, &block_path)?);
             }
             Some("tool_reference") => {
+                validate_unrepresentable_tool_reference_extensions(block, &block_path)?;
                 let tool_name = block
                     .get("tool_name")
                     .and_then(|t| t.as_str())
@@ -617,8 +928,19 @@ fn map_content(content: &Value, support_pdf: bool) -> Result<Option<Value>, AppE
                     "text": format!("Tool {tool_name} loaded"),
                 }));
             }
-            // No default
-            _ => {}
+            // These assistant-only blocks are represented by message-level
+            // reasoning/tool-call fields in `handle_assistant_message`.
+            Some("thinking" | "tool_use") => {}
+            Some(other) => {
+                return Err(AppError::BadRequest(format!(
+                    "{block_path}.type \"{other}\" is not supported by Chat Completions"
+                )));
+            }
+            None => {
+                return Err(AppError::BadRequest(format!(
+                    "{block_path}.type must be a non-empty string"
+                )));
+            }
         }
     }
 
@@ -626,6 +948,163 @@ fn map_content(content: &Value, support_pdf: bool) -> Result<Option<Value>, AppE
         return Ok(Some(Value::String(String::new())));
     }
     Ok(Some(Value::Array(content_parts)))
+}
+
+#[allow(clippy::result_large_err)]
+fn create_chat_image_part(block: &Value, path: &str) -> Result<Value, AppError> {
+    let block_source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    let source_path = format!("{path}.source");
+    let source = block_source
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AppError::BadRequest(format!("{source_path} must be an object")))?;
+    validate_source_field_usage(source, &source_path)?;
+    let source_extensions = collect_open_object_extensions(
+        source,
+        &["type", "media_type", "data", "url", "file_id"],
+        &["url"],
+        &source_path,
+    )?;
+    let mut image_url = Map::from_iter([(
+        "url".to_string(),
+        json!(image_url_from_source(block_source.get("source"))?),
+    )]);
+    image_url.extend(source_extensions);
+
+    let block_extensions = collect_open_object_extensions(
+        block_source,
+        &["type", "source", "cache_control"],
+        &["type", "image_url"],
+        path,
+    )?;
+    let mut target = Map::from_iter([
+        ("type".to_string(), json!("image_url")),
+        ("image_url".to_string(), Value::Object(image_url)),
+    ]);
+    if let Some(cache_control) = block_source
+        .get("cache_control")
+        .filter(|value| !value.is_null())
+    {
+        target.insert("cache_control".to_string(), cache_control.clone());
+    }
+    target.extend(block_extensions);
+    Ok(Value::Object(target))
+}
+
+#[allow(clippy::result_large_err)]
+fn create_chat_document_part(
+    block: &Value,
+    support_pdf: bool,
+    path: &str,
+) -> Result<Value, AppError> {
+    let block_source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    let source_path = format!("{path}.source");
+    let source = block_source
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AppError::BadRequest(format!("{source_path} must be an object")))?;
+    validate_source_field_usage(source, &source_path)?;
+    let source_extensions = collect_open_object_extensions(
+        source,
+        &["type", "media_type", "data", "url", "file_id"],
+        &["file_data", "filename"],
+        &source_path,
+    )?;
+    let block_extensions = collect_open_object_extensions(
+        block_source,
+        &["type", "source", "title", "cache_control"],
+        &["type", "file"],
+        path,
+    )?;
+    let has_cache_control = block_source
+        .get("cache_control")
+        .is_some_and(|value| !value.is_null());
+
+    if !support_pdf {
+        if has_cache_control || !source_extensions.is_empty() || !block_extensions.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "{path}: document extensions cannot be represented by the Chat text fallback"
+            )));
+        }
+        return Ok(create_document_text_part());
+    }
+
+    let filename = block_source
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("document.pdf");
+    let mut file = Map::from_iter([
+        (
+            "file_data".to_string(),
+            json!(image_url_from_source(block_source.get("source"))?),
+        ),
+        ("filename".to_string(), json!(filename)),
+    ]);
+    file.extend(source_extensions);
+    let mut target = Map::from_iter([
+        ("type".to_string(), json!("file")),
+        ("file".to_string(), Value::Object(file)),
+    ]);
+    if let Some(cache_control) = block_source
+        .get("cache_control")
+        .filter(|value| !value.is_null())
+    {
+        target.insert("cache_control".to_string(), cache_control.clone());
+    }
+    target.extend(block_extensions);
+    Ok(Value::Object(target))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_source_field_usage(source: &Map<String, Value>, path: &str) -> Result<(), AppError> {
+    let source_type = source
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("base64");
+    let unused_fields: &[&str] = match source_type {
+        "base64" => &["url", "file_id"],
+        "url" => &["media_type", "data", "file_id"],
+        _ => &[],
+    };
+    if let Some(field) = unused_fields
+        .iter()
+        .find(|field| source.get(**field).is_some_and(|value| !value.is_null()))
+    {
+        return Err(AppError::BadRequest(format!(
+            "{path}.{field} is not valid for a {source_type} source"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_unrepresentable_tool_reference_extensions(
+    block: &Value,
+    path: &str,
+) -> Result<(), AppError> {
+    let source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    let extensions = collect_open_object_extensions(
+        source,
+        &["type", "tool_name", "cache_control"],
+        &["type", "text"],
+        path,
+    )?;
+    if source
+        .get("cache_control")
+        .is_some_and(|value| !value.is_null())
+        || !extensions.is_empty()
+    {
+        return Err(AppError::BadRequest(format!(
+            "{path}: tool_reference extensions cannot be represented after Chat text conversion"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolves an Anthropic image `source` object into the `image_url.url` string
@@ -691,56 +1170,70 @@ fn create_document_text_part() -> Value {
     })
 }
 
-/// Mirrors `createDocumentFilePart`.
-fn create_document_file_part(block: &Value) -> Value {
-    let media_type = block
-        .get("source")
-        .and_then(|s| s.get("media_type"))
-        .and_then(|m| m.as_str())
-        .unwrap_or("");
-    let data = block
-        .get("source")
-        .and_then(|s| s.get("data"))
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
-    let filename = block
-        .get("title")
-        .and_then(|t| t.as_str())
-        .unwrap_or("document.pdf");
-    json!({
-        "type": "file",
-        "file": {
-            "file_data": format!("data:{media_type};base64,{data}"),
-            "filename": filename,
-        },
-    })
-}
-
 /// Mirrors `translateAnthropicToolsToOpenAI`.
+#[allow(clippy::result_large_err)]
 fn translate_anthropic_tools_to_openai(
     anthropic_tools: Option<&Vec<AnthropicTool>>,
-) -> Option<Vec<Value>> {
-    let tools = anthropic_tools?;
-    Some(
-        tools
-            .iter()
-            .map(|tool| {
-                let mut function = Map::new();
-                function.insert("name".to_string(), json!(tool.name));
-                if let Some(description) = &tool.description {
-                    function.insert("description".to_string(), json!(description));
-                }
-                function.insert(
-                    "parameters".to_string(),
-                    normalize_tool_schema(tool.input_schema.as_ref()),
-                );
-                json!({
-                    "type": "function",
-                    "function": Value::Object(function),
-                })
-            })
-            .collect(),
-    )
+) -> Result<Option<Vec<Value>>, AppError> {
+    let Some(tools) = anthropic_tools else {
+        return Ok(None);
+    };
+    let mut translated = Vec::with_capacity(tools.len());
+    for (index, tool) in tools.iter().enumerate() {
+        let path = format!("tools[{index}]");
+        validate_chat_tool_controls(tool, &path)?;
+        let mut function = Map::new();
+        function.insert("name".to_string(), json!(tool.name));
+        if let Some(description) = &tool.description {
+            function.insert("description".to_string(), json!(description));
+        }
+        function.insert(
+            "parameters".to_string(),
+            normalize_tool_schema(tool.input_schema.as_ref()),
+        );
+        if let Some(strict) = tool.strict {
+            function.insert("strict".to_string(), json!(strict));
+        }
+        let mut target = Map::from_iter([
+            ("type".to_string(), json!("function")),
+            ("function".to_string(), Value::Object(function)),
+        ]);
+        if let Some(cache_control) = tool.cache_control.as_ref().filter(|value| !value.is_null()) {
+            target.insert("cache_control".to_string(), cache_control.clone());
+        }
+        merge_open_object_extensions(&tool.extra, &[], &mut target, &path)?;
+        translated.push(Value::Object(target));
+    }
+    Ok(Some(translated))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_chat_tool_controls(tool: &AnthropicTool, path: &str) -> Result<(), AppError> {
+    if tool.input_schema.is_none() {
+        return Err(AppError::BadRequest(format!(
+            "{path}: server tools cannot be represented by Chat function tools"
+        )));
+    }
+    if tool.defer_loading == Some(true) {
+        return Err(AppError::BadRequest(format!(
+            "{path}.defer_loading cannot be represented by Chat Completions"
+        )));
+    }
+    for (field, present) in [
+        ("allowed_domains", tool.allowed_domains.is_some()),
+        ("blocked_domains", tool.blocked_domains.is_some()),
+        ("user_location", tool.user_location.is_some()),
+        ("allowed_callers", tool.allowed_callers.is_some()),
+        ("response_inclusion", tool.response_inclusion.is_some()),
+        ("max_uses", tool.max_uses.is_some()),
+    ] {
+        if present {
+            return Err(AppError::BadRequest(format!(
+                "{path}.{field} cannot be represented by a Chat function tool"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Mirrors `normalizeToolSchema`: ensures a `type: "object"` schema has a
@@ -763,21 +1256,37 @@ fn normalize_tool_schema(schema: Option<&Value>) -> Value {
 }
 
 /// Mirrors `translateAnthropicToolChoiceToOpenAI`.
+#[allow(clippy::result_large_err)]
 fn translate_anthropic_tool_choice_to_openai(
     anthropic_tool_choice: Option<&AnthropicToolChoice>,
-) -> Option<Value> {
-    let choice = anthropic_tool_choice?;
+) -> Result<Option<Value>, AppError> {
+    let Some(choice) = anthropic_tool_choice else {
+        return Ok(None);
+    };
+    let scalar = |value: Value| -> Result<Option<Value>, AppError> {
+        reject_unrepresentable_extensions(
+            &choice.extra,
+            "tool_choice",
+            "a scalar Chat tool_choice",
+        )?;
+        Ok(Some(value))
+    };
     match choice.kind.as_str() {
-        "auto" => Some(json!("auto")),
-        "any" => Some(json!("required")),
-        "tool" => choice.name.as_ref().map(|name| {
-            json!({
-                "type": "function",
-                "function": { "name": name },
-            })
-        }),
-        "none" => Some(json!("none")),
-        _ => None,
+        "auto" => scalar(json!("auto")),
+        "any" => scalar(json!("required")),
+        "tool" => {
+            let Some(name) = choice.name.as_ref() else {
+                return Ok(None);
+            };
+            let mut target = Map::from_iter([
+                ("type".to_string(), json!("function")),
+                ("function".to_string(), json!({ "name": name })),
+            ]);
+            merge_open_object_extensions(&choice.extra, &[], &mut target, "tool_choice")?;
+            Ok(Some(Value::Object(target)))
+        }
+        "none" => scalar(json!("none")),
+        _ => Ok(None),
     }
 }
 
@@ -1084,7 +1593,7 @@ mod tests {
             ],
         });
 
-        let result = handle_tool_result_block(&block, &caps).unwrap();
+        let result = handle_tool_result_block(&block, &caps, "messages[0].content[0]").unwrap();
         assert!(result.moved_user_message.is_some());
         // No text in the original content -> placeholder text used.
         assert_eq!(
@@ -1197,7 +1706,7 @@ mod tests {
             { "type": "text", "text": "first" },
             { "type": "text", "text": "second" },
         ]);
-        let messages = handle_system_prompt(Some(&system));
+        let messages = handle_system_prompt(Some(&system)).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "system");
         assert_eq!(
@@ -1209,7 +1718,7 @@ mod tests {
     #[test]
     fn system_prompt_string_passthrough() {
         let system = json!("you are helpful");
-        let messages = handle_system_prompt(Some(&system));
+        let messages = handle_system_prompt(Some(&system)).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].content,
@@ -1337,7 +1846,9 @@ mod tests {
             input_schema: Some(json!({ "type": "object" })),
             ..Default::default()
         }];
-        let out = translate_anthropic_tools_to_openai(Some(&tools)).unwrap();
+        let out = translate_anthropic_tools_to_openai(Some(&tools))
+            .unwrap()
+            .unwrap();
         assert_eq!(out.len(), 1);
         let params = out[0]
             .get("function")
@@ -1354,7 +1865,7 @@ mod tests {
             extra: Default::default(),
         };
         assert_eq!(
-            translate_anthropic_tool_choice_to_openai(Some(&auto)),
+            translate_anthropic_tool_choice_to_openai(Some(&auto)).unwrap(),
             Some(json!("auto"))
         );
         let any = AnthropicToolChoice {
@@ -1363,7 +1874,7 @@ mod tests {
             extra: Default::default(),
         };
         assert_eq!(
-            translate_anthropic_tool_choice_to_openai(Some(&any)),
+            translate_anthropic_tool_choice_to_openai(Some(&any)).unwrap(),
             Some(json!("required"))
         );
         let tool = AnthropicToolChoice {
@@ -1372,7 +1883,7 @@ mod tests {
             extra: Default::default(),
         };
         assert_eq!(
-            translate_anthropic_tool_choice_to_openai(Some(&tool)),
+            translate_anthropic_tool_choice_to_openai(Some(&tool)).unwrap(),
             Some(json!({ "type": "function", "function": { "name": "t" } }))
         );
         let none = AnthropicToolChoice {
@@ -1381,7 +1892,7 @@ mod tests {
             extra: Default::default(),
         };
         assert_eq!(
-            translate_anthropic_tool_choice_to_openai(Some(&none)),
+            translate_anthropic_tool_choice_to_openai(Some(&none)).unwrap(),
             Some(json!("none"))
         );
     }

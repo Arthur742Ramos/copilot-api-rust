@@ -6707,6 +6707,7 @@ fn configure_direct_copilot(fixture: &Fixture) {
         "gpt-direct-response-oversized",
         "gpt-direct-response-400",
         "gpt-direct-response-500",
+        "gpt-direct-chat-extensions",
     ];
     let models = ModelsResponse {
         object: "list".to_string(),
@@ -6715,7 +6716,11 @@ fn configure_direct_copilot(fixture: &Fixture) {
             .map(|id| Model {
                 id: id.to_string(),
                 name: id.to_string(),
-                supported_endpoints: Some(vec!["/responses".to_string()]),
+                supported_endpoints: Some(vec![if id == "gpt-direct-chat-extensions" {
+                    "/chat/completions".to_string()
+                } else {
+                    "/responses".to_string()
+                }]),
                 ..Default::default()
             })
             .collect(),
@@ -7064,9 +7069,21 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
     .into_iter()
     .map(|model| (model.to_string(), ModelConfig::default()))
     .collect();
-    let chat_models = [("gpt-chat-fixture".to_string(), ModelConfig::default())]
-        .into_iter()
-        .collect();
+    let chat_models = [
+        (
+            "gpt-chat-fixture".to_string(),
+            ModelConfig {
+                tool_content_support_type: Some(vec!["array".to_string(), "image".to_string()]),
+                ..Default::default()
+            },
+        ),
+        (
+            "gpt-chat-scalar-fixture".to_string(),
+            ModelConfig::default(),
+        ),
+    ]
+    .into_iter()
+    .collect();
     let providers = BTreeMap::from([
         (
             "anthropic-fixture".to_string(),
@@ -10718,6 +10735,608 @@ async fn claude_responses_controls_preserve_supported_and_reject_unrepresentable
     assert!(capture.body.get("top_k").is_none());
     assert!(capture.body.get("cache_control").is_none());
     assert!(capture.body.get("service_tier").is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_chat_extensions_preserve_scope_nulls_order_and_split_messages() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let body = json!({
+        "model":"chat-fixture/gpt-chat-fixture",
+        "max_tokens":128,
+        "top_k":4,
+        "service_tier":"auto",
+        "future_request_extension":{
+            "first":1,
+            "nested":{"keep":true,"null":null},
+            "last":2
+        },
+        "system":[
+            {
+                "type":"text",
+                "text":"system one",
+                "future_system_extension":{"keep":"system","null":null}
+            },
+            {
+                "type":"text",
+                "text":"system two",
+                "cache_control":{"type":"ephemeral","ttl":"1h"}
+            }
+        ],
+        "metadata":{"user_id":"chat-user"},
+        "output_config":{"effort":"high"},
+        "tools":[{
+            "name":"actual",
+            "description":"actual tool",
+            "input_schema":{"type":"object","properties":{}},
+            "strict":true,
+            "cache_control":{"type":"ephemeral"},
+            "future_tool_extension":{"keep":"tool","null":null}
+        }],
+        "tool_choice":{
+            "type":"tool",
+            "name":"actual",
+            "future_choice_extension":{"keep":"choice","null":null}
+        },
+        "messages":[
+            {
+                "role":"user",
+                "content":"plain user",
+                "future_plain_user":{"keep":"plain","null":null}
+            },
+            {
+                "role":"assistant",
+                "future_assistant_message":{"keep":"assistant","null":null},
+                "content":[
+                    {
+                        "type":"text",
+                        "text":"before tool",
+                        "future_assistant_text":{"keep":"text","null":null}
+                    },
+                    {
+                        "type":"tool_use",
+                        "id":"call",
+                        "name":"actual",
+                        "input":{"value":1},
+                        "cache_control":{"type":"ephemeral"},
+                        "future_tool_use":{"keep":"call","null":null}
+                    }
+                ]
+            },
+            {
+                "role":"user",
+                "future_split_user":{"keep":"split","null":null},
+                "content":[
+                    {
+                        "type":"tool_result",
+                        "tool_use_id":"call",
+                        "is_error":false,
+                        "cache_control":{"type":"ephemeral"},
+                        "future_tool_result":{"keep":"result","null":null},
+                        "content":[{
+                            "type":"text",
+                            "text":"done",
+                            "future_result_text":{"keep":"result-text","null":null}
+                        }]
+                    },
+                    {
+                        "type":"text",
+                        "text":"after result",
+                        "future_user_text":{"keep":"user-text","null":null}
+                    }
+                ]
+            }
+        ]
+    });
+    let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/chat/completions")
+        .expect("Chat extension capture");
+
+    assert_eq!(
+        capture.body["future_request_extension"],
+        json!({
+            "first":1,
+            "nested":{"keep":true,"null":null},
+            "last":2
+        })
+    );
+    let request_extension_keys: Vec<&str> = capture.body["future_request_extension"]
+        .as_object()
+        .expect("request extension object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(request_extension_keys, ["first", "nested", "last"]);
+    let request_keys: Vec<&str> = capture
+        .body
+        .as_object()
+        .expect("Chat request object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        request_keys
+            .iter()
+            .position(|key| *key == "future_request_extension")
+            > request_keys.iter().position(|key| *key == "service_tier")
+    );
+    assert_eq!(capture.body["top_k"], 4);
+    assert_eq!(capture.body["service_tier"], "auto");
+    assert_eq!(capture.body["reasoning_effort"], "high");
+    assert_eq!(capture.body["user"], "chat-user");
+    assert_eq!(
+        capture.body["tools"][0]["future_tool_extension"],
+        json!({"keep":"tool","null":null})
+    );
+    assert_eq!(capture.body["tools"][0]["function"]["strict"], true);
+    assert_eq!(
+        capture.body["tool_choice"]["future_choice_extension"],
+        json!({"keep":"choice","null":null})
+    );
+
+    let messages = capture.body["messages"]
+        .as_array()
+        .expect("Chat message array");
+    let system = messages
+        .iter()
+        .find(|message| message["role"] == "system")
+        .expect("structured system message");
+    assert!(system["content"].is_array());
+    assert_eq!(
+        system["content"][0]["future_system_extension"],
+        json!({"keep":"system","null":null})
+    );
+    assert_eq!(
+        system["content"][1]["cache_control"],
+        json!({"type":"ephemeral","ttl":"1h"})
+    );
+
+    let plain_user = messages
+        .iter()
+        .find(|message| message.get("future_plain_user").is_some())
+        .expect("plain user extension");
+    assert_eq!(
+        plain_user["future_plain_user"],
+        json!({"keep":"plain","null":null})
+    );
+    assert_eq!(
+        plain_user
+            .as_object()
+            .and_then(|message| message.keys().next_back())
+            .map(String::as_str),
+        Some("future_plain_user")
+    );
+
+    let assistant = messages
+        .iter()
+        .find(|message| message.get("future_assistant_message").is_some())
+        .expect("assistant extension");
+    assert_eq!(
+        assistant["future_assistant_message"],
+        json!({"keep":"assistant","null":null})
+    );
+    assert_eq!(
+        assistant["content"][0]["future_assistant_text"],
+        json!({"keep":"text","null":null})
+    );
+    assert_eq!(
+        assistant["tool_calls"][0]["future_tool_use"],
+        json!({"keep":"call","null":null})
+    );
+    assert_eq!(
+        assistant["tool_calls"][0]["cache_control"],
+        json!({"type":"ephemeral"})
+    );
+
+    let tool = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool result message");
+    assert_eq!(tool["tool_call_id"], "call");
+    assert_eq!(tool["is_error"], false);
+    assert_eq!(
+        tool["future_tool_result"],
+        json!({"keep":"result","null":null})
+    );
+    assert_eq!(
+        tool["content"][0]["future_result_text"],
+        json!({"keep":"result-text","null":null})
+    );
+    assert!(
+        tool.get("future_split_user").is_none(),
+        "wrapper extension must not move onto the tool result"
+    );
+
+    let split_user = messages
+        .iter()
+        .find(|message| message.get("future_split_user").is_some())
+        .expect("split user extension");
+    assert_eq!(
+        split_user["future_split_user"],
+        json!({"keep":"split","null":null})
+    );
+    assert_eq!(
+        split_user["content"][0]["future_user_text"],
+        json!({"keep":"user-text","null":null})
+    );
+
+    let rich_body = json!({
+        "model":"chat-fixture/gpt-chat-scalar-fixture",
+        "max_tokens":128,
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[
+            {
+                "role":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"rich-call",
+                    "name":"actual",
+                    "input":{}
+                }]
+            },
+            {
+                "role":"user",
+                "future_rich_wrapper":{"keep":"moved","null":null},
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"rich-call",
+                    "future_rich_result":{"keep":"tool","null":null},
+                    "content":[{
+                        "type":"image",
+                        "source":{
+                            "type":"base64",
+                            "media_type":"image/png",
+                            "data":"AAAA"
+                        }
+                    }]
+                }]
+            }
+        ]
+    });
+    let (status, response) = send(post_json("/v1/messages", rich_body, Some(CLIENT_KEY))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let rich_capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/chat/completions")
+        .expect("rich Chat split capture");
+    let rich_messages = rich_capture.body["messages"]
+        .as_array()
+        .expect("rich Chat messages");
+    let rich_tool = rich_messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("rich tool message");
+    assert_eq!(
+        rich_tool["future_rich_result"],
+        json!({"keep":"tool","null":null})
+    );
+    assert!(rich_tool.get("future_rich_wrapper").is_none());
+    let moved_user = rich_messages
+        .iter()
+        .find(|message| message.get("future_rich_wrapper").is_some())
+        .expect("single moved user carrier");
+    assert_eq!(
+        moved_user["future_rich_wrapper"],
+        json!({"keep":"moved","null":null})
+    );
+    assert_eq!(moved_user["content"][1]["type"], "image_url");
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_direct_chat_preprocessing_keeps_split_message_extension_carrier() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure_direct_copilot(&fixture);
+    let body = json!({
+        "model":"gpt-direct-chat-extensions",
+        "max_tokens":128,
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[
+            {
+                "role":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call",
+                    "name":"actual",
+                    "input":{}
+                }]
+            },
+            {
+                "role":"user",
+                "future_direct_split":{"keep":true,"null":null},
+                "content":[
+                    {
+                        "type":"tool_result",
+                        "tool_use_id":"call",
+                        "content":"done"
+                    },
+                    {"type":"text","text":"after result"}
+                ]
+            }
+        ]
+    });
+    let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/chat/completions")
+        .expect("direct Chat split capture");
+    let messages = capture.body["messages"]
+        .as_array()
+        .expect("direct Chat messages");
+    let tool = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("direct tool result");
+    assert!(tool.get("future_direct_split").is_none());
+    let user = messages
+        .iter()
+        .find(|message| message.get("future_direct_split").is_some())
+        .expect("direct user extension carrier");
+    assert_eq!(
+        user["future_direct_split"],
+        json!({"keep":true,"null":null})
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_chat_extensions_reject_collisions_and_unrepresentable_scopes() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let base = || {
+        json!({
+            "model":"chat-fixture/gpt-chat-fixture",
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"hello"}]
+        })
+    };
+
+    let mut cases = Vec::new();
+    let mut body = base();
+    body["stop"] = json!(["bypass"]);
+    cases.push(("request stop collision", body));
+
+    let mut body = base();
+    body["messages"][0]["tool_call_id"] = json!("override");
+    cases.push(("user message collision", body));
+
+    let mut body = base();
+    body["messages"][0] = json!({
+        "role":"assistant",
+        "content":"answer",
+        "tool_calls":[]
+    });
+    cases.push(("assistant message collision", body));
+
+    let mut body = base();
+    body["metadata"] = json!({"user_id":"user","future_metadata":{"drop":true}});
+    cases.push(("metadata extension", body));
+
+    let mut body = base();
+    body["thinking"] =
+        json!({"type":"enabled","budget_tokens":1024,"future_thinking":{"drop":true}});
+    cases.push(("thinking config extension", body));
+
+    let mut body = base();
+    body["output_config"] = json!({"effort":"high","future_output":{"drop":true}});
+    cases.push(("output config extension", body));
+
+    let mut body = base();
+    body["cache_control"] = json!({"type":"ephemeral"});
+    cases.push(("top-level cache control", body));
+
+    let mut body = base();
+    body["system"] = json!([{
+        "type":"text",
+        "text":"ordinary system",
+        "future_system":{"keep":true}
+    }]);
+    body["messages"][0]["content"] = json!([{
+        "type":"document",
+        "source":{
+            "type":"base64",
+            "media_type":"application/pdf",
+            "data":"AAAA"
+        },
+        "future_document":{"cannot_flatten":true}
+    }]);
+    cases.push(("document fallback extension", body));
+
+    let mut body = base();
+    body["tools"] = json!([{
+        "name":"actual",
+        "input_schema":{"type":"object"},
+        "function":{"override":true}
+    }]);
+    cases.push(("tool canonical collision", body));
+
+    let mut body = base();
+    body["tools"] = json!([{
+        "name":"actual",
+        "input_schema":{"type":"object"}
+    }]);
+    body["tool_choice"] = json!({
+        "type":"tool",
+        "name":"actual",
+        "function":{"override":true}
+    });
+    cases.push(("tool choice canonical collision", body));
+
+    let mut body = base();
+    body["tools"] = json!([{
+        "name":"actual",
+        "input_schema":{"type":"object"},
+        "defer_loading":true
+    }]);
+    cases.push(("deferred tool", body));
+
+    let mut body = base();
+    body["messages"][0]["content"] = json!([{
+        "type":"image",
+        "source":{
+            "type":"base64",
+            "media_type":"image/png",
+            "data":"AAAA",
+            "url":"https://invalid.example/image.png"
+        }
+    }]);
+    cases.push(("inconsistent image source", body));
+
+    let body = json!({
+        "model":"chat-fixture/gpt-chat-fixture",
+        "max_tokens":128,
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[
+            {
+                "role":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call",
+                    "name":"actual",
+                    "input":{}
+                }]
+            },
+            {
+                "role":"user",
+                "future_tool_result_wrapper":{"cannot_move":true},
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"call",
+                    "content":"done"
+                }]
+            }
+        ]
+    });
+    cases.push(("tool-result-only wrapper extension", body));
+
+    let body = json!({
+        "model":"chat-fixture/gpt-chat-fixture",
+        "max_tokens":128,
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[
+            {
+                "role":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call",
+                    "name":"actual",
+                    "input":{}
+                }]
+            },
+            {
+                "role":"user",
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"call",
+                    "role":"assistant",
+                    "content":"done"
+                }]
+            }
+        ]
+    });
+    cases.push(("tool result message collision", body));
+
+    let body = json!({
+        "model":"chat-fixture/gpt-chat-fixture",
+        "max_tokens":128,
+        "messages":[{
+            "role":"assistant",
+            "content":[{
+                "type":"thinking",
+                "thinking":"reason",
+                "signature":"sig",
+                "future_thinking_block":{"cannot_move":true}
+            }]
+        }]
+    });
+    cases.push(("thinking block extension", body));
+
+    let body = json!({
+        "model":"chat-fixture/gpt-chat-scalar-fixture",
+        "max_tokens":128,
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[
+            {
+                "role":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call",
+                    "name":"actual",
+                    "input":{}
+                }]
+            },
+            {
+                "role":"user",
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"call",
+                    "content":[{
+                        "type":"text",
+                        "text":"done",
+                        "future_result_text":{"cannot_flatten":true}
+                    }]
+                }]
+            }
+        ]
+    });
+    cases.push(("scalar tool content extension", body));
+
+    for (label, body) in cases {
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_anthropic_invalid_request(&response, label);
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
 }
 
 fn binary_schema(depth: usize) -> Value {

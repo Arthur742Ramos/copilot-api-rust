@@ -967,7 +967,8 @@ fn apply_context_cache_control(
         Some(Value::Array(mut parts)) => {
             if let Some(last) = parts.last_mut() {
                 if let Some(obj) = last.as_object_mut() {
-                    obj.insert("cache_control".to_string(), cache_control);
+                    obj.entry("cache_control".to_string())
+                        .or_insert(cache_control);
                 }
             }
             message.content = Some(Value::Array(parts));
