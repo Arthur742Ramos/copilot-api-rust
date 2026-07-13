@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 11,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -56,6 +56,11 @@
       "iteration": 10,
       "verdict": "FAIL",
       "summary": "Scalar parity and web fixtures pass, but nullable terminal status is over-rejected, full-created web-search snapshots are not reconciled, and raw output variants become empty end_turn success."
+    },
+    {
+      "iteration": 11,
+      "verdict": "FAIL",
+      "summary": "Nullable statuses and raw variants now pass, but model-less web snapshots fail, optional usage details and IDs are over-rejected, nested details can conflict silently, and native non-stream nulls are elided."
     }
   ]
 }
