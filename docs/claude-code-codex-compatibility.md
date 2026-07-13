@@ -198,6 +198,11 @@ arrays). Unknown keywords and values remain byte-semantically unchanged.
 Validation is bounded to depth 64, 4,096 schema nodes, and 4,096 entries per
 known collection. An object schema with `type: "object"` and no `properties`
 retains the established empty-properties normalization.
+The known `type` keyword accepts only `null`, `boolean`, `object`, `array`,
+`number`, `string`, or `integer`; arrays must be non-empty, unique subsets of
+those values. `required`, `dependentRequired`, and legacy name-array
+dependencies contain unique non-blank property names. `enum`, `const`, and
+unknown keywords are not semantically interpreted and remain unchanged.
 
 An explicit `tool_choice` of type `tool` must name exactly one declared
 non-deferred function. Server tools and deferred functions cannot be selected as
@@ -206,6 +211,22 @@ maps deliberately to Responses `auto` only when the resolved model supports tool
 search and the catalog contains a real `defer_loading: true` tool. `auto`, `any`,
 and `none` accept no `name`; duplicate catalog names fail before choice
 resolution.
+
+Open-object extensions use a per-target policy rather than blanket dropping:
+
+- Benign unknown keys on function tools, deferred namespaces, the tool-search
+  bridge, and web-search tools are appended to the corresponding open Responses
+  object in source order. `strict` maps to the canonical function field.
+- Object-form function choices preserve unknown keys after canonical `type` and
+  `name`. Scalar `auto`/`required`/`none` choices and the bridge-to-`auto`
+  exception cannot represent extensions and reject them explicitly.
+- Extensions that collide with a canonical target key (`parameters`, namespace
+  `tools`, bridge `execution`, web `filters`, and analogous content/item keys)
+  fail with a path-specific Anthropic 400 before provider dispatch.
+- Metadata extras already serialize directly. Representable text, media,
+  tool-use/result, thinking, source, thinking-config, and output-config extras
+  are retained on their open target objects; unrepresentable structured-system
+  extras fail explicitly. Large base64 data is not duplicated.
 
 System blocks, metadata, thinking/output configuration, stop sequences, cache
 controls, text/image/document sources, tool-use inputs, and tool-result content
@@ -231,6 +252,7 @@ allowed. Exact public evidence is in
 `claude_tool_choice_must_resolve_to_one_compatible_declared_tool`,
 `claude_recursive_schema_shape_and_bounds_fail_before_dispatch`,
 `claude_complex_boolean_schemas_choices_and_sources_preserve_supported_shape`,
+`claude_open_object_extension_collisions_fail_before_provider_dispatch`,
 and `claude_unsupported_source_types_fail_before_admission_or_dispatch`.
 
 ### Reasoning framing and stream lifecycle policy
@@ -591,7 +613,7 @@ Status means deterministic, credential-free evidence exists.
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
 | Usage | strict nonnegative input/output/cache mapping; malformed Responses usage errors once | OpenAI cached/reasoning token details | public valid/absent/partial/type/range/overflow usage fixtures |
 | Model routing | aliases, `[1m]`, provider models; model-less created events use validated request context | aliases and `provider/model` | model helpers and public model-less-created boundary tests |
-| Unknown fields/output variants | known-field extensions retained; unsupported raw outputs fail explicitly in Messages | typed extensions and all raw variants preserved natively | captured sentinels, paired raw-variant failures, and native passthrough audit |
+| Unknown fields/output variants | representable open-object extensions retain value/order; canonical collisions and scalar-target extensions fail explicitly; unsupported raw outputs fail explicitly | typed extensions and all raw variants preserved natively | captured tool/choice/content/config sentinels, collision fixtures, paired raw-variant failures, and native passthrough audit |
 | Cancellation | response-body drop releases admission/upstream resources | same | load-shedding and WebSocket cancellation tests |
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |

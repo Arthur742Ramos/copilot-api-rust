@@ -9567,6 +9567,7 @@ async fn claude_web_search_request_policy_preserves_valid_empty_duplicate_and_un
         capture.body["tools"][0]["user_location"]["future_location_key"]["keep"],
         true
     );
+    assert_eq!(capture.body["tools"][0]["future_tool_key"]["keep"], true);
 
     let before = fixture.requests().len();
     let (status, _) = send(web_search_policy_request(json!({
@@ -9637,7 +9638,8 @@ fn deferred_reference_body(content: Option<Value>, defer_loading: bool) -> Value
     let mut tool_result = json!({
         "type":"tool_result",
         "tool_use_id":"search-call",
-        "is_error":false
+        "is_error":false,
+        "future_tool_result":{"keep":true}
     });
     if let Some(content) = content {
         tool_result["content"] = content;
@@ -9685,7 +9687,8 @@ fn deferred_reference_body(content: Option<Value>, defer_loading: bool) -> Value
                     "type":"tool_use",
                     "id":"search-call",
                     "name":"mcp__tool_search__search",
-                    "input":{"names":["mcp__weather"]}
+                    "input":{"names":["mcp__weather"]},
+                    "future_tool_use":{"keep":true}
                 }]
             },
             {"role":"user","content":[tool_result]}
@@ -9963,7 +9966,8 @@ async fn claude_tool_choice_must_resolve_to_one_compatible_declared_tool() {
                 "tools":[
                     {
                         "name":"mcp__tool_search__search",
-                        "input_schema":{"type":"object"}
+                        "input_schema":{"type":"object"},
+                        "future_bridge":{"keep":true}
                     },
                     {
                         "name":"mcp__deferred",
@@ -9972,6 +9976,31 @@ async fn claude_tool_choice_must_resolve_to_one_compatible_declared_tool() {
                     }
                 ],
                 "tool_choice":{"type":"tool","name":"mcp__tool_search__search"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "bridge choice extension",
+            json!({
+                "model":"responses-fixture/gpt-5.4",
+                "max_tokens":128,
+                "tools":[
+                    {
+                        "name":"mcp__tool_search__search",
+                        "input_schema":{"type":"object"},
+                        "future_bridge":{"keep":true}
+                    },
+                    {
+                        "name":"mcp__deferred",
+                        "defer_loading":true,
+                        "input_schema":{"type":"object"}
+                    }
+                ],
+                "tool_choice":{
+                    "type":"tool",
+                    "name":"mcp__tool_search__search",
+                    "future_choice":true
+                },
                 "messages":[{"role":"user","content":"choose"}]
             }),
         ),
@@ -10033,6 +10062,135 @@ async fn claude_tool_choice_must_resolve_to_one_compatible_declared_tool() {
         assert!(json_body(&response)["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains(expected_path)));
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_open_object_extension_collisions_fail_before_provider_dispatch() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let mut cases = Vec::new();
+    let mut body = tool_schema_messages_body("gpt-fixture", json!({"type":"object"}), None);
+    body["tools"][0]["parameters"] = json!({"override":true});
+    cases.push(("function parameters collision", body));
+    let body = json!({
+        "model":"responses-fixture/gpt-5.4",
+        "max_tokens":128,
+        "tools":[{
+            "name":"mcp__deferred",
+            "defer_loading":true,
+            "input_schema":{"type":"object"},
+            "tools":[]
+        }],
+        "messages":[{"role":"user","content":"collision"}]
+    });
+    cases.push(("deferred tools collision", body));
+    let body = json!({
+        "model":"responses-fixture/gpt-5.4",
+        "max_tokens":128,
+        "tools":[{
+            "name":"mcp__tool_search__search",
+            "input_schema":{"type":"object"},
+            "execution":"server"
+        }],
+        "messages":[{"role":"user","content":"collision"}]
+    });
+    cases.push(("bridge execution collision", body));
+    let body = json!({
+        "model":"claude-sonnet-4-6",
+        "max_tokens":128,
+        "tools":[{
+            "type":"web_search_20250305",
+            "name":"web_search",
+            "filters":{"override":true}
+        }],
+        "messages":[{"role":"user","content":"collision"}]
+    });
+    cases.push(("web filters collision", body));
+    let body = tool_schema_messages_body(
+        "gpt-fixture",
+        json!({"type":"object"}),
+        Some(json!({"type":"auto","future_choice":true})),
+    );
+    cases.push(("scalar choice extension", body));
+
+    let body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "messages":[{
+            "role":"user",
+            "content":[{
+                "type":"image",
+                "image_url":"collision",
+                "source":{"type":"url","url":"https://example.test/image.png"}
+            }]
+        }]
+    });
+    cases.push(("image canonical collision", body));
+    let body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "messages":[{
+            "role":"assistant",
+            "content":[{
+                "type":"tool_use",
+                "id":"call",
+                "name":"tool",
+                "input":{},
+                "call_id":"collision"
+            }]
+        }]
+    });
+    cases.push(("tool use canonical collision", body));
+    let body = tool_result_messages_body(json!({
+        "type":"tool_result",
+        "tool_use_id":"call",
+        "content":"result",
+        "output":"collision"
+    }));
+    cases.push(("tool result canonical collision", body));
+    let body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "messages":[{
+            "role":"assistant",
+            "content":[{
+                "type":"thinking",
+                "thinking":"analysis",
+                "signature":"enc@id",
+                "summary":"collision"
+            }]
+        }]
+    });
+    cases.push(("thinking block collision", body));
+    let mut body = base_provider_messages_body();
+    body["thinking"] = json!({"type":"enabled","budget_tokens":1024,"effort":"collision"});
+    cases.push(("thinking config collision", body));
+    let mut body = base_provider_messages_body();
+    body["output_config"] = json!({"effort":"high","summary":"collision"});
+    cases.push(("output config collision", body));
+    let mut body = base_provider_messages_body();
+    body["system"] = json!([{
+        "type":"text",
+        "text":"system",
+        "future_system":{"cannot":"represent"}
+    }]);
+    cases.push(("system extension", body));
+
+    for (label, body) in cases {
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_anthropic_invalid_request(&response, label);
         assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
     }
 }
@@ -10103,8 +10261,27 @@ async fn claude_recursive_schema_shape_and_bounds_fail_before_dispatch() {
         ("dependencies container", json!({"dependencies":[] })),
         ("dependencies scalar", json!({"dependencies":{"x":7}})),
         ("reference type", json!({"$ref":7})),
+        ("type unknown", json!({"type":"future"})),
+        ("type empty", json!({"type":""})),
         ("type array empty", json!({"type":[]})),
         ("type array mixed", json!({"type":["object",7]})),
+        ("type array unknown", json!({"type":["object","future"]})),
+        ("type array duplicate", json!({"type":["string","string"]})),
+        ("required empty name", json!({"required":[""]})),
+        ("required blank name", json!({"required":["  "]})),
+        ("required duplicate", json!({"required":["x","x"]})),
+        (
+            "dependent required empty",
+            json!({"dependentRequired":{"x":[""]}}),
+        ),
+        (
+            "dependent required duplicate",
+            json!({"dependentRequired":{"x":["y","y"]}}),
+        ),
+        (
+            "dependencies duplicate",
+            json!({"dependencies":{"x":["y","y"]}}),
+        ),
         ("depth bound", too_deep),
         ("node bound", binary_schema(12)),
         (
@@ -10144,7 +10321,10 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
         "type":["object","null"],
         "properties":{
             "path":{"type":"string"},
-            "flags":{"type":"array","items":[true,{"not":false}]}
+            "flags":{"type":"array","items":[true,{"not":false}]},
+            "all_types":{
+                "type":["null","boolean","object","array","number","string","integer"]
+            }
         },
         "patternProperties":{"^x-":false},
         "$defs":{"name":{"type":"string"}},
@@ -10166,18 +10346,21 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
         "required":["path"],
         "dependentRequired":{"path":["flags"]},
         "dependencies":{"legacy":["path"],"schema":true},
+        "enum":[null,1,"x",{"unknown":true}],
+        "const":{"unknown":["value"]},
         "future_keyword":{"opaque":[1,2,3]}
     });
-    let (status, _) = send(post_json(
-        "/v1/messages",
-        tool_schema_messages_body(
-            "gpt-fixture",
-            complex_schema.clone(),
-            Some(json!({"type":"tool","name":"selected_tool","future_choice":true})),
-        ),
-        Some(CLIENT_KEY),
-    ))
-    .await;
+    let mut complex_body = tool_schema_messages_body(
+        "gpt-fixture",
+        complex_schema.clone(),
+        Some(json!({"type":"tool","name":"selected_tool","future_choice":true})),
+    );
+    complex_body["metadata"] = json!({"user_id":"session-1","future_metadata":{"keep":true}});
+    complex_body["tools"][0]["strict"] = json!(true);
+    complex_body["thinking"] =
+        json!({"type":"enabled","budget_tokens":1024,"future_thinking":{"keep":true}});
+    complex_body["output_config"] = json!({"effort":"high","future_output_config":{"keep":true}});
+    let (status, _) = send(post_json("/v1/messages", complex_body, Some(CLIENT_KEY))).await;
     assert_eq!(status, StatusCode::OK);
     let capture = fixture
         .requests()
@@ -10188,7 +10371,16 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
     assert_eq!(capture.body["tools"][0]["parameters"], complex_schema);
     assert_eq!(
         capture.body["tool_choice"],
-        json!({"type":"function","name":"selected_tool"})
+        json!({"type":"function","name":"selected_tool","future_choice":true})
+    );
+    assert_eq!(capture.body["tools"][0]["future_tool_key"]["keep"], true);
+    assert_eq!(capture.body["tools"][0]["strict"], true);
+    assert_eq!(capture.body["metadata"]["future_metadata"]["keep"], true);
+    assert_eq!(capture.body["reasoning"]["effort"], "high");
+    assert_eq!(capture.body["reasoning"]["future_thinking"]["keep"], true);
+    assert_eq!(
+        capture.body["reasoning"]["future_output_config"]["keep"],
+        true
     );
 
     let (status, _) = send(post_json(
@@ -10237,7 +10429,8 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
         "tools":[
             {
                 "name":"mcp__tool_search__search",
-                "input_schema":{"type":"object"}
+                "input_schema":{"type":"object"},
+                "future_bridge":{"keep":true}
             },
             {
                 "name":"mcp__weather",
@@ -10247,7 +10440,8 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
             {
                 "name":"ordinary_tool",
                 "defer_loading":false,
-                "input_schema":{"type":"object"}
+                "input_schema":{"type":"object"},
+                "future_ordinary":{"keep":true}
             }
         ],
         "tool_choice":{"type":"tool","name":"mcp__tool_search__search"},
@@ -10270,6 +10464,13 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
             .iter()
             .any(|tool| tool["type"] == "function" && tool["name"] == "ordinary_tool")
     }));
+    let tools = capture.body["tools"].as_array().expect("translated tools");
+    assert!(tools
+        .iter()
+        .any(|tool| { tool["type"] == "tool_search" && tool["future_bridge"]["keep"] == true }));
+    assert!(tools.iter().any(|tool| {
+        tool["name"] == "ordinary_tool" && tool["future_ordinary"]["keep"] == true
+    }));
 
     let source_body = json!({
         "model":"responses-fixture/gpt-fixture",
@@ -10279,6 +10480,7 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
             "content":[
                 {
                     "type":"image",
+                    "future_image_block":{"keep":true},
                     "source":{
                         "type":"base64",
                         "media_type":"image/png",
@@ -10289,6 +10491,7 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
                 {
                     "type":"document",
                     "title":"doc.pdf",
+                    "future_document_block":{"keep":true},
                     "source":{
                         "type":"url",
                         "url":"https://example.test/doc.pdf",
@@ -10311,10 +10514,103 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
         content[0]["anthropic_source_extensions"]["future_image_key"]["keep"],
         true
     );
+    assert_eq!(content[0]["future_image_block"]["keep"], true);
     assert_eq!(
         content[1]["anthropic_source_extensions"]["future_document_key"]["keep"],
         true
     );
+    assert_eq!(content[1]["future_document_block"]["keep"], true);
+
+    let open_blocks_body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "messages":[{
+            "role":"assistant",
+            "content":[
+                {
+                    "type":"thinking",
+                    "thinking":"analysis",
+                    "signature":"enc@id",
+                    "future_thinking_block":{"keep":true}
+                },
+                {
+                    "type":"text",
+                    "text":"answer",
+                    "future_text_block":{"keep":true}
+                }
+            ]
+        }]
+    });
+    let (status, _) = send(post_json(
+        "/v1/messages",
+        open_blocks_body,
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("open content capture");
+    let input = capture.body["input"].as_array().expect("translated input");
+    assert!(input.iter().any(|item| {
+        item["type"] == "reasoning" && item["future_thinking_block"]["keep"] == true
+    }));
+    assert!(input.iter().any(|item| {
+        item["type"] == "message" && item["content"][0]["future_text_block"]["keep"] == true
+    }));
+
+    let function_blocks_body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[
+            {
+                "role":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call",
+                    "name":"actual",
+                    "input":{},
+                    "future_tool_use":{"keep":true}
+                }]
+            },
+            {
+                "role":"user",
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"call",
+                    "content":"done",
+                    "future_tool_result":{"keep":true}
+                }]
+            }
+        ]
+    });
+    let (status, _) = send(post_json(
+        "/v1/messages",
+        function_blocks_body,
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("open tool block capture");
+    let input = capture.body["input"].as_array().expect("translated input");
+    assert!(input.iter().any(|item| {
+        item["type"] == "function_call" && item["future_tool_use"]["keep"] == true
+    }));
+    assert!(input.iter().any(|item| {
+        item["type"] == "function_call_output" && item["future_tool_result"]["keep"] == true
+    }));
 }
 
 #[tokio::test]
@@ -10502,6 +10798,16 @@ async fn claude_deferred_tool_empty_duplicate_and_unknown_extensions_are_explici
                 .find(|item| item["type"] == "tool_search_output")
         })
         .expect("tool-search output");
+    let call = capture.body["input"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["type"] == "tool_search_call"))
+        .expect("tool-search call");
+    assert_eq!(call["future_tool_use"]["keep"], true);
+    assert_eq!(output["future_tool_result"]["keep"], true);
+    assert_eq!(
+        output["anthropic_tool_reference_extensions"][0]["future_reference_key"]["keep"],
+        true
+    );
     assert_eq!(output["tools"].as_array().map(Vec::len), Some(3));
     assert_eq!(output["tools"][0]["name"], "mcp__weather");
     assert_eq!(output["tools"][1]["name"], "mcp__forecast");
@@ -10510,6 +10816,7 @@ async fn claude_deferred_tool_empty_duplicate_and_unknown_extensions_are_explici
         output["tools"][0]["tools"][0]["parameters"]["future_schema_key"]["keep"],
         true
     );
+    assert_eq!(output["tools"][0]["future_tool_key"]["keep"], true);
 
     let (status, _) = send(post_json(
         "/v1/messages",

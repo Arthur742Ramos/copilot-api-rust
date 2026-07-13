@@ -189,6 +189,7 @@ pub fn extract_web_search_config(
         allowed_domains: tool.and_then(|tool| tool.allowed_domains.clone()),
         blocked_domains: tool.and_then(|tool| tool.blocked_domains.clone()),
         user_location: tool.and_then(|tool| tool.user_location.clone()),
+        extensions: tool.map(|tool| tool.extra.clone()).unwrap_or_default(),
     })
 }
 
@@ -303,7 +304,7 @@ pub fn prepare_web_search_responses_payload(
 
     let mut responses_payload =
         translate_anthropic_messages_to_responses_payload(&switched, subagent_agent_id)?;
-    responses_payload.tools = Some(vec![build_responses_web_search_tool(&config)]);
+    responses_payload.tools = Some(vec![build_responses_web_search_tool(&config)?]);
     responses_payload.tool_choice = None;
     Ok(responses_payload)
 }

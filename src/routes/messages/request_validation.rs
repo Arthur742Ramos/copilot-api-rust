@@ -7,7 +7,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -29,6 +29,79 @@ type ToolUseCatalog = HashMap<String, String>;
 pub const MAX_REQUEST_SCHEMA_DEPTH: usize = 64;
 pub const MAX_REQUEST_SCHEMA_NODES: usize = 4096;
 pub const MAX_REQUEST_SCHEMA_COLLECTION_ITEMS: usize = 4096;
+
+const JSON_SCHEMA_TYPES: &[&str] = &[
+    "null", "boolean", "object", "array", "number", "string", "integer",
+];
+
+pub(crate) const ANTHROPIC_TOOL_KNOWN_FIELDS: &[&str] = &[
+    "name",
+    "description",
+    "input_schema",
+    "defer_loading",
+    "cache_control",
+    "allowed_domains",
+    "blocked_domains",
+    "user_location",
+    "allowed_callers",
+    "response_inclusion",
+    "max_uses",
+    "strict",
+    "type",
+];
+
+pub(crate) fn merge_open_object_extensions(
+    source: &Map<String, Value>,
+    known_source_fields: &[&str],
+    target: &mut Map<String, Value>,
+    path: &str,
+) -> Result<(), AppError> {
+    for (key, value) in source {
+        if known_source_fields.contains(&key.as_str()) {
+            continue;
+        }
+        if target.contains_key(key) {
+            return Err(invalid(
+                &format!("{path}.{key}"),
+                "extension collides with a canonical Responses field",
+            ));
+        }
+        target.insert(key.clone(), value.clone());
+    }
+    Ok(())
+}
+
+pub(crate) fn collect_open_object_extensions(
+    source: &Map<String, Value>,
+    known_source_fields: &[&str],
+    canonical_target_fields: &[&str],
+    path: &str,
+) -> Result<Map<String, Value>, AppError> {
+    let mut extensions = Map::new();
+    for (key, value) in source {
+        if known_source_fields.contains(&key.as_str()) {
+            continue;
+        }
+        if canonical_target_fields.contains(&key.as_str()) {
+            return Err(invalid(
+                &format!("{path}.{key}"),
+                "extension collides with a canonical Responses field",
+            ));
+        }
+        extensions.insert(key.clone(), value.clone());
+    }
+    Ok(extensions)
+}
+
+fn validate_extension_collisions(
+    source: &Map<String, Value>,
+    known_source_fields: &[&str],
+    canonical_target_fields: &[&str],
+    path: &str,
+) -> Result<(), AppError> {
+    collect_open_object_extensions(source, known_source_fields, canonical_target_fields, path)
+        .map(|_| ())
+}
 
 fn invalid(path: &str, expectation: &str) -> AppError {
     AppError::BadRequest(format!("{path}: {expectation}"))
@@ -187,14 +260,27 @@ fn validate_schema_collection_bound(length: usize, path: &str) -> Result<(), App
     Ok(())
 }
 
-fn validate_schema_string_array(value: &Value, path: &str) -> Result<(), AppError> {
+fn validate_schema_name_array(value: &Value, path: &str) -> Result<(), AppError> {
     let array = value
         .as_array()
-        .ok_or_else(|| invalid(path, "must be an array of strings"))?;
+        .ok_or_else(|| invalid(path, "must be an array of property-name strings"))?;
     validate_schema_collection_bound(array.len(), path)?;
+    let mut seen = HashSet::new();
     for (index, value) in array.iter().enumerate() {
-        if !value.is_string() {
-            return Err(invalid(&format!("{path}[{index}]"), "must be a string"));
+        let name = value
+            .as_str()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    &format!("{path}[{index}]"),
+                    "must be a non-empty property-name string",
+                )
+            })?;
+        if !seen.insert(name) {
+            return Err(invalid(
+                &format!("{path}[{index}]"),
+                "property names must be unique",
+            ));
         }
     }
     Ok(())
@@ -267,20 +353,41 @@ fn validate_json_schema_node(
 
     if let Some(schema_type) = object.get("type") {
         match schema_type {
-            Value::String(_) => {}
+            Value::String(schema_type) if JSON_SCHEMA_TYPES.contains(&schema_type.as_str()) => {}
             Value::Array(types) => {
                 validate_schema_collection_bound(types.len(), &format!("{path}.type"))?;
-                if types.is_empty() || types.iter().any(|value| !value.is_string()) {
+                if types.is_empty() {
                     return Err(invalid(
                         &format!("{path}.type"),
-                        "must be a string or a non-empty array of strings",
+                        "must be a permitted type string or a non-empty unique array of permitted type strings",
                     ));
+                }
+                let mut seen = HashSet::new();
+                for (index, schema_type) in types.iter().enumerate() {
+                    let schema_type = schema_type.as_str().ok_or_else(|| {
+                        invalid(
+                            &format!("{path}.type[{index}]"),
+                            "must be a permitted type string",
+                        )
+                    })?;
+                    if !JSON_SCHEMA_TYPES.contains(&schema_type) {
+                        return Err(invalid(
+                            &format!("{path}.type[{index}]"),
+                            "must be one of null, boolean, object, array, number, string, or integer",
+                        ));
+                    }
+                    if !seen.insert(schema_type) {
+                        return Err(invalid(
+                            &format!("{path}.type[{index}]"),
+                            "schema type values must be unique",
+                        ));
+                    }
                 }
             }
             _ => {
                 return Err(invalid(
                     &format!("{path}.type"),
-                    "must be a string or a non-empty array of strings",
+                    "must be one of null, boolean, object, array, number, string, or integer, or a non-empty unique array of those values",
                 ))
             }
         }
@@ -325,7 +432,7 @@ fn validate_json_schema_node(
         }
     }
     if let Some(required) = object.get("required") {
-        validate_schema_string_array(required, &format!("{path}.required"))?;
+        validate_schema_name_array(required, &format!("{path}.required"))?;
     }
     if let Some(dependent_required) = object.get("dependentRequired") {
         let dependencies = dependent_required.as_object().ok_or_else(|| {
@@ -336,7 +443,7 @@ fn validate_json_schema_node(
         })?;
         validate_schema_collection_bound(dependencies.len(), &format!("{path}.dependentRequired"))?;
         for (name, required) in dependencies {
-            validate_schema_string_array(required, &format!("{path}.dependentRequired.{name}"))?;
+            validate_schema_name_array(required, &format!("{path}.dependentRequired.{name}"))?;
         }
     }
     if let Some(dependencies) = object.get("dependencies") {
@@ -350,7 +457,7 @@ fn validate_json_schema_node(
         for (name, dependency) in dependencies {
             let dependency_path = format!("{path}.dependencies.{name}");
             if dependency.is_array() {
-                validate_schema_string_array(dependency, &dependency_path)?;
+                validate_schema_name_array(dependency, &dependency_path)?;
             } else {
                 validate_json_schema_node(dependency, &dependency_path, depth + 1, budget)?;
             }
@@ -456,6 +563,12 @@ fn validate_tools(payload: &Map<String, Value>) -> Result<ToolCatalog, AppError>
         };
         let catalog_entry = if kind.is_some_and(|kind| kind.starts_with("web_search")) {
             validate_web_search_tool(tool, &path)?;
+            validate_extension_collisions(
+                tool,
+                ANTHROPIC_TOOL_KNOWN_FIELDS,
+                &["type", "filters", "user_location"],
+                &path,
+            )?;
             Some((
                 required_nonempty_string(tool, "name", &path)?.to_string(),
                 ToolCatalogKind::Server,
@@ -469,16 +582,32 @@ fn validate_tools(payload: &Map<String, Value>) -> Result<ToolCatalog, AppError>
                 )
             })?;
             validate_json_schema(schema, &format!("{path}.input_schema"))?;
-            Some((
-                name.to_string(),
-                if is_bridge_tool_search_name(name) {
-                    ToolCatalogKind::BridgeSearch
-                } else {
-                    ToolCatalogKind::Function {
-                        deferred: defer_loading,
-                    }
-                },
-            ))
+            let catalog_kind = if is_bridge_tool_search_name(name) {
+                ToolCatalogKind::BridgeSearch
+            } else {
+                ToolCatalogKind::Function {
+                    deferred: defer_loading,
+                }
+            };
+            let canonical_fields: &[&str] = match catalog_kind {
+                ToolCatalogKind::BridgeSearch => {
+                    &["type", "execution", "description", "parameters"]
+                }
+                ToolCatalogKind::Function { deferred: true } => {
+                    &["type", "name", "description", "tools"]
+                }
+                ToolCatalogKind::Function { deferred: false } => {
+                    &["type", "name", "description", "parameters", "strict"]
+                }
+                ToolCatalogKind::Server => unreachable!(),
+            };
+            validate_extension_collisions(
+                tool,
+                ANTHROPIC_TOOL_KNOWN_FIELDS,
+                canonical_fields,
+                &path,
+            )?;
+            Some((name.to_string(), catalog_kind))
         } else {
             validate_optional_string(tool, "name", &path, true)?;
             tool.get("name")
@@ -561,6 +690,12 @@ fn validate_tool_reference(
             ))
         }
     }
+    validate_extension_collisions(
+        block,
+        &["type", "tool_name", "cache_control"],
+        &["type", "text"],
+        path,
+    )?;
     validate_cache_control_field(block, path)
 }
 
@@ -615,12 +750,19 @@ fn validate_content_block(
     role: &str,
     tools: &ToolCatalog,
     tool_uses: &mut ToolUseCatalog,
+    bridge_enabled: bool,
 ) -> Result<(), AppError> {
     let block = required_object(block, path)?;
     let block_type = required_nonempty_string(block, "type", path)?;
     validate_cache_control_field(block, path)?;
     match block_type {
         "text" => {
+            validate_extension_collisions(
+                block,
+                &["type", "text", "cache_control"],
+                &["type", "text"],
+                path,
+            )?;
             if !block.get("text").is_some_and(Value::is_string) {
                 return Err(invalid(
                     &format!("{path}.text"),
@@ -635,6 +777,33 @@ fn validate_content_block(
                     "image and document blocks require a user message",
                 ));
             }
+            if block_type == "image" {
+                validate_extension_collisions(
+                    block,
+                    &["type", "source", "cache_control"],
+                    &[
+                        "type",
+                        "image_url",
+                        "file_id",
+                        "detail",
+                        "anthropic_source_extensions",
+                    ],
+                    path,
+                )?;
+            } else {
+                validate_extension_collisions(
+                    block,
+                    &["type", "source", "title", "cache_control"],
+                    &[
+                        "type",
+                        "file_data",
+                        "file_id",
+                        "filename",
+                        "anthropic_source_extensions",
+                    ],
+                    path,
+                )?;
+            }
             validate_source(block, path)?;
             validate_optional_string(block, "title", path, false)?;
         }
@@ -647,6 +816,26 @@ fn validate_content_block(
             }
             let id = required_nonempty_string(block, "id", path)?;
             let name = required_nonempty_string(block, "name", path)?;
+            let canonical_fields: &[&str] = if bridge_enabled
+                && matches!(tools.get(name), Some(ToolCatalogKind::BridgeSearch))
+            {
+                &["type", "call_id", "arguments", "execution", "status"]
+            } else {
+                &[
+                    "type",
+                    "call_id",
+                    "name",
+                    "arguments",
+                    "status",
+                    "namespace",
+                ]
+            };
+            validate_extension_collisions(
+                block,
+                &["type", "id", "name", "input", "cache_control"],
+                canonical_fields,
+                path,
+            )?;
             if !block.get("input").is_some_and(Value::is_object) {
                 return Err(invalid(
                     &format!("{path}.input"),
@@ -668,12 +857,40 @@ fn validate_content_block(
                 ));
             }
             let tool_use_id = required_nonempty_string(block, "tool_use_id", path)?;
-            if !tool_uses.contains_key(tool_use_id) {
-                return Err(invalid(
+            let tool_use_name = tool_uses.get(tool_use_id).ok_or_else(|| {
+                invalid(
                     &format!("{path}.tool_use_id"),
                     "must reference an earlier tool_use block",
-                ));
-            }
+                )
+            })?;
+            let canonical_fields: &[&str] = if bridge_enabled
+                && matches!(
+                    tools.get(tool_use_name),
+                    Some(ToolCatalogKind::BridgeSearch)
+                ) {
+                &[
+                    "type",
+                    "call_id",
+                    "tools",
+                    "execution",
+                    "status",
+                    "anthropic_tool_reference_extensions",
+                ]
+            } else {
+                &["type", "call_id", "output", "status"]
+            };
+            validate_extension_collisions(
+                block,
+                &[
+                    "type",
+                    "tool_use_id",
+                    "content",
+                    "is_error",
+                    "cache_control",
+                ],
+                canonical_fields,
+                path,
+            )?;
             match block.get("is_error") {
                 None | Some(Value::Null | Value::Bool(_)) => {}
                 Some(_) => {
@@ -692,6 +909,12 @@ fn validate_content_block(
                     "thinking blocks require an assistant message",
                 ));
             }
+            validate_extension_collisions(
+                block,
+                &["type", "thinking", "signature", "cache_control"],
+                &["type", "id", "summary", "encrypted_content"],
+                path,
+            )?;
             if !block.get("thinking").is_some_and(Value::is_string) {
                 return Err(invalid(
                     &format!("{path}.thinking"),
@@ -715,7 +938,11 @@ fn validate_content_block(
     Ok(())
 }
 
-fn validate_messages(payload: &Map<String, Value>, tools: &ToolCatalog) -> Result<(), AppError> {
+fn validate_messages(
+    payload: &Map<String, Value>,
+    tools: &ToolCatalog,
+    bridge_enabled: bool,
+) -> Result<(), AppError> {
     let messages = payload
         .get("messages")
         .and_then(Value::as_array)
@@ -741,6 +968,7 @@ fn validate_messages(payload: &Map<String, Value>, tools: &ToolCatalog) -> Resul
                         role,
                         tools,
                         &mut tool_uses,
+                        bridge_enabled,
                     )?;
                 }
             }
@@ -792,6 +1020,18 @@ fn effective_responses_model(payload: &Map<String, Value>) -> Option<String> {
     )
 }
 
+fn tool_search_bridge_enabled(payload: &Map<String, Value>, tools: &ToolCatalog) -> bool {
+    effective_responses_model(payload)
+        .as_deref()
+        .is_some_and(supports_responses_tool_search_model)
+        && tools
+            .values()
+            .any(|kind| matches!(kind, ToolCatalogKind::BridgeSearch))
+        && tools
+            .values()
+            .any(|kind| matches!(kind, ToolCatalogKind::Function { deferred: true }))
+}
+
 fn validate_tool_choice(payload: &Map<String, Value>, tools: &ToolCatalog) -> Result<(), AppError> {
     let Some(choice) = payload.get("tool_choice") else {
         return Ok(());
@@ -814,6 +1054,15 @@ fn validate_tool_choice(payload: &Map<String, Value>, tools: &ToolCatalog) -> Re
                 "is only valid when tool_choice.type is \"tool\"",
             ));
         }
+        if let Some((key, _)) = choice
+            .iter()
+            .find(|(key, _)| !matches!(key.as_str(), "type" | "name"))
+        {
+            return Err(invalid(
+                &format!("tool_choice.{key}"),
+                "cannot be represented by the scalar Responses tool choice",
+            ));
+        }
         return Ok(());
     }
 
@@ -829,13 +1078,16 @@ fn validate_tool_choice(payload: &Map<String, Value>, tools: &ToolCatalog) -> Re
             "must reference a compatible custom function tool",
         )),
         Some(ToolCatalogKind::BridgeSearch) => {
-            let model_supports_bridge = effective_responses_model(payload)
-                .as_deref()
-                .is_some_and(supports_responses_tool_search_model);
-            let has_deferred_tool = tools
-                .values()
-                .any(|kind| matches!(kind, ToolCatalogKind::Function { deferred: true }));
-            if model_supports_bridge && has_deferred_tool {
+            if let Some((key, _)) = choice
+                .iter()
+                .find(|(key, _)| !matches!(key.as_str(), "type" | "name"))
+            {
+                return Err(invalid(
+                    &format!("tool_choice.{key}"),
+                    "cannot be represented when the tool-search bridge maps to auto",
+                ));
+            }
+            if tool_search_bridge_enabled(payload, tools) {
                 Ok(())
             } else {
                 Err(invalid(
@@ -887,7 +1139,13 @@ fn validate_thinking(payload: &Map<String, Value>) -> Result<(), AppError> {
             ))
         }
     }
-    validate_optional_string(thinking, "display", "thinking", true)
+    validate_optional_string(thinking, "display", "thinking", true)?;
+    validate_extension_collisions(
+        thinking,
+        &["type", "budget_tokens", "display"],
+        &["effort", "summary"],
+        "thinking",
+    )
 }
 
 fn validate_output_config(payload: &Map<String, Value>) -> Result<(), AppError> {
@@ -898,7 +1156,8 @@ fn validate_output_config(payload: &Map<String, Value>) -> Result<(), AppError> 
         return Ok(());
     }
     let config = required_object(config, "output_config")?;
-    validate_optional_string(config, "effort", "output_config", true)
+    validate_optional_string(config, "effort", "output_config", true)?;
+    validate_extension_collisions(config, &["effort"], &["effort", "summary"], "output_config")
 }
 
 fn validate_optional_string_list(
@@ -917,7 +1176,7 @@ fn validate_optional_string_list(
 pub fn validate_messages_request_shape(payload: &Value) -> Result<(), AppError> {
     let payload = required_object(payload, "request")?;
     let tools = validate_tools(payload)?;
-    validate_messages(payload, &tools)?;
+    validate_messages(payload, &tools, tool_search_bridge_enabled(payload, &tools))?;
     validate_system(payload)?;
     validate_tool_choice(payload, &tools)?;
     validate_metadata(payload)?;

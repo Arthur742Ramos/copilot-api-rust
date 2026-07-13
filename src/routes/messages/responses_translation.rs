@@ -32,6 +32,9 @@ use crate::routes::messages::anthropic_types::{
     AnthropicInputMessage, AnthropicMessagesPayload, AnthropicResponse, AnthropicTool,
     AnthropicUsage,
 };
+use crate::routes::messages::request_validation::{
+    collect_open_object_extensions, merge_open_object_extensions, ANTHROPIC_TOOL_KNOWN_FIELDS,
+};
 use crate::services::copilot::create_responses::{
     FunctionCallOutputContent, InputField, MessageContent, ReasoningSummaryText,
     ResponseFunctionCallOutputItem, ResponseFunctionToolCallItem, ResponseInputCompaction,
@@ -275,7 +278,11 @@ pub fn translate_anthropic_messages_to_responses_payload(
     // missing value to 0 so the 12800 floor applies.
     let max_output_tokens = payload.max_tokens.unwrap_or(0).max(12800);
 
-    let resolved_effort = get_reasoning_effort_for_model(&payload.model);
+    let resolved_effort = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.clone())
+        .unwrap_or_else(|| get_reasoning_effort_for_model(&payload.model));
     tracing::info!(
         target: "audit",
         model = %payload.model,
@@ -283,10 +290,16 @@ pub fn translate_anthropic_messages_to_responses_payload(
         api = "responses",
         "resolved reasoning effort"
     );
-    let reasoning = json!({
-        "effort": resolved_effort,
-        "summary": "detailed",
-    });
+    let mut reasoning = Map::from_iter([
+        ("effort".to_string(), json!(resolved_effort)),
+        ("summary".to_string(), json!("detailed")),
+    ]);
+    if let Some(thinking) = &payload.thinking {
+        merge_open_object_extensions(&thinking.extra, &[], &mut reasoning, "thinking")?;
+    }
+    if let Some(output_config) = &payload.output_config {
+        merge_open_object_extensions(&output_config.extra, &[], &mut reasoning, "output_config")?;
+    }
 
     let mut responses_payload = ResponsesPayload {
         model: payload.model.clone(),
@@ -304,7 +317,7 @@ pub fn translate_anthropic_messages_to_responses_payload(
         prompt_cache_retention: None,
         parallel_tool_calls: Some(true),
         store: Some(false),
-        reasoning: Some(reasoning),
+        reasoning: Some(Value::Object(reasoning)),
         context_management: None,
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
         service_tier: None,
@@ -463,7 +476,11 @@ fn translate_assistant_message(
 #[allow(clippy::result_large_err)]
 fn translate_user_content_block(block: &Value) -> Result<Vec<ResponseInputContent>, AppError> {
     Ok(match block_type(block) {
-        Some("text") => vec![create_text_content(text_field(block)?)],
+        Some("text") => vec![create_text_content_from_block(
+            block,
+            "input_text",
+            "user text block",
+        )?],
         Some("image") => vec![ResponseInputContent::Image(create_image_content(block)?)],
         Some("document") => vec![ResponseInputContent::File(create_file_content(block)?)],
         Some(other) => {
@@ -484,7 +501,11 @@ fn translate_assistant_content_block(
     block: &Value,
 ) -> Result<Option<ResponseInputContent>, AppError> {
     match block_type(block) {
-        Some("text") => Ok(Some(create_output_text_content(text_field(block)?))),
+        Some("text") => Ok(Some(create_text_content_from_block(
+            block,
+            "output_text",
+            "assistant text block",
+        )?)),
         Some(other) => Err(AppError::BadRequest(format!(
             "Unsupported assistant content block type \"{other}\""
         ))),
@@ -556,20 +577,27 @@ fn resolve_assistant_phase(_model: &str, content: &Value, apply_phase: bool) -> 
     )
 }
 
-fn create_text_content(text: String) -> ResponseInputContent {
-    ResponseInputContent::Text(ResponseInputText {
-        block_type: "input_text".to_string(),
+#[allow(clippy::result_large_err)]
+fn create_text_content_from_block(
+    block: &Value,
+    target_type: &str,
+    path: &str,
+) -> Result<ResponseInputContent, AppError> {
+    let source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    let extra = collect_open_object_extensions(
+        source,
+        &["type", "text", "cache_control"],
+        &["type", "text"],
+        path,
+    )?;
+    let text = text_field(block)?;
+    Ok(ResponseInputContent::Text(ResponseInputText {
+        block_type: target_type.to_string(),
         text,
-        extra: Default::default(),
-    })
-}
-
-fn create_output_text_content(text: String) -> ResponseInputContent {
-    ResponseInputContent::Text(ResponseInputText {
-        block_type: "output_text".to_string(),
-        text,
-        extra: Default::default(),
-    })
+        extra,
+    }))
 }
 
 fn source_extensions(block: &Value) -> Map<String, Value> {
@@ -590,6 +618,19 @@ fn source_extensions(block: &Value) -> Map<String, Value> {
             Value::Object(extensions),
         )])
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn translated_block_extensions(
+    block: &Value,
+    known_source_fields: &[&str],
+    canonical_target_fields: &[&str],
+    path: &str,
+) -> Result<Map<String, Value>, AppError> {
+    let source = block
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest(format!("{path} must be an object")))?;
+    collect_open_object_extensions(source, known_source_fields, canonical_target_fields, path)
 }
 
 #[allow(clippy::result_large_err)]
@@ -616,12 +657,25 @@ fn create_image_content(block: &Value) -> Result<ResponseInputImage, AppError> {
         }
     };
 
+    let mut extra = source_extensions(block);
+    extra.extend(translated_block_extensions(
+        block,
+        &["type", "source", "cache_control"],
+        &[
+            "type",
+            "image_url",
+            "file_id",
+            "detail",
+            "anthropic_source_extensions",
+        ],
+        "image block",
+    )?);
     Ok(ResponseInputImage {
         block_type: "input_image".to_string(),
         image_url: Some(image_url),
         file_id: None,
         detail: Some("auto".to_string()),
-        extra: source_extensions(block),
+        extra,
     })
 }
 
@@ -653,12 +707,25 @@ fn create_file_content(block: &Value) -> Result<ResponseInputFile, AppError> {
         }
     };
 
+    let mut extra = source_extensions(block);
+    extra.extend(translated_block_extensions(
+        block,
+        &["type", "source", "title", "cache_control"],
+        &[
+            "type",
+            "file_data",
+            "file_id",
+            "filename",
+            "anthropic_source_extensions",
+        ],
+        "document block",
+    )?);
     Ok(ResponseInputFile {
         block_type: "input_file".to_string(),
         file_data: Some(file_data),
         file_id: None,
         filename: Some(filename),
-        extra: source_extensions(block),
+        extra,
     })
 }
 
@@ -723,12 +790,18 @@ fn create_reasoning_content(block: &Value) -> Result<ResponseInputReasoning, App
         raw_thinking
     };
     let summary = create_reasoning_summary(thinking);
+    let extra = translated_block_extensions(
+        block,
+        &["type", "thinking", "signature", "cache_control"],
+        &["type", "id", "summary", "encrypted_content"],
+        "thinking block",
+    )?;
     Ok(ResponseInputReasoning {
         id,
         item_type: "reasoning".to_string(),
         summary,
         encrypted_content,
-        extra: Default::default(),
+        extra,
     })
 }
 
@@ -790,6 +863,19 @@ fn create_function_tool_call(
     } else {
         None
     };
+    let extra = translated_block_extensions(
+        block,
+        &["type", "id", "name", "input", "cache_control"],
+        &[
+            "type",
+            "call_id",
+            "name",
+            "arguments",
+            "status",
+            "namespace",
+        ],
+        "tool_use",
+    )?;
     Ok(ResponseFunctionToolCallItem {
         item_type: "function_call".to_string(),
         call_id: id.to_string(),
@@ -797,7 +883,7 @@ fn create_function_tool_call(
         arguments,
         status: Some("completed".to_string()),
         namespace,
-        extra: Default::default(),
+        extra,
     })
 }
 
@@ -814,13 +900,19 @@ fn create_tool_search_call(block: &Value) -> Result<ResponseToolSearchCallItem, 
         .get("input")
         .filter(|input| input.is_object())
         .ok_or_else(|| AppError::BadRequest("tool_use.input must be an object".to_string()))?;
+    let extra = translated_block_extensions(
+        block,
+        &["type", "id", "name", "input", "cache_control"],
+        &["type", "call_id", "arguments", "execution", "status"],
+        "tool-search use",
+    )?;
     Ok(ResponseToolSearchCallItem {
         item_type: "tool_search_call".to_string(),
         call_id: Some(id.to_string()),
         arguments: normalize_tool_search_bridge_arguments(input),
         execution: Some("client".to_string()),
         status: Some("completed".to_string()),
-        extra: Default::default(),
+        extra,
     })
 }
 
@@ -865,12 +957,24 @@ fn create_function_call_output(block: &Value) -> Result<ResponseFunctionCallOutp
             ))
         }
     };
+    let extra = translated_block_extensions(
+        block,
+        &[
+            "type",
+            "tool_use_id",
+            "content",
+            "is_error",
+            "cache_control",
+        ],
+        &["type", "call_id", "output", "status"],
+        "tool_result",
+    )?;
     Ok(ResponseFunctionCallOutputItem {
         item_type: "function_call_output".to_string(),
         call_id: call_id.to_string(),
         output: convert_tool_result_content(block.get("content"))?,
         status: Some(if is_error { "incomplete" } else { "completed" }.to_string()),
-        extra: Default::default(),
+        extra,
     })
 }
 
@@ -938,13 +1042,57 @@ fn create_tool_search_output(
         })
         .collect::<Result<_, _>>()?;
 
+    let mut extra = translated_block_extensions(
+        block,
+        &[
+            "type",
+            "tool_use_id",
+            "content",
+            "is_error",
+            "cache_control",
+        ],
+        &["type", "call_id", "tools", "execution", "status"],
+        "tool-search result",
+    )?;
+    if let Some(Value::Array(blocks)) = content {
+        let mut reference_extensions = Vec::new();
+        for block in blocks {
+            if block_type(block) != Some("tool_reference") {
+                continue;
+            }
+            let source = block.as_object().ok_or_else(|| {
+                AppError::BadRequest("tool_reference must be an object".to_string())
+            })?;
+            let extensions = collect_open_object_extensions(
+                source,
+                &["type", "tool_name", "cache_control"],
+                &[],
+                "tool_reference",
+            )?;
+            if !extensions.is_empty() {
+                let mut preserved = Map::new();
+                preserved.insert(
+                    "tool_name".to_string(),
+                    block.get("tool_name").cloned().unwrap_or(Value::Null),
+                );
+                preserved.extend(extensions);
+                reference_extensions.push(Value::Object(preserved));
+            }
+        }
+        if !reference_extensions.is_empty() {
+            extra.insert(
+                "anthropic_tool_reference_extensions".to_string(),
+                Value::Array(reference_extensions),
+            );
+        }
+    }
     Ok(ResponseToolSearchOutputItem {
         item_type: "tool_search_output".to_string(),
         call_id: Some(call_id.to_string()),
         tools,
         execution: Some("client".to_string()),
         status: Some(if is_error { "incomplete" } else { "completed" }.to_string()),
-        extra: Default::default(),
+        extra,
     })
 }
 
@@ -1109,6 +1257,17 @@ fn translate_system_prompt(
         .iter()
         .enumerate()
         .map(|(index, block)| -> Result<String, AppError> {
+            let block_object = block.as_object().ok_or_else(|| {
+                AppError::BadRequest(format!("system[{index}] must be an object"))
+            })?;
+            if let Some((key, _)) = block_object
+                .iter()
+                .find(|(key, _)| !matches!(key.as_str(), "type" | "text" | "cache_control"))
+            {
+                return Err(AppError::BadRequest(format!(
+                    "system[{index}].{key} cannot be represented in Responses instructions"
+                )));
+            }
             let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
                 AppError::BadRequest(format!("system[{index}].text must be a string"))
             })?;
@@ -1156,8 +1315,9 @@ fn convert_anthropic_tools(
         if is_bridge_tool_search_name(name) {
             if tool_search_enabled && !added_tool_search {
                 converted.push(create_responses_tool_search_definition(
+                    tool,
                     &searchable_tool_names,
-                ));
+                )?);
                 added_tool_search = true;
             }
             continue;
@@ -1177,8 +1337,12 @@ fn convert_anthropic_tools(
     Ok(Some(converted))
 }
 
-fn create_responses_tool_search_definition(searchable_tool_names: &[String]) -> Value {
-    json!({
+#[allow(clippy::result_large_err)]
+fn create_responses_tool_search_definition(
+    source_tool: &Value,
+    searchable_tool_names: &[String],
+) -> Result<Value, AppError> {
+    let mut value = json!({
         "type": "tool_search",
         "execution": "client",
         "description": "Load deferred tools by exact name before using them. Return only the searchable tool names you need for the next step.",
@@ -1198,7 +1362,20 @@ fn create_responses_tool_search_definition(searchable_tool_names: &[String]) -> 
             "required": ["names"],
             "additionalProperties": false,
         },
-    })
+    });
+    let target = value
+        .as_object_mut()
+        .expect("static tool-search definition object");
+    let source = source_tool.as_object().ok_or_else(|| {
+        AppError::BadRequest("tool-search bridge definition must be an object".to_string())
+    })?;
+    merge_open_object_extensions(
+        source,
+        ANTHROPIC_TOOL_KNOWN_FIELDS,
+        target,
+        "tool-search bridge",
+    )?;
+    Ok(value)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1221,12 +1398,19 @@ fn convert_tool_to_function(tool: &Value) -> Result<Value, AppError> {
     obj.insert("type".to_string(), json!("function"));
     obj.insert("name".to_string(), json!(name));
     obj.insert("parameters".to_string(), parameters);
-    obj.insert("strict".to_string(), json!(false));
+    obj.insert(
+        "strict".to_string(),
+        tool.get("strict").cloned().unwrap_or(Value::Bool(false)),
+    );
     if let Some(description) = tool.get("description").and_then(Value::as_str) {
         if !description.is_empty() {
             obj.insert("description".to_string(), json!(description));
         }
     }
+    let source = tool
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("tool definition must be an object".to_string()))?;
+    merge_open_object_extensions(source, ANTHROPIC_TOOL_KNOWN_FIELDS, &mut obj, "tool")?;
     Ok(Value::Object(obj))
 }
 
@@ -1257,7 +1441,10 @@ fn convert_deferred_tool_to_namespace(tool: &Value) -> Result<Value, AppError> {
     inner.insert("type".to_string(), json!("function"));
     inner.insert("name".to_string(), json!(name));
     inner.insert("parameters".to_string(), parameters);
-    inner.insert("strict".to_string(), json!(false));
+    inner.insert(
+        "strict".to_string(),
+        tool.get("strict").cloned().unwrap_or(Value::Bool(false)),
+    );
     inner.insert("defer_loading".to_string(), json!(true));
     if let Some(description) = description {
         inner.insert("description".to_string(), json!(description));
@@ -1273,6 +1460,15 @@ fn convert_deferred_tool_to_namespace(tool: &Value) -> Result<Value, AppError> {
         "tools".to_string(),
         Value::Array(vec![Value::Object(inner)]),
     );
+    let source = tool.as_object().ok_or_else(|| {
+        AppError::BadRequest("deferred tool definition must be an object".to_string())
+    })?;
+    merge_open_object_extensions(
+        source,
+        ANTHROPIC_TOOL_KNOWN_FIELDS,
+        &mut obj,
+        "deferred tool",
+    )?;
     Ok(Value::Object(obj))
 }
 
@@ -1285,35 +1481,46 @@ fn convert_anthropic_tool_choice(
         return Ok(json!("auto"));
     };
 
-    Ok(match choice.kind.as_str() {
-        "auto" => json!("auto"),
-        "any" => json!("required"),
+    let scalar_choice = |value: Value| -> Result<Value, AppError> {
+        if let Some((key, _)) = choice.extra.iter().next() {
+            return Err(AppError::BadRequest(format!(
+                "tool_choice.{key} cannot be represented by a scalar Responses tool choice"
+            )));
+        }
+        Ok(value)
+    };
+
+    match choice.kind.as_str() {
+        "auto" => scalar_choice(json!("auto")),
+        "any" => scalar_choice(json!("required")),
         "tool" => {
             if tool_search_enabled {
                 if let Some(name) = choice.name.as_deref() {
                     if is_bridge_tool_search_name(name) {
-                        return Ok(json!("auto"));
+                        return scalar_choice(json!("auto"));
                     }
                 }
             }
-            match choice.name.as_deref() {
-                Some(name) if !name.trim().is_empty() => {
-                    json!({ "type": "function", "name": name })
-                }
+            let name = match choice.name.as_deref() {
+                Some(name) if !name.trim().is_empty() => name,
                 _ => {
                     return Err(AppError::BadRequest(
                         "tool_choice.name must be a non-empty string for type tool".to_string(),
                     ))
                 }
-            }
+            };
+            let mut target = Map::from_iter([
+                ("type".to_string(), json!("function")),
+                ("name".to_string(), json!(name)),
+            ]);
+            merge_open_object_extensions(&choice.extra, &[], &mut target, "tool_choice")?;
+            Ok(Value::Object(target))
         }
-        "none" => json!("none"),
-        _ => {
-            return Err(AppError::BadRequest(
-                "tool_choice.type must be one of auto, any, tool, or none".to_string(),
-            ))
-        }
-    })
+        "none" => scalar_choice(json!("none")),
+        _ => Err(AppError::BadRequest(
+            "tool_choice.type must be one of auto, any, tool, or none".to_string(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2244,7 +2451,11 @@ fn convert_tool_result_content(
             let mut result: Vec<ResponseInputContent> = Vec::new();
             for block in arr {
                 match block_type(block) {
-                    Some("text") => result.push(create_text_content(text_field(block)?)),
+                    Some("text") => result.push(create_text_content_from_block(
+                        block,
+                        "input_text",
+                        "tool_result text block",
+                    )?),
                     Some("image") => {
                         result.push(ResponseInputContent::Image(create_image_content(block)?))
                     }
@@ -2262,7 +2473,17 @@ fn convert_tool_result_content(
                                         .to_string(),
                                 )
                             })?;
-                        result.push(create_text_content(format!("Tool {tool_name} loaded")));
+                        let extra = translated_block_extensions(
+                            block,
+                            &["type", "tool_name", "cache_control"],
+                            &["type", "text"],
+                            "tool_reference",
+                        )?;
+                        result.push(ResponseInputContent::Text(ResponseInputText {
+                            block_type: "input_text".to_string(),
+                            text: format!("Tool {tool_name} loaded"),
+                            extra,
+                        }));
                     }
                     Some(other) => {
                         return Err(AppError::BadRequest(format!(
