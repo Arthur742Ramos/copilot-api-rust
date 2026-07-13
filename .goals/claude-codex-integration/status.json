@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 16,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -81,6 +81,11 @@
       "iteration": 15,
       "verdict": "FAIL",
       "summary": "Web request policy and deferred-reference validation now pass, but undefined tool choices and shallow nested JSON schemas still reach translation/provider paths."
+    },
+    {
+      "iteration": 16,
+      "verdict": "FAIL",
+      "summary": "Catalog choices, recursive bounds, boolean schemas, source types, and deferred references pass, but schema primitive semantics and unknown tool-choice/tool fields are still lost or accepted."
     }
   ]
 }
