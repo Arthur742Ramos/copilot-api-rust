@@ -858,6 +858,27 @@ pub enum ResponsesBufferedContract {
     Compact,
 }
 
+impl ResponsesBufferedContract {
+    pub const fn metrics_endpoint(self) -> &'static str {
+        match self {
+            Self::Regular => "responses",
+            Self::Compact => "responses_compact",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Regular => "Responses",
+            Self::Compact => "compact Responses",
+        }
+    }
+}
+
+pub enum ResponsesBufferedBody {
+    Regular(Box<ResponsesBufferedResult>),
+    Compact(Box<ResponsesCompactBufferedResult>),
+}
+
 fn safe_buffered_response_headers(headers: &HeaderMap) -> HeaderMap {
     let mut safe = HeaderMap::new();
     for name in ["x-request-id", "openai-request-id", "x-codex-turn-state"] {
@@ -915,6 +936,66 @@ fn parse_buffered_compact(
         raw,
         headers,
     })
+}
+
+/// Read, size-bound, validate, and retain the exact bytes of a successful
+/// buffered Responses reply. Both direct Copilot and provider compact routing
+/// use this function so contract, header, and sanitized 502 behavior cannot
+/// drift between branches.
+pub async fn read_buffered_responses_response(
+    response: reqwest::Response,
+    contract: ResponsesBufferedContract,
+    upstream_error_message: &str,
+) -> Result<ResponsesBufferedBody, HttpError> {
+    if !response.status().is_success() {
+        return Err(http_error_from_response(upstream_error_message, response).await);
+    }
+    let headers = safe_buffered_response_headers(response.headers());
+    let raw = crate::libs::http::read_bytes_capped(response)
+        .await
+        .map_err(|error| {
+            HttpError::new(
+                if error.contains("too large") || error.contains("exceeded") {
+                    format!(
+                        "Upstream {} body exceeded the maximum allowed size.",
+                        contract.description()
+                    )
+                } else {
+                    format!(
+                        "The upstream {} body could not be read.",
+                        contract.description()
+                    )
+                },
+                StatusCode::BAD_GATEWAY,
+                headers.clone(),
+                String::new(),
+            )
+        })?;
+
+    match contract {
+        ResponsesBufferedContract::Regular => {
+            let parsed = parse_buffered_responses(raw, headers.clone()).map_err(|_| {
+                HttpError::new(
+                    "The upstream Responses body was malformed.",
+                    StatusCode::BAD_GATEWAY,
+                    headers,
+                    String::new(),
+                )
+            })?;
+            Ok(ResponsesBufferedBody::Regular(Box::new(parsed)))
+        }
+        ResponsesBufferedContract::Compact => {
+            let parsed = parse_buffered_compact(raw, headers.clone()).map_err(|_| {
+                HttpError::new(
+                    "The upstream compact Responses body was malformed.",
+                    StatusCode::BAD_GATEWAY,
+                    headers,
+                    String::new(),
+                )
+            })?;
+            Ok(ResponsesBufferedBody::Compact(Box::new(parsed)))
+        }
+    }
 }
 
 /// Return type of [`create_responses`] / [`create_http_responses`], mirroring
@@ -1172,6 +1253,7 @@ async fn create_http_responses(
             .headers(headers)
             .body(body.clone())
     };
+    let metrics_endpoint = options.buffered_contract.metrics_endpoint();
     let response = crate::libs::token::send_copilot_with_401_retry(
         crate::libs::http::retry_endpoint::RESPONSES,
         build,
@@ -1179,68 +1261,40 @@ async fn create_http_responses(
     .await
     .map_err(|e| {
         crate::libs::metrics::record_upstream_request(
-            "responses",
+            metrics_endpoint,
             crate::libs::metrics::UpstreamStatus::TransportError,
             upstream_start.elapsed().as_secs_f64(),
         );
         HttpError::internal(format!("Failed to create responses: {e}"))
     })?;
     crate::libs::metrics::record_upstream_request(
-        "responses",
+        metrics_endpoint,
         crate::libs::metrics::UpstreamStatus::from_code(response.status().as_u16()),
         upstream_start.elapsed().as_secs_f64(),
     );
 
     log_copilot_rate_limits(response.headers());
 
-    if !response.status().is_success() {
-        tracing::error!("Failed to create responses");
-        return Err(http_error_from_response("Failed to create responses", response).await);
-    }
-
     if stream {
+        if !response.status().is_success() {
+            tracing::error!("Failed to create responses");
+            return Err(http_error_from_response("Failed to create responses", response).await);
+        }
         Ok(CreateResponsesReturn::Stream(Box::pin(
             crate::libs::sse::events(response),
         )))
     } else {
-        let headers = safe_buffered_response_headers(response.headers());
-        let raw = crate::libs::http::read_bytes_capped(response)
-            .await
-            .map_err(|error| {
-                HttpError::new(
-                    if error.contains("too large") || error.contains("exceeded") {
-                        "Upstream Responses body exceeded the maximum allowed size."
-                    } else {
-                        "The upstream Responses body could not be read."
-                    },
-                    StatusCode::BAD_GATEWAY,
-                    headers.clone(),
-                    String::new(),
-                )
-            })?;
-        match options.buffered_contract {
-            ResponsesBufferedContract::Compact => {
-                let result = parse_buffered_compact(raw, headers.clone()).map_err(|_| {
-                    HttpError::new(
-                        "The upstream compact Responses body was malformed.",
-                        StatusCode::BAD_GATEWAY,
-                        headers,
-                        String::new(),
-                    )
-                })?;
-                Ok(CreateResponsesReturn::CompactResult(Box::new(result)))
+        match read_buffered_responses_response(
+            response,
+            options.buffered_contract,
+            "Failed to create responses",
+        )
+        .await?
+        {
+            ResponsesBufferedBody::Compact(result) => {
+                Ok(CreateResponsesReturn::CompactResult(result))
             }
-            ResponsesBufferedContract::Regular => {
-                let result = parse_buffered_responses(raw, headers.clone()).map_err(|_| {
-                    HttpError::new(
-                        "The upstream Responses body was malformed.",
-                        StatusCode::BAD_GATEWAY,
-                        headers,
-                        String::new(),
-                    )
-                })?;
-                Ok(CreateResponsesReturn::Result(Box::new(result)))
-            }
+            ResponsesBufferedBody::Regular(result) => Ok(CreateResponsesReturn::Result(result)),
         }
     }
 }
@@ -1409,7 +1463,15 @@ mod tests {
         for raw in [
             br#"{"output":"wrong"}"#.as_slice(),
             br#"{"output":[{"type":"compaction"}]}"#.as_slice(),
+            br#"{"output":[],"usage":{"input_tokens":"2","output_tokens":1,"total_tokens":3}}"#
+                .as_slice(),
             br#"{"output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":9}}"#
+                .as_slice(),
+            br#"{"output":[],"usage":{"input_tokens":-1,"output_tokens":1,"total_tokens":0}}"#
+                .as_slice(),
+            br#"{"output":[],"usage":{"input_tokens":9223372036854775807,"output_tokens":1,"total_tokens":9223372036854775807}}"#
+                .as_slice(),
+            br#"{"output":[],"usage":{"input_tokens":2,"input_tokens_details":{"cached_tokens":3},"output_tokens":1,"total_tokens":3}}"#
                 .as_slice(),
         ] {
             assert!(parse_buffered_compact(Bytes::copy_from_slice(raw), HeaderMap::new()).is_err());

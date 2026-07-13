@@ -7,11 +7,14 @@ use serde_json::Value;
 
 use crate::libs::compact::COMPACT_REQUEST;
 use crate::libs::config::resolve_mapped_model;
-use crate::libs::error::{http_error_from_response, openai_error_response, AppError, HttpError};
+use crate::libs::error::{openai_error_response, AppError, HttpError};
 use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::state;
-use crate::libs::token_usage::{create_copilot_token_usage_recorder, normalize_responses_usage};
+use crate::libs::token_usage::{
+    create_copilot_token_usage_recorder, create_request_scoped_provider_token_usage_recorder,
+    normalize_responses_usage, TokenUsageRecorder,
+};
 use crate::routes::parse_json_body;
 use crate::routes::responses::handler::{
     get_codex_responses_subagent_marker, get_incoming_responses_session_id,
@@ -22,8 +25,9 @@ use crate::routes::responses::utils::{
 };
 use crate::services::codex::create_responses::forward_codex_compact;
 use crate::services::copilot::create_responses::{
-    create_responses, CreateResponsesReturn, ResponsesBufferedContract, ResponsesPayload,
-    ResponsesRequestOptions,
+    create_responses, read_buffered_responses_response, CreateResponsesReturn,
+    ResponsesBufferedBody, ResponsesBufferedContract, ResponsesCompactBufferedResult,
+    ResponsesPayload, ResponsesRequestOptions,
 };
 use crate::services::providers::provider_proxy::forward_provider_responses_compact;
 
@@ -119,30 +123,12 @@ async fn handle_responses_compact(body: Value, headers: HeaderMap) -> Result<Res
     .await?;
 
     match result {
-        CreateResponsesReturn::CompactResult(result) => {
-            if let Some(ctx) = crate::libs::request_context::request_context_store() {
-                ctx.set_flow_transport_model_non_streaming(
-                    &response_model,
-                    "responses_compact",
-                    crate::libs::stream_metrics::transport::NATIVE,
-                );
-            }
-            let usage = result
-                .parsed
-                .usage
-                .as_ref()
-                .and_then(|usage| serde_json::to_value(usage).ok());
-            recorder.record(normalize_responses_usage(usage.as_ref()));
-            let mut response = Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(result.raw))
-                .expect("static compact Responses response");
-            for (name, value) in &result.headers {
-                response.headers_mut().insert(name, value.clone());
-            }
-            Ok(response)
-        }
+        CreateResponsesReturn::CompactResult(result) => Ok(finish_compact_response(
+            result,
+            recorder,
+            &response_model,
+            StatusCode::OK,
+        )),
         CreateResponsesReturn::Result(_) => Err(HttpError::internal(
             "Responses compact unexpectedly returned a full response",
         )
@@ -151,6 +137,36 @@ async fn handle_responses_compact(body: Value, headers: HeaderMap) -> Result<Res
             Err(HttpError::internal("Responses compact unexpectedly returned a stream").into())
         }
     }
+}
+
+fn finish_compact_response(
+    result: Box<ResponsesCompactBufferedResult>,
+    recorder: TokenUsageRecorder,
+    response_model: &str,
+    status: StatusCode,
+) -> Response {
+    if let Some(ctx) = crate::libs::request_context::request_context_store() {
+        ctx.set_flow_transport_model_non_streaming(
+            response_model,
+            "responses_compact",
+            crate::libs::stream_metrics::transport::NATIVE,
+        );
+    }
+    let usage = result
+        .parsed
+        .usage
+        .as_ref()
+        .and_then(|usage| serde_json::to_value(usage).ok());
+    recorder.record(normalize_responses_usage(usage.as_ref()));
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(result.raw))
+        .expect("static compact Responses response");
+    for (name, value) in &result.headers {
+        response.headers_mut().insert(name, value.clone());
+    }
+    response
 }
 
 async fn handle_provider_compact(
@@ -175,64 +191,58 @@ async fn handle_provider_compact(
         ));
     }
 
-    let upstream = if config.name == "codex" {
-        forward_codex_compact(payload, &headers, &config.base_url).await?
+    let response_model = payload.model.clone();
+    let recorder = create_request_scoped_provider_token_usage_recorder(
+        "responses_compact",
+        response_model.clone(),
+        provider.clone(),
+    );
+    let upstream_start = std::time::Instant::now();
+    let upstream_result = if config.name == "codex" {
+        forward_codex_compact(payload, &headers, &config.base_url).await
     } else {
-        forward_provider_responses_compact(&config, &payload, &headers).await?
+        forward_provider_responses_compact(&config, &payload, &headers).await
     };
-    if !upstream.status().is_success() {
-        return Err(http_error_from_response(
-            format!("Failed to compact {provider} responses"),
-            upstream,
-        )
-        .await
-        .into());
-    }
-
+    let upstream = match upstream_result {
+        Ok(upstream) => {
+            crate::libs::metrics::record_provider_upstream_request(
+                ResponsesBufferedContract::Compact.metrics_endpoint(),
+                crate::libs::metrics::UpstreamStatus::from_code(upstream.status().as_u16()),
+                upstream_start.elapsed().as_secs_f64(),
+            );
+            upstream
+        }
+        Err(error) => {
+            crate::libs::metrics::record_provider_upstream_request(
+                ResponsesBufferedContract::Compact.metrics_endpoint(),
+                crate::libs::metrics::UpstreamStatus::TransportError,
+                upstream_start.elapsed().as_secs_f64(),
+            );
+            return Err(error.into());
+        }
+    };
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let upstream_headers = upstream.headers().clone();
-    let bytes = crate::libs::http::read_bytes_capped(upstream)
-        .await
-        .map_err(|error| {
-            AppError::Http(HttpError::new(
-                "Upstream compact response exceeded the maximum allowed size.",
-                StatusCode::BAD_GATEWAY,
-                HeaderMap::new(),
-                if error.contains("too large") {
-                    String::new()
-                } else {
-                    "The upstream compact response could not be read.".to_string()
-                },
-            ))
-        })?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        AppError::Http(HttpError::new(
-            "Upstream compact response was malformed.",
-            StatusCode::BAD_GATEWAY,
-            HeaderMap::new(),
-            String::new(),
-        ))
-    })?;
-    if !value.get("output").is_some_and(serde_json::Value::is_array) {
-        return Err(HttpError::new(
-            "Upstream compact response is missing output.",
-            StatusCode::BAD_GATEWAY,
-            HeaderMap::new(),
-            String::new(),
-        )
-        .into());
-    }
-
-    let mut response = Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(bytes))
-        .expect("static provider compact response");
-    for name in ["x-request-id", "openai-request-id", "x-codex-turn-state"] {
-        if let Some(value) = upstream_headers.get(name) {
-            response.headers_mut().insert(name, value.clone());
+    let error_message = format!("Failed to compact {provider} responses");
+    let result = match read_buffered_responses_response(
+        upstream,
+        ResponsesBufferedContract::Compact,
+        &error_message,
+    )
+    .await?
+    {
+        ResponsesBufferedBody::Compact(result) => result,
+        ResponsesBufferedBody::Regular(_) => {
+            return Err(HttpError::internal(
+                "Provider compact unexpectedly returned a full response",
+            )
+            .into())
         }
-    }
-    Ok(response)
+    };
+    Ok(finish_compact_response(
+        result,
+        recorder,
+        &response_model,
+        status,
+    ))
 }

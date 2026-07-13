@@ -360,7 +360,7 @@ well-typed conflicts fail. Failed/incomplete terminals, malformed JSON, and any
 event after a terminal fail before JSON or synthetic Anthropic SSE success.
 Output comparison canonicalizes only reconstruction semantics: optional null and
 absence are equivalent, ignored item/annotation extensions do not create false
-conflicts, citation URL/title/text and ordering remain authoritative, and cached
+conflicts, citation URL/title and ordering remain authoritative, and cached
 plus reasoning usage details are compared. A representable web-search call keeps
 its original Responses item ID as the Anthropic server-tool ID.
 
@@ -397,34 +397,50 @@ Nested output authority is likewise field-specific:
 | Item `status` | Progressive assertion. `in_progress` may advance to `completed`/`incomplete`; a done snapshot may omit status; contradictory present terminal states fail. |
 | Message `role` | Required and stable. |
 | Message `content` | Added snapshots may be empty/partial; done/terminal text must converge. Content type/text conflicts fail. |
-| Text `annotations` | Optional assertion. Consumed citation URL/title semantics merge; omission/null makes no assertion. Duplicate URLs and unknown annotation extensions are ignored consistently. |
+| Text `annotations` | Canonical optional assertion. Missing/null/empty/unknown-only arrays make no assertion. Mixed arrays compare only known `url_citation` URL/title semantics in source order; absent/null title deterministically defaults to the URL. Duplicate URLs and unknown extensions are ignored. Matching known citations merge; conflicting known citations fail. A non-array field, non-object entry, wrong-typed annotation discriminator, or malformed known URL/title fails. |
 | Web-search `action` | Optional in partial item snapshots. Exactly one non-empty final search query is required; matching `query`/single `queries` forms merge, conflicts fail. |
 | Message `phase`, internal passthrough metadata, unknown item extensions | Ignored by web reconstruction and excluded consistently from semantic equality. |
 
-Native non-stream `/v1/responses` and `/v1/responses/compact` do not serialize
-the typed validation model back to the client. Successful upstream JSON is
-size-bounded and parsed for malformed-body/usage/output handling, but the
-original bytes are returned across Copilot, Codex-provider, and generic-provider
-branches, preserving explicit nulls, unknown fields, whitespace, and key order.
-Native SSE remains raw event forwarding under the existing lifecycle guard.
+The annotation matrix covers both created/terminal directions, lifecycle
+added/done snapshots, empty/null/absent/unknown-only arrays, mixed known and
+unknown values, deterministic title/default/deduplication behavior, conflicts,
+and malformed field/entry/known-citation shapes through both Anthropic JSON and
+synthetic SSE. The remaining optional collections were audited: response output
+and progressive message content deliberately give empty arrays phase-specific
+authority. A present web-search action must still resolve to exactly one query
+(`queries: []` may use a non-empty `query` fallback); it is not an optional
+canonical collection. Annotations are the only canonical optional collection
+where empty is equivalent to no assertion.
 
-Direct Copilot buffering uses separate contracts:
+Native non-stream `/v1/responses` and `/v1/responses/compact` do not serialize
+their validation model back to the client. Bodies remain size-bounded and valid
+JSON is returned in its original bytes, preserving explicit nulls, unknown
+fields, whitespace, and key order. Direct regular Responses validates the full
+result contract. Direct Copilot, Codex-provider, and generic-provider compact
+routing all use the same shared reader and output-only contract. Native SSE
+remains raw event forwarding under the existing lifecycle guard.
+
+Buffered validation contracts:
 
 | Endpoint | Buffered validation |
 |---|---|
-| `/v1/responses` | Full Responses result: required identity/model/status/output, strict known output item fields, and internally consistent nonnegative usage. |
-| `/v1/responses/compact` | Compact output-only result: required output array, source-valid ResponseItem shapes (including id-less `compaction`), optional strict usage, and arbitrary extensions; no fabricated response ID/model/status requirement. |
+| Direct `/v1/responses` | Full Responses result: required identity/model/status/output, strict known output item fields, and internally consistent nonnegative usage. |
+| `/v1/responses/compact` (direct and provider) | Shared compact output-only result: required output array, source-valid ResponseItem shapes (including id-less `compaction`), optional strict usage, and arbitrary extensions; no fabricated response ID/model/status requirement. |
 
-Malformed JSON, wrong known output/item shapes, inconsistent usage, and
-size-limit failures from an otherwise successful direct upstream response become
-sanitized OpenAI `502 Bad Gateway` errors. Real upstream 4xx/5xx statuses,
-OpenAI error bodies, `Retry-After`, and allowlisted request IDs are retained.
-Successful direct regular/compact bodies preserve original bytes and only
+Malformed JSON, wrong known compact output/item shapes, malformed, inconsistent,
+negative, or overflowing usage, and size-limit failures from an otherwise
+successful direct/provider compact response become sanitized OpenAI
+`502 Bad Gateway` errors. Real upstream 4xx/5xx statuses, OpenAI error bodies,
+`Retry-After`, and allowlisted request IDs are retained. Successful direct
+regular and all compact bodies preserve original bytes and only
 allowlisted `x-request-id`, `openai-request-id`, and `x-codex-turn-state`
 headers; arbitrary upstream headers are not exposed.
-The public fixtures exercise the actual 16 MiB response bound and assert the
-bounded `copilot_upstream_request_seconds` status classes. Successful direct
-compact usage is recorded under the `responses_compact` token-usage endpoint;
+Public fixtures exercise the actual 16 MiB response bound. Direct and provider
+latency use `copilot_upstream_request_seconds` and
+`provider_upstream_request_seconds`, respectively, with only bounded
+`endpoint=responses_compact` and coarse status labels; configured provider
+aliases are never metric labels. Successful compact usage is recorded under the
+`responses_compact` endpoint with `copilot` or `provider` source attribution;
 malformed/oversized bodies are rejected before usage is recorded.
 
 `response.completed` and `response.incomplete` cannot produce Anthropic success
@@ -459,6 +475,10 @@ evidence is in
 `direct_copilot_compact_preserves_output_only_contract_and_continuation`,
 `direct_copilot_compact_failures_use_native_bad_gateway_semantics`,
 `direct_copilot_regular_responses_preserve_bytes_headers_and_errors`,
+`provider_compact_uses_shared_output_contract_and_records_usage`,
+`provider_compact_failures_match_direct_native_semantics`,
+`claude_web_search_annotations_canonicalize_across_all_snapshots`,
+`claude_web_search_malformed_or_conflicting_annotations_fail_once`,
 and
 `claude_incomplete_or_out_of_order_response_items_fail_once_without_success`,
 in addition to the JSON/SSE framing regressions.

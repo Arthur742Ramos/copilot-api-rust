@@ -32,6 +32,7 @@ const UPSTREAM_KEY: &str = "fixture-upstream-key";
 const NATIVE_NULL_SHAPE: &str = r#"{"unknown_before":{"keep":true},"id":"resp_native_null","object":null,"created_at":null,"model":"gpt-native-null-shape","output":[],"output_text":null,"status":"completed","usage":null,"metadata":null,"parallel_tool_calls":null,"tools":null,"unknown_after":null}"#;
 const COMPACT_NULL_SHAPE: &str = r#"{"unknown_before":{"keep":true},"output":[{"type":"compaction","id":null,"encrypted_content":"enc_raw"}],"metadata":null,"unknown_after":null}"#;
 const DIRECT_COMPACT_SHAPE: &str = r#"{"extension_before":null,"output":[{"type":"compaction","id":null,"encrypted_content":"enc_direct","internal_chat_message_metadata_passthrough":{"turn_id":"direct-turn"}}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3},"extension_after":{"keep":true}}"#;
+const PROVIDER_COMPACT_SHAPE: &str = r#"{"extension_before":null,"output":[{"type":"message","id":null,"role":"assistant","status":null,"content":[{"type":"input_text","text":"retained","annotations":null,"future_block_field":true}],"future_item_field":{"keep":true}},{"type":"compaction","encrypted_content":"enc_provider","internal_chat_message_metadata_passthrough":{"turn_id":"provider-turn"}}],"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":1},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":1},"total_tokens":7},"extension_after":{"keep":true}}"#;
 const DIRECT_RESPONSES_SHAPE: &str = r#"{"extension_before":null,"id":"resp_direct","object":null,"created_at":null,"model":"gpt-direct-response-raw","output":[],"output_text":null,"status":"completed","usage":null,"metadata":null,"extension_after":{"keep":true}}"#;
 static INIT_HOME: Once = Once::new();
 
@@ -131,7 +132,11 @@ async fn fixture_handler(
 }
 
 fn compact_fixture(body: &Value) -> Response {
-    match body["model"].as_str().unwrap_or_default() {
+    let model = body["model"].as_str().unwrap_or_default();
+    if model.starts_with("gpt-provider-compact-") {
+        return provider_compact_fixture(model);
+    }
+    match model {
         "gpt-native-null-shape" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
@@ -214,6 +219,100 @@ fn compact_fixture(body: &Value) -> Response {
             "fixture_extension": {"preserved": true}
         }))
         .into_response(),
+    }
+}
+
+fn provider_compact_fixture(model: &str) -> Response {
+    match model {
+        "gpt-provider-compact-success" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "provider-compact-request")
+            .header("openai-request-id", "provider-openai-request")
+            .header("x-codex-turn-state", "provider-state")
+            .header("x-unsafe-secret", "must-not-propagate")
+            .body(Body::from(PROVIDER_COMPACT_SHAPE))
+            .expect("provider compact success fixture"),
+        "gpt-provider-compact-wrong-item" => {
+            Json(json!({"output":[{"type":"compaction","id":null}]})).into_response()
+        }
+        "gpt-provider-compact-wrong-output" => {
+            Json(json!({"output":"wrong","extension":{"keep":true}})).into_response()
+        }
+        "gpt-provider-compact-usage-malformed" => Json(json!({
+            "output":[],
+            "usage":{"input_tokens":"5","output_tokens":2,"total_tokens":7}
+        }))
+        .into_response(),
+        "gpt-provider-compact-usage-inconsistent" => Json(json!({
+            "output":[],
+            "usage":{"input_tokens":5,"output_tokens":2,"total_tokens":8}
+        }))
+        .into_response(),
+        "gpt-provider-compact-usage-negative" => Json(json!({
+            "output":[],
+            "usage":{"input_tokens":-1,"output_tokens":2,"total_tokens":1}
+        }))
+        .into_response(),
+        "gpt-provider-compact-usage-overflow" => Json(json!({
+            "output":[],
+            "usage":{"input_tokens":i64::MAX,"output_tokens":1,"total_tokens":i64::MAX}
+        }))
+        .into_response(),
+        "gpt-provider-compact-malformed-json" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "provider-compact-malformed")
+            .header("x-unsafe-secret", "must-not-propagate")
+            .body(Body::from("{provider-not-json"))
+            .expect("provider malformed compact fixture"),
+        "gpt-provider-compact-oversized" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "provider-compact-oversized")
+            .header(
+                "content-length",
+                (copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES + 1).to_string(),
+            )
+            .body(Body::from(vec![
+                b'x';
+                copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+                    + 1
+            ]))
+            .expect("provider oversized compact fixture"),
+        "gpt-provider-compact-400" => (
+            StatusCode::BAD_REQUEST,
+            [
+                ("x-request-id", "provider-compact-400"),
+                ("x-unsafe-secret", "must-not-propagate"),
+            ],
+            Json(json!({
+                "error":{
+                    "message":"provider compact invalid",
+                    "type":"invalid_request_error",
+                    "code":"provider_compact_invalid",
+                    "fixture_extension":{"keep":true}
+                }
+            })),
+        )
+            .into_response(),
+        "gpt-provider-compact-503" => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("x-request-id", "provider-compact-503"),
+                ("retry-after", "4"),
+                ("x-unsafe-secret", "must-not-propagate"),
+            ],
+            Json(json!({
+                "error":{
+                    "message":"provider compact unavailable",
+                    "type":"server_error",
+                    "code":"provider_compact_unavailable"
+                }
+            })),
+        )
+            .into_response(),
+        other => panic!("unexpected provider compact fixture model {other}"),
     }
 }
 
@@ -3373,6 +3472,246 @@ fn web_search_authority_fixture(model: &str) -> Option<Response> {
     Some(sse_response(render_sse(&events)))
 }
 
+fn web_annotation_output(annotations: Option<Value>, status: &str) -> Vec<Value> {
+    let mut text = json!({
+        "type":"output_text",
+        "text":"Grounded answer."
+    });
+    if let Some(annotations) = annotations {
+        text["annotations"] = annotations;
+    }
+    vec![
+        json!({
+            "type":"web_search_call",
+            "id":"annotation-web",
+            "status":status,
+            "action":{"type":"search","query":"rust async"}
+        }),
+        json!({
+            "type":"message",
+            "id":"annotation-message",
+            "role":"assistant",
+            "status":status,
+            "content":[text]
+        }),
+    ]
+}
+
+fn web_search_annotation_lifecycle_fixture(model: &str) -> Option<Response> {
+    let citation = json!({
+        "type":"url_citation",
+        "url":"https://example.test/source",
+        "title":"Source"
+    });
+    let conflicting = json!({
+        "type":"url_citation",
+        "url":"https://example.test/other",
+        "title":"Other"
+    });
+    let unknown = json!({"type":"future_annotation","opaque":{"keep":true}});
+    let (added_annotations, done_annotations, terminal_annotations) = match model {
+        "gpt-web-annotations-lifecycle-empty-unknown" => {
+            (Some(json!([unknown])), Some(json!([])), None)
+        }
+        "gpt-web-annotations-lifecycle-mixed-known" => (
+            Some(json!([citation.clone(), unknown])),
+            Some(json!([citation.clone()])),
+            Some(json!([citation])),
+        ),
+        "gpt-web-annotations-lifecycle-conflict-known" => (
+            Some(json!([citation])),
+            Some(json!([conflicting.clone()])),
+            Some(json!([conflicting])),
+        ),
+        _ => return None,
+    };
+    let added = web_annotation_output(added_annotations, "in_progress");
+    let done = web_annotation_output(done_annotations, "completed");
+    let terminal = web_annotation_output(terminal_annotations, "completed");
+    Some(sse_response(render_sse(&[
+        (
+            "response.created",
+            json!({
+                "type":"response.created",
+                "sequence_number":0,
+                "response":{"id":"resp_web_annotations","status":null,"output":null}
+            }),
+        ),
+        (
+            "response.output_item.added",
+            json!({
+                "type":"response.output_item.added",
+                "sequence_number":1,
+                "output_index":0,
+                "item":added[0]
+            }),
+        ),
+        (
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "sequence_number":2,
+                "output_index":0,
+                "item":done[0]
+            }),
+        ),
+        (
+            "response.output_item.added",
+            json!({
+                "type":"response.output_item.added",
+                "sequence_number":3,
+                "output_index":1,
+                "item":added[1]
+            }),
+        ),
+        (
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "sequence_number":4,
+                "output_index":1,
+                "item":done[1]
+            }),
+        ),
+        (
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "sequence_number":5,
+                "response":{
+                    "id":"resp_web_annotations",
+                    "status":null,
+                    "output":terminal,
+                    "usage":{"input_tokens":6,"output_tokens":4,"total_tokens":10}
+                }
+            }),
+        ),
+    ])))
+}
+
+fn web_search_annotation_fixture(model: &str) -> Option<Response> {
+    if let Some(response) = web_search_annotation_lifecycle_fixture(model) {
+        return Some(response);
+    }
+    let citation = json!({
+        "type":"url_citation",
+        "url":"https://example.test/source",
+        "title":"Source"
+    });
+    let unknown = json!({"type":"future_annotation","opaque":{"keep":true}});
+    let mixed = json!([citation.clone(), unknown.clone()]);
+    let (created_annotations, terminal_annotations) = match model {
+        "gpt-web-annotations-created-empty-terminal-absent" => (Some(json!([])), None),
+        "gpt-web-annotations-created-absent-terminal-empty" => (None, Some(json!([]))),
+        "gpt-web-annotations-created-unknown-terminal-null" => {
+            (Some(json!([unknown.clone()])), Some(Value::Null))
+        }
+        "gpt-web-annotations-created-null-terminal-unknown" => {
+            (Some(Value::Null), Some(json!([unknown])))
+        }
+        "gpt-web-annotations-created-mixed-terminal-known" => {
+            (Some(mixed.clone()), Some(json!([citation.clone()])))
+        }
+        "gpt-web-annotations-created-known-terminal-mixed" => {
+            (Some(json!([citation.clone()])), Some(mixed))
+        }
+        "gpt-web-annotations-duplicate-known" => (
+            Some(json!([
+                citation.clone(),
+                {
+                    "type":"url_citation",
+                    "url":"https://example.test/source",
+                    "title":"Ignored duplicate title"
+                }
+            ])),
+            Some(json!([citation.clone()])),
+        ),
+        "gpt-web-annotations-default-title" => (
+            Some(json!([{
+                "type":"url_citation",
+                "url":"https://example.test/source"
+            }])),
+            Some(json!([{
+                "type":"url_citation",
+                "url":"https://example.test/source",
+                "title":"https://example.test/source"
+            }])),
+        ),
+        "gpt-web-annotations-known-extensions" => (
+            Some(json!([{
+                "type":"url_citation",
+                "url":"https://example.test/source",
+                "title":"Source",
+                "start_index":0,
+                "end_index":4,
+                "future":{"keep":true}
+            }])),
+            Some(json!([citation.clone()])),
+        ),
+        "gpt-web-annotations-conflict-known" => (
+            Some(json!([citation])),
+            Some(json!([{
+                "type":"url_citation",
+                "url":"https://example.test/other",
+                "title":"Other"
+            }])),
+        ),
+        "gpt-web-annotations-malformed-field" => (Some(json!("wrong")), None),
+        "gpt-web-annotations-malformed-entry" => (None, Some(json!([1]))),
+        "gpt-web-annotations-malformed-type" => (Some(json!([{"type":1,"opaque":true}])), None),
+        "gpt-web-annotations-malformed-known-missing-url" => (
+            None,
+            Some(json!([{"type":"url_citation","title":"Missing"}])),
+        ),
+        "gpt-web-annotations-malformed-known-url" => (
+            Some(json!([{
+                "type":"url_citation",
+                "url":42,
+                "title":"Wrong URL"
+            }])),
+            None,
+        ),
+        "gpt-web-annotations-malformed-known-title" => (
+            None,
+            Some(json!([{
+                "type":"url_citation",
+                "url":"https://example.test/source",
+                "title":42
+            }])),
+        ),
+        _ => return None,
+    };
+    let created_output = web_annotation_output(created_annotations, "completed");
+    let terminal_output = web_annotation_output(terminal_annotations, "completed");
+    Some(sse_response(render_sse(&[
+        (
+            "response.created",
+            json!({
+                "type":"response.created",
+                "sequence_number":0,
+                "response":{
+                    "id":"resp_web_annotations",
+                    "status":null,
+                    "output":created_output
+                }
+            }),
+        ),
+        (
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "sequence_number":1,
+                "response":{
+                    "id":"resp_web_annotations",
+                    "status":null,
+                    "output":terminal_output,
+                    "usage":{"input_tokens":6,"output_tokens":4,"total_tokens":10}
+                }
+            }),
+        ),
+    ])))
+}
+
 fn web_search_item_lifecycle_fixture(model: &str) -> Option<Response> {
     let (added, done) = match model {
         "gpt-web-lifecycle-item-fields-added-only" => (
@@ -3463,6 +3802,9 @@ fn web_search_item_lifecycle_fixture(model: &str) -> Option<Response> {
 }
 
 fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
+    if let Some(response) = web_search_annotation_fixture(model) {
+        return Some(response);
+    }
     if let Some(response) = web_search_authority_fixture(model) {
         return Some(response);
     }
@@ -6393,6 +6735,17 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-premature-eof",
         "gpt-incomplete",
         "gpt-cli-smoke",
+        "gpt-provider-compact-success",
+        "gpt-provider-compact-wrong-item",
+        "gpt-provider-compact-wrong-output",
+        "gpt-provider-compact-usage-malformed",
+        "gpt-provider-compact-usage-inconsistent",
+        "gpt-provider-compact-usage-negative",
+        "gpt-provider-compact-usage-overflow",
+        "gpt-provider-compact-malformed-json",
+        "gpt-provider-compact-oversized",
+        "gpt-provider-compact-400",
+        "gpt-provider-compact-503",
         "gpt-scalar-function-valid",
         "gpt-scalar-custom-tool-valid",
         "gpt-scalar-function-whitespace-namespace-valid",
@@ -6489,6 +6842,25 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-web-metadata-terminal-only",
         "gpt-web-metadata-matching",
         "gpt-web-metadata-null-absent",
+        "gpt-web-annotations-created-empty-terminal-absent",
+        "gpt-web-annotations-created-absent-terminal-empty",
+        "gpt-web-annotations-created-unknown-terminal-null",
+        "gpt-web-annotations-created-null-terminal-unknown",
+        "gpt-web-annotations-created-mixed-terminal-known",
+        "gpt-web-annotations-created-known-terminal-mixed",
+        "gpt-web-annotations-duplicate-known",
+        "gpt-web-annotations-default-title",
+        "gpt-web-annotations-known-extensions",
+        "gpt-web-annotations-lifecycle-empty-unknown",
+        "gpt-web-annotations-lifecycle-mixed-known",
+        "gpt-web-annotations-conflict-known",
+        "gpt-web-annotations-malformed-field",
+        "gpt-web-annotations-malformed-entry",
+        "gpt-web-annotations-malformed-type",
+        "gpt-web-annotations-malformed-known-missing-url",
+        "gpt-web-annotations-malformed-known-url",
+        "gpt-web-annotations-malformed-known-title",
+        "gpt-web-annotations-lifecycle-conflict-known",
         "gpt-web-created-metadata-malformed",
         "gpt-web-terminal-metadata-malformed",
         "gpt-web-created-incomplete-details-malformed",
@@ -9159,6 +9531,122 @@ async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
+async fn claude_web_search_annotations_canonicalize_across_all_snapshots() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+
+    for model in [
+        "gpt-web-annotations-created-empty-terminal-absent",
+        "gpt-web-annotations-created-absent-terminal-empty",
+        "gpt-web-annotations-created-unknown-terminal-null",
+        "gpt-web-annotations-created-null-terminal-unknown",
+        "gpt-web-annotations-created-mixed-terminal-known",
+        "gpt-web-annotations-created-known-terminal-mixed",
+        "gpt-web-annotations-duplicate-known",
+        "gpt-web-annotations-default-title",
+        "gpt-web-annotations-known-extensions",
+        "gpt-web-annotations-lifecycle-empty-unknown",
+        "gpt-web-annotations-lifecycle-mixed-known",
+    ] {
+        configure_with_web_search_model(&fixture, Some(&format!("responses-fixture/{model}")));
+        let expects_source = matches!(
+            model,
+            "gpt-web-annotations-created-mixed-terminal-known"
+                | "gpt-web-annotations-created-known-terminal-mixed"
+                | "gpt-web-annotations-duplicate-known"
+                | "gpt-web-annotations-default-title"
+                | "gpt-web-annotations-known-extensions"
+                | "gpt-web-annotations-lifecycle-mixed-known"
+        );
+
+        let (json_status, json_bytes) = send(web_search_messages_request(false)).await;
+        assert_eq!(
+            json_status,
+            StatusCode::OK,
+            "{model}: {}",
+            String::from_utf8_lossy(&json_bytes)
+        );
+        let json_response = json_body(&json_bytes);
+        assert_eq!(json_response["id"], "resp_web_annotations", "{model}");
+        assert_eq!(json_response["stop_reason"], "end_turn", "{model}");
+        let sources = json_response["content"][1]["content"]
+            .as_array()
+            .expect("web-search source array");
+        assert_eq!(sources.len(), usize::from(expects_source), "{model}");
+        if expects_source {
+            assert_eq!(sources[0]["url"], "https://example.test/source", "{model}");
+            assert_eq!(
+                sources[0]["title"],
+                if model == "gpt-web-annotations-default-title" {
+                    "https://example.test/source"
+                } else {
+                    "Source"
+                },
+                "{model}"
+            );
+        }
+
+        let (sse_status, sse_bytes) = send(web_search_messages_request(true)).await;
+        assert_eq!(sse_status, StatusCode::OK, "{model}");
+        let events = data_events(&sse_bytes);
+        assert!(
+            !events.iter().any(|event| event["type"] == "error"),
+            "{model}"
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("message_stop"),
+            "{model}"
+        );
+        let tool_result = events
+            .iter()
+            .find(|event| event["content_block"]["type"] == "web_search_tool_result")
+            .expect("synthetic web-search tool-result block");
+        assert_eq!(
+            tool_result["content_block"]["content"]
+                .as_array()
+                .map(Vec::len),
+            Some(usize::from(expects_source)),
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_web_search_malformed_or_conflicting_annotations_fail_once() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+
+    for model in [
+        "gpt-web-annotations-conflict-known",
+        "gpt-web-annotations-malformed-field",
+        "gpt-web-annotations-malformed-entry",
+        "gpt-web-annotations-malformed-type",
+        "gpt-web-annotations-malformed-known-missing-url",
+        "gpt-web-annotations-malformed-known-url",
+        "gpt-web-annotations-malformed-known-title",
+        "gpt-web-annotations-lifecycle-conflict-known",
+    ] {
+        configure_with_web_search_model(&fixture, Some(&format!("responses-fixture/{model}")));
+        for stream in [false, true] {
+            let (status, body) = send(web_search_messages_request(stream)).await;
+            assert!(
+                status.is_server_error(),
+                "{model}/{stream}: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+            let error = json_body(&body);
+            assert_eq!(error["type"], "error", "{model}/{stream}");
+            assert_eq!(error["error"]["type"], "api_error", "{model}/{stream}");
+            assert!(error.get("content").is_none(), "{model}/{stream}");
+            assert!(error.get("stop_reason").is_none(), "{model}/{stream}");
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
 async fn claude_web_search_lifecycle_optionals_merge_in_both_directions() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
@@ -9379,12 +9867,13 @@ async fn native_nonstream_responses_preserves_exact_null_and_unknown_shape() {
     assert_eq!(error["error"]["type"], "server_error");
 }
 
-fn assert_responses_upstream_metric(status: &str) {
+fn assert_upstream_metric(metric: &str, endpoint: &str, status: &str) {
     let rendered = copilot_api::libs::metrics::render();
+    let prefix = format!("{metric}_count{{");
     assert!(
         rendered.lines().any(|line| {
-            line.starts_with("copilot_upstream_request_seconds_count{")
-                && line.contains("endpoint=\"responses\"")
+            line.starts_with(&prefix)
+                && line.contains(&format!("endpoint=\"{endpoint}\""))
                 && line.contains(&format!("status=\"{status}\""))
                 && line
                     .split_whitespace()
@@ -9392,7 +9881,7 @@ fn assert_responses_upstream_metric(status: &str) {
                     .and_then(|value| value.parse::<f64>().ok())
                     .is_some_and(|value| value >= 1.0)
         }),
-        "missing bounded Responses upstream metric for {status}:\n{rendered}"
+        "missing bounded {metric} metric for {endpoint}/{status}:\n{rendered}"
     );
 }
 
@@ -9426,6 +9915,245 @@ fn direct_compact_request(model: &str) -> Request<Body> {
         }),
         Some(CLIENT_KEY),
     )
+}
+
+fn provider_compact_request(model: &str) -> Request<Body> {
+    post_json(
+        "/v1/responses/compact",
+        json!({
+            "model":format!("responses-fixture/{model}"),
+            "instructions":"Keep provider decisions.",
+            "input":[{
+                "type":"message",
+                "role":"user",
+                "content":[{"type":"input_text","text":"compact provider history"}]
+            }],
+            "fixture_extension":{"keep":true}
+        }),
+        Some(CLIENT_KEY),
+    )
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn provider_compact_uses_shared_output_contract_and_records_usage() {
+    let _ = copilot_api::libs::metrics::metrics_handle();
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let (status, headers, body) =
+        send_full(provider_compact_request("gpt-provider-compact-success")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_slice(), PROVIDER_COMPACT_SHAPE.as_bytes());
+    assert_eq!(
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("provider-compact-request")
+    );
+    assert_eq!(
+        headers
+            .get("openai-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("provider-openai-request")
+    );
+    assert_eq!(
+        headers
+            .get("x-codex-turn-state")
+            .and_then(|value| value.to_str().ok()),
+        Some("provider-state")
+    );
+    assert!(headers.get("x-unsafe-secret").is_none());
+
+    let compacted = serde_json::from_str::<Value>(PROVIDER_COMPACT_SHAPE)
+        .expect("provider compact fixture JSON")["output"][1]
+        .clone();
+    let (status, _) = send(post_json(
+        "/v1/responses",
+        json!({
+            "model":"responses-fixture/gpt-fixture",
+            "input":[
+                compacted,
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+            ],
+            "stream":false
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let captures = fixture.requests();
+    let compact_capture = captures
+        .iter()
+        .find(|capture| {
+            capture.path == "/v1/responses/compact"
+                && capture.body["model"] == "gpt-provider-compact-success"
+        })
+        .expect("provider compact capture");
+    assert_eq!(
+        compact_capture.headers["authorization"],
+        format!("Bearer {UPSTREAM_KEY}")
+    );
+    assert_ne!(
+        compact_capture.headers["authorization"],
+        format!("Bearer {CLIENT_KEY}")
+    );
+    let continuation = captures
+        .iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("provider compact continuation capture");
+    let continued_compaction = continuation.body["input"]
+        .as_array()
+        .and_then(|input| input.iter().find(|item| item["type"] == "compaction"))
+        .expect("id-less provider compaction continuation");
+    assert!(continued_compaction.get("id").is_none());
+    assert_eq!(
+        continued_compaction["internal_chat_message_metadata_passthrough"]["turn_id"],
+        "provider-turn"
+    );
+
+    let usage = await_usage_event("gpt-provider-compact-success").await;
+    assert_eq!(usage.endpoint, "responses_compact");
+    assert_eq!(usage.source, "provider");
+    assert_eq!(usage.provider_name.as_deref(), Some("responses-fixture"));
+    assert_eq!(usage.cache_read_input_tokens, 1);
+    assert_eq!(usage.input_tokens, 4);
+    assert_eq!(usage.output_tokens, 2);
+    assert_eq!(usage.total_tokens, 7);
+    assert_upstream_metric(
+        "provider_upstream_request_seconds",
+        "responses_compact",
+        "ok",
+    );
+    assert!(
+        copilot_api::libs::metrics::render()
+            .lines()
+            .filter(|line| line.starts_with("provider_upstream_request_seconds_count{"))
+            .all(|line| !line.contains("provider=")),
+        "configured provider aliases must not become metric labels"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn provider_compact_failures_match_direct_native_semantics() {
+    let _ = copilot_api::libs::metrics::metrics_handle();
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let invalid_models = [
+        "gpt-provider-compact-wrong-item",
+        "gpt-provider-compact-wrong-output",
+        "gpt-provider-compact-usage-malformed",
+        "gpt-provider-compact-usage-inconsistent",
+        "gpt-provider-compact-usage-negative",
+        "gpt-provider-compact-usage-overflow",
+        "gpt-provider-compact-malformed-json",
+        "gpt-provider-compact-oversized",
+    ];
+    for model in invalid_models {
+        let (status, headers, body) = send_full(provider_compact_request(model)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}");
+        let error = json_body(&body);
+        assert_eq!(error["error"]["type"], "server_error", "{model}");
+        assert_eq!(error["error"]["code"], "server_error", "{model}");
+        assert_eq!(error["error"]["param"], Value::Null, "{model}");
+        assert!(!body
+            .windows(b"provider-not-json".len())
+            .any(|window| window == b"provider-not-json"));
+        let expected_request_id = match model {
+            "gpt-provider-compact-malformed-json" => Some("provider-compact-malformed"),
+            "gpt-provider-compact-oversized" => Some("provider-compact-oversized"),
+            _ => None,
+        };
+        assert_eq!(
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            expected_request_id,
+            "{model}"
+        );
+        assert!(headers.get("x-unsafe-secret").is_none(), "{model}");
+    }
+
+    for (model, expected_status, request_id, retry_after, expected_code) in [
+        (
+            "gpt-provider-compact-400",
+            StatusCode::BAD_REQUEST,
+            "provider-compact-400",
+            None,
+            "provider_compact_invalid",
+        ),
+        (
+            "gpt-provider-compact-503",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider-compact-503",
+            Some("4"),
+            "provider_compact_unavailable",
+        ),
+    ] {
+        let (status, headers, body) = send_full(provider_compact_request(model)).await;
+        assert_eq!(status, expected_status, "{model}");
+        assert_eq!(
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id),
+            "{model}"
+        );
+        assert_eq!(
+            headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            retry_after,
+            "{model}"
+        );
+        assert!(headers.get("x-unsafe-secret").is_none(), "{model}");
+        let error = json_body(&body);
+        assert_eq!(error["error"]["code"], expected_code, "{model}");
+        assert_eq!(
+            error["error"]["type"],
+            if expected_status == StatusCode::BAD_REQUEST {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            },
+            "{model}"
+        );
+        if expected_status == StatusCode::BAD_REQUEST {
+            assert_eq!(error["error"]["fixture_extension"]["keep"], true);
+        }
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("provider compact")));
+    }
+
+    let events = copilot_api::libs::token_usage::get_token_usage_events_page(1, 100, "day").items;
+    assert!(
+        !events
+            .iter()
+            .any(|event| invalid_models.contains(&event.model.as_str())),
+        "invalid compact responses must not emit usage: {events:#?}"
+    );
+    assert_upstream_metric(
+        "provider_upstream_request_seconds",
+        "responses_compact",
+        "ok",
+    );
+    assert_upstream_metric(
+        "provider_upstream_request_seconds",
+        "responses_compact",
+        "client_error",
+    );
+    assert_upstream_metric(
+        "provider_upstream_request_seconds",
+        "responses_compact",
+        "server_error",
+    );
 }
 
 #[tokio::test]
@@ -9491,7 +10219,11 @@ async fn direct_copilot_compact_preserves_output_only_contract_and_continuation(
     assert_eq!(usage.input_tokens, 2);
     assert_eq!(usage.output_tokens, 1);
     assert_eq!(usage.total_tokens, 3);
-    assert_responses_upstream_metric("ok");
+    assert_upstream_metric(
+        "copilot_upstream_request_seconds",
+        "responses_compact",
+        "ok",
+    );
 }
 
 #[tokio::test]
@@ -9573,9 +10305,21 @@ async fn direct_copilot_compact_failures_use_native_bad_gateway_semantics() {
             "{model}"
         );
     }
-    assert_responses_upstream_metric("ok");
-    assert_responses_upstream_metric("client_error");
-    assert_responses_upstream_metric("server_error");
+    assert_upstream_metric(
+        "copilot_upstream_request_seconds",
+        "responses_compact",
+        "ok",
+    );
+    assert_upstream_metric(
+        "copilot_upstream_request_seconds",
+        "responses_compact",
+        "client_error",
+    );
+    assert_upstream_metric(
+        "copilot_upstream_request_seconds",
+        "responses_compact",
+        "server_error",
+    );
 }
 
 #[tokio::test]
@@ -9661,9 +10405,17 @@ async fn direct_copilot_regular_responses_preserve_bytes_headers_and_errors() {
         Some("2")
     );
     assert_eq!(json_body(&body)["error"]["code"], "direct_unavailable");
-    assert_responses_upstream_metric("ok");
-    assert_responses_upstream_metric("client_error");
-    assert_responses_upstream_metric("server_error");
+    assert_upstream_metric("copilot_upstream_request_seconds", "responses", "ok");
+    assert_upstream_metric(
+        "copilot_upstream_request_seconds",
+        "responses",
+        "client_error",
+    );
+    assert_upstream_metric(
+        "copilot_upstream_request_seconds",
+        "responses",
+        "server_error",
+    );
 }
 
 #[tokio::test]

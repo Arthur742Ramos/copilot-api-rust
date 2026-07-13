@@ -18,10 +18,9 @@ use serde_json::{json, Value};
 
 use crate::libs::error::{http_error_from_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
-use crate::libs::request_context::request_context_store;
 use crate::libs::token_usage::{
-    create_provider_token_usage_recorder, normalize_responses_usage, TokenUsageRecorder,
-    UsageTokens,
+    create_request_scoped_provider_token_usage_recorder, normalize_responses_usage,
+    TokenUsageRecorder, UsageTokens,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
@@ -77,7 +76,11 @@ pub async fn handle_provider_responses_for_provider(
     compact_input_by_latest_compaction(&mut payload);
 
     let is_stream = payload.stream.unwrap_or(false);
-    let recorder = create_provider_responses_usage_recorder(&payload, &provider);
+    let recorder = create_request_scoped_provider_token_usage_recorder(
+        "responses",
+        payload.model.clone(),
+        provider.clone(),
+    );
 
     if provider_config.name == "codex" {
         let upstream_response =
@@ -164,23 +167,6 @@ pub async fn handle_provider_responses_for_provider(
         &resp_headers,
         bytes,
     ))
-}
-
-/// Mirrors `createProviderResponsesUsageRecorder`: session id derived from the
-/// request-context session affinity.
-fn create_provider_responses_usage_recorder(
-    payload: &ResponsesPayload,
-    provider: &str,
-) -> TokenUsageRecorder {
-    let session_affinity = request_context_store()
-        .and_then(|s| s.session_affinity)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let mut recorder =
-        create_provider_token_usage_recorder("responses", payload.model.clone(), provider, None);
-    recorder.session_id = Some(session_affinity.unwrap_or_default());
-    recorder
 }
 
 /// Mirrors `streamProviderResponses`: peek the first event for a leading `error`

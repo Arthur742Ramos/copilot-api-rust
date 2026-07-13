@@ -258,6 +258,24 @@ pub fn create_provider_token_usage_recorder(
     }
 }
 
+/// Create a provider recorder bound to the current request's session affinity.
+/// Responses and Responses compact use this common constructor so their
+/// attribution remains identical.
+pub fn create_request_scoped_provider_token_usage_recorder(
+    endpoint: TokenUsageEndpoint,
+    model: impl Into<String>,
+    provider_name: impl Into<String>,
+) -> TokenUsageRecorder {
+    let session_affinity = request_context_store()
+        .and_then(|context| context.session_affinity)
+        .map(|session| session.trim().to_string())
+        .filter(|session| !session.is_empty())
+        .unwrap_or_default();
+    let mut recorder = create_provider_token_usage_recorder(endpoint, model, provider_name, None);
+    recorder.session_id = Some(session_affinity);
+    recorder
+}
+
 // ---------------------------------------------------------------------------
 // SQLite persistence: structs, schema, writes, aggregation queries.
 // Mirrors src/lib/token-usage/store.ts. JSON struct field order matches the TS

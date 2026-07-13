@@ -423,16 +423,18 @@ pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(),
     for item in &result.output {
         let raw = match item {
             ResponseOutputItem::Message(message) => {
-                if message.content.iter().any(|block| {
-                    !matches!(
-                        block,
-                        ResponseOutputContentBlock::Text(text)
-                            if text.block_type == "output_text"
-                    )
-                }) {
-                    return Err(invalid_web_search_stream(
-                        "the web-search response contained unsupported message content",
-                    ));
+                for block in &message.content {
+                    let ResponseOutputContentBlock::Text(text) = block else {
+                        return Err(invalid_web_search_stream(
+                            "the web-search response contained unsupported message content",
+                        ));
+                    };
+                    if text.block_type != "output_text" {
+                        return Err(invalid_web_search_stream(
+                            "the web-search response contained unsupported message content",
+                        ));
+                    }
+                    canonical_web_annotations(text.annotations.as_deref())?;
                 }
                 continue;
             }
@@ -1224,30 +1226,54 @@ fn validated_snapshot_output(
     Ok(Some(output.clone()))
 }
 
-fn canonical_web_annotations(annotations: &[Value]) -> Vec<Value> {
+#[allow(clippy::result_large_err)]
+fn canonical_web_annotations(
+    annotations: Option<&[Value]>,
+) -> Result<Option<Vec<Value>>, AppError> {
+    let Some(annotations) = annotations else {
+        return Ok(None);
+    };
     let mut seen_urls = HashSet::new();
     let mut canonical = Vec::new();
     for annotation in annotations {
-        if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+        let annotation = annotation.as_object().ok_or_else(|| {
+            invalid_web_search_stream("web-search message annotation was not an object")
+        })?;
+        let annotation_type = match annotation.get("type") {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(annotation_type)) => annotation_type.as_str(),
+            Some(_) => {
+                return Err(invalid_web_search_stream(
+                    "web-search message annotation type was not a string or null",
+                ))
+            }
+        };
+        if annotation_type != "url_citation" {
             continue;
         }
-        let Some(url) = annotation
-            .get("url")
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
-        else {
-            continue;
+        let url = match annotation.get("url") {
+            Some(Value::String(url)) if !url.is_empty() => url.as_str(),
+            _ => {
+                return Err(invalid_web_search_stream(
+                    "web-search URL citation had a missing, empty, or non-string URL",
+                ))
+            }
         };
         if !seen_urls.insert(url.to_string()) {
             continue;
         }
-        let title = annotation
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or(url);
+        let title = match annotation.get("title") {
+            None | Some(Value::Null) => url,
+            Some(Value::String(title)) => title.as_str(),
+            Some(_) => {
+                return Err(invalid_web_search_stream(
+                    "web-search URL citation title was not a string or null",
+                ))
+            }
+        };
         canonical.push(json!({"type":"url_citation","url":url,"title":title}));
     }
-    canonical
+    Ok((!canonical.is_empty()).then_some(canonical))
 }
 
 #[derive(Debug, Clone)]
@@ -1323,11 +1349,20 @@ fn parse_web_output_assertion(
                         "web-search message content was unsupported",
                     ));
                 };
-                let annotations = raw_content
+                let raw_annotations = raw_content
                     .get(index)
-                    .and_then(|block| block.get("annotations"))
-                    .filter(|annotations| !annotations.is_null())
-                    .map(|_| canonical_web_annotations(text.annotations.as_deref().unwrap_or(&[])));
+                    .and_then(|block| block.get("annotations"));
+                let annotations = match raw_annotations {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Array(annotations)) => {
+                        canonical_web_annotations(Some(annotations.as_slice()))?
+                    }
+                    Some(_) => {
+                        return Err(invalid_web_search_stream(
+                            "web-search message annotations were not an array or null",
+                        ))
+                    }
+                };
                 content.push(WebTextAssertion {
                     block_type: text.block_type,
                     text: text.text,
