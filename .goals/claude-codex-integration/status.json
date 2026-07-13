@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 22,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -111,6 +111,11 @@
       "iteration": 21,
       "verdict": "FAIL",
       "summary": "Chat SSE identity, terminal, usage, extras, and adversarial failure handling pass, but official optional tool-fragment forms are over-rejected, refusal/logprobs policies diverge, and nested usage service tiers accept invalid enums."
+    },
+    {
+      "iteration": 22,
+      "verdict": "FAIL",
+      "summary": "Optional tool fragments, service-tier enums, logprobs rejection, and executed provider/direct fixtures pass, but refusal deltas are treated as complete values and JSON/SSE refusal preservation still diverges."
     }
   ]
 }
