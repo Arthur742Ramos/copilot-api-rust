@@ -176,6 +176,7 @@ struct TranslationState {
     /// Original Anthropic tools as `Value` for interop with `tool_search`.
     original_tools: Vec<Value>,
     tool_search_enabled: bool,
+    deferred_tool_names: HashSet<String>,
     tool_use_name_by_id: std::collections::HashMap<String, String>,
 }
 
@@ -231,10 +232,12 @@ pub fn translate_anthropic_messages_to_responses_payload(
         Some(tool_values.as_slice())
     };
     let tool_search_enabled = should_enable_responses_tool_search(&payload.model, tool_slice);
+    let deferred_tool_names = list_deferred_tool_names(&tool_values).into_iter().collect();
 
     let mut state = TranslationState {
         original_tools: tool_values.clone(),
         tool_search_enabled,
+        deferred_tool_names,
         tool_use_name_by_id: std::collections::HashMap::new(),
     };
 
@@ -569,6 +572,26 @@ fn create_output_text_content(text: String) -> ResponseInputContent {
     })
 }
 
+fn source_extensions(block: &Value) -> Map<String, Value> {
+    let Some(source) = block.get("source").and_then(Value::as_object) else {
+        return Map::new();
+    };
+    let known = ["type", "media_type", "data", "url", "file_id"];
+    let extensions: Map<String, Value> = source
+        .iter()
+        .filter(|(key, _)| !known.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if extensions.is_empty() {
+        Map::new()
+    } else {
+        Map::from_iter([(
+            "anthropic_source_extensions".to_string(),
+            Value::Object(extensions),
+        )])
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn create_image_content(block: &Value) -> Result<ResponseInputImage, AppError> {
     let source = block.get("source");
@@ -598,7 +621,7 @@ fn create_image_content(block: &Value) -> Result<ResponseInputImage, AppError> {
         image_url: Some(image_url),
         file_id: None,
         detail: Some("auto".to_string()),
-        extra: Default::default(),
+        extra: source_extensions(block),
     })
 }
 
@@ -635,7 +658,7 @@ fn create_file_content(block: &Value) -> Result<ResponseInputFile, AppError> {
         file_data: Some(file_data),
         file_id: None,
         filename: Some(filename),
-        extra: Default::default(),
+        extra: source_extensions(block),
     })
 }
 
@@ -762,7 +785,7 @@ fn create_function_tool_call(
         .ok_or_else(|| AppError::BadRequest("tool_use.input must be an object".to_string()))?;
     let arguments = serde_json::to_string(input)
         .map_err(|error| AppError::Other(anyhow::anyhow!("{error}")))?;
-    let namespace = if state.tool_search_enabled && is_deferred_tool_name(name) {
+    let namespace = if state.tool_search_enabled && state.deferred_tool_names.contains(name) {
         Some(name.to_string())
     } else {
         None
@@ -1044,6 +1067,7 @@ fn resolve_deferred_tool(tool_name: &str, original_tools: &[Value]) -> Result<Va
             .get("name")
             .and_then(Value::as_str)
             .is_some_and(is_deferred_tool_name)
+            && tool.get("defer_loading") == Some(&Value::Bool(true))
         {
             return Ok(tool.clone());
         }
@@ -1139,7 +1163,10 @@ fn convert_anthropic_tools(
             continue;
         }
 
-        if tool_search_enabled && is_deferred_tool_name(name) {
+        if tool_search_enabled
+            && is_deferred_tool_name(name)
+            && tool.get("defer_loading") == Some(&Value::Bool(true))
+        {
             converted.push(convert_deferred_tool_to_namespace(tool)?);
             continue;
         }
@@ -1183,8 +1210,12 @@ fn convert_tool_to_function(tool: &Value) -> Result<Value, AppError> {
         .ok_or_else(|| AppError::BadRequest("tool.name must be a non-empty string".to_string()))?;
     let schema = tool
         .get("input_schema")
-        .filter(|schema| schema.is_object())
-        .ok_or_else(|| AppError::BadRequest("tool.input_schema must be an object".to_string()))?;
+        .filter(|schema| schema.is_object() || schema.is_boolean())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "tool.input_schema must be an object or boolean schema".to_string(),
+            )
+        })?;
     let parameters = normalize_tool_schema(Some(schema));
     let mut obj = Map::new();
     obj.insert("type".to_string(), json!("function"));
@@ -1210,9 +1241,11 @@ fn convert_deferred_tool_to_namespace(tool: &Value) -> Result<Value, AppError> {
         })?;
     let schema = tool
         .get("input_schema")
-        .filter(|schema| schema.is_object())
+        .filter(|schema| schema.is_object() || schema.is_boolean())
         .ok_or_else(|| {
-            AppError::BadRequest("deferred tool.input_schema must be an object".to_string())
+            AppError::BadRequest(
+                "deferred tool.input_schema must be an object or boolean schema".to_string(),
+            )
         })?;
     let parameters = normalize_tool_schema(Some(schema));
     let description = tool

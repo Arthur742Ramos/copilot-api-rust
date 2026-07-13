@@ -188,12 +188,32 @@ The web-search policy follows Anthropic's
   `allowed_callers` and `response_inclusion` cannot be represented by this
   Responses bridge and therefore fail explicitly rather than being discarded.
 
-Custom/deferred tools require a non-empty unique name and object
-`input_schema`; consumed schema fields (`type`, `properties`, `required`) are
-shape-validated while unknown schema keys survive conversion. `tool_choice`,
-system blocks, metadata, thinking/output configuration, stop sequences, cache
+Custom/deferred tools require a non-empty unique name and an object or boolean
+`input_schema`. Schema validation is structural rather than a full metaschema
+evaluation: every schema node is object/boolean, and known recursive containers
+are traversed (`properties`, `patternProperties`, `$defs`/`definitions`,
+`items`/`prefixItems`, additional/unevaluated properties, combinators,
+conditionals, dependencies, `contains`, `propertyNames`, and required-name
+arrays). Unknown keywords and values remain byte-semantically unchanged.
+Validation is bounded to depth 64, 4,096 schema nodes, and 4,096 entries per
+known collection. An object schema with `type: "object"` and no `properties`
+retains the established empty-properties normalization.
+
+An explicit `tool_choice` of type `tool` must name exactly one declared
+non-deferred function. Server tools and deferred functions cannot be selected as
+ordinary functions. The sole exception is the declared tool-search bridge: it
+maps deliberately to Responses `auto` only when the resolved model supports tool
+search and the catalog contains a real `defer_loading: true` tool. `auto`, `any`,
+and `none` accept no `name`; duplicate catalog names fail before choice
+resolution.
+
+System blocks, metadata, thinking/output configuration, stop sequences, cache
 controls, text/image/document sources, tool-use inputs, and tool-result content
-all validate their known container and scalar types before translation.
+all validate their known container and scalar types before translation. Image
+and document sources support only the bridge's `base64` and `url` forms;
+`file` and future source types fail before admission. Unknown fields inside a
+supported source object are retained in
+`anthropic_source_extensions` without duplicating large base64 data.
 
 Anthropic
 [`tool_reference`](https://github.com/anthropics/anthropic-sdk-python/blob/d2f6543ee7995adcae74666a5d37b3d9743debfe/src/anthropic/types/tool_reference_block_param.py)
@@ -207,7 +227,11 @@ allowed. Exact public evidence is in
 `claude_web_search_request_policy_preserves_valid_empty_duplicate_and_unknown_values`,
 `claude_known_request_collections_fail_closed_before_provider_dispatch`,
 `claude_deferred_tool_references_reject_malformed_collections_before_dispatch`,
-and `claude_deferred_tool_empty_duplicate_and_unknown_extensions_are_explicit`.
+`claude_deferred_tool_empty_duplicate_and_unknown_extensions_are_explicit`,
+`claude_tool_choice_must_resolve_to_one_compatible_declared_tool`,
+`claude_recursive_schema_shape_and_bounds_fail_before_dispatch`,
+`claude_complex_boolean_schemas_choices_and_sources_preserve_supported_shape`,
+and `claude_unsupported_source_types_fail_before_admission_or_dispatch`.
 
 ### Reasoning framing and stream lifecycle policy
 
@@ -561,7 +585,7 @@ Status means deterministic, credential-free evidence exists.
 | Streaming and non-streaming | Supported | Supported | fixture captures and native response assertions |
 | Instructions/system variants | string and structured system blocks | `instructions` plus input messages | request captures |
 | Text and structured input | Messages content blocks | string/array input; images with optional `detail` | typed audit and provider-boundary captures |
-| Tool definitions/results | tool use/result, multi-turn; deferred references are defined/non-empty and preserve explicit order/duplicates; malformed definitions, schemas, identities, arguments, and result collections fail before dispatch | function/custom/tool-search calls and outputs, including optional IDs | request collection, deferred reference, optional-item, and paired JSON/SSE boundary audits |
+| Tool definitions/results | tool use/result, multi-turn; explicit choices bind to one compatible catalog entry; recursive object/boolean schemas are shape/bound validated; deferred references preserve explicit order/duplicates; malformed definitions, identities, arguments, and result collections fail before dispatch | function/custom/tool-search calls and outputs, including optional IDs | catalog choice, recursive schema, request collection, deferred reference, optional-item, and paired JSON/SSE boundary audits |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
 | Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |

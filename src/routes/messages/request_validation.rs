@@ -11,10 +11,24 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use crate::libs::config::resolve_mapped_model;
 use crate::libs::error::AppError;
+use crate::libs::provider_model::parse_provider_model_alias;
+use crate::libs::tool_search::{is_bridge_tool_search_name, supports_responses_tool_search_model};
 
-type ToolCatalog = HashMap<String, bool>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCatalogKind {
+    Function { deferred: bool },
+    BridgeSearch,
+    Server,
+}
+
+type ToolCatalog = HashMap<String, ToolCatalogKind>;
 type ToolUseCatalog = HashMap<String, String>;
+
+pub const MAX_REQUEST_SCHEMA_DEPTH: usize = 64;
+pub const MAX_REQUEST_SCHEMA_NODES: usize = 4096;
+pub const MAX_REQUEST_SCHEMA_COLLECTION_ITEMS: usize = 4096;
 
 fn invalid(path: &str, expectation: &str) -> AppError {
     AppError::BadRequest(format!("{path}: {expectation}"))
@@ -155,21 +169,203 @@ fn validate_user_location(value: &Value, path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_json_schema(value: &Value, path: &str) -> Result<(), AppError> {
-    let object = required_object(value, path)?;
-    validate_optional_string(object, "type", path, true)?;
-    if let Some(properties) = object.get("properties") {
-        if !properties.is_object() {
-            return Err(invalid(&format!("{path}.properties"), "must be an object"));
+#[derive(Default)]
+struct SchemaValidationBudget {
+    nodes: usize,
+}
+
+fn validate_schema_collection_bound(length: usize, path: &str) -> Result<(), AppError> {
+    if length > MAX_REQUEST_SCHEMA_COLLECTION_ITEMS {
+        return Err(invalid(
+            path,
+            &format!(
+                "contains {length} entries, exceeding the {} entry limit",
+                MAX_REQUEST_SCHEMA_COLLECTION_ITEMS
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schema_string_array(value: &Value, path: &str) -> Result<(), AppError> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| invalid(path, "must be an array of strings"))?;
+    validate_schema_collection_bound(array.len(), path)?;
+    for (index, value) in array.iter().enumerate() {
+        if !value.is_string() {
+            return Err(invalid(&format!("{path}[{index}]"), "must be a string"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_schema_array(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    budget: &mut SchemaValidationBudget,
+) -> Result<(), AppError> {
+    let schemas = value
+        .as_array()
+        .ok_or_else(|| invalid(path, "must be an array of schema nodes"))?;
+    validate_schema_collection_bound(schemas.len(), path)?;
+    for (index, schema) in schemas.iter().enumerate() {
+        validate_json_schema_node(schema, &format!("{path}[{index}]"), depth + 1, budget)?;
+    }
+    Ok(())
+}
+
+fn validate_schema_map(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    budget: &mut SchemaValidationBudget,
+) -> Result<(), AppError> {
+    let schemas = value
+        .as_object()
+        .ok_or_else(|| invalid(path, "must be an object of schema nodes"))?;
+    validate_schema_collection_bound(schemas.len(), path)?;
+    for (name, schema) in schemas {
+        validate_json_schema_node(schema, &format!("{path}.{name}"), depth + 1, budget)?;
+    }
+    Ok(())
+}
+
+fn validate_json_schema_node(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    budget: &mut SchemaValidationBudget,
+) -> Result<(), AppError> {
+    if depth > MAX_REQUEST_SCHEMA_DEPTH {
+        return Err(invalid(
+            path,
+            &format!(
+                "exceeds the maximum schema depth of {}",
+                MAX_REQUEST_SCHEMA_DEPTH
+            ),
+        ));
+    }
+    budget.nodes = budget.nodes.saturating_add(1);
+    if budget.nodes > MAX_REQUEST_SCHEMA_NODES {
+        return Err(invalid(
+            path,
+            &format!(
+                "exceeds the maximum schema node count of {}",
+                MAX_REQUEST_SCHEMA_NODES
+            ),
+        ));
+    }
+    if value.is_boolean() {
+        return Ok(());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid(path, "schema node must be an object or boolean"))?;
+    validate_schema_collection_bound(object.len(), path)?;
+
+    if let Some(schema_type) = object.get("type") {
+        match schema_type {
+            Value::String(_) => {}
+            Value::Array(types) => {
+                validate_schema_collection_bound(types.len(), &format!("{path}.type"))?;
+                if types.is_empty() || types.iter().any(|value| !value.is_string()) {
+                    return Err(invalid(
+                        &format!("{path}.type"),
+                        "must be a string or a non-empty array of strings",
+                    ));
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    &format!("{path}.type"),
+                    "must be a string or a non-empty array of strings",
+                ))
+            }
+        }
+    }
+
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        if let Some(value) = object.get(keyword) {
+            validate_schema_map(value, &format!("{path}.{keyword}"), depth, budget)?;
+        }
+    }
+
+    if let Some(items) = object.get("items") {
+        if items.is_array() {
+            validate_schema_array(items, &format!("{path}.items"), depth, budget)?;
+        } else {
+            validate_json_schema_node(items, &format!("{path}.items"), depth + 1, budget)?;
+        }
+    }
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if let Some(value) = object.get(keyword) {
+            validate_schema_array(value, &format!("{path}.{keyword}"), depth, budget)?;
+        }
+    }
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "propertyNames",
+    ] {
+        if let Some(value) = object.get(keyword) {
+            validate_json_schema_node(value, &format!("{path}.{keyword}"), depth + 1, budget)?;
         }
     }
     if let Some(required) = object.get("required") {
-        if required.is_null() {
-            return Err(invalid(&format!("{path}.required"), "must be an array"));
+        validate_schema_string_array(required, &format!("{path}.required"))?;
+    }
+    if let Some(dependent_required) = object.get("dependentRequired") {
+        let dependencies = dependent_required.as_object().ok_or_else(|| {
+            invalid(
+                &format!("{path}.dependentRequired"),
+                "must be an object of string arrays",
+            )
+        })?;
+        validate_schema_collection_bound(dependencies.len(), &format!("{path}.dependentRequired"))?;
+        for (name, required) in dependencies {
+            validate_schema_string_array(required, &format!("{path}.dependentRequired.{name}"))?;
         }
-        validate_string_array(required, &format!("{path}.required"), true)?;
+    }
+    if let Some(dependencies) = object.get("dependencies") {
+        let dependencies = dependencies.as_object().ok_or_else(|| {
+            invalid(
+                &format!("{path}.dependencies"),
+                "must be an object of schemas or string arrays",
+            )
+        })?;
+        validate_schema_collection_bound(dependencies.len(), &format!("{path}.dependencies"))?;
+        for (name, dependency) in dependencies {
+            let dependency_path = format!("{path}.dependencies.{name}");
+            if dependency.is_array() {
+                validate_schema_string_array(dependency, &dependency_path)?;
+            } else {
+                validate_json_schema_node(dependency, &dependency_path, depth + 1, budget)?;
+            }
+        }
+    }
+    if let Some(reference) = object.get("$ref") {
+        if !reference.is_string() {
+            return Err(invalid(&format!("{path}.$ref"), "must be a string"));
+        }
     }
     Ok(())
+}
+
+fn validate_json_schema(value: &Value, path: &str) -> Result<(), AppError> {
+    validate_json_schema_node(value, path, 0, &mut SchemaValidationBudget::default())
 }
 
 fn validate_web_search_tool(tool: &Map<String, Value>, path: &str) -> Result<(), AppError> {
@@ -258,8 +454,12 @@ fn validate_tools(payload: &Map<String, Value>) -> Result<ToolCatalog, AppError>
             }
             Some(_) => return Err(invalid(&format!("{path}.type"), "must be a string or null")),
         };
-        if kind.is_some_and(|kind| kind.starts_with("web_search")) {
+        let catalog_entry = if kind.is_some_and(|kind| kind.starts_with("web_search")) {
             validate_web_search_tool(tool, &path)?;
+            Some((
+                required_nonempty_string(tool, "name", &path)?.to_string(),
+                ToolCatalogKind::Server,
+            ))
         } else if kind.is_none() || tool.get("input_schema").is_some() {
             let name = required_nonempty_string(tool, "name", &path)?;
             let schema = tool.get("input_schema").ok_or_else(|| {
@@ -269,18 +469,24 @@ fn validate_tools(payload: &Map<String, Value>) -> Result<ToolCatalog, AppError>
                 )
             })?;
             validate_json_schema(schema, &format!("{path}.input_schema"))?;
-            if catalog.insert(name.to_string(), defer_loading).is_some() {
-                return Err(invalid(
-                    &format!("{path}.name"),
-                    "tool names must be unique",
-                ));
-            }
-            continue;
+            Some((
+                name.to_string(),
+                if is_bridge_tool_search_name(name) {
+                    ToolCatalogKind::BridgeSearch
+                } else {
+                    ToolCatalogKind::Function {
+                        deferred: defer_loading,
+                    }
+                },
+            ))
         } else {
             validate_optional_string(tool, "name", &path, true)?;
-        }
-        if let Some(name) = tool.get("name").and_then(Value::as_str) {
-            if catalog.insert(name.to_string(), defer_loading).is_some() {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(|name| (name.to_string(), ToolCatalogKind::Server))
+        };
+        if let Some((name, kind)) = catalog_entry {
+            if catalog.insert(name, kind).is_some() {
                 return Err(invalid(
                     &format!("{path}.name"),
                     "tool names must be unique",
@@ -319,9 +525,17 @@ fn validate_source(block: &Map<String, Value>, path: &str) -> Result<(), AppErro
             required_nonempty_string(source, "url", &source_path)?;
         }
         "file" => {
-            required_nonempty_string(source, "file_id", &source_path)?;
+            return Err(invalid(
+                &format!("{source_path}.type"),
+                "file sources are not supported by the Responses translation",
+            ))
         }
-        _ => {}
+        unsupported => {
+            return Err(invalid(
+                &format!("{source_path}.type"),
+                &format!("unsupported source type \"{unsupported}\""),
+            ))
+        }
     }
     Ok(())
 }
@@ -333,8 +547,8 @@ fn validate_tool_reference(
 ) -> Result<(), AppError> {
     let name = required_nonempty_string(block, "tool_name", path)?;
     match tools.get(name) {
-        Some(true) => {}
-        Some(false) => {
+        Some(ToolCatalogKind::Function { deferred: true }) => {}
+        Some(_) => {
             return Err(invalid(
                 &format!("{path}.tool_name"),
                 "must reference a tool with defer_loading=true",
@@ -568,7 +782,17 @@ fn validate_system(payload: &Map<String, Value>) -> Result<(), AppError> {
     }
 }
 
-fn validate_tool_choice(payload: &Map<String, Value>) -> Result<(), AppError> {
+fn effective_responses_model(payload: &Map<String, Value>) -> Option<String> {
+    let model = payload.get("model").and_then(Value::as_str)?;
+    let mapped = resolve_mapped_model(model);
+    Some(
+        parse_provider_model_alias(&mapped)
+            .map(|alias| alias.model)
+            .unwrap_or(mapped),
+    )
+}
+
+fn validate_tool_choice(payload: &Map<String, Value>, tools: &ToolCatalog) -> Result<(), AppError> {
     let Some(choice) = payload.get("tool_choice") else {
         return Ok(());
     };
@@ -583,12 +807,48 @@ fn validate_tool_choice(payload: &Map<String, Value>) -> Result<(), AppError> {
             "must be one of auto, any, tool, or none",
         ));
     }
-    if kind == "tool" {
-        required_nonempty_string(choice, "name", "tool_choice")?;
-    } else {
-        validate_optional_string(choice, "name", "tool_choice", true)?;
+    if kind != "tool" {
+        if choice.get("name").is_some_and(|name| !name.is_null()) {
+            return Err(invalid(
+                "tool_choice.name",
+                "is only valid when tool_choice.type is \"tool\"",
+            ));
+        }
+        return Ok(());
     }
-    Ok(())
+
+    let name = required_nonempty_string(choice, "name", "tool_choice")?;
+    match tools.get(name) {
+        Some(ToolCatalogKind::Function { deferred: false }) => Ok(()),
+        Some(ToolCatalogKind::Function { deferred: true }) => Err(invalid(
+            "tool_choice.name",
+            "cannot directly select a deferred tool; select the declared tool-search bridge",
+        )),
+        Some(ToolCatalogKind::Server) => Err(invalid(
+            "tool_choice.name",
+            "must reference a compatible custom function tool",
+        )),
+        Some(ToolCatalogKind::BridgeSearch) => {
+            let model_supports_bridge = effective_responses_model(payload)
+                .as_deref()
+                .is_some_and(supports_responses_tool_search_model);
+            let has_deferred_tool = tools
+                .values()
+                .any(|kind| matches!(kind, ToolCatalogKind::Function { deferred: true }));
+            if model_supports_bridge && has_deferred_tool {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "tool_choice.name",
+                    "tool-search bridge selection requires a supported model and a declared deferred tool",
+                ))
+            }
+        }
+        None => Err(invalid(
+            "tool_choice.name",
+            "must reference exactly one declared compatible tool",
+        )),
+    }
 }
 
 fn validate_metadata(payload: &Map<String, Value>) -> Result<(), AppError> {
@@ -659,7 +919,7 @@ pub fn validate_messages_request_shape(payload: &Value) -> Result<(), AppError> 
     let tools = validate_tools(payload)?;
     validate_messages(payload, &tools)?;
     validate_system(payload)?;
-    validate_tool_choice(payload)?;
+    validate_tool_choice(payload, &tools)?;
     validate_metadata(payload)?;
     validate_thinking(payload)?;
     validate_output_config(payload)?;

@@ -9867,6 +9867,496 @@ async fn claude_known_request_collections_fail_closed_before_provider_dispatch()
     }
 }
 
+fn tool_schema_messages_body(model: &str, schema: Value, tool_choice: Option<Value>) -> Value {
+    let mut body = json!({
+        "model":format!("responses-fixture/{model}"),
+        "max_tokens":128,
+        "tools":[{
+            "name":"selected_tool",
+            "description":"Selected tool",
+            "input_schema":schema,
+            "future_tool_key":{"keep":true}
+        }],
+        "messages":[{"role":"user","content":"Use the selected tool"}],
+        "stream":false
+    });
+    if let Some(tool_choice) = tool_choice {
+        body["tool_choice"] = tool_choice;
+    }
+    body
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_tool_choice_must_resolve_to_one_compatible_declared_tool() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let function_tool = json!({
+        "name":"actual",
+        "input_schema":{"type":"object"}
+    });
+    for (label, body) in [
+        (
+            "undefined function",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[function_tool.clone()],
+                "tool_choice":{"type":"tool","name":"missing"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "deferred function",
+            json!({
+                "model":"responses-fixture/gpt-5.4",
+                "max_tokens":128,
+                "tools":[{
+                    "name":"mcp__deferred",
+                    "defer_loading":true,
+                    "input_schema":{"type":"object"}
+                }],
+                "tool_choice":{"type":"tool","name":"mcp__deferred"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "server tool",
+            json!({
+                "model":"claude-sonnet-4-6",
+                "max_tokens":128,
+                "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                "tool_choice":{"type":"tool","name":"web_search"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "unknown server kind",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[{"type":"future_server","name":"future"}],
+                "tool_choice":{"type":"tool","name":"future"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "bridge without deferred tool",
+            json!({
+                "model":"responses-fixture/gpt-5.4",
+                "max_tokens":128,
+                "tools":[{
+                    "name":"mcp__tool_search__search",
+                    "input_schema":{"type":"object"}
+                }],
+                "tool_choice":{"type":"tool","name":"mcp__tool_search__search"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "bridge unsupported model",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[
+                    {
+                        "name":"mcp__tool_search__search",
+                        "input_schema":{"type":"object"}
+                    },
+                    {
+                        "name":"mcp__deferred",
+                        "defer_loading":true,
+                        "input_schema":{"type":"object"}
+                    }
+                ],
+                "tool_choice":{"type":"tool","name":"mcp__tool_search__search"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "auto with name",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[function_tool.clone()],
+                "tool_choice":{"type":"auto","name":"actual"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "any with name",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[function_tool.clone()],
+                "tool_choice":{"type":"any","name":"actual"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "none with name",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[function_tool.clone()],
+                "tool_choice":{"type":"none","name":"actual"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+        (
+            "duplicate ambiguous catalog",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[function_tool.clone(),function_tool],
+                "tool_choice":{"type":"tool","name":"actual"},
+                "messages":[{"role":"user","content":"choose"}]
+            }),
+        ),
+    ] {
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_anthropic_invalid_request(&response, label);
+        let expected_path = if label == "duplicate ambiguous catalog" {
+            "tools[1].name"
+        } else {
+            "tool_choice"
+        };
+        assert!(json_body(&response)["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(expected_path)));
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
+fn binary_schema(depth: usize) -> Value {
+    if depth == 0 {
+        return Value::Bool(true);
+    }
+    let child = binary_schema(depth - 1);
+    json!({"allOf":[child.clone(),child]})
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_recursive_schema_shape_and_bounds_fail_before_dispatch() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let mut too_deep = Value::Bool(true);
+    for _ in 0..=copilot_api::routes::messages::request_validation::MAX_REQUEST_SCHEMA_DEPTH {
+        too_deep = json!({"not":too_deep});
+    }
+    let oversized_properties: Map<String, Value> = (0
+        ..=copilot_api::routes::messages::request_validation::MAX_REQUEST_SCHEMA_COLLECTION_ITEMS)
+        .map(|index| (format!("p{index}"), Value::Bool(true)))
+        .collect();
+    let cases = [
+        ("property scalar", json!({"properties":{"path":42}})),
+        (
+            "pattern property scalar",
+            json!({"patternProperties":{"^x":42}}),
+        ),
+        ("defs scalar", json!({"$defs":{"entry":"wrong"}})),
+        ("definitions scalar", json!({"definitions":{"entry":7}})),
+        ("items scalar", json!({"items":"wrong"})),
+        ("items schema array scalar", json!({"items":[true,7]})),
+        ("prefix items container", json!({"prefixItems":{"x":true}})),
+        ("prefix items scalar", json!({"prefixItems":[true,7]})),
+        (
+            "additional properties scalar",
+            json!({"additionalProperties":"wrong"}),
+        ),
+        (
+            "unevaluated properties scalar",
+            json!({"unevaluatedProperties":7}),
+        ),
+        ("all of container", json!({"allOf":{"x":true}})),
+        ("any of scalar", json!({"anyOf":[true,"wrong"]})),
+        ("one of scalar", json!({"oneOf":[7]})),
+        ("not scalar", json!({"not":"wrong"})),
+        ("if scalar", json!({"if":7,"then":true,"else":false})),
+        (
+            "dependent schemas scalar",
+            json!({"dependentSchemas":{"x":"wrong"}}),
+        ),
+        ("contains scalar", json!({"contains":"wrong"})),
+        ("property names scalar", json!({"propertyNames":7})),
+        ("required mixed", json!({"required":["x",7]})),
+        (
+            "dependent required container",
+            json!({"dependentRequired":["x"]}),
+        ),
+        (
+            "dependent required mixed",
+            json!({"dependentRequired":{"x":["y",7]}}),
+        ),
+        ("dependencies container", json!({"dependencies":[] })),
+        ("dependencies scalar", json!({"dependencies":{"x":7}})),
+        ("reference type", json!({"$ref":7})),
+        ("type array empty", json!({"type":[]})),
+        ("type array mixed", json!({"type":["object",7]})),
+        ("depth bound", too_deep),
+        ("node bound", binary_schema(12)),
+        (
+            "collection bound",
+            Value::Object(Map::from_iter([(
+                "properties".to_string(),
+                Value::Object(oversized_properties),
+            )])),
+        ),
+    ];
+    for (label, schema) in cases {
+        let before = fixture.requests().len();
+        let body = tool_schema_messages_body("gpt-fixture", schema, None);
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_anthropic_invalid_request(&response, label);
+        assert!(json_body(&response)["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("tools[0].input_schema")));
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_shape() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let complex_schema = json!({
+        "type":["object","null"],
+        "properties":{
+            "path":{"type":"string"},
+            "flags":{"type":"array","items":[true,{"not":false}]}
+        },
+        "patternProperties":{"^x-":false},
+        "$defs":{"name":{"type":"string"}},
+        "definitions":{"legacy":true},
+        "items":true,
+        "prefixItems":[true,{"type":"integer"}],
+        "additionalProperties":false,
+        "unevaluatedProperties":{"type":"string"},
+        "allOf":[true,{"required":["path"]}],
+        "anyOf":[false,{"$ref":"#/$defs/name"}],
+        "oneOf":[true,false],
+        "not":false,
+        "if":{"properties":{"path":true}},
+        "then":true,
+        "else":false,
+        "dependentSchemas":{"path":{"properties":{"other":true}}},
+        "contains":true,
+        "propertyNames":{"type":"string"},
+        "required":["path"],
+        "dependentRequired":{"path":["flags"]},
+        "dependencies":{"legacy":["path"],"schema":true},
+        "future_keyword":{"opaque":[1,2,3]}
+    });
+    let (status, _) = send(post_json(
+        "/v1/messages",
+        tool_schema_messages_body(
+            "gpt-fixture",
+            complex_schema.clone(),
+            Some(json!({"type":"tool","name":"selected_tool","future_choice":true})),
+        ),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("complex schema capture");
+    assert_eq!(capture.body["tools"][0]["parameters"], complex_schema);
+    assert_eq!(
+        capture.body["tool_choice"],
+        json!({"type":"function","name":"selected_tool"})
+    );
+
+    let (status, _) = send(post_json(
+        "/v1/messages",
+        tool_schema_messages_body(
+            "gpt-fixture",
+            Value::Bool(true),
+            Some(json!({"type":"tool","name":"selected_tool"})),
+        ),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("boolean schema capture");
+    assert_eq!(capture.body["tools"][0]["parameters"], true);
+
+    for (choice, expected) in [
+        (json!({"type":"auto"}), json!("auto")),
+        (json!({"type":"any"}), json!("required")),
+        (json!({"type":"none"}), json!("none")),
+    ] {
+        let (status, _) = send(post_json(
+            "/v1/messages",
+            tool_schema_messages_body("gpt-fixture", json!({"type":"object"}), Some(choice)),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let capture = fixture
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|capture| capture.path == "/v1/responses")
+            .expect("tool-choice capture");
+        assert_eq!(capture.body["tool_choice"], expected);
+    }
+
+    let bridge_body = json!({
+        "model":"responses-fixture/gpt-5.4",
+        "max_tokens":128,
+        "tools":[
+            {
+                "name":"mcp__tool_search__search",
+                "input_schema":{"type":"object"}
+            },
+            {
+                "name":"mcp__weather",
+                "defer_loading":true,
+                "input_schema":true
+            },
+            {
+                "name":"ordinary_tool",
+                "defer_loading":false,
+                "input_schema":{"type":"object"}
+            }
+        ],
+        "tool_choice":{"type":"tool","name":"mcp__tool_search__search"},
+        "messages":[{"role":"user","content":"choose through bridge"}]
+    });
+    let (status, _) = send(post_json("/v1/messages", bridge_body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("bridge choice capture");
+    assert_eq!(capture.body["tool_choice"], "auto");
+    assert!(capture.body["tools"]
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|tool| tool["type"] == "tool_search")));
+    assert!(capture.body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["type"] == "function" && tool["name"] == "ordinary_tool")
+    }));
+
+    let source_body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "messages":[{
+            "role":"user",
+            "content":[
+                {
+                    "type":"image",
+                    "source":{
+                        "type":"base64",
+                        "media_type":"image/png",
+                        "data":"aGVsbG8=",
+                        "future_image_key":{"keep":true}
+                    }
+                },
+                {
+                    "type":"document",
+                    "title":"doc.pdf",
+                    "source":{
+                        "type":"url",
+                        "url":"https://example.test/doc.pdf",
+                        "future_document_key":{"keep":true}
+                    }
+                }
+            ]
+        }]
+    });
+    let (status, _) = send(post_json("/v1/messages", source_body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("supported source capture");
+    let content = &capture.body["input"][0]["content"];
+    assert_eq!(
+        content[0]["anthropic_source_extensions"]["future_image_key"]["keep"],
+        true
+    );
+    assert_eq!(
+        content[1]["anthropic_source_extensions"]["future_document_key"]["keep"],
+        true
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_unsupported_source_types_fail_before_admission_or_dispatch() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    for (label, block) in [
+        (
+            "image file source",
+            json!({"type":"image","source":{"type":"file","file_id":"file-1"}}),
+        ),
+        (
+            "document file source",
+            json!({"type":"document","source":{"type":"file","file_id":"file-2"}}),
+        ),
+        (
+            "image unknown source",
+            json!({"type":"image","source":{"type":"future","opaque":true}}),
+        ),
+        (
+            "document unknown source",
+            json!({"type":"document","source":{"type":"future","opaque":true}}),
+        ),
+    ] {
+        let before = fixture.requests().len();
+        let body = json!({
+            "model":"responses-fixture/gpt-fixture",
+            "max_tokens":128,
+            "messages":[{"role":"user","content":[block]}]
+        });
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+        assert_anthropic_invalid_request(&response, label);
+        assert!(json_body(&response)["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("source.type")));
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
 async fn claude_deferred_tool_references_reject_malformed_collections_before_dispatch() {
