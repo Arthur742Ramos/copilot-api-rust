@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 25,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -126,6 +126,11 @@
       "iteration": 24,
       "verdict": "FAIL",
       "summary": "Source-ordered scheduler, refusal/tool/reasoning ordering, terminal handling, bounds fixtures, and provider/direct cases pass, but direct reasoning and opaque output bypass the aggregate emitted-response size bound."
+    },
+    {
+      "iteration": 25,
+      "verdict": "FAIL",
+      "summary": "Shared Chat budgets, exact/overflow UTF-8 fixtures, scheduler cleanup, and reasoning/signature accounting pass, but Responses function-argument state is over-reserved, web-search records usage before budget validation, and no public Responses budget fixtures exist."
     }
   ]
 }
