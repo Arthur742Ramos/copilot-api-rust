@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 12,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -61,6 +61,11 @@
       "iteration": 11,
       "verdict": "FAIL",
       "summary": "Nullable statuses and raw variants now pass, but model-less web snapshots fail, optional usage details and IDs are over-rejected, nested details can conflict silently, and native non-stream nulls are elided."
+    },
+    {
+      "iteration": 12,
+      "verdict": "FAIL",
+      "summary": "Web authority and raw-byte forwarding largely pass, but direct Copilot compaction rejects valid id-less output and malformed structured snapshot fields are silently accepted."
     }
   ]
 }
