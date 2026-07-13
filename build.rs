@@ -6,6 +6,7 @@
 //! source tarball with no git, or without a working clock), so the build never
 //! fails just because metadata could not be gathered.
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,13 +23,11 @@ fn main() {
 /// Emits `cargo:rerun-if-changed` triggers so the embedded SHA stays fresh.
 ///
 /// Watching `.git/HEAD` alone is not enough: on an ordinary commit to the
-/// current branch, `.git/HEAD` keeps its `ref: refs/heads/<branch>` content
-/// while the *ref file* under `.git/refs/heads/` (or an entry in
-/// `.git/packed-refs`) is what actually changes. So we also watch the
-/// `refs/heads` directory and `packed-refs`. Each path is guarded by an
-/// existence check — in a checkout where `.git` is absent (e.g. a Docker
-/// build from a source tarball) no triggers are emitted and the SHA simply
-/// falls back to "unknown".
+/// current branch, `HEAD` keeps its `ref: refs/heads/<branch>` content while the
+/// branch ref (or `packed-refs`) is what actually changes. Resolve those paths
+/// through `git rev-parse --git-path` rather than assuming `.git` is a
+/// directory: linked worktrees store `.git` as a pointer file and keep HEAD and
+/// branch refs in different git directories.
 ///
 /// Tradeoff: once a build script emits *any* `rerun-if-*` trigger, Cargo stops
 /// using its default "rerun on any source change" heuristic for this script.
@@ -43,31 +42,44 @@ fn emit_rerun_triggers() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
-    let git_dir = std::path::Path::new(".git");
-    for rel in ["HEAD", "refs/heads", "packed-refs"] {
-        let path = git_dir.join(rel);
-        if path.exists() {
-            println!("cargo:rerun-if-changed=.git/{rel}");
+    let mut paths = Vec::new();
+    for rel in ["HEAD", "packed-refs"] {
+        if let Some(path) = git_path(rel) {
+            paths.push(path);
         }
     }
+    if let Some(head_ref) = git_stdout(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git_path(&head_ref) {
+            paths.push(path);
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+fn git_path(path: &str) -> Option<PathBuf> {
+    git_stdout(&["rev-parse", "--git-path", path]).map(PathBuf::from)
+}
+
+fn git_stdout(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 /// Returns the short git commit SHA, or `None` if git is unavailable or this is
 /// not a git checkout.
 fn git_sha() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if sha.is_empty() {
-        None
-    } else {
-        Some(sha)
-    }
+    git_stdout(&["rev-parse", "--short", "HEAD"])
 }
 
 /// Returns an RFC 3339-ish UTC build timestamp. Honors `SOURCE_DATE_EPOCH` for
