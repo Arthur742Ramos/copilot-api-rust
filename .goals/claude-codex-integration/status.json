@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 19,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -96,6 +96,11 @@
       "iteration": 18,
       "verdict": "FAIL",
       "summary": "Responses extensions, route-aware stop_sequences, schema empty arrays, and gates pass, but the supported Chat Completions Messages bridge still silently drops top-level, message, and structured-system extras without public regressions."
+    },
+    {
+      "iteration": 19,
+      "verdict": "FAIL",
+      "summary": "Chat request extras, collisions, split carriers, structured content, and no-dispatch policy pass, but reverse Chat responses still drop open fields and turn malformed choices, tool calls, arguments, and usage into successful Anthropic output."
     }
   ]
 }
