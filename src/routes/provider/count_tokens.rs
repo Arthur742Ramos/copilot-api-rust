@@ -18,6 +18,7 @@ use crate::routes::messages::non_stream_translation::{
     translate_to_openai_with_options, TranslateToOpenAiOptions,
 };
 use crate::routes::messages::preprocess::normalize_system_messages;
+use crate::routes::messages::request_validation::validate_messages_request_shape;
 
 /// Mirrors `handleProviderCountTokensForProvider`.
 #[allow(clippy::result_large_err)]
@@ -99,6 +100,9 @@ pub async fn post_provider_count_tokens(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = validate_messages_request_shape(&value) {
+        return error.into_response();
+    }
     let payload: AnthropicMessagesPayload = match serde_json::from_value(value) {
         Ok(p) => p,
         Err(e) => {

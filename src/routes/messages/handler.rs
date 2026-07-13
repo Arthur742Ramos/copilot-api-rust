@@ -39,6 +39,7 @@ use crate::services::copilot::create_messages::CONTEXT_1M_BETA;
 use crate::services::copilot::get_models::Model;
 
 const MESSAGES_ENDPOINT: &str = "/v1/messages";
+const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 
 /// Reads the `model` field from the (loosely-typed) payload, defaulting to "".
 fn model_of(payload: &Value) -> String {
@@ -54,6 +55,22 @@ fn set_model(payload: &mut Value, model: &str) {
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".to_string(), Value::String(model.to_string()));
     }
+}
+
+fn is_claude_code_subagent_warmup(
+    payload: &Value,
+    headers: &HeaderMap,
+    has_subagent_marker: bool,
+) -> bool {
+    let no_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| tools.is_empty())
+        .unwrap_or(true);
+    headers.contains_key("anthropic-beta")
+        && no_tools
+        && get_compact_type(payload) == 0
+        && (has_subagent_marker || headers.contains_key(CLAUDE_CODE_AGENT_ID_HEADER))
 }
 
 /// Validate controls only after resolving the request's actual transport.
@@ -110,12 +127,11 @@ fn validate_selected_responses_controls(
     }
 
     let compact_type = get_compact_type(payload);
-    let no_tools = payload
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|tools| tools.is_empty())
-        .unwrap_or(true);
-    let warmup = headers.contains_key("anthropic-beta") && no_tools && compact_type == 0;
+    let warmup = is_claude_code_subagent_warmup(
+        payload,
+        headers,
+        parse_subagent_marker_from_first_user(payload).is_some(),
+    );
     let effective_model = if warmup {
         get_small_model()
     } else {
@@ -148,6 +164,8 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     }
     validate_generation_request(&payload)?;
     validate_messages_request_shape(&payload)?;
+    normalize_system_messages(&mut payload);
+    validate_generation_request(&payload)?;
 
     // 1. Resolve configured model mappings.
     let requested_model = model_of(&payload);
@@ -209,9 +227,6 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         .await;
     }
 
-    // 4. Anthropic preprocessing.
-    normalize_system_messages(&mut payload);
-
     crate::libs::premium_interactions::check_premium_interactions()?;
 
     sanitize_ide_tools(&mut payload);
@@ -226,18 +241,18 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     // claude code / opencode compact / auto-continue detection.
     let compact_type = get_compact_type(&payload);
 
-    // claude code 2.0.28+ warmup requests consume a premium request; force the
-    // small model when no tools are used and this is not a compact request.
+    // Claude Code subagent warmups can consume a premium request. Restrict the
+    // small-model swap to identified subagents: ordinary no-tool user requests
+    // carry the same beta header and must retain their selected model.
     let anthropic_beta = headers
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let no_tools = payload
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|t| t.is_empty())
-        .unwrap_or(true);
-    if anthropic_beta.is_some() && no_tools && compact_type == 0 {
+    let anthropic_version = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    if is_claude_code_subagent_warmup(&payload, &headers, subagent_marker.is_some()) {
         set_model(&mut payload, &get_small_model());
     }
 
@@ -326,6 +341,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         subagent_marker,
         selected_model: selected_model.clone(),
         anthropic_beta_header: anthropic_beta,
+        anthropic_version_header: anthropic_version,
         request_id,
         session_id,
         compact_type: Some(compact_type),
@@ -490,5 +506,25 @@ mod tests {
                 Err(AppError::BadRequest(_))
             ));
         }
+    }
+
+    #[test]
+    fn no_tool_user_request_is_not_misclassified_as_subagent_warmup() {
+        let payload = serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": []
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-beta", "claude-code-20250219".parse().unwrap());
+
+        assert!(!is_claude_code_subagent_warmup(&payload, &headers, false));
+
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            "agent-fixture".parse().unwrap(),
+        );
+        assert!(is_claude_code_subagent_warmup(&payload, &headers, false));
+        headers.remove(CLAUDE_CODE_AGENT_ID_HEADER);
+        assert!(is_claude_code_subagent_warmup(&payload, &headers, true));
     }
 }

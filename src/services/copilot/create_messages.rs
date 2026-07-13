@@ -47,6 +47,7 @@ pub struct CreateMessagesOptions<'a> {
     pub request_id: &'a str,
     pub session_id: Option<&'a str>,
     pub compact_type: Option<i32>,
+    pub anthropic_version_header: Option<&'a str>,
 }
 
 /// The result of a `/v1/messages` call: either a fully-buffered JSON response
@@ -207,6 +208,9 @@ pub async fn create_messages(
 
         if let Some(beta) = anthropic_beta.as_deref() {
             set_header(&mut headers, "anthropic-beta", beta);
+        }
+        if let Some(version) = options.anthropic_version_header {
+            set_header(&mut headers, "anthropic-version", version);
         }
 
         client()

@@ -34,6 +34,7 @@ use crate::routes::messages::non_stream_translation::{
     translate_to_anthropic, translate_to_openai_with_options, TranslateToOpenAiOptions,
 };
 use crate::routes::messages::preprocess::normalize_system_messages;
+use crate::routes::messages::request_validation::validate_messages_request_shape;
 use crate::routes::messages::responses_stream_translation::{
     build_error_event, terminate_responses_stream_with_error, translate_responses_stream_event,
     ResponsesStreamState,
@@ -79,6 +80,9 @@ pub async fn post_provider_messages(
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    if let Err(error) = validate_messages_request_shape(&value) {
+        return error.into_response();
+    }
     let payload: AnthropicMessagesPayload = match serde_json::from_value(value) {
         Ok(p) => p,
         Err(e) => {
@@ -146,6 +150,11 @@ pub async fn handle_provider_messages_for_provider(
     let mut payload_value = serde_json::to_value(&payload)?;
     normalize_system_messages(&mut payload_value);
     payload = serde_json::from_value(payload_value)?;
+    if payload.messages.is_empty() {
+        return Err(AppError::BadRequest(
+            "messages: must contain at least one user or assistant message".to_string(),
+        ));
+    }
 
     apply_model_defaults(&mut payload, model_config.as_ref());
 

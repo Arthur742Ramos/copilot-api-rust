@@ -51,7 +51,7 @@ Status terms:
 | Extended/adaptive thinking and reasoning signatures | Supported | `non_stream_translation.rs`; `responses_translation.rs`; streaming translator tests; `create_messages.rs` beta tests | Includes compaction-carrier and reasoning signature round trips. |
 | Metadata / `user_id` and safe unknown JSON fields | Supported | `anthropic_types.rs` tests `messages_payload_round_trips_byte_stable` and `response_round_trips_unknown_usage_and_top_level_fields` | Unknown fields survive native typed round trips via flattened maps; translated transports preserve fields they can represent safely. |
 | Web-search server tool bridge | Supported | `src/routes/messages/web_search/`; provider web-search tests | Fulfilled requests preserve Anthropic content and usage shapes. |
-| Model mapping, endpoint normalization, warmup/small-model selection, and `[1m]` beta injection | Supported | `handler.rs`; model/config tests; `create_messages.rs::beta_header_keeps_context_1m_beta` | The alias is resolved before transport selection and the 1M beta is injected idempotently. |
+| Model mapping, endpoint normalization, warmup/small-model selection, and `[1m]` beta injection | Supported | `handler.rs`; model/config tests; `create_messages.rs::beta_header_keeps_context_1m_beta`; installed Claude canary | The alias is resolved before transport selection, ordinary no-tool requests retain their selected model, only identified subagent warmups use the small model, and the 1M beta is injected idempotently. |
 
 ## Response and streaming matrix
 

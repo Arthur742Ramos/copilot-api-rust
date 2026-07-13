@@ -942,6 +942,38 @@ fn validate_content_block(
     Ok(())
 }
 
+fn validate_system_content(value: &Value, path: &str, allow_null: bool) -> Result<(), AppError> {
+    match value {
+        Value::Null if allow_null => Ok(()),
+        Value::String(_) => Ok(()),
+        Value::Array(blocks) => {
+            for (index, block) in blocks.iter().enumerate() {
+                let path = format!("{path}[{index}]");
+                let block = required_object(block, &path)?;
+                if required_nonempty_string(block, "type", &path)? != "text" {
+                    return Err(invalid(&format!("{path}.type"), "must equal \"text\""));
+                }
+                if !block.get("text").is_some_and(Value::is_string) {
+                    return Err(invalid(
+                        &format!("{path}.text"),
+                        "field required and must be a string",
+                    ));
+                }
+                validate_cache_control_field(block, &path)?;
+            }
+            Ok(())
+        }
+        _ => Err(invalid(
+            path,
+            if allow_null {
+                "must be a string, array, or null"
+            } else {
+                "must be a string or array"
+            },
+        )),
+    }
+}
+
 fn validate_messages(
     payload: &Map<String, Value>,
     tools: &ToolCatalog,
@@ -956,15 +988,25 @@ fn validate_messages(
         let path = format!("messages[{message_index}]");
         let message = required_object(message, &path)?;
         let role = required_nonempty_string(message, "role", &path)?;
-        if !matches!(role, "user" | "assistant") {
+        if !matches!(role, "user" | "assistant" | "system") {
             return Err(invalid(
                 &format!("{path}.role"),
-                "must equal \"user\" or \"assistant\"",
+                "must equal \"user\", \"assistant\", or \"system\"",
             ));
         }
-        match message.get("content") {
-            Some(Value::String(_)) => {}
-            Some(Value::Array(blocks)) => {
+        let content = message.get("content").ok_or_else(|| {
+            invalid(
+                &format!("{path}.content"),
+                "field required and must be a string or array",
+            )
+        })?;
+        if role == "system" {
+            validate_system_content(content, &format!("{path}.content"), false)?;
+            continue;
+        }
+        match content {
+            Value::String(_) => {}
+            Value::Array(blocks) => {
                 for (block_index, block) in blocks.iter().enumerate() {
                     validate_content_block(
                         block,
@@ -991,27 +1033,7 @@ fn validate_system(payload: &Map<String, Value>) -> Result<(), AppError> {
     let Some(system) = payload.get("system") else {
         return Ok(());
     };
-    match system {
-        Value::Null | Value::String(_) => Ok(()),
-        Value::Array(blocks) => {
-            for (index, block) in blocks.iter().enumerate() {
-                let path = format!("system[{index}]");
-                let block = required_object(block, &path)?;
-                if required_nonempty_string(block, "type", &path)? != "text" {
-                    return Err(invalid(&format!("{path}.type"), "must equal \"text\""));
-                }
-                if !block.get("text").is_some_and(Value::is_string) {
-                    return Err(invalid(
-                        &format!("{path}.text"),
-                        "field required and must be a string",
-                    ));
-                }
-                validate_cache_control_field(block, &path)?;
-            }
-            Ok(())
-        }
-        _ => Err(invalid("system", "must be a string, array, or null")),
-    }
+    validate_system_content(system, "system", true)
 }
 
 fn effective_responses_model(payload: &Map<String, Value>) -> Option<String> {
