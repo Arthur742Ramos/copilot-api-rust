@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 14,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -71,6 +71,11 @@
       "iteration": 13,
       "verdict": "FAIL",
       "summary": "Direct compact buffering, native errors, headers, metrics, and authority validation pass, but provider compact skips typed validation/usage metrics and annotation omission can false-conflict."
+    },
+    {
+      "iteration": 14,
+      "verdict": "FAIL",
+      "summary": "Direct/provider compact and annotation parity now pass, but malformed web-search request collections are silently filtered or forwarded with invalid shapes."
     }
   ]
 }
