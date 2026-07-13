@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES;
 use crate::libs::tool_search::{format_tool_search_bridge_arguments, BRIDGE_TOOL_SEARCH_NAME};
@@ -70,26 +71,35 @@ pub struct FunctionCallStreamState {
     pub tool_call_id: String,
     pub name: String,
     pub consecutive_whitespace_count: i64,
-    pub buffered_arguments: Vec<String>,
     pub accumulated_arguments: String,
-    pub arguments_done: Option<String>,
+    pub arguments_done: bool,
     pub started: bool,
     pub done: bool,
 }
+
+type OutputItemDigest = [u8; 32];
 
 #[derive(Debug, Clone)]
 pub struct OutputItemLifecycle {
     pub item_type: String,
     pub item_id: Option<String>,
     pub done: bool,
-    pub added_item: Option<Value>,
-    pub done_item: Option<Value>,
+    /// The provisional item is needed only until its authoritative `done`
+    /// counterpart has been reconciled. Completed payloads are represented by
+    /// fixed-size digests so already-rendered text/arguments do not remain
+    /// charged as historical retained state.
+    pub pending_item: Option<Value>,
+    pub pending_item_bytes: usize,
+    pub initial_digest: OutputItemDigest,
+    pub final_digest: Option<OutputItemDigest>,
+    pub done_event_digest: Option<OutputItemDigest>,
+    pub completed_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ReasoningSummaryPartState {
     pub text: String,
-    pub done_text: Option<String>,
+    pub done: bool,
     pub added: bool,
 }
 
@@ -100,13 +110,101 @@ pub struct ReasoningItemStreamState {
     pub content_parts: BTreeMap<i64, String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct OutputTextStreamState {
+    pub text: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RetainedStateOwner {
+    SequenceSnapshot,
+    CreatedResponseId,
+    BlockKey(i64, i64),
+    FunctionMetadata(i64),
+    FunctionArguments(i64),
+    PendingOutputItem(i64),
+    OutputItemMetadata(i64),
+    OutputItemIdIndex(i64),
+    ReasoningItemId(i64),
+    ReasoningSummary(i64, i64),
+    ReasoningContent(i64, i64),
+    OutputTextKey(i64, i64),
+    OutputText(i64, i64),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RetainedStateBudget {
+    used_bytes: usize,
+    owners: HashMap<RetainedStateOwner, usize>,
+}
+
+impl RetainedStateBudget {
+    fn reserve(&mut self, owner: RetainedStateOwner, bytes: usize) -> Result<(), &'static str> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if self.owners.contains_key(&owner) {
+            return Err("The Responses stream retained-state owner was reserved more than once.");
+        }
+        self.replace(owner, bytes)
+    }
+
+    fn release(&mut self, owner: RetainedStateOwner) -> Result<(), &'static str> {
+        if !self.owners.contains_key(&owner) {
+            return Err("The Responses stream released an unowned retained-state buffer.");
+        }
+        self.replace(owner, 0)
+    }
+
+    fn replace(&mut self, owner: RetainedStateOwner, bytes: usize) -> Result<(), &'static str> {
+        let old = self.owners.get(&owner).copied().unwrap_or(0);
+        let without_old = self
+            .used_bytes
+            .checked_sub(old)
+            .ok_or("The Responses stream retained-state accounting underflowed.")?;
+        let total = without_old
+            .checked_add(bytes)
+            .ok_or("The Responses stream exceeded the translation buffer limit.")?;
+        if total > MAX_BUFFERED_TRANSLATION_BYTES {
+            return Err("The Responses stream exceeded the translation buffer limit.");
+        }
+        self.used_bytes = total;
+        if bytes == 0 {
+            self.owners.remove(&owner);
+        } else {
+            self.owners.insert(owner, bytes);
+        }
+        debug_assert_eq!(
+            self.used_bytes,
+            self.owners.values().copied().sum::<usize>()
+        );
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.used_bytes = 0;
+        self.owners.clear();
+    }
+
+    #[cfg(test)]
+    fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    #[cfg(test)]
+    fn owner_bytes(&self, owner: RetainedStateOwner) -> usize {
+        self.owners.get(&owner).copied().unwrap_or(0)
+    }
+}
+
 /// Mirrors the TS `ResponsesStreamState`.
 #[derive(Debug, Clone)]
 pub struct ResponsesStreamState {
     pub message_start_sent: bool,
     pub message_completed: bool,
     pub created_response_id: Option<String>,
-    pub created_output: Option<Vec<Value>>,
+    pub created_output_digests: Option<Vec<OutputItemDigest>>,
     pub fallback_model: Option<String>,
     pub next_content_block_index: i64,
     pub block_index_by_key: HashMap<String, i64>,
@@ -122,12 +220,11 @@ pub struct ResponsesStreamState {
     pub last_sequence_number: Option<i64>,
     pub last_sequence_event: Option<Value>,
     pub last_sequence_event_bytes: usize,
-    pub buffered_translation_bytes: usize,
+    pub retained_budget: RetainedStateBudget,
     pub output_budget: TranslatedOutputBudget,
     pub tracked_reasoning_parts: usize,
     pub tracked_text_parts: usize,
-    pub output_text_by_key: HashMap<String, String>,
-    pub output_text_done_by_key: HashMap<String, String>,
+    pub output_text_by_key: HashMap<String, OutputTextStreamState>,
     pub tool_search_name: String,
     pub has_tool_call: bool,
 }
@@ -146,7 +243,7 @@ impl ResponsesStreamState {
             message_start_sent: false,
             message_completed: false,
             created_response_id: None,
-            created_output: None,
+            created_output_digests: None,
             fallback_model: fallback_model.filter(|model| !model.trim().is_empty()),
             next_content_block_index: 0,
             block_index_by_key: HashMap::new(),
@@ -161,12 +258,11 @@ impl ResponsesStreamState {
             last_sequence_number: None,
             last_sequence_event: None,
             last_sequence_event_bytes: 0,
-            buffered_translation_bytes: 0,
+            retained_budget: RetainedStateBudget::default(),
             output_budget: TranslatedOutputBudget::default(),
             tracked_reasoning_parts: 0,
             tracked_text_parts: 0,
             output_text_by_key: HashMap::new(),
-            output_text_done_by_key: HashMap::new(),
             tool_search_name: tool_search_name
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| BRIDGE_TOOL_SEARCH_NAME.to_string()),
@@ -381,35 +477,36 @@ fn validate_event_sequence(
     let snapshot_bytes = serde_json::to_vec(event)
         .map_err(|_| "A Responses stream event could not be serialized.")?
         .len();
-    let retained_without_snapshot = state
-        .buffered_translation_bytes
-        .checked_sub(state.last_sequence_event_bytes)
-        .ok_or("The Responses stream sequence snapshot accounting was inconsistent.")?;
-    let retained_with_snapshot = retained_without_snapshot
-        .checked_add(snapshot_bytes)
-        .ok_or("The Responses stream exceeded the translation buffer limit.")?;
-    if retained_with_snapshot > MAX_BUFFERED_TRANSLATION_BYTES {
-        return Err("The Responses stream exceeded the translation buffer limit.");
-    }
-    state.buffered_translation_bytes = retained_with_snapshot;
+    state
+        .retained_budget
+        .replace(RetainedStateOwner::SequenceSnapshot, snapshot_bytes)?;
     state.last_sequence_event_bytes = snapshot_bytes;
     state.last_sequence_number = Some(sequence);
     state.last_sequence_event = Some(event.clone());
     Ok(false)
 }
 
-fn reserve_buffered_translation_bytes(
+fn reserve_retained_state_bytes(
     state: &mut ResponsesStreamState,
-    additional: usize,
+    owner: RetainedStateOwner,
+    bytes: usize,
 ) -> Result<(), &'static str> {
-    let Some(total) = state.buffered_translation_bytes.checked_add(additional) else {
-        return Err("The Responses stream exceeded the translation buffer limit.");
-    };
-    if total > MAX_BUFFERED_TRANSLATION_BYTES {
-        return Err("The Responses stream exceeded the translation buffer limit.");
-    }
-    state.buffered_translation_bytes = total;
-    Ok(())
+    state.retained_budget.reserve(owner, bytes)
+}
+
+fn release_retained_state_bytes(
+    state: &mut ResponsesStreamState,
+    owner: RetainedStateOwner,
+) -> Result<(), &'static str> {
+    state.retained_budget.release(owner)
+}
+
+fn replace_retained_state_bytes(
+    state: &mut ResponsesStreamState,
+    owner: RetainedStateOwner,
+    bytes: usize,
+) -> Result<(), &'static str> {
+    state.retained_budget.replace(owner, bytes)
 }
 
 fn reserve_output_payload(
@@ -440,14 +537,135 @@ fn reserve_function_call_metadata_if_new(
         .len()
         .checked_add(name.len())
         .ok_or("The Responses stream exceeded the translated output payload limit.")?;
-    reserve_output_payload(state, additional)
+    reserve_output_payload(state, additional)?;
+    reserve_retained_state_bytes(
+        state,
+        RetainedStateOwner::FunctionMetadata(output_index),
+        additional,
+    )
 }
 
-fn reserve_json_value(state: &mut ResponsesStreamState, value: &Value) -> Result<(), &'static str> {
-    let size = serde_json::to_vec(value)
+fn serialized_json_value_bytes(value: &Value) -> Result<usize, &'static str> {
+    serde_json::to_vec(value)
         .map(|bytes| bytes.len())
-        .unwrap_or(MAX_BUFFERED_TRANSLATION_BYTES.saturating_add(1));
-    reserve_buffered_translation_bytes(state, size)
+        .map_err(|_| "A Responses stream value could not be serialized.")
+}
+
+fn semantically_ordered_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(semantically_ordered_json).collect())
+        }
+        Value::Object(object) => {
+            let mut keys: Vec<&String> = object.keys().collect();
+            keys.sort_unstable();
+            let mut ordered = serde_json::Map::new();
+            for key in keys {
+                ordered.insert(key.clone(), semantically_ordered_json(&object[key]));
+            }
+            Value::Object(ordered)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn raw_output_item_digest(value: &Value) -> Result<OutputItemDigest, &'static str> {
+    // `serde_json` preserves insertion order for forwarding, while lifecycle
+    // reconciliation has always been semantic: reordering object members must
+    // not turn an identical replay into a conflict. Sort object keys only in the
+    // fixed-size digest representation; arrays and client-visible wire bytes
+    // remain untouched.
+    let bytes = serde_json::to_vec(&semantically_ordered_json(value))
+        .map_err(|_| "A Responses output item could not be serialized for reconciliation.")?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+fn canonical_output_item_digest(
+    value: &Value,
+    phase: OutputValidationPhase,
+) -> Result<OutputItemDigest, &'static str> {
+    raw_output_item_digest(&canonical_anthropic_output_item(value, phase)?)
+}
+
+fn output_array_digests(
+    output: &[Value],
+    phase: OutputValidationPhase,
+) -> Result<Vec<OutputItemDigest>, &'static str> {
+    output
+        .iter()
+        .map(|item| canonical_output_item_digest(item, phase))
+        .collect()
+}
+
+fn retain_late_output_item_id(
+    state: &mut ResponsesStreamState,
+    output_index: i64,
+    item_id: &str,
+) -> Result<(), &'static str> {
+    if item_id.is_empty() {
+        return Ok(());
+    }
+    if state
+        .output_index_by_item_id
+        .get(item_id)
+        .is_some_and(|index| *index != output_index)
+    {
+        return Err("An output item event reused an item id at another output index.");
+    }
+    let Some((item_type, existing_id)) = state
+        .output_items_by_index
+        .get(&output_index)
+        .map(|lifecycle| (lifecycle.item_type.clone(), lifecycle.item_id.clone()))
+    else {
+        return Err("An output item id arrived without a tracked output item.");
+    };
+    if let Some(existing_id) = existing_id.as_deref().filter(|id| !id.is_empty()) {
+        return if existing_id == item_id {
+            Ok(())
+        } else {
+            Err("An output item event changed its item id.")
+        };
+    }
+
+    let metadata_bytes = item_type
+        .len()
+        .checked_add(item_id.len())
+        .ok_or("The Responses stream retained-state size overflowed.")?;
+    replace_retained_state_bytes(
+        state,
+        RetainedStateOwner::OutputItemMetadata(output_index),
+        metadata_bytes,
+    )?;
+    reserve_retained_state_bytes(
+        state,
+        RetainedStateOwner::OutputItemIdIndex(output_index),
+        item_id.len(),
+    )?;
+    if item_type == "reasoning"
+        && state
+            .reasoning_state_by_output_index
+            .contains_key(&output_index)
+    {
+        replace_retained_state_bytes(
+            state,
+            RetainedStateOwner::ReasoningItemId(output_index),
+            item_id.len(),
+        )?;
+        state
+            .reasoning_state_by_output_index
+            .get_mut(&output_index)
+            .expect("reasoning item checked above")
+            .item_id = Some(item_id.to_string());
+    }
+    state
+        .output_index_by_item_id
+        .insert(item_id.to_string(), output_index);
+    state
+        .output_items_by_index
+        .get_mut(&output_index)
+        .expect("output item checked above")
+        .item_id = Some(item_id.to_string());
+    Ok(())
 }
 
 fn block_key(output_index: i64, content_index: i64) -> String {
@@ -459,25 +677,6 @@ fn indices_are_contiguous<T>(parts: &BTreeMap<i64, T>) -> bool {
         .keys()
         .enumerate()
         .all(|(expected, actual)| i64::try_from(expected).ok() == Some(*actual))
-}
-
-fn output_arrays_equivalent(
-    left: &[Value],
-    left_phase: OutputValidationPhase,
-    right: &[Value],
-    right_phase: OutputValidationPhase,
-) -> Result<bool, &'static str> {
-    if left.len() != right.len() {
-        return Ok(false);
-    }
-    for (left, right) in left.iter().zip(right) {
-        if canonical_anthropic_output_item(left, left_phase)?
-            != canonical_anthropic_output_item(right, right_phase)?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn reserve_reasoning_part(
@@ -640,6 +839,7 @@ fn close_all_open_blocks(
     events: &mut Vec<AnthropicStreamEventData>,
 ) {
     close_open_blocks(state, events);
+    state.block_index_by_key.clear();
     state.function_call_state_by_output_index.clear();
     state.function_call_order.clear();
     state.active_function_call_output_index = None;
@@ -649,12 +849,12 @@ fn close_all_open_blocks(
     state.last_sequence_number = None;
     state.last_sequence_event = None;
     state.last_sequence_event_bytes = 0;
-    state.buffered_translation_bytes = 0;
+    state.retained_budget.clear();
     state.tracked_reasoning_parts = 0;
     state.tracked_text_parts = 0;
     state.output_text_by_key.clear();
-    state.output_text_done_by_key.clear();
-    state.created_output = None;
+    state.created_response_id = None;
+    state.created_output_digests = None;
 }
 
 /// Mirrors `openTextBlockIfNeeded`.
@@ -663,11 +863,16 @@ fn open_text_block_if_needed(
     output_index: i64,
     content_index: i64,
     events: &mut Vec<AnthropicStreamEventData>,
-) -> i64 {
+) -> Result<i64, &'static str> {
     let key = block_key(output_index, content_index);
     let block_index = match state.block_index_by_key.get(&key) {
         Some(idx) => *idx,
         None => {
+            reserve_retained_state_bytes(
+                state,
+                RetainedStateOwner::BlockKey(output_index, content_index),
+                key.len(),
+            )?;
             let idx = state.next_content_block_index;
             state.next_content_block_index += 1;
             state.block_index_by_key.insert(key, idx);
@@ -684,7 +889,7 @@ fn open_text_block_if_needed(
         state.open_blocks.push(block_index);
     }
 
-    block_index
+    Ok(block_index)
 }
 
 /// Mirrors `openThinkingBlockIfNeeded` (all summary_index values fold into one
@@ -693,12 +898,17 @@ fn open_thinking_block_if_needed(
     state: &mut ResponsesStreamState,
     output_index: i64,
     events: &mut Vec<AnthropicStreamEventData>,
-) -> i64 {
+) -> Result<i64, &'static str> {
     let summary_index = 0;
     let key = block_key(output_index, summary_index);
     let block_index = match state.block_index_by_key.get(&key) {
         Some(idx) => *idx,
         None => {
+            reserve_retained_state_bytes(
+                state,
+                RetainedStateOwner::BlockKey(output_index, summary_index),
+                key.len(),
+            )?;
             let idx = state.next_content_block_index;
             state.next_content_block_index += 1;
             state.block_index_by_key.insert(key, idx);
@@ -715,7 +925,7 @@ fn open_thinking_block_if_needed(
         state.open_blocks.push(block_index);
     }
 
-    block_index
+    Ok(block_index)
 }
 
 /// Mirrors `openFunctionCallBlock`.
@@ -725,7 +935,7 @@ fn open_function_call_block(
     tool_call_id: Option<&str>,
     name: Option<&str>,
     events: &mut Vec<AnthropicStreamEventData>,
-) -> i64 {
+) -> Result<i64, &'static str> {
     state.has_tool_call = true;
 
     if !state
@@ -748,24 +958,32 @@ fn open_function_call_block(
                 tool_call_id: resolved_tool_call_id,
                 name: resolved_name,
                 consecutive_whitespace_count: 0,
-                buffered_arguments: Vec::new(),
                 accumulated_arguments: String::new(),
-                arguments_done: None,
+                arguments_done: false,
                 started: false,
                 done: false,
             },
         );
         state.function_call_order.push(output_index);
-    } else if let Some(fc) = state
-        .function_call_state_by_output_index
-        .get_mut(&output_index)
-    {
-        // Reconcile metadata that may first appear on the authoritative done item.
-        if let Some(id) = tool_call_id.filter(|id| !id.is_empty()) {
-            fc.tool_call_id = id.to_string();
+    } else {
+        // Metadata is charged to the client-visible budget when the function
+        // owner is created. Later lifecycle snapshots may repeat it, but they
+        // cannot replace already-emitted or pre-reserved tool identity.
+        let existing = state
+            .function_call_state_by_output_index
+            .get(&output_index)
+            .expect("function call state exists");
+        if tool_call_id
+            .filter(|id| !id.is_empty())
+            .is_some_and(|id| id != existing.tool_call_id)
+        {
+            return Err("A completed function/tool call changed its call id.");
         }
-        if let Some(name) = name.filter(|name| !name.is_empty()) {
-            fc.name = name.to_string();
+        if name
+            .filter(|name| !name.is_empty())
+            .is_some_and(|name| name != existing.name)
+        {
+            return Err("A completed function/tool call changed its function name.");
         }
     }
 
@@ -803,7 +1021,7 @@ fn open_function_call_block(
         }
     }
 
-    block_index
+    Ok(block_index)
 }
 
 fn function_call_is_active(state: &ResponsesStreamState, output_index: i64) -> bool {
@@ -819,21 +1037,27 @@ fn append_function_call_arguments(
     if arguments.is_empty() {
         return Ok(());
     }
-    reserve_output_payload(state, arguments.len())?;
-    reserve_buffered_translation_bytes(state, arguments.len())?;
     let active = function_call_is_active(state, output_index);
-    if !active {
-        reserve_buffered_translation_bytes(state, arguments.len())?;
-    }
-    let Some(call) = state
-        .function_call_state_by_output_index
-        .get_mut(&output_index)
-    else {
+    let Some(call) = state.function_call_state_by_output_index.get(&output_index) else {
         return Err("Received function call arguments without an output item.");
     };
-    if call.arguments_done.is_some() {
+    if call.arguments_done {
         return Err("Function call argument data arrived after arguments.done.");
     }
+    let old_len = call.accumulated_arguments.len();
+    let new_len = old_len
+        .checked_add(arguments.len())
+        .ok_or("The Responses stream exceeded the translation buffer limit.")?;
+    reserve_output_payload(state, arguments.len())?;
+    replace_retained_state_bytes(
+        state,
+        RetainedStateOwner::FunctionArguments(output_index),
+        new_len,
+    )?;
+    let call = state
+        .function_call_state_by_output_index
+        .get_mut(&output_index)
+        .expect("function call validated above");
     call.accumulated_arguments.push_str(&arguments);
     let block_index = call.block_index;
     if active {
@@ -844,8 +1068,6 @@ fn append_function_call_arguments(
             },
         });
         state.block_has_delta.insert(block_index);
-    } else {
-        call.buffered_arguments.push(arguments);
     }
     Ok(())
 }
@@ -866,7 +1088,35 @@ fn reconcile_function_call_arguments(
     let Some(suffix) = authoritative.strip_prefix(&current) else {
         return Err("Completed function arguments conflicted with streamed argument deltas.");
     };
-    append_function_call_arguments(state, output_index, suffix.to_string(), events)
+    if !suffix.is_empty() {
+        reserve_output_payload(state, suffix.len())?;
+    }
+    replace_retained_state_bytes(
+        state,
+        RetainedStateOwner::FunctionArguments(output_index),
+        authoritative.len(),
+    )?;
+    let active = function_call_is_active(state, output_index);
+    let block_index = state
+        .function_call_state_by_output_index
+        .get(&output_index)
+        .expect("function call validated above")
+        .block_index;
+    let call = state
+        .function_call_state_by_output_index
+        .get_mut(&output_index)
+        .expect("function call validated above");
+    call.accumulated_arguments = authoritative.to_string();
+    if active && !suffix.is_empty() {
+        events.push(AnthropicStreamEventData::ContentBlockDelta {
+            index: block_index,
+            delta: AnthropicContentBlockDelta::InputJsonDelta {
+                partial_json: suffix.to_string(),
+            },
+        });
+        state.block_has_delta.insert(block_index);
+    }
+    Ok(())
 }
 
 /// Finish the active call and activate buffered parallel calls in first-seen
@@ -875,7 +1125,7 @@ fn reconcile_function_call_arguments(
 fn advance_function_call_queue(
     state: &mut ResponsesStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
+) -> Result<(), &'static str> {
     if let Some(active) = state.active_function_call_output_index.take() {
         if let Some(fc) = state.function_call_state_by_output_index.remove(&active) {
             if open_blocks_has(state, fc.block_index) {
@@ -885,6 +1135,7 @@ fn advance_function_call_queue(
                 state.open_blocks.retain(|index| *index != fc.block_index);
                 state.block_has_delta.remove(&fc.block_index);
             }
+            release_function_call_state(state, active, &fc)?;
         }
     }
 
@@ -895,48 +1146,65 @@ fn advance_function_call_queue(
                 .contains_key(index)
         });
         let Some(next) = next else {
-            return;
+            return Ok(());
         };
 
         state.active_function_call_output_index = Some(next);
-        let block_index = open_function_call_block(state, next, None, None, events);
-        let (fragments, done) = {
+        let block_index = open_function_call_block(state, next, None, None, events)?;
+        let (arguments, done) = {
             let fc = state
                 .function_call_state_by_output_index
-                .get_mut(&next)
+                .get(&next)
                 .expect("queued function call exists");
-            (std::mem::take(&mut fc.buffered_arguments), fc.done)
+            (fc.accumulated_arguments.clone(), fc.done)
         };
-        for partial_json in fragments {
+        if !arguments.is_empty() {
             events.push(AnthropicStreamEventData::ContentBlockDelta {
                 index: block_index,
-                delta: AnthropicContentBlockDelta::InputJsonDelta { partial_json },
+                delta: AnthropicContentBlockDelta::InputJsonDelta {
+                    partial_json: arguments,
+                },
             });
             state.block_has_delta.insert(block_index);
         }
         if !done {
-            return;
+            return Ok(());
         }
         if open_blocks_has(state, block_index) {
             events.push(AnthropicStreamEventData::ContentBlockStop { index: block_index });
             state.open_blocks.retain(|index| *index != block_index);
             state.block_has_delta.remove(&block_index);
         }
-        state.function_call_state_by_output_index.remove(&next);
+        if let Some(fc) = state.function_call_state_by_output_index.remove(&next) {
+            release_function_call_state(state, next, &fc)?;
+        }
         state.active_function_call_output_index = None;
     }
+}
+
+fn release_function_call_state(
+    state: &mut ResponsesStreamState,
+    output_index: i64,
+    call: &FunctionCallStreamState,
+) -> Result<(), &'static str> {
+    release_retained_state_bytes(state, RetainedStateOwner::FunctionMetadata(output_index))?;
+    if !call.accumulated_arguments.is_empty() {
+        release_retained_state_bytes(state, RetainedStateOwner::FunctionArguments(output_index))?;
+    }
+    Ok(())
 }
 
 fn finish_all_function_calls(
     state: &mut ResponsesStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
+) -> Result<(), &'static str> {
     for fc in state.function_call_state_by_output_index.values_mut() {
         fc.done = true;
     }
     while !state.function_call_state_by_output_index.is_empty() {
-        advance_function_call_queue(state, events);
+        advance_function_call_queue(state, events)?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -994,7 +1262,7 @@ fn handle_response_created(
             return terminate_responses_stream_with_error(state, build_error_event(message))
         }
     };
-    let created_output = match response.get("output") {
+    let created_output_digests = match response.get("output") {
         None | Some(Value::Null) => None,
         Some(Value::Array(output)) => {
             if output.len() > MAX_TRACKED_OUTPUT_ITEMS {
@@ -1003,21 +1271,12 @@ fn handle_response_created(
                     build_error_event("response.created contained too many output items."),
                 );
             }
-            for item in output {
-                if let Err(message) =
-                    parse_and_validate_anthropic_output_item(item, OutputValidationPhase::Added)
-                {
-                    return terminate_responses_stream_with_error(
-                        state,
-                        build_error_event(message),
-                    );
+            match output_array_digests(output, OutputValidationPhase::Added) {
+                Ok(digests) => Some(digests),
+                Err(message) => {
+                    return terminate_responses_stream_with_error(state, build_error_event(message))
                 }
             }
-            let raw_output = Value::Array(output.clone());
-            if let Err(message) = reserve_json_value(state, &raw_output) {
-                return terminate_responses_stream_with_error(state, build_error_event(message));
-            }
-            Some(output.clone())
         }
         Some(_) => {
             return terminate_responses_stream_with_error(
@@ -1026,8 +1285,13 @@ fn handle_response_created(
             )
         }
     };
+    if let Err(message) =
+        reserve_retained_state_bytes(state, RetainedStateOwner::CreatedResponseId, id.len())
+    {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     state.created_response_id = Some(id.to_string());
-    state.created_output = created_output;
+    state.created_output_digests = created_output_digests;
     message_start(state, id, &model, usage)
 }
 
@@ -1109,7 +1373,7 @@ fn handle_output_item_added(
     };
 
     if let Some(existing) = state.output_items_by_index.get(&output_index) {
-        if !existing.done && existing.added_item.as_ref() == Some(item) {
+        if !existing.done && existing.pending_item.as_ref() == Some(item) {
             // Identical replay before completion is safe to deduplicate.
             return events;
         }
@@ -1126,9 +1390,6 @@ fn handle_output_item_added(
             build_error_event("The Responses stream emitted too many output items."),
         );
     }
-    if let Err(message) = reserve_json_value(state, item) {
-        return terminate_responses_stream_with_error(state, build_error_event(message));
-    }
     if let Some(nonempty_id) = item_id.as_deref().filter(|id| !id.is_empty()) {
         if state
             .output_index_by_item_id
@@ -1142,6 +1403,62 @@ fn handle_output_item_added(
                 ),
             );
         }
+    }
+    let item_bytes = match serialized_json_value_bytes(item) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
+    let initial_digest = match canonical_output_item_digest(item, OutputValidationPhase::Added) {
+        Ok(digest) => digest,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
+    let item_id_bytes = item_id.as_ref().map_or(0, String::len);
+    let metadata_bytes = match item_type.len().checked_add(item_id_bytes) {
+        Some(bytes) => bytes,
+        None => {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event("The Responses stream retained-state size overflowed."),
+            )
+        }
+    };
+    for (owner, bytes) in [
+        (
+            RetainedStateOwner::PendingOutputItem(output_index),
+            item_bytes,
+        ),
+        (
+            RetainedStateOwner::OutputItemMetadata(output_index),
+            metadata_bytes,
+        ),
+    ] {
+        if let Err(message) = reserve_retained_state_bytes(state, owner, bytes) {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
+    }
+    if item_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        if let Err(message) = reserve_retained_state_bytes(
+            state,
+            RetainedStateOwner::OutputItemIdIndex(output_index),
+            item_id_bytes,
+        ) {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
+    }
+    if item_type == "reasoning" && item_id_bytes > 0 {
+        if let Err(message) = reserve_retained_state_bytes(
+            state,
+            RetainedStateOwner::ReasoningItemId(output_index),
+            item_id_bytes,
+        ) {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
+    }
+    if let Some(nonempty_id) = item_id.as_deref().filter(|id| !id.is_empty()) {
         state
             .output_index_by_item_id
             .insert(nonempty_id.to_string(), output_index);
@@ -1152,8 +1469,12 @@ fn handle_output_item_added(
             item_type: item_type.to_string(),
             item_id: item_id.clone(),
             done: false,
-            added_item: Some(item.clone()),
-            done_item: None,
+            pending_item: Some(item.clone()),
+            pending_item_bytes: item_bytes,
+            initial_digest,
+            final_digest: None,
+            done_event_digest: None,
+            completed_incomplete: false,
         },
     );
     if item_type == "reasoning" {
@@ -1179,13 +1500,15 @@ fn handle_output_item_added(
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
 
-    open_function_call_block(
+    if let Err(message) = open_function_call_block(
         state,
         details.output_index,
         details.tool_call_id.as_deref(),
         Some(&details.name),
         &mut events,
-    );
+    ) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
 
     if let Some(initial) = details.initial_arguments {
         if let Err(message) =
@@ -1333,51 +1656,121 @@ fn handle_output_item_done(
         }
     };
 
-    if let Some(existing) = state.output_items_by_index.get(&output_index).cloned() {
-        if existing.item_type != item_type {
-            return terminate_responses_stream_with_error(
-                state,
-                build_error_event(
-                    "A response.output_item.done event did not match its added item type.",
-                ),
-            );
+    let final_digest = match canonical_output_item_digest(item, OutputValidationPhase::Done) {
+        Ok(digest) => digest,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
         }
-        if let Some(added) = existing.added_item.as_ref() {
-            if let Err(message) = validate_output_item_reconciliation(added, item) {
+    };
+    let done_event_digest = match raw_output_item_digest(item) {
+        Ok(digest) => digest,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
+    let completed_incomplete = item.get("status").and_then(Value::as_str) == Some("incomplete");
+    let prior_added_call_id = state
+        .output_items_by_index
+        .get(&output_index)
+        .and_then(|lifecycle| lifecycle.pending_item.as_ref())
+        .and_then(|item| item.get("call_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let prior_added_item_id = state
+        .output_items_by_index
+        .get(&output_index)
+        .and_then(|lifecycle| lifecycle.pending_item.as_ref())
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let actual_id = item_id.as_deref().filter(|id| !id.is_empty());
+
+    if state.output_items_by_index.contains_key(&output_index) {
+        let pending_item_bytes;
+        {
+            let existing = state
+                .output_items_by_index
+                .get(&output_index)
+                .expect("output item checked above");
+            if existing.item_type != item_type {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event(
+                        "A response.output_item.done event did not match its added item type.",
+                    ),
+                );
+            }
+            if let Some(added) = existing.pending_item.as_ref() {
+                if let Err(message) = validate_output_item_reconciliation(added, item) {
+                    return terminate_responses_stream_with_error(
+                        state,
+                        build_error_event(message),
+                    );
+                }
+            }
+            let expected_id = existing.item_id.as_deref().filter(|id| !id.is_empty());
+            if expected_id.is_some() && actual_id.is_some() && expected_id != actual_id {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event(
+                        "A response.output_item.done event did not match its added item id.",
+                    ),
+                );
+            }
+            if existing.done {
+                if existing.done_event_digest == Some(done_event_digest) {
+                    // A structurally identical JSON replay is safe to deduplicate.
+                    return events;
+                }
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event(
+                        "The Responses stream emitted conflicting response.output_item.done events.",
+                    ),
+                );
+            }
+            pending_item_bytes = existing.pending_item_bytes;
+        }
+        if item_type == "function_call" {
+            let final_arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .expect("function call item validated above");
+            if let Some(call) = state
+                .function_call_state_by_output_index
+                .get(&output_index)
+                .filter(|call| call.arguments_done)
+            {
+                if call.accumulated_arguments != final_arguments {
+                    return terminate_responses_stream_with_error(
+                        state,
+                        build_error_event(
+                            "Function call output_item.done arguments conflicted with arguments.done.",
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(actual_id) = actual_id {
+            if let Err(message) = retain_late_output_item_id(state, output_index, actual_id) {
                 return terminate_responses_stream_with_error(state, build_error_event(message));
             }
         }
-        let expected_id = existing.item_id.as_deref().filter(|id| !id.is_empty());
-        let actual_id = item_id.as_deref().filter(|id| !id.is_empty());
-        if expected_id.is_some() && actual_id.is_some() && expected_id != actual_id {
-            return terminate_responses_stream_with_error(
+        if pending_item_bytes > 0 {
+            if let Err(message) = release_retained_state_bytes(
                 state,
-                build_error_event(
-                    "A response.output_item.done event did not match its added item id.",
-                ),
-            );
-        }
-        if existing.done {
-            if existing.done_item.as_ref() == Some(item) {
-                // A structurally identical JSON replay is safe to deduplicate.
-                return events;
+                RetainedStateOwner::PendingOutputItem(output_index),
+            ) {
+                return terminate_responses_stream_with_error(state, build_error_event(message));
             }
-            return terminate_responses_stream_with_error(
-                state,
-                build_error_event(
-                    "The Responses stream emitted conflicting response.output_item.done events.",
-                ),
-            );
-        }
-        if let Err(message) = reserve_json_value(state, item) {
-            return terminate_responses_stream_with_error(state, build_error_event(message));
         }
         if let Some(lifecycle) = state.output_items_by_index.get_mut(&output_index) {
             lifecycle.done = true;
-            lifecycle.done_item = Some(item.clone());
-            if lifecycle.item_id.as_deref().is_none_or(|id| id.is_empty()) && actual_id.is_some() {
-                lifecycle.item_id.clone_from(&item_id);
-            }
+            lifecycle.pending_item = None;
+            lifecycle.pending_item_bytes = 0;
+            lifecycle.final_digest = Some(final_digest);
+            lifecycle.done_event_digest = Some(done_event_digest);
+            lifecycle.completed_incomplete = completed_incomplete;
         }
     } else {
         // Some compatible upstreams omit `output_item.added` when an item has no
@@ -1389,8 +1782,53 @@ fn handle_output_item_done(
                 build_error_event("The Responses stream emitted too many output items."),
             );
         }
-        if let Err(message) = reserve_json_value(state, item) {
+        let initial_digest = match canonical_output_item_digest(item, OutputValidationPhase::Added)
+        {
+            Ok(digest) => digest,
+            Err(message) => {
+                return terminate_responses_stream_with_error(state, build_error_event(message))
+            }
+        };
+        let item_id_bytes = item_id.as_ref().map_or(0, String::len);
+        let metadata_bytes = match item_type.len().checked_add(item_id_bytes) {
+            Some(bytes) => bytes,
+            None => {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event("The Responses stream retained-state size overflowed."),
+                )
+            }
+        };
+        if let Err(message) = reserve_retained_state_bytes(
+            state,
+            RetainedStateOwner::OutputItemMetadata(output_index),
+            metadata_bytes,
+        ) {
             return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
+        if let Some(nonempty_id) = item_id.as_deref().filter(|id| !id.is_empty()) {
+            if state
+                .output_index_by_item_id
+                .get(nonempty_id)
+                .is_some_and(|index| *index != output_index)
+            {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event(
+                        "A response.output_item.done event reused an item id at another index.",
+                    ),
+                );
+            }
+            if let Err(message) = reserve_retained_state_bytes(
+                state,
+                RetainedStateOwner::OutputItemIdIndex(output_index),
+                nonempty_id.len(),
+            ) {
+                return terminate_responses_stream_with_error(state, build_error_event(message));
+            }
+            state
+                .output_index_by_item_id
+                .insert(nonempty_id.to_string(), output_index);
         }
         state.output_items_by_index.insert(
             output_index,
@@ -1398,34 +1836,62 @@ fn handle_output_item_done(
                 item_type: item_type.to_string(),
                 item_id: item_id.clone(),
                 done: true,
-                added_item: None,
-                done_item: Some(item.clone()),
+                pending_item: None,
+                pending_item_bytes: 0,
+                initial_digest,
+                final_digest: Some(final_digest),
+                done_event_digest: Some(done_event_digest),
+                completed_incomplete,
             },
         );
-    }
-    if let Some(nonempty_id) = item_id.as_deref().filter(|id| !id.is_empty()) {
-        if state
-            .output_index_by_item_id
-            .get(nonempty_id)
-            .is_some_and(|index| *index != output_index)
-        {
-            return terminate_responses_stream_with_error(
-                state,
-                build_error_event(
-                    "A response.output_item.done event reused an item id at another index.",
-                ),
-            );
-        }
-        state
-            .output_index_by_item_id
-            .insert(nonempty_id.to_string(), output_index);
     }
 
     if item_type == "message" {
         if let Err(message) = render_complete_message_item(item, state, output_index, &mut events) {
             return terminate_responses_stream_with_error(state, build_error_event(message));
         }
+        if let Err(message) = release_output_text_state(state, output_index) {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
         return events;
+    }
+
+    fn release_output_text_state(
+        state: &mut ResponsesStreamState,
+        output_index: i64,
+    ) -> Result<(), &'static str> {
+        let prefix = format!("{output_index}:");
+        let keys: Vec<String> = state
+            .output_text_by_key
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(part) = state.output_text_by_key.remove(&key) {
+                let content_index = key
+                    .strip_prefix(&prefix)
+                    .and_then(|index| index.parse::<i64>().ok())
+                    .ok_or("A tracked message content index was invalid.")?;
+                release_retained_state_bytes(
+                    state,
+                    RetainedStateOwner::OutputTextKey(output_index, content_index),
+                )?;
+                if !part.text.is_empty() {
+                    release_retained_state_bytes(
+                        state,
+                        RetainedStateOwner::OutputText(output_index, content_index),
+                    )?;
+                }
+                if state.block_index_by_key.remove(&key).is_some() {
+                    release_retained_state_bytes(
+                        state,
+                        RetainedStateOwner::BlockKey(output_index, content_index),
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     if matches!(
@@ -1446,30 +1912,21 @@ fn handle_output_item_done(
             None
         };
         let (call_id, name, final_arguments) = if item_type == "tool_search_call" {
-            let added = state
-                .output_items_by_index
-                .get(&output_index)
-                .and_then(|lifecycle| lifecycle.added_item.as_ref());
-            let added_call_id = added
-                .and_then(|item| item.get("call_id"))
-                .and_then(Value::as_str);
             let done_call_id = optional_string_field(
                 item,
                 "call_id",
                 "A tool_search_call call_id was not a string or null.",
             )
             .expect("tool search item validated above");
-            let resolved_call_id = reconcile_tool_search_call_id(added_call_id, done_call_id)
-                .expect("tool search call id reconciled during done validation");
-            let added_item_id = added
-                .and_then(|item| item.get("id"))
-                .and_then(Value::as_str);
+            let resolved_call_id =
+                reconcile_tool_search_call_id(prior_added_call_id.as_deref(), done_call_id)
+                    .expect("tool search call id reconciled during done validation");
             (
                 Some(stable_tool_use_id(
                     resolved_call_id,
                     optional_string_field(item, "id", "A tool_search_call id was invalid.")
                         .expect("tool search item validated above")
-                        .or(added_item_id),
+                        .or(prior_added_item_id.as_deref()),
                     output_index,
                 )),
                 state.tool_search_name.clone(),
@@ -1527,21 +1984,23 @@ fn handle_output_item_done(
         {
             return terminate_responses_stream_with_error(state, build_error_event(message));
         }
-        open_function_call_block(
+        if let Err(message) = open_function_call_block(
             state,
             output_index,
             call_id.as_deref(),
             Some(&name),
             &mut events,
-        );
+        ) {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
 
         if let Some(args) = final_arguments {
-            if let Some(arguments_done) = state
+            if let Some(call) = state
                 .function_call_state_by_output_index
                 .get(&output_index)
-                .and_then(|call| call.arguments_done.as_deref())
+                .filter(|call| call.arguments_done)
             {
-                if arguments_done != args {
+                if call.accumulated_arguments != args {
                     return terminate_responses_stream_with_error(
                         state,
                         build_error_event(
@@ -1565,7 +2024,9 @@ fn handle_output_item_done(
             fc.done = true;
         }
         if active {
-            advance_function_call_queue(state, &mut events);
+            if let Err(message) = advance_function_call_queue(state, &mut events) {
+                return terminate_responses_stream_with_error(state, build_error_event(message));
+            }
         }
         return events;
     }
@@ -1596,7 +2057,12 @@ fn handle_output_item_done(
             return terminate_responses_stream_with_error(state, build_error_event(message));
         }
 
-        let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
+        let block_index = match open_thinking_block_if_needed(state, output_index, &mut events) {
+            Ok(index) => index,
+            Err(message) => {
+                return terminate_responses_stream_with_error(state, build_error_event(message))
+            }
+        };
 
         if !state.block_has_delta.contains(&block_index) {
             events.push(AnthropicStreamEventData::ContentBlockDelta {
@@ -1634,6 +2100,9 @@ fn handle_output_item_done(
         .reasoning_state_by_output_index
         .remove(&output_index)
         .unwrap_or_default();
+    if let Err(message) = release_reasoning_state(state, output_index, &buffered) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     if !indices_are_contiguous(&buffered.summary_parts)
         || !indices_are_contiguous(&buffered.content_parts)
     {
@@ -1673,10 +2142,11 @@ fn handle_output_item_done(
                     .enumerate()
                     .any(|(index, buffered)| {
                         let final_text = &final_summary_segments[index];
-                        buffered.done_text.as_ref().map_or_else(
-                            || !final_text.starts_with(&buffered.text),
-                            |done| final_text != done,
-                        )
+                        if buffered.done {
+                            final_text != &buffered.text
+                        } else {
+                            !final_text.starts_with(&buffered.text)
+                        }
                     })
             {
                 return terminate_responses_stream_with_error(
@@ -1735,6 +2205,18 @@ fn handle_output_item_done(
     // A carrier-free item with no aggregate summary has no Anthropic thinking
     // content to represent. Do not open a block or invent a signature.
     let Some(display_text) = display_text else {
+        let reasoning_block_key = block_key(output_index, 0);
+        if state
+            .block_index_by_key
+            .remove(&reasoning_block_key)
+            .is_some()
+        {
+            if let Err(message) =
+                release_retained_state_bytes(state, RetainedStateOwner::BlockKey(output_index, 0))
+            {
+                return terminate_responses_stream_with_error(state, build_error_event(message));
+            }
+        }
         return events;
     };
 
@@ -1754,7 +2236,12 @@ fn handle_output_item_done(
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
 
-    let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
+    let block_index = match open_thinking_block_if_needed(state, output_index, &mut events) {
+        Ok(index) => index,
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
+        }
+    };
     events.push(AnthropicStreamEventData::ContentBlockDelta {
         index: block_index,
         delta: AnthropicContentBlockDelta::ThinkingDelta {
@@ -1769,7 +2256,50 @@ fn handle_output_item_done(
     });
     state.block_has_delta.insert(block_index);
 
+    let reasoning_block_key = block_key(output_index, 0);
+    if state
+        .block_index_by_key
+        .remove(&reasoning_block_key)
+        .is_some()
+    {
+        if let Err(message) =
+            release_retained_state_bytes(state, RetainedStateOwner::BlockKey(output_index, 0))
+        {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
+    }
     events
+}
+
+fn release_reasoning_state(
+    state: &mut ResponsesStreamState,
+    output_index: i64,
+    reasoning: &ReasoningItemStreamState,
+) -> Result<(), &'static str> {
+    if reasoning
+        .item_id
+        .as_deref()
+        .is_some_and(|item_id| !item_id.is_empty())
+    {
+        release_retained_state_bytes(state, RetainedStateOwner::ReasoningItemId(output_index))?;
+    }
+    for (summary_index, part) in &reasoning.summary_parts {
+        if !part.text.is_empty() {
+            release_retained_state_bytes(
+                state,
+                RetainedStateOwner::ReasoningSummary(output_index, *summary_index),
+            )?;
+        }
+    }
+    for (content_index, text) in &reasoning.content_parts {
+        if !text.is_empty() {
+            release_retained_state_bytes(
+                state,
+                RetainedStateOwner::ReasoningContent(output_index, *content_index),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn append_output_text(
@@ -1780,7 +2310,11 @@ fn append_output_text(
     events: &mut Vec<AnthropicStreamEventData>,
 ) -> Result<(), &'static str> {
     let key = block_key(output_index, content_index);
-    if state.output_text_done_by_key.contains_key(&key) {
+    if state
+        .output_text_by_key
+        .get(&key)
+        .is_some_and(|part| part.done)
+    {
         return Err("Output text data arrived after output_text.done.");
     }
     if !state.output_text_by_key.contains_key(&key) {
@@ -1788,19 +2322,39 @@ fn append_output_text(
             return Err("The Responses stream emitted too many text content parts.");
         }
         state.tracked_text_parts += 1;
-        state.output_text_by_key.insert(key.clone(), String::new());
+        reserve_retained_state_bytes(
+            state,
+            RetainedStateOwner::OutputTextKey(output_index, content_index),
+            key.len(),
+        )?;
+        state
+            .output_text_by_key
+            .insert(key.clone(), OutputTextStreamState::default());
     }
     if text.is_empty() {
         return Ok(());
     }
     reserve_output_payload(state, text.len())?;
-    reserve_buffered_translation_bytes(state, text.len())?;
+    let old_len = state
+        .output_text_by_key
+        .get(&key)
+        .map(|part| part.text.len())
+        .expect("text part inserted above");
+    let new_len = old_len
+        .checked_add(text.len())
+        .ok_or("The Responses stream retained-state size overflowed.")?;
+    replace_retained_state_bytes(
+        state,
+        RetainedStateOwner::OutputText(output_index, content_index),
+        new_len,
+    )?;
     state
         .output_text_by_key
         .get_mut(&key)
         .expect("text part inserted above")
+        .text
         .push_str(text);
-    let block_index = open_text_block_if_needed(state, output_index, content_index, events);
+    let block_index = open_text_block_if_needed(state, output_index, content_index, events)?;
     events.push(AnthropicStreamEventData::ContentBlockDelta {
         index: block_index,
         delta: AnthropicContentBlockDelta::TextDelta {
@@ -1819,8 +2373,8 @@ fn reconcile_output_text(
     events: &mut Vec<AnthropicStreamEventData>,
 ) -> Result<(), &'static str> {
     let key = block_key(output_index, content_index);
-    if let Some(done) = state.output_text_done_by_key.get(&key) {
-        return if done == authoritative {
+    if let Some(done) = state.output_text_by_key.get(&key).filter(|part| part.done) {
+        return if done.text == authoritative {
             Ok(())
         } else {
             Err("Completed output text conflicted with output_text.done.")
@@ -1829,7 +2383,7 @@ fn reconcile_output_text(
     let current = state
         .output_text_by_key
         .get(&key)
-        .cloned()
+        .map(|part| part.text.clone())
         .unwrap_or_default();
     let Some(suffix) = authoritative.strip_prefix(&current) else {
         return Err("Completed output text conflicted with streamed text deltas.");
@@ -1915,7 +2469,9 @@ fn handle_function_call_arguments_delta(
         );
     }
 
-    open_function_call_block(state, output_index, None, None, &mut events);
+    if let Err(message) = open_function_call_block(state, output_index, None, None, &mut events) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
 
     let fc = match state.function_call_state_by_output_index.get(&output_index) {
         Some(fc) => fc,
@@ -1982,27 +2538,26 @@ fn handle_function_call_arguments_done(
     if state
         .function_call_state_by_output_index
         .get(&output_index)
-        .is_some_and(|call| call.arguments_done.is_some())
+        .is_some_and(|call| call.arguments_done)
     {
         return terminate_responses_stream_with_error(
             state,
             build_error_event("A function call emitted duplicate arguments.done events."),
         );
     }
-    open_function_call_block(state, output_index, None, None, &mut events);
+    if let Err(message) = open_function_call_block(state, output_index, None, None, &mut events) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     if let Err(message) =
         reconcile_function_call_arguments(state, output_index, final_arguments, &mut events)
     {
-        return terminate_responses_stream_with_error(state, build_error_event(message));
-    }
-    if let Err(message) = reserve_buffered_translation_bytes(state, final_arguments.len()) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     if let Some(call) = state
         .function_call_state_by_output_index
         .get_mut(&output_index)
     {
-        call.arguments_done = Some(final_arguments.to_string());
+        call.arguments_done = true;
     }
     events
 }
@@ -2082,19 +2637,7 @@ fn validate_active_output_item(
     }
     if expected_id.is_none() {
         if let Some(actual) = actual_id {
-            if state
-                .output_index_by_item_id
-                .get(actual)
-                .is_some_and(|index| *index != output_index)
-            {
-                return Err("An incremental output event reused an item id at another index.");
-            }
-            state
-                .output_index_by_item_id
-                .insert(actual.to_string(), output_index);
-            if let Some(lifecycle) = state.output_items_by_index.get_mut(&output_index) {
-                lifecycle.item_id = Some(actual.to_string());
-            }
+            retain_late_output_item_id(state, output_index, actual)?;
         }
     }
     if let Some(actual_call_id) = optional_string_field(
@@ -2158,22 +2701,7 @@ fn validate_reasoning_event(
     }
     if expected_id.is_none() {
         if let Some(actual) = actual_id {
-            if state
-                .output_index_by_item_id
-                .get(actual)
-                .is_some_and(|index| *index != output_index)
-            {
-                return Err("A reasoning stream event reused an item id at another output index.");
-            }
-            state
-                .output_index_by_item_id
-                .insert(actual.to_string(), output_index);
-            if let Some(lifecycle) = state.output_items_by_index.get_mut(&output_index) {
-                lifecycle.item_id = Some(actual.to_string());
-            }
-            if let Some(reasoning) = state.reasoning_state_by_output_index.get_mut(&output_index) {
-                reasoning.item_id = Some(actual.to_string());
-            }
+            retain_late_output_item_id(state, output_index, actual)?;
         }
     }
     Ok((output_index, part_index))
@@ -2211,7 +2739,7 @@ fn handle_reasoning_summary_part_added(
     if part.added {
         return Vec::new();
     }
-    if !part.text.is_empty() || part.done_text.is_some() {
+    if !part.text.is_empty() || part.done {
         return terminate_responses_stream_with_error(
             state,
             build_error_event(
@@ -2249,7 +2777,7 @@ fn handle_reasoning_summary_text_delta(
         .reasoning_state_by_output_index
         .get(&output_index)
         .and_then(|reasoning| reasoning.summary_parts.get(&summary_index))
-        .is_some_and(|part| part.done_text.is_some());
+        .is_some_and(|part| part.done);
     if already_done {
         return terminate_responses_stream_with_error(
             state,
@@ -2258,7 +2786,25 @@ fn handle_reasoning_summary_text_delta(
             ),
         );
     }
-    if let Err(message) = reserve_buffered_translation_bytes(state, delta_text.len()) {
+    let old_len = state
+        .reasoning_state_by_output_index
+        .get(&output_index)
+        .and_then(|reasoning| reasoning.summary_parts.get(&summary_index))
+        .map_or(0, |part| part.text.len());
+    let new_len = match old_len.checked_add(delta_text.len()) {
+        Some(new_len) => new_len,
+        None => {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event("The Responses stream retained-state size overflowed."),
+            )
+        }
+    };
+    if let Err(message) = replace_retained_state_bytes(
+        state,
+        RetainedStateOwner::ReasoningSummary(output_index, summary_index),
+        new_len,
+    ) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     let part = state
@@ -2317,9 +2863,9 @@ fn handle_reasoning_summary_text_done(
         .reasoning_state_by_output_index
         .get(&output_index)
         .and_then(|reasoning| reasoning.summary_parts.get(&summary_index))
-        .and_then(|part| part.done_text.clone());
+        .filter(|part| part.done);
     if let Some(previous) = previous {
-        if previous == text {
+        if previous.text == text {
             return Vec::new();
         }
         return terminate_responses_stream_with_error(
@@ -2333,18 +2879,19 @@ fn handle_reasoning_summary_text_done(
         .and_then(|reasoning| reasoning.summary_parts.get(&summary_index))
         .map(|part| part.text.as_str())
         .expect("reasoning part reserved above");
-    let Some(suffix) = text.strip_prefix(current) else {
+    if !text.starts_with(current) {
         return terminate_responses_stream_with_error(
             state,
             build_error_event(
                 "A reasoning summary text.done value conflicted with streamed deltas.",
             ),
         );
-    };
-    if let Err(message) = reserve_buffered_translation_bytes(state, suffix.len()) {
-        return terminate_responses_stream_with_error(state, build_error_event(message));
     }
-    if let Err(message) = reserve_buffered_translation_bytes(state, text.len()) {
+    if let Err(message) = replace_retained_state_bytes(
+        state,
+        RetainedStateOwner::ReasoningSummary(output_index, summary_index),
+        text.len(),
+    ) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     // `text.done` is the authoritative complete text for this summary part.
@@ -2357,7 +2904,7 @@ fn handle_reasoning_summary_text_done(
         .entry(summary_index)
         .or_default();
     part.text = text.to_string();
-    part.done_text = Some(text.to_string());
+    part.done = true;
     Vec::new()
 }
 
@@ -2381,7 +2928,25 @@ fn handle_reasoning_text_delta(
     if let Err(message) = reserve_reasoning_part(state, output_index, content_index, false) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
-    if let Err(message) = reserve_buffered_translation_bytes(state, delta.len()) {
+    let old_len = state
+        .reasoning_state_by_output_index
+        .get(&output_index)
+        .and_then(|reasoning| reasoning.content_parts.get(&content_index))
+        .map_or(0, String::len);
+    let new_len = match old_len.checked_add(delta.len()) {
+        Some(new_len) => new_len,
+        None => {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event("The Responses stream retained-state size overflowed."),
+            )
+        }
+    };
+    if let Err(message) = replace_retained_state_bytes(
+        state,
+        RetainedStateOwner::ReasoningContent(output_index, content_index),
+        new_len,
+    ) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     state
@@ -2427,7 +2992,11 @@ fn handle_output_text_done(
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     let key = block_key(output_index, content_index);
-    if state.output_text_done_by_key.contains_key(&key) {
+    if state
+        .output_text_by_key
+        .get(&key)
+        .is_some_and(|part| part.done)
+    {
         return terminate_responses_stream_with_error(
             state,
             build_error_event("A text content part emitted duplicate output_text.done events."),
@@ -2438,10 +3007,11 @@ fn handle_output_text_done(
     {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
-    if let Err(message) = reserve_buffered_translation_bytes(state, text.len()) {
-        return terminate_responses_stream_with_error(state, build_error_event(message));
-    }
-    state.output_text_done_by_key.insert(key, text.to_string());
+    state
+        .output_text_by_key
+        .get_mut(&key)
+        .expect("text part reconciled above")
+        .done = true;
 
     events
 }
@@ -2519,90 +3089,56 @@ fn handle_response_completed(
             .ok()
             .is_some_and(|index| state.output_items_by_index.contains_key(&index))
     });
-    let lifecycle_initial: Vec<Value> = if output_indices_contiguous {
+    let lifecycle_initial: Vec<OutputItemDigest> = if output_indices_contiguous {
         (0..state.output_items_by_index.len())
             .filter_map(|index| {
                 let index = i64::try_from(index).ok()?;
-                let lifecycle = state.output_items_by_index.get(&index)?;
-                lifecycle
-                    .added_item
-                    .as_ref()
-                    .or(lifecycle.done_item.as_ref())
-                    .cloned()
+                Some(state.output_items_by_index.get(&index)?.initial_digest)
             })
             .collect()
     } else {
         Vec::new()
     };
-    let lifecycle_final: Vec<Value> = if output_indices_contiguous {
+    let lifecycle_final: Vec<OutputItemDigest> = if output_indices_contiguous {
         (0..state.output_items_by_index.len())
             .filter_map(|index| {
                 let index = i64::try_from(index).ok()?;
-                state.output_items_by_index.get(&index)?.done_item.clone()
+                state.output_items_by_index.get(&index)?.final_digest
             })
             .collect()
     } else {
         Vec::new()
     };
     let created_output_mismatch = if let Some(created) = state
-        .created_output
+        .created_output_digests
         .as_ref()
         .filter(|output| !output.is_empty())
     {
         if lifecycle_final.is_empty() {
             true
         } else {
-            let matches_initial = match output_arrays_equivalent(
-                created,
-                OutputValidationPhase::Added,
-                &lifecycle_initial,
-                OutputValidationPhase::Added,
-            ) {
-                Ok(matches) => matches,
-                Err(message) => {
-                    return terminate_responses_stream_with_error(state, build_error_event(message))
-                }
-            };
-            let matches_final = match output_arrays_equivalent(
-                created,
-                OutputValidationPhase::Added,
-                &lifecycle_final,
-                OutputValidationPhase::Done,
-            ) {
-                Ok(matches) => matches,
-                Err(message) => {
-                    return terminate_responses_stream_with_error(state, build_error_event(message))
-                }
-            };
-            !matches_initial && !matches_final
+            created != &lifecycle_initial && created != &lifecycle_final
         }
     } else {
         false
     };
     let terminal_output_mismatch = match response.get("output") {
         None | Some(Value::Null) => false,
-        Some(Value::Array(output)) => match output_arrays_equivalent(
-            output,
-            OutputValidationPhase::Done,
-            &lifecycle_final,
-            OutputValidationPhase::Done,
-        ) {
-            Ok(matches) => !matches,
-            Err(message) => {
-                return terminate_responses_stream_with_error(state, build_error_event(message))
+        Some(Value::Array(output)) => {
+            match output_array_digests(output, OutputValidationPhase::Done) {
+                Ok(digests) => digests != lifecycle_final,
+                Err(message) => {
+                    return terminate_responses_stream_with_error(state, build_error_event(message))
+                }
             }
-        },
+        }
         Some(_) => true,
     };
     let terminal_item_status_mismatch = terminal_kind == ResponsesTerminalKind::Completed
-        && state.output_items_by_index.values().any(|lifecycle| {
-            lifecycle
-                .done_item
-                .as_ref()
-                .and_then(|item| item.get("status"))
-                .and_then(Value::as_str)
-                == Some("incomplete")
-        });
+        && state
+            .output_items_by_index
+            .values()
+            .any(|lifecycle| lifecycle.completed_incomplete);
     if pending_output_item
         || pending_function_call
         || !state.reasoning_state_by_output_index.is_empty()
@@ -2628,7 +3164,9 @@ fn handle_response_completed(
     };
     let usage = map_responses_usage_delta(validated_usage);
 
-    finish_all_function_calls(state, &mut events);
+    if let Err(message) = finish_all_function_calls(state, &mut events) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     close_all_open_blocks(state, &mut events);
 
     events.push(AnthropicStreamEventData::MessageDelta {
@@ -3751,7 +4289,11 @@ mod tests {
             &mut state,
         )
         .is_empty());
-        state.buffered_translation_bytes = MAX_BUFFERED_TRANSLATION_BYTES;
+        let remaining = MAX_BUFFERED_TRANSLATION_BYTES - state.retained_budget.used_bytes();
+        state
+            .retained_budget
+            .reserve(RetainedStateOwner::SequenceSnapshot, remaining)
+            .expect("fixture fills the retained budget");
         let events = translate_responses_stream_event(
             &json!({
                 "type":"response.reasoning_text.delta",
@@ -3887,6 +4429,8 @@ mod tests {
             .iter()
             .any(|event| matches!(event, AnthropicStreamEventData::MessageStop)));
         assert!(state.message_completed);
+        assert!(state.block_index_by_key.is_empty());
+        assert_eq!(state.retained_budget.used_bytes(), 0);
         assert!(translate_responses_stream_event(
             &json!({
                 "type":"response.output_text.delta",
@@ -3902,19 +4446,353 @@ mod tests {
     #[test]
     fn sequence_snapshot_replacement_is_byte_accounted() {
         let mut state = create_responses_stream_state(None);
-        state.buffered_translation_bytes = 7;
+        state
+            .retained_budget
+            .reserve(RetainedStateOwner::CreatedResponseId, 7)
+            .expect("independent retained owner");
         let first = json!({"type":"ping","sequence_number":1,"payload":"first"});
         assert_eq!(validate_event_sequence(&first, &mut state), Ok(false));
         let first_bytes = serde_json::to_vec(&first).unwrap().len();
         assert_eq!(state.last_sequence_event_bytes, first_bytes);
-        assert_eq!(state.buffered_translation_bytes, 7 + first_bytes);
+        assert_eq!(state.retained_budget.used_bytes(), 7 + first_bytes);
         assert_eq!(validate_event_sequence(&first, &mut state), Ok(true));
-        assert_eq!(state.buffered_translation_bytes, 7 + first_bytes);
+        assert_eq!(state.retained_budget.used_bytes(), 7 + first_bytes);
 
         let second = json!({"type":"ping","sequence_number":2,"payload":"x"});
         assert_eq!(validate_event_sequence(&second, &mut state), Ok(false));
         let second_bytes = serde_json::to_vec(&second).unwrap().len();
         assert_eq!(state.last_sequence_event_bytes, second_bytes);
-        assert_eq!(state.buffered_translation_bytes, 7 + second_bytes);
+        assert_eq!(state.retained_budget.used_bytes(), 7 + second_bytes);
+    }
+
+    #[test]
+    fn retained_budget_replace_release_and_underflow_are_checked() {
+        let mut budget = RetainedStateBudget::default();
+        let owner = RetainedStateOwner::FunctionArguments(7);
+        budget
+            .reserve(owner, MAX_BUFFERED_TRANSLATION_BYTES)
+            .expect("exact retained limit");
+        assert!(budget.reserve(owner, 1).is_err());
+        assert!(budget
+            .reserve(RetainedStateOwner::FunctionArguments(8), 1)
+            .is_err());
+        assert_eq!(budget.used_bytes(), MAX_BUFFERED_TRANSLATION_BYTES);
+        budget
+            .replace(owner, 3)
+            .expect("authoritative replacement releases old bytes");
+        assert_eq!(budget.used_bytes(), 3);
+        budget.replace(owner, 7).expect("replacement can grow");
+        assert_eq!(budget.used_bytes(), 7);
+        assert_eq!(budget.owner_bytes(owner), 7);
+        budget.release(owner).expect("owner removal releases bytes");
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(budget.release(owner).is_err());
+
+        let utf8_owner = RetainedStateOwner::ReasoningContent(0, 0);
+        budget
+            .reserve(utf8_owner, "é".len())
+            .expect("UTF-8 bytes are counted");
+        assert_eq!(budget.used_bytes(), 2);
+        assert!(budget
+            .replace(utf8_owner, MAX_BUFFERED_TRANSLATION_BYTES + 1)
+            .is_err());
+        assert_eq!(
+            budget.owner_bytes(utf8_owner),
+            2,
+            "failed replacement is atomic"
+        );
+    }
+
+    #[test]
+    fn lifecycle_digests_ignore_object_key_order_but_preserve_array_order() {
+        let first: Value = serde_json::from_str(
+            r#"{"type":"message","id":"ordered","role":"assistant","content":[],"future":{"a":1,"b":2}}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"future":{"b":2,"a":1},"content":[],"role":"assistant","id":"ordered","type":"message"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            raw_output_item_digest(&first),
+            raw_output_item_digest(&reordered)
+        );
+        assert_eq!(
+            canonical_output_item_digest(&first, OutputValidationPhase::Added),
+            canonical_output_item_digest(&reordered, OutputValidationPhase::Added)
+        );
+
+        let array_a = json!({"type":"message","id":"ordered","role":"assistant","content":[
+            {"type":"output_text","text":"a"},
+            {"type":"output_text","text":"b"}
+        ]});
+        let array_b = json!({"type":"message","id":"ordered","role":"assistant","content":[
+            {"type":"output_text","text":"b"},
+            {"type":"output_text","text":"a"}
+        ]});
+        assert_ne!(
+            raw_output_item_digest(&array_a),
+            raw_output_item_digest(&array_b)
+        );
+    }
+
+    #[test]
+    fn parallel_function_buffers_reserve_replace_and_release_exactly() {
+        let mut state = create_responses_stream_state(None);
+        let mut events = Vec::new();
+        for (index, id, name) in [(0, "a", "f"), (1, "b", "g")] {
+            reserve_function_call_metadata_if_new(&mut state, index, Some(id), name)
+                .expect("tool metadata fits");
+            open_function_call_block(&mut state, index, Some(id), Some(name), &mut events)
+                .expect("tool block opens");
+        }
+        let metadata_bytes = 4;
+        let argument_bytes = MAX_BUFFERED_TRANSLATION_BYTES - metadata_bytes;
+        let first_len = argument_bytes / 2;
+        let second_len = argument_bytes - first_len;
+        append_function_call_arguments(&mut state, 0, "a".repeat(first_len), &mut events)
+            .expect("active call fits");
+        append_function_call_arguments(&mut state, 1, "b".repeat(second_len), &mut events)
+            .expect("inactive call is retained once");
+        assert_eq!(
+            state.retained_budget.used_bytes(),
+            MAX_BUFFERED_TRANSLATION_BYTES
+        );
+        assert_eq!(state.output_budget.used_bytes, MAX_UPSTREAM_RESPONSE_BYTES);
+        assert!(
+            append_function_call_arguments(&mut state, 1, "x".to_string(), &mut events).is_err()
+        );
+        assert_eq!(
+            state.retained_budget.used_bytes(),
+            MAX_BUFFERED_TRANSLATION_BYTES
+        );
+
+        state
+            .function_call_state_by_output_index
+            .get_mut(&0)
+            .expect("first call")
+            .done = true;
+        advance_function_call_queue(&mut state, &mut events).expect("first call drains");
+        assert_eq!(
+            state.retained_budget.used_bytes(),
+            2 + second_len,
+            "only the inactive call remains retained"
+        );
+        state
+            .function_call_state_by_output_index
+            .get_mut(&1)
+            .expect("second call")
+            .done = true;
+        advance_function_call_queue(&mut state, &mut events).expect("second call drains");
+        assert_eq!(state.retained_budget.used_bytes(), 0);
+        assert!(state
+            .retained_budget
+            .release(RetainedStateOwner::FunctionArguments(1))
+            .is_err());
+    }
+
+    #[test]
+    fn inactive_authoritative_arguments_replace_one_owner_then_drain() {
+        let mut state = create_responses_stream_state(None);
+        let mut events = Vec::new();
+        for (index, id, name) in [(0, "active", "first"), (1, "inactive", "second")] {
+            reserve_function_call_metadata_if_new(&mut state, index, Some(id), name)
+                .expect("tool metadata fits");
+            open_function_call_block(&mut state, index, Some(id), Some(name), &mut events)
+                .expect("tool block opens");
+        }
+        append_function_call_arguments(&mut state, 0, "{}".to_string(), &mut events)
+            .expect("active arguments fit");
+        append_function_call_arguments(&mut state, 1, "{\"v\":".to_string(), &mut events)
+            .expect("inactive prefix fits");
+        assert_eq!(
+            state
+                .retained_budget
+                .owner_bytes(RetainedStateOwner::FunctionArguments(1)),
+            "{\"v\":".len()
+        );
+
+        reconcile_function_call_arguments(&mut state, 1, "{\"v\":1}", &mut events)
+            .expect("authoritative suffix replaces the inactive buffer");
+        assert_eq!(
+            state
+                .retained_budget
+                .owner_bytes(RetainedStateOwner::FunctionArguments(1)),
+            "{\"v\":1}".len(),
+            "the authoritative value owns its current bytes exactly once"
+        );
+        assert_eq!(
+            state.output_budget.used_bytes,
+            "active".len()
+                + "first".len()
+                + "inactive".len()
+                + "second".len()
+                + "{}".len()
+                + "{\"v\":1}".len()
+        );
+
+        state
+            .function_call_state_by_output_index
+            .get_mut(&0)
+            .expect("first call")
+            .done = true;
+        advance_function_call_queue(&mut state, &mut events).expect("first call drains");
+        assert_eq!(
+            state
+                .retained_budget
+                .owner_bytes(RetainedStateOwner::FunctionArguments(1)),
+            "{\"v\":1}".len()
+        );
+        state
+            .function_call_state_by_output_index
+            .get_mut(&1)
+            .expect("second call")
+            .done = true;
+        advance_function_call_queue(&mut state, &mut events).expect("second call drains");
+        assert_eq!(state.retained_budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn reasoning_authority_replaces_and_releases_its_buffer() {
+        let mut state = started_state();
+        assert!(translate_responses_stream_event(
+            &json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"reasoning","id":"reasoning-owner","summary":[]}
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert!(translate_responses_stream_event(
+            &json!({
+                "type":"response.reasoning_summary_text.delta",
+                "item_id":"reasoning-owner",
+                "output_index":0,
+                "summary_index":0,
+                "delta":"é"
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert_eq!(
+            state
+                .retained_budget
+                .owner_bytes(RetainedStateOwner::ReasoningSummary(0, 0)),
+            "é".len()
+        );
+        assert!(translate_responses_stream_event(
+            &json!({
+                "type":"response.reasoning_summary_text.done",
+                "item_id":"reasoning-owner",
+                "output_index":0,
+                "summary_index":0,
+                "text":"éx"
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert_eq!(
+            state
+                .retained_budget
+                .owner_bytes(RetainedStateOwner::ReasoningSummary(0, 0)),
+            "éx".len()
+        );
+        let events = translate_responses_stream_event(
+            &json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"reasoning",
+                    "id":"reasoning-owner",
+                    "summary":[{"type":"summary_text","text":"éx"}],
+                    "encrypted_content":"enc",
+                    "status":"completed"
+                }
+            }),
+            &mut state,
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AnthropicStreamEventData::ContentBlockDelta {
+                delta: AnthropicContentBlockDelta::SignatureDelta { .. },
+                ..
+            }
+        )));
+        assert_eq!(
+            state
+                .retained_budget
+                .owner_bytes(RetainedStateOwner::ReasoningSummary(0, 0)),
+            0
+        );
+    }
+
+    #[test]
+    fn completed_payload_history_is_released_and_terminal_cleanup_is_empty() {
+        let mut state = started_state();
+        let extension = "x".repeat(64 * 1024);
+        let added = json!({
+            "type":"message",
+            "id":"history-release",
+            "role":"assistant",
+            "content":[],
+            "future_large_assertion":extension
+        });
+        assert!(translate_responses_stream_event(
+            &json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":added
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert!(
+            state
+                .retained_budget
+                .owner_bytes(RetainedStateOwner::PendingOutputItem(0))
+                > 64 * 1024
+        );
+        assert!(translate_responses_stream_event(
+            &json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"message",
+                    "id":"history-release",
+                    "role":"assistant",
+                    "status":"completed",
+                    "content":[],
+                    "future_large_assertion":extension
+                }
+            }),
+            &mut state,
+        )
+        .is_empty());
+        assert_eq!(
+            state
+                .retained_budget
+                .owner_bytes(RetainedStateOwner::PendingOutputItem(0)),
+            0,
+            "a completed snapshot is retained only as a fixed-size digest"
+        );
+
+        let events = translate_responses_stream_event(
+            &json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp_test",
+                    "status":"completed",
+                    "usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}
+                }
+            }),
+            &mut state,
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AnthropicStreamEventData::MessageStop)
+        ));
+        assert_eq!(state.retained_budget.used_bytes(), 0);
+        assert!(state.retained_budget.owners.is_empty());
     }
 }

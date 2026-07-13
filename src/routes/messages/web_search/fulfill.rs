@@ -2278,6 +2278,8 @@ pub async fn handle_web_search_via_responses(
         &serde_json::to_value(&result).unwrap_or(Value::Null),
     );
 
+    validate_reconstructed_payload_budget(&response)?;
+
     let recorder = create_copilot_token_usage_recorder(
         "responses",
         options.web_search_model.clone(),
@@ -2298,8 +2300,6 @@ pub async fn handle_web_search_via_responses(
             .and_then(|u| serde_json::to_value(u).ok())
             .as_ref(),
     ));
-
-    validate_reconstructed_payload_budget(&response)?;
 
     if !wants_stream {
         return Ok(Json(response.to_json()).into_response());

@@ -7248,10 +7248,358 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
     Some(sse_response(render_sse(&events)))
 }
 
+fn responses_state_budget_stream_fixture(model: &str) -> Option<Response> {
+    let text_mode = model.ends_with("responses-state-exact")
+        || model.ends_with("responses-state-over")
+        || model.ends_with("responses-state-utf8-exact");
+    let function_mode = model.ends_with("responses-function-state-exact")
+        || model.ends_with("responses-function-state-over");
+    let mixed_mode =
+        model.ends_with("responses-mixed-budget") || model.ends_with("responses-mixed-budget-over");
+    if !text_mode && !function_mode && !mixed_mode {
+        return None;
+    }
+
+    let created = (
+        "response.created",
+        json!({
+            "type":"response.created",
+            "response":{
+                "id":"resp_budget",
+                "object":"response",
+                "created_at":1,
+                "status":"in_progress",
+                "model":model
+            }
+        }),
+    );
+    let terminal = (
+        "response.completed",
+        json!({
+            "type":"response.completed",
+            "response":{
+                "id":"resp_budget",
+                "status":"completed",
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+            }
+        }),
+    );
+
+    if text_mode {
+        let utf8 = model.ends_with("utf8-exact");
+        let over = usize::from(model.ends_with("state-over"));
+        let mut remaining = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES + over;
+        let mut events = vec![created];
+        let mut index = 0usize;
+        while remaining > 0 {
+            let id = format!("message-{index}");
+            let filler_bytes = remaining.min(BUDGET_FIXTURE_FRAGMENT_BYTES);
+            let text = if utf8 {
+                utf8_payload_fragments(filler_bytes)
+                    .into_iter()
+                    .collect::<String>()
+            } else {
+                "t".repeat(filler_bytes)
+            };
+            let added = json!({
+                "type":"message",
+                "id":id,
+                "role":"assistant",
+                "content":[]
+            });
+            let done = json!({
+                "type":"message",
+                "id":format!("message-{index}"),
+                "role":"assistant",
+                "content":[{"type":"output_text","text":text}]
+            });
+            events.extend([
+                (
+                    "response.output_item.added",
+                    json!({"type":"response.output_item.added","output_index":index,"item":added}),
+                ),
+                (
+                    "response.output_text.delta",
+                    json!({"type":"response.output_text.delta","output_index":index,"content_index":0,"delta":text}),
+                ),
+                (
+                    "response.output_text.done",
+                    json!({"type":"response.output_text.done","output_index":index,"content_index":0,"text":text}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"type":"response.output_item.done","output_index":index,"item":done}),
+                ),
+            ]);
+            remaining -= filler_bytes;
+            index += 1;
+        }
+        events.push(terminal);
+        return Some(sse_response(render_sse(&events)));
+    }
+
+    if function_mode {
+        let over = usize::from(model.ends_with("state-over"));
+        const COUNT: usize = 64;
+        let mut retained_metadata = "resp_budget".len();
+        for index in 0..COUNT {
+            let id = format!("function-{index}");
+            let call_id = format!("call-{index}");
+            let added = json!({
+                "type":"function_call",
+                "id":id,
+                "call_id":call_id,
+                "name":"actual",
+                "arguments":""
+            });
+            retained_metadata += serde_json::to_vec(&added).unwrap().len()
+                + "function_call".len()
+                + id.len()
+                + id.len()
+                + call_id.len()
+                + "actual".len();
+        }
+        let argument_total = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+            .checked_add(over)
+            .and_then(|limit| limit.checked_sub(retained_metadata))
+            .expect("function retained-budget fixture metadata fits");
+        assert!(argument_total >= COUNT * 8);
+        let base_argument_len = argument_total / COUNT;
+        let argument_remainder = argument_total % COUNT;
+        let mut added_events = Vec::new();
+        let mut argument_events = Vec::new();
+        let mut done_events = Vec::new();
+        for index in 0..COUNT {
+            let id = format!("function-{index}");
+            let call_id = format!("call-{index}");
+            let argument_bytes = base_argument_len + usize::from(index < argument_remainder);
+            let value_bytes = argument_bytes - 8;
+            let arguments = format!(r#"{{"v":"{}"}}"#, "a".repeat(value_bytes));
+            debug_assert_eq!(arguments.len(), argument_bytes);
+            let streamed_prefix = &arguments[..arguments.len() - 1];
+            let added = json!({
+                "type":"function_call",
+                "id":id,
+                "call_id":call_id,
+                "name":"actual",
+                "arguments":""
+            });
+            let done = json!({
+                "type":"function_call",
+                "id":format!("function-{index}"),
+                "call_id":format!("call-{index}"),
+                "name":"actual",
+                "arguments":arguments
+            });
+            added_events.push((
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":index,"item":added}),
+            ));
+            argument_events.extend([
+                (
+                    "response.function_call_arguments.delta",
+                    json!({"type":"response.function_call_arguments.delta","output_index":index,"delta":streamed_prefix}),
+                ),
+                (
+                    "response.function_call_arguments.done",
+                    json!({"type":"response.function_call_arguments.done","output_index":index,"arguments":arguments}),
+                ),
+            ]);
+            done_events.push((
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":index,"item":done}),
+            ));
+        }
+        let mut events = vec![created];
+        events.extend(added_events);
+        events.extend(argument_events);
+        events.extend(done_events);
+        events.push(terminal);
+        return Some(sse_response(render_sse(&events)));
+    }
+
+    const REASONING_TEXT: &str = "inspect";
+    const MIXED_ARGUMENTS: &str = "{\"value\":1}";
+    let signature =
+        copilot_api::routes::messages::responses_translation::encode_reasoning_signature(
+            Some("enc"),
+            Some("reasoning-mixed"),
+        );
+    let fixed_output_bytes = REASONING_TEXT.len()
+        + signature.len()
+        + (0..2)
+            .map(|index| {
+                format!("mixed-call-{index}").len() + "actual".len() + MIXED_ARGUMENTS.len()
+            })
+            .sum::<usize>();
+    let mixed_over = usize::from(model.ends_with("mixed-budget-over"));
+    let mut remaining_text = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+        .checked_add(mixed_over)
+        .and_then(|limit| limit.checked_sub(fixed_output_bytes))
+        .expect("mixed Responses budget fixture fits");
+    let mut events = vec![created];
+    let mut output_index = 0usize;
+    while remaining_text > 0 {
+        let text_bytes = remaining_text.min(BUDGET_FIXTURE_FRAGMENT_BYTES);
+        let text = utf8_payload_fragments(text_bytes)
+            .into_iter()
+            .collect::<String>();
+        let id = format!("mixed-message-{output_index}");
+        events.extend([
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":output_index,
+                    "item":{"type":"message","id":id,"role":"assistant","content":[]}
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type":"response.output_text.delta",
+                    "output_index":output_index,
+                    "content_index":0,
+                    "delta":text
+                }),
+            ),
+            (
+                "response.output_text.done",
+                json!({
+                    "type":"response.output_text.done",
+                    "output_index":output_index,
+                    "content_index":0,
+                    "text":text
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":output_index,
+                    "item":{
+                        "type":"message",
+                        "id":format!("mixed-message-{output_index}"),
+                        "role":"assistant",
+                        "status":"completed",
+                        "content":[{"type":"output_text","text":text}]
+                    }
+                }),
+            ),
+        ]);
+        remaining_text -= text_bytes;
+        output_index += 1;
+    }
+
+    let reasoning = json!({
+        "type":"reasoning",
+        "id":"reasoning-mixed",
+        "summary":[{"type":"summary_text","text":REASONING_TEXT}],
+        "encrypted_content":"enc",
+        "status":"completed"
+    });
+    events.push((
+        "response.output_item.done",
+        json!({"type":"response.output_item.done","output_index":output_index,"item":reasoning}),
+    ));
+    output_index += 1;
+    for index in 0..2 {
+        events.push((
+            "response.output_item.added",
+            json!({
+                "type":"response.output_item.added",
+                "output_index":output_index + index,
+                "item":{
+                    "type":"function_call",
+                    "id":format!("mixed-function-{index}"),
+                    "call_id":format!("mixed-call-{index}"),
+                    "name":"actual",
+                    "arguments":""
+                }
+            }),
+        ));
+    }
+    for index in 0..2 {
+        events.push((
+            "response.function_call_arguments.delta",
+            json!({"type":"response.function_call_arguments.delta","output_index":output_index + index,"delta":"{\"value\":"}),
+        ));
+        events.push((
+            "response.function_call_arguments.done",
+            json!({"type":"response.function_call_arguments.done","output_index":output_index + index,"arguments":MIXED_ARGUMENTS}),
+        ));
+    }
+    for index in 0..2 {
+        events.push((
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "output_index":output_index + index,
+                "item":{
+                    "type":"function_call",
+                    "id":format!("mixed-function-{index}"),
+                    "call_id":format!("mixed-call-{index}"),
+                    "name":"actual",
+                    "arguments":MIXED_ARGUMENTS
+                }
+            }),
+        ));
+    }
+    events.push(terminal);
+    Some(sse_response(render_sse(&events)))
+}
+
+fn web_search_reconstructed_overflow_fixture(model: &str) -> Response {
+    let mut result = json!({
+        "id":"resp_web_budget",
+        "object":"response",
+        "created_at":1,
+        "status":"completed",
+        "model":model,
+        "output":[
+            {
+                "type":"web_search_call",
+                "status":"completed",
+                "action":{"type":"search","query":"budget"}
+            },
+            {
+                "type":"message",
+                "role":"assistant",
+                "status":"completed",
+                "content":[{
+                    "type":"output_text",
+                    "text":"",
+                    "annotations":[]
+                }]
+            }
+        ],
+        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+    });
+    let base = serde_json::to_vec(&result).expect("web overflow fixture");
+    let filler_bytes = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+        .checked_sub(base.len())
+        .expect("web overflow fixture base fits");
+    result["output"][1]["content"][0]["text"] = json!("w".repeat(filler_bytes));
+    let body = serde_json::to_vec(&result).expect("web overflow fixture body");
+    assert_eq!(
+        body.len(),
+        copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("content-length", body.len().to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
 fn responses_fixture(body: &Value) -> Response {
     let model = body["model"].as_str().unwrap_or("gpt-fixture");
     if model.starts_with("gpt-direct-compact-") {
         return compact_fixture(body);
+    }
+    if model == "gpt-web-reconstructed-overflow" {
+        return web_search_reconstructed_overflow_fixture(model);
     }
     match model {
         "gpt-rate-limit" => {
@@ -7508,6 +7856,9 @@ fn responses_fixture(body: &Value) -> Response {
     }
 
     if body["stream"] == true {
+        if let Some(response) = responses_state_budget_stream_fixture(model) {
+            return response;
+        }
         if let Some(response) = created_output_contract_stream_fixture(model) {
             return response;
         }
@@ -8140,6 +8491,14 @@ fn configure_direct_copilot(fixture: &Fixture) {
         "gpt-direct-response-oversized",
         "gpt-direct-response-400",
         "gpt-direct-response-500",
+        "gpt-direct-responses-state-exact",
+        "gpt-direct-responses-state-over",
+        "gpt-direct-responses-state-utf8-exact",
+        "gpt-direct-responses-function-state-exact",
+        "gpt-direct-responses-function-state-over",
+        "gpt-direct-responses-mixed-budget",
+        "gpt-direct-responses-mixed-budget-over",
+        "gpt-web-reconstructed-overflow",
         "gpt-direct-chat-extensions",
         "gpt-direct-chat-response-extras",
         "gpt-direct-chat-response-refusal",
@@ -8203,6 +8562,14 @@ fn configure_direct_copilot(fixture: &Fixture) {
         state.models = Some(Arc::new(models));
         state.premium_interactions = None;
     });
+}
+
+fn configure_direct_web_search(fixture: &Fixture, model: &str) {
+    configure_direct_copilot(fixture);
+    let mut config = (*copilot_api::libs::config::get_config()).clone();
+    config.message_api_web_search_model = Some(model.to_string());
+    config.use_responses_api_web_search = Some(true);
+    set_cached_config_for_test(config);
 }
 
 fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&str>) {
@@ -8331,6 +8698,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-web-usage-details-terminal-only",
         "gpt-web-created-usage-details-malformed",
         "gpt-web-terminal-usage-details-malformed",
+        "gpt-web-reconstructed-overflow",
         "gpt-web-incomplete-details-created-only",
         "gpt-web-incomplete-details-terminal-only",
         "gpt-web-incomplete-details-matching",
@@ -8655,6 +9023,13 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-chat-stream-bad-budget-mixed-utf8-over",
         "gpt-chat-stream-bad-tool-late-extra",
         "gpt-chat-stream-bad-tool-missing-terminal",
+        "gpt-responses-state-exact",
+        "gpt-responses-state-over",
+        "gpt-responses-state-utf8-exact",
+        "gpt-responses-function-state-exact",
+        "gpt-responses-function-state-over",
+        "gpt-responses-mixed-budget",
+        "gpt-responses-mixed-budget-over",
     ]
     .into_iter()
     .map(|model| {
@@ -14029,6 +14404,166 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
     }
 }
 
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_responses_state_budgets_cross_provider_and_direct_boundaries() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+
+    configure(&fixture);
+    for model in [
+        "gpt-responses-state-exact",
+        "gpt-responses-state-utf8-exact",
+        "gpt-responses-function-state-exact",
+        "gpt-responses-mixed-budget",
+    ] {
+        let body = json!({
+            "model":format!("responses-fixture/{model}"),
+            "max_tokens":128,
+            "stream":true,
+            "messages":[{"role":"user","content":"responses budget"}]
+        });
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&response);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}: {:?}",
+            events.last()
+        );
+        assert!(!events.iter().any(|event| event["type"] == "error"));
+        if model.ends_with("utf8-exact") {
+            assert!(events.iter().any(|event| {
+                event
+                    .pointer("/delta/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains('é'))
+            }));
+        }
+        if model.ends_with("mixed-budget") {
+            assert!(events.iter().any(|event| {
+                event["delta"]["type"] == "text_delta"
+                    && event["delta"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains('é'))
+            }));
+            assert!(events
+                .iter()
+                .any(|event| event["delta"]["type"] == "thinking_delta"));
+            assert!(events
+                .iter()
+                .any(|event| event["delta"]["type"] == "signature_delta"));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["content_block"]["type"] == "tool_use")
+                    .count(),
+                2
+            );
+        }
+    }
+    for model in [
+        "gpt-responses-state-over",
+        "gpt-responses-function-state-over",
+        "gpt-responses-mixed-budget-over",
+    ] {
+        let body = json!({
+            "model":format!("responses-fixture/{model}"),
+            "max_tokens":128,
+            "stream":true,
+            "messages":[{"role":"user","content":"responses overflow"}]
+        });
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&response);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}"
+        );
+        assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+    }
+
+    configure_direct_copilot(&fixture);
+    for model in [
+        "gpt-direct-responses-state-exact",
+        "gpt-direct-responses-state-utf8-exact",
+        "gpt-direct-responses-function-state-exact",
+        "gpt-direct-responses-mixed-budget",
+    ] {
+        let body = json!({
+            "model":model,
+            "max_tokens":128,
+            "stream":true,
+            "messages":[{"role":"user","content":"direct responses budget"}]
+        });
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&response);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+        assert!(!events.iter().any(|event| event["type"] == "error"));
+        if model.ends_with("mixed-budget") {
+            assert!(events.iter().any(|event| {
+                event["delta"]["type"] == "text_delta"
+                    && event["delta"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains('é'))
+            }));
+            assert!(events
+                .iter()
+                .any(|event| event["delta"]["type"] == "thinking_delta"));
+            assert!(events
+                .iter()
+                .any(|event| event["delta"]["type"] == "signature_delta"));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["content_block"]["type"] == "tool_use")
+                    .count(),
+                2
+            );
+        }
+    }
+    for model in [
+        "gpt-direct-responses-state-over",
+        "gpt-direct-responses-function-state-over",
+        "gpt-direct-responses-mixed-budget-over",
+    ] {
+        let body = json!({
+            "model":model,
+            "max_tokens":128,
+            "stream":true,
+            "messages":[{"role":"user","content":"direct responses overflow"}]
+        });
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&response);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}"
+        );
+        assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+    }
+}
+
 fn binary_schema(depth: usize) -> Value {
     if depth == 0 {
         return Value::Bool(true);
@@ -14843,6 +15378,94 @@ async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
         assert_eq!(events[9]["delta"]["stop_reason"], "end_turn", "{model}");
         assert_eq!(events[9]["usage"]["output_tokens"], 4, "{model}");
     }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_web_search_overflow_precedes_usage_recording() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    let model = "gpt-web-reconstructed-overflow";
+    configure_direct_web_search(&fixture, model);
+    let before = copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+        .items
+        .into_iter()
+        .filter(|event| event.model == model)
+        .count();
+    let metric_value = |status: &str| {
+        copilot_api::libs::metrics::render()
+            .lines()
+            .find(|line| {
+                line.starts_with("http_requests_total{")
+                    && line.contains("method=\"POST\"")
+                    && line.contains(&format!("status=\"{status}\""))
+            })
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let success_before = metric_value("200");
+    let error_before = metric_value("500");
+    let in_flight_before = copilot_api::libs::metrics::render()
+        .lines()
+        .find(|line| line.starts_with("http_requests_in_flight "))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+
+    for stream in [false, true] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":"claude-sonnet-4-6",
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"overflow web reconstruction"}],
+                "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                "stream":stream
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert!(
+            status.is_server_error(),
+            "unexpected status {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let error = json_body(&body);
+        assert_eq!(
+            error.as_object().map(Map::len),
+            Some(2),
+            "overflow returns one native Anthropic error envelope"
+        );
+        assert_eq!(error["type"], "error");
+        assert!(error["error"].is_object());
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.contains("w".repeat(128).as_str())));
+    }
+
+    let after = copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+        .items
+        .into_iter()
+        .filter(|event| event.model == model)
+        .count();
+    assert_eq!(after, before, "overflow must not record token usage");
+    assert_eq!(
+        metric_value("200"),
+        success_before,
+        "overflow must not record reconstruction success"
+    );
+    assert!(metric_value("500") >= error_before + 2.0);
+    let in_flight_after = copilot_api::libs::metrics::render()
+        .lines()
+        .find(|line| line.starts_with("http_requests_in_flight "))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    assert_eq!(
+        in_flight_after, in_flight_before,
+        "overflow request finalization must release in-flight accounting"
+    );
 }
 
 #[tokio::test]
