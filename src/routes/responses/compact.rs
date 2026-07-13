@@ -1,9 +1,8 @@
 //! OpenAI Responses compaction endpoint used by Codex CLI 0.144.1.
 
-use axum::body::Bytes;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::body::{Body, Bytes};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::Response;
 use serde_json::Value;
 
 use crate::libs::compact::COMPACT_REQUEST;
@@ -111,7 +110,11 @@ async fn handle_responses_compact(body: Value, headers: HeaderMap) -> Result<Res
     .await?;
 
     match result {
-        CreateResponsesReturn::Result(result) => Ok(Json(*result).into_response()),
+        CreateResponsesReturn::Result(result) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(result.raw))
+            .expect("static compact Responses response")),
         CreateResponsesReturn::Stream(_) => {
             Err(HttpError::internal("Responses compact unexpectedly returned a stream").into())
         }
@@ -189,7 +192,11 @@ async fn handle_provider_compact(
         .into());
     }
 
-    let mut response = (status, Json(value)).into_response();
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .expect("static provider compact response");
     for name in ["x-request-id", "openai-request-id", "x-codex-turn-state"] {
         if let Some(value) = upstream_headers.get(name) {
             response.headers_mut().insert(name, value.clone());

@@ -323,6 +323,7 @@ async fn handle_openai_responses_provider_web_search_messages(
         DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO,
     );
     compact_input_by_latest_compaction(&mut responses_payload);
+    let requested_response_model = responses_payload.model.clone();
 
     let is_codex = provider_config.name == "codex";
     let error_prefix = format!("{provider} web search responses stream");
@@ -340,7 +341,12 @@ async fn handle_openai_responses_provider_web_search_messages(
             .into());
         }
         let stream = Box::pin(crate::libs::sse::events(upstream_response));
-        collect_web_search_responses_stream_result(stream, &error_prefix).await?
+        collect_web_search_responses_stream_result(
+            stream,
+            &error_prefix,
+            Some(&requested_response_model),
+        )
+        .await?
     } else {
         let upstream_response =
             forward_provider_responses(provider_config, &responses_payload, headers).await?;
@@ -358,7 +364,12 @@ async fn handle_openai_responses_provider_web_search_messages(
         let content_type = response_content_type(&upstream_response);
         if content_type.contains("text/event-stream") {
             let stream = Box::pin(crate::libs::sse::events(upstream_response));
-            collect_web_search_responses_stream_result(stream, &error_prefix).await?
+            collect_web_search_responses_stream_result(
+                stream,
+                &error_prefix,
+                Some(&requested_response_model),
+            )
+            .await?
         } else {
             read_responses_result(upstream_response).await?
         }

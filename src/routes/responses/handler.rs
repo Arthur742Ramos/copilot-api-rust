@@ -2,8 +2,7 @@
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::response::Response;
 use serde_json::Value;
 
 use crate::libs::approval::await_approval;
@@ -161,6 +160,7 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
             Ok(stream_responses_sse(upstream, recorder))
         }
         CreateResponsesReturn::Result(result) => {
+            let result = *result;
             // Native non-streaming responses never pass through a StreamTimer, so
             // record the flow/model/transport headline here so the trace
             // middleware's `has_flow` guard emits the single `request.completed`
@@ -173,11 +173,16 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
                 );
             }
             let usage_value = result
+                .parsed
                 .usage
                 .as_ref()
                 .and_then(|u| serde_json::to_value(u).ok());
             recorder.record(normalize_responses_usage(usage_value.as_ref()));
-            Ok(Json(*result).into_response())
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(result.raw))
+                .expect("static native Responses response"))
         }
     }
 }

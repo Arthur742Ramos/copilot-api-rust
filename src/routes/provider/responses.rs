@@ -102,11 +102,17 @@ pub async fn handle_provider_responses_for_provider(
             return stream_provider_responses(upstream_response, &provider, recorder, true).await;
         }
 
+        let status = upstream_response.status();
+        let resp_headers = upstream_response.headers().clone();
         let response_body = read_responses_result(upstream_response).await?;
         recorder.record(normalize_responses_usage(
-            usage_value(&response_body).as_ref(),
+            usage_value(&response_body.value).as_ref(),
         ));
-        return Ok(Json(response_body).into_response());
+        return Ok(build_proxy_response_from_parts(
+            status,
+            &resp_headers,
+            response_body.bytes,
+        ));
     }
 
     let upstream_response =
@@ -334,8 +340,15 @@ fn responses_stream_event_usage(event: &Value) -> Option<UsageTokens> {
     }
 }
 
-/// Read a non-streaming Codex responses body into a JSON `Value`.
-async fn read_responses_result(response: reqwest::Response) -> Result<Value, AppError> {
+struct BufferedResponsesBody {
+    bytes: Bytes,
+    value: Value,
+}
+
+/// Read a non-streaming Codex responses body without reserializing its JSON.
+async fn read_responses_result(
+    response: reqwest::Response,
+) -> Result<BufferedResponsesBody, AppError> {
     let bytes = crate::libs::http::read_bytes_capped(response)
         .await
         .map_err(|error| {
@@ -350,14 +363,15 @@ async fn read_responses_result(response: reqwest::Response) -> Result<Value, App
                 String::new(),
             ))
         })?;
-    serde_json::from_slice(&bytes).map_err(|_| {
+    let value = serde_json::from_slice(&bytes).map_err(|_| {
         AppError::Http(crate::libs::error::HttpError::new(
             "The upstream Responses body was not valid JSON.",
             StatusCode::BAD_GATEWAY,
             HeaderMap::new(),
             String::new(),
         ))
-    })
+    })?;
+    Ok(BufferedResponsesBody { bytes, value })
 }
 
 fn usage_value(body: &Value) -> Option<Value> {

@@ -350,11 +350,11 @@ The web-search collector reconciles three snapshots before replying: the full
 `response.created`, optional item lifecycle, and partial terminal. Missing/null
 model, object, output, output text, usage, and metadata are filled without
 overwriting existing values. Repeated model/object/output-text/metadata must
-match; valid usage counters (including cached/reasoning details) must be
-semantically equal. Non-empty created output must semantically match final output, or
-match the lifecycle's added snapshot while the terminal matches its authoritative
-done snapshot. Terminal and lifecycle output must agree under the same canonical
-form. Created-only,
+match; required usage counters agree while optional cached/reasoning assertions
+merge field-by-field. Non-empty created output must semantically match final
+output, or match the lifecycle's added snapshot while the terminal matches its
+authoritative done snapshot. Terminal and lifecycle output must agree under the
+same canonical form. Created-only,
 terminal-only, matching duplicate, and lifecycle-derived output are supported;
 well-typed conflicts fail. Failed/incomplete terminals, malformed JSON, and any
 event after a terminal fail before JSON or synthetic Anthropic SSE success.
@@ -363,6 +363,45 @@ absence are equivalent, ignored item/annotation extensions do not create false
 conflicts, citation URL/title/text and ordering remain authoritative, and cached
 plus reasoning usage details are compared. A representable web-search call keeps
 its original Responses item ID as the Anthropic server-tool ID.
+
+### Web-search field authority
+
+The collector uses the following explicit authority model; later partial
+snapshots never overwrite an asserted earlier value silently:
+
+| Response field | Authority / merge rule |
+|---|---|
+| `id` | Required in created and terminal; present values must match. |
+| `model` | Non-null source values must match. The validated requested/resolved model is used only when every source snapshot omits/nulls it. |
+| `object` | Optional assertion; absent/null makes no assertion, conflicting present values fail. |
+| `status` | Phase discriminator: created allows absent/null/`in_progress`; terminal allows absent/null or its event-matching value. Final status comes from the terminal event type. |
+| `output` | Structured merge across created, lifecycle-added, lifecycle-done, and terminal snapshots using the nested item rules below. Created `[]` is provisional; terminal `[]` is authoritative. |
+| `output_text` | Optional assertion; one present value is retained, matching values merge, conflicts fail. |
+| `usage` | A present object requires valid input/output/total counters. Required counters must match across snapshots. Optional cached/reasoning details merge independently when present; omission/null is no assertion, and contradictory present values fail. |
+| `metadata`, `incomplete_details` | Optional opaque semantic assertions. Missing/null values are filled from another snapshot; deep conflicting present values fail. |
+| `end_turn` | Optional boolean assertion. Missing/null is no assertion; conflicts fail; `false` maps to `pause_turn`. |
+| `error` | Used only to report failed terminals; never merged into successful reconstruction. |
+| `created_at`, `instructions`, `parallel_tool_calls`, `temperature`, `tool_choice`, `tools`, `top_p`, unknown fields | Client/bridge-ignored raw extras. They are retained from created or filled when missing, but are not conflict/type gates. |
+
+Nested output authority is likewise field-specific:
+
+| Item/field | Authority / merge rule |
+|---|---|
+| Every item `type` | Required and stable by output index. |
+| Message / web-search `id` | Optional stable assertion. A known ID survives omission/null in any other partial snapshot; conflicting present IDs fail. |
+| Item `status` | Progressive assertion. `in_progress` may advance to `completed`/`incomplete`; a done snapshot may omit status; contradictory present terminal states fail. |
+| Message `role` | Required and stable. |
+| Message `content` | Added snapshots may be empty/partial; done/terminal text must converge. Content type/text conflicts fail. |
+| Text `annotations` | Optional assertion. Consumed citation URL/title semantics merge; omission/null makes no assertion. Duplicate URLs and unknown annotation extensions are ignored consistently. |
+| Web-search `action` | Optional in partial item snapshots. Exactly one non-empty final search query is required; matching `query`/single `queries` forms merge, conflicts fail. |
+| Message `phase`, internal passthrough metadata, unknown item extensions | Ignored by web reconstruction and excluded consistently from semantic equality. |
+
+Native non-stream `/v1/responses` and `/v1/responses/compact` do not serialize
+the typed validation model back to the client. Successful upstream JSON is
+size-bounded and parsed for malformed-body/usage/output handling, but the
+original bytes are returned across Copilot, Codex-provider, and generic-provider
+branches, preserving explicit nulls, unknown fields, whitespace, and key order.
+Native SSE remains raw event forwarding under the existing lifecycle guard.
 
 `response.completed` and `response.incomplete` cannot produce Anthropic success
 while an added output item, function call, or reasoning buffer is unfinished.
@@ -385,11 +424,14 @@ evidence is in
 `claude_malformed_handled_scalars_fail_once_without_empty_blocks`,
 `claude_json_and_sse_outputs_match_for_valid_families`,
 `claude_json_and_sse_reject_equivalent_malformed_outputs`,
-`claude_tool_search_late_identity_corruption_fails_once_after_closing_block`,
+`claude_tool_search_identity_merges_omission_and_rejects_conflicts`,
 `claude_web_search_partial_terminals_preserve_output_in_json_and_sse`,
+`claude_web_search_lifecycle_optionals_merge_in_both_directions`,
+`claude_web_search_end_turn_assertions_merge_in_both_directions`,
 `claude_web_search_terminal_conflicts_fail_before_json_or_sse_success`,
 `claude_raw_output_variants_fail_explicitly_in_json_and_sse`,
 `native_responses_preserves_all_raw_output_variants`,
+`native_nonstream_responses_preserves_exact_null_and_unknown_shape`,
 and
 `claude_incomplete_or_out_of_order_response_items_fail_once_without_success`,
 in addition to the JSON/SSE framing regressions.

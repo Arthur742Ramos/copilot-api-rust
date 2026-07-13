@@ -568,8 +568,9 @@ pub async fn handle_with_responses_api(
         }
         CreateResponsesReturn::Result(response) => {
             let anthropic_response =
-                translate_responses_result_to_anthropic(&response, Some(&tool_search_name))?;
+                translate_responses_result_to_anthropic(&response.parsed, Some(&tool_search_name))?;
             let usage_value = response
+                .parsed
                 .usage
                 .as_ref()
                 .map(|u| serde_json::to_value(u).unwrap_or(Value::Null));

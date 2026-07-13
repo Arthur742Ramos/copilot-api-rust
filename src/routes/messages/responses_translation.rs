@@ -1281,6 +1281,7 @@ pub(crate) fn validate_typed_output_item(
                         if text
                             .annotations
                             .iter()
+                            .flatten()
                             .any(|annotation| !annotation.is_object())
                         {
                             return Err("An annotation entry was not an object.");
@@ -1510,7 +1511,8 @@ pub(crate) fn reconcile_tool_search_call_id<'a>(
         done.filter(|id| !id.is_empty()),
     ) {
         (Some(added), Some(done)) if added == done => Ok(Some(done)),
-        (Some(_), _) => Err("A completed tool_search_call changed or removed its call id."),
+        (Some(_), Some(_)) => Err("A completed tool_search_call changed its call id."),
+        (Some(added), None) => Ok(Some(added)),
         (None, done) => Ok(done),
     }
 }
@@ -2432,7 +2434,7 @@ mod tests {
                         crate::services::copilot::create_responses::ResponseOutputText {
                             block_type: "output_text".to_string(),
                             text: "the answer".to_string(),
-                            annotations: vec![],
+                            annotations: Some(vec![]),
                             extra: Default::default(),
                         },
                     )],

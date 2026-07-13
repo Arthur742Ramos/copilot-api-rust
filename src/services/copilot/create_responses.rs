@@ -14,6 +14,7 @@
 //! - All optionals use `#[serde(skip_serializing_if = "Option::is_none")]`.
 
 use axum::http::HeaderMap;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -607,8 +608,8 @@ pub struct ResponseOutputText {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: String,
-    #[serde(default)]
-    pub annotations: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Vec<Value>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -825,6 +826,16 @@ pub type ResponsesEventStream = std::pin::Pin<
     Box<dyn futures_util::Stream<Item = Result<crate::libs::sse::SseEvent, std::io::Error>> + Send>,
 >;
 
+pub struct ResponsesBufferedResult {
+    pub parsed: ResponsesResult,
+    pub raw: Bytes,
+}
+
+fn parse_buffered_responses(raw: Bytes) -> Result<ResponsesBufferedResult, serde_json::Error> {
+    let parsed = serde_json::from_slice::<ResponsesResult>(&raw)?;
+    Ok(ResponsesBufferedResult { parsed, raw })
+}
+
 /// Return type of [`create_responses`] / [`create_http_responses`], mirroring
 /// the TS `CreateResponsesReturn = ResponsesResult | ResponsesStream`.
 ///
@@ -833,7 +844,7 @@ pub type ResponsesEventStream = std::pin::Pin<
 /// cannot derive `Serialize`/`Deserialize`/`Clone`.
 pub enum CreateResponsesReturn {
     /// Non-streaming: the fully-buffered, parsed result.
-    Result(Box<ResponsesResult>),
+    Result(Box<ResponsesBufferedResult>),
     /// Streaming: decoded SSE events from the chosen transport.
     Stream(ResponsesEventStream),
 }
@@ -1108,8 +1119,10 @@ async fn create_http_responses(
             crate::libs::sse::events(response),
         )))
     } else {
-        let result = crate::libs::http::read_json_capped::<ResponsesResult>(response)
+        let raw = crate::libs::http::read_bytes_capped(response)
             .await
+            .map_err(|e| HttpError::internal(format!("Failed to parse responses: {e}")))?;
+        let result = parse_buffered_responses(raw)
             .map_err(|e| HttpError::internal(format!("Failed to parse responses: {e}")))?;
         Ok(CreateResponsesReturn::Result(Box::new(result)))
     }
@@ -1244,6 +1257,17 @@ mod tests {
         assert!(serialized.get("object").is_none());
         assert_eq!(serialized["created_at"], "provider-extension");
         assert_eq!(serialized["metadata"][0], "ignored-by-bridge");
+    }
+
+    #[test]
+    fn buffered_native_result_retains_exact_null_and_key_order() {
+        let raw = Bytes::from_static(
+            br#"{"unknown_before":1,"id":"r","object":null,"created_at":null,"model":"gpt","output":[],"output_text":null,"status":"completed","usage":null,"metadata":null,"unknown_after":null}"#,
+        );
+        let result = parse_buffered_responses(raw.clone()).expect("parse buffered response");
+        assert_eq!(result.parsed.id, "r");
+        assert!(result.parsed.object.is_null());
+        assert_eq!(result.raw, raw);
     }
 
     #[test]

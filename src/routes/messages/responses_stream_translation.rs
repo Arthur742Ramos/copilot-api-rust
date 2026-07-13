@@ -49,10 +49,10 @@ use super::utils::THINKING_TEXT;
 use super::responses_translation::{
     canonical_anthropic_output_item, effective_reasoning_text, encode_compaction_carrier_signature,
     encode_reasoning_signature, optional_nonnull_string_field,
-    parse_and_validate_anthropic_output_item, stable_tool_use_id, validate_created_status,
-    validate_function_arguments, validate_output_item_reconciliation, validate_raw_responses_usage,
-    validate_terminal_status, OutputValidationPhase, ResponsesTerminalKind,
-    ValidatedResponsesUsage,
+    parse_and_validate_anthropic_output_item, reconcile_tool_search_call_id, stable_tool_use_id,
+    validate_created_status, validate_function_arguments, validate_output_item_reconciliation,
+    validate_raw_responses_usage, validate_terminal_status, OutputValidationPhase,
+    ResponsesTerminalKind, ValidatedResponsesUsage,
 };
 
 // ---------------------------------------------------------------------------
@@ -1371,16 +1371,30 @@ fn handle_output_item_done(
             None
         };
         let (call_id, name, final_arguments) = if item_type == "tool_search_call" {
+            let added = state
+                .output_items_by_index
+                .get(&output_index)
+                .and_then(|lifecycle| lifecycle.added_item.as_ref());
+            let added_call_id = added
+                .and_then(|item| item.get("call_id"))
+                .and_then(Value::as_str);
+            let done_call_id = optional_string_field(
+                item,
+                "call_id",
+                "A tool_search_call call_id was not a string or null.",
+            )
+            .expect("tool search item validated above");
+            let resolved_call_id = reconcile_tool_search_call_id(added_call_id, done_call_id)
+                .expect("tool search call id reconciled during done validation");
+            let added_item_id = added
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str);
             (
                 Some(stable_tool_use_id(
-                    optional_string_field(
-                        item,
-                        "call_id",
-                        "A tool_search_call call_id was not a string or null.",
-                    )
-                    .expect("tool search item validated above"),
+                    resolved_call_id,
                     optional_string_field(item, "id", "A tool_search_call id was invalid.")
-                        .expect("tool search item validated above"),
+                        .expect("tool search item validated above")
+                        .or(added_item_id),
                     output_index,
                 )),
                 state.tool_search_name.clone(),

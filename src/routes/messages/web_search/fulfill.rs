@@ -328,7 +328,14 @@ pub fn reconstruct_web_search_response(
         id,
         model: payload.model.clone(),
         content: build_response_content(request_id, &extract),
-        stop_reason: Some("end_turn".to_string()),
+        stop_reason: Some(
+            if result.extra.get("end_turn").and_then(Value::as_bool) == Some(false) {
+                "pause_turn"
+            } else {
+                "end_turn"
+            }
+            .to_string(),
+        ),
         stop_sequence: None,
         usage,
     };
@@ -433,6 +440,107 @@ pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(),
         representable_web_search_query(raw)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotFieldAuthority {
+    RequiredStable,
+    OptionalStable,
+    RequestedFallback,
+    PhaseDiscriminator,
+    StructuredOutput,
+    StructuredUsage,
+    TerminalBoolean,
+    IgnoredRaw,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotFieldRule {
+    name: &'static str,
+    authority: SnapshotFieldAuthority,
+}
+
+const WEB_SNAPSHOT_FIELD_RULES: &[SnapshotFieldRule] = &[
+    SnapshotFieldRule {
+        name: "id",
+        authority: SnapshotFieldAuthority::RequiredStable,
+    },
+    SnapshotFieldRule {
+        name: "model",
+        authority: SnapshotFieldAuthority::RequestedFallback,
+    },
+    SnapshotFieldRule {
+        name: "object",
+        authority: SnapshotFieldAuthority::OptionalStable,
+    },
+    SnapshotFieldRule {
+        name: "status",
+        authority: SnapshotFieldAuthority::PhaseDiscriminator,
+    },
+    SnapshotFieldRule {
+        name: "output",
+        authority: SnapshotFieldAuthority::StructuredOutput,
+    },
+    SnapshotFieldRule {
+        name: "output_text",
+        authority: SnapshotFieldAuthority::OptionalStable,
+    },
+    SnapshotFieldRule {
+        name: "usage",
+        authority: SnapshotFieldAuthority::StructuredUsage,
+    },
+    SnapshotFieldRule {
+        name: "metadata",
+        authority: SnapshotFieldAuthority::OptionalStable,
+    },
+    SnapshotFieldRule {
+        name: "incomplete_details",
+        authority: SnapshotFieldAuthority::OptionalStable,
+    },
+    SnapshotFieldRule {
+        name: "end_turn",
+        authority: SnapshotFieldAuthority::TerminalBoolean,
+    },
+    SnapshotFieldRule {
+        name: "created_at",
+        authority: SnapshotFieldAuthority::IgnoredRaw,
+    },
+    SnapshotFieldRule {
+        name: "error",
+        authority: SnapshotFieldAuthority::IgnoredRaw,
+    },
+    SnapshotFieldRule {
+        name: "instructions",
+        authority: SnapshotFieldAuthority::IgnoredRaw,
+    },
+    SnapshotFieldRule {
+        name: "parallel_tool_calls",
+        authority: SnapshotFieldAuthority::IgnoredRaw,
+    },
+    SnapshotFieldRule {
+        name: "temperature",
+        authority: SnapshotFieldAuthority::IgnoredRaw,
+    },
+    SnapshotFieldRule {
+        name: "tool_choice",
+        authority: SnapshotFieldAuthority::IgnoredRaw,
+    },
+    SnapshotFieldRule {
+        name: "tools",
+        authority: SnapshotFieldAuthority::IgnoredRaw,
+    },
+    SnapshotFieldRule {
+        name: "top_p",
+        authority: SnapshotFieldAuthority::IgnoredRaw,
+    },
+];
+
+fn snapshot_field_authority(field: &str) -> SnapshotFieldAuthority {
+    WEB_SNAPSHOT_FIELD_RULES
+        .iter()
+        .find(|rule| rule.name == field)
+        .map(|rule| rule.authority)
+        .unwrap_or(SnapshotFieldAuthority::IgnoredRaw)
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,53 +1224,112 @@ fn canonical_web_annotations(annotations: &[Value]) -> Vec<Value> {
     canonical
 }
 
+#[derive(Debug, Clone)]
+enum WebOutputAssertion {
+    Message {
+        id: Option<String>,
+        status: Option<String>,
+        role: String,
+        content: Vec<WebTextAssertion>,
+    },
+    WebSearchCall {
+        id: Option<String>,
+        status: Option<String>,
+        query: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebTextAssertion {
+    block_type: String,
+    text: String,
+    annotations: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemFieldAuthority {
+    RequiredStable,
+    OptionalStable,
+    ProgressStatus,
+    ProgressiveContent,
+    OptionalAction,
+    IgnoredRaw,
+}
+
+const MESSAGE_OUTPUT_FIELD_AUTHORITY: &[(&str, ItemFieldAuthority)] = &[
+    ("type", ItemFieldAuthority::RequiredStable),
+    ("id", ItemFieldAuthority::OptionalStable),
+    ("role", ItemFieldAuthority::RequiredStable),
+    ("status", ItemFieldAuthority::ProgressStatus),
+    ("content", ItemFieldAuthority::ProgressiveContent),
+    ("phase", ItemFieldAuthority::IgnoredRaw),
+    (
+        "internal_chat_message_metadata_passthrough",
+        ItemFieldAuthority::IgnoredRaw,
+    ),
+];
+
+const WEB_SEARCH_OUTPUT_FIELD_AUTHORITY: &[(&str, ItemFieldAuthority)] = &[
+    ("type", ItemFieldAuthority::RequiredStable),
+    ("id", ItemFieldAuthority::OptionalStable),
+    ("status", ItemFieldAuthority::ProgressStatus),
+    ("action", ItemFieldAuthority::OptionalAction),
+];
+
 #[allow(clippy::result_large_err)]
-fn canonical_web_output_item(
+fn parse_web_output_assertion(
     value: &Value,
     phase: OutputValidationPhase,
-) -> Result<Value, AppError> {
+) -> Result<WebOutputAssertion, AppError> {
     match parse_and_validate_output_item(value, phase).map_err(invalid_web_search_stream)? {
         ResponseOutputItem::Message(message) => {
-            let mut canonical = Map::new();
-            canonical.insert("type".to_string(), Value::String("message".to_string()));
-            if let Some(id) = message.id {
-                canonical.insert("id".to_string(), Value::String(id));
-            }
-            canonical.insert("role".to_string(), Value::String(message.role));
+            let _authority = MESSAGE_OUTPUT_FIELD_AUTHORITY;
             let mut content = Vec::with_capacity(message.content.len());
-            for block in message.content {
+            let raw_content = value
+                .get("content")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    invalid_web_search_stream("web-search message content was invalid")
+                })?;
+            for (index, block) in message.content.into_iter().enumerate() {
                 let ResponseOutputContentBlock::Text(text) = block else {
                     return Err(invalid_web_search_stream(
                         "web-search message content was unsupported",
                     ));
                 };
-                content.push(json!({
-                    "type":text.block_type,
-                    "text":text.text,
-                    "annotations":canonical_web_annotations(&text.annotations)
-                }));
+                let annotations = raw_content
+                    .get(index)
+                    .and_then(|block| block.get("annotations"))
+                    .filter(|annotations| !annotations.is_null())
+                    .map(|_| canonical_web_annotations(text.annotations.as_deref().unwrap_or(&[])));
+                content.push(WebTextAssertion {
+                    block_type: text.block_type,
+                    text: text.text,
+                    annotations,
+                });
             }
-            canonical.insert("content".to_string(), Value::Array(content));
-            Ok(Value::Object(canonical))
+            Ok(WebOutputAssertion::Message {
+                id: message.id,
+                status: message.status,
+                role: message.role,
+                content,
+            })
         }
         ResponseOutputItem::Other(raw)
             if raw.get("type").and_then(Value::as_str) == Some("web_search_call") =>
         {
-            let mut canonical = Map::new();
-            canonical.insert(
-                "type".to_string(),
-                Value::String("web_search_call".to_string()),
-            );
-            if let Some(id) =
-                optional_nonnull_string_field(&raw, "id").map_err(invalid_web_search_stream)?
-            {
-                canonical.insert("id".to_string(), Value::String(id.to_string()));
-            }
-            canonical.insert(
-                "query".to_string(),
-                Value::String(representable_web_search_query(&raw)?),
-            );
-            Ok(Value::Object(canonical))
+            let _authority = WEB_SEARCH_OUTPUT_FIELD_AUTHORITY;
+            let id = optional_nonnull_string_field(&raw, "id")
+                .map_err(invalid_web_search_stream)?
+                .map(str::to_string);
+            let status = optional_nonnull_string_field(&raw, "status")
+                .map_err(invalid_web_search_stream)?
+                .map(str::to_string);
+            let query = match raw.get("action") {
+                None | Some(Value::Null) => None,
+                _ => Some(representable_web_search_query(&raw)?),
+            };
+            Ok(WebOutputAssertion::WebSearchCall { id, status, query })
         }
         _ => Err(invalid_web_search_stream(
             "web-search output contained an unsupported item",
@@ -1171,35 +1338,246 @@ fn canonical_web_output_item(
 }
 
 #[allow(clippy::result_large_err)]
-fn web_output_arrays_equivalent(
-    left: &[Value],
-    left_phase: OutputValidationPhase,
-    right: &[Value],
-    right_phase: OutputValidationPhase,
-) -> Result<bool, AppError> {
-    if left.len() != right.len() {
-        return Ok(false);
+fn merge_optional_item_field(
+    field: &str,
+    current: Option<String>,
+    incoming: Option<String>,
+) -> Result<Option<String>, AppError> {
+    match (current, incoming) {
+        (Some(current), Some(incoming)) if current != incoming => Err(invalid_web_search_stream(
+            format_args!("output item {field} conflicted"),
+        )),
+        (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
     }
-    for (left, right) in left.iter().zip(right) {
-        if canonical_web_output_item(left, left_phase)?
-            != canonical_web_output_item(right, right_phase)?
+}
+
+#[allow(clippy::result_large_err)]
+fn merge_item_status(
+    current: Option<String>,
+    incoming: Option<String>,
+    incoming_phase: OutputValidationPhase,
+) -> Result<Option<String>, AppError> {
+    match (current, incoming) {
+        (None, incoming) => Ok(incoming),
+        (Some(current), None)
+            if current == "in_progress" && incoming_phase == OutputValidationPhase::Done =>
         {
-            return Ok(false);
+            Ok(None)
+        }
+        (Some(current), None) => Ok(Some(current)),
+        (Some(current), Some(incoming)) if current == incoming => Ok(Some(current)),
+        (Some(current), Some(incoming))
+            if current == "in_progress"
+                && matches!(incoming.as_str(), "completed" | "incomplete") =>
+        {
+            Ok(Some(incoming))
+        }
+        _ => Err(invalid_web_search_stream(
+            "output item status assertions conflicted",
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn merge_web_output_assertion(
+    current: WebOutputAssertion,
+    incoming: WebOutputAssertion,
+    incoming_phase: OutputValidationPhase,
+) -> Result<WebOutputAssertion, AppError> {
+    match (current, incoming) {
+        (
+            WebOutputAssertion::Message {
+                id,
+                status,
+                role,
+                content,
+            },
+            WebOutputAssertion::Message {
+                id: incoming_id,
+                status: incoming_status,
+                role: incoming_role,
+                content: incoming_content,
+            },
+        ) => {
+            if role != incoming_role {
+                return Err(invalid_web_search_stream(
+                    "web-search message role conflicted",
+                ));
+            }
+            let content = if content == incoming_content {
+                content
+            } else if content.is_empty() {
+                incoming_content
+            } else if incoming_content.is_empty() && incoming_phase == OutputValidationPhase::Added
+            {
+                content
+            } else {
+                if content.len() != incoming_content.len() {
+                    return Err(invalid_web_search_stream(
+                        "web-search message content lengths conflicted",
+                    ));
+                }
+                let mut merged = Vec::with_capacity(content.len());
+                for (current, incoming) in content.into_iter().zip(incoming_content) {
+                    if current.block_type != incoming.block_type {
+                        return Err(invalid_web_search_stream(
+                            "web-search message content type conflicted",
+                        ));
+                    }
+                    let text = if current.text == incoming.text {
+                        current.text
+                    } else if current.text.is_empty() {
+                        incoming.text
+                    } else if incoming.text.is_empty()
+                        && incoming_phase == OutputValidationPhase::Added
+                    {
+                        current.text
+                    } else {
+                        return Err(invalid_web_search_stream(
+                            "web-search message text conflicted",
+                        ));
+                    };
+                    let annotations = match (current.annotations, incoming.annotations) {
+                        (Some(current), Some(incoming)) if current != incoming => {
+                            return Err(invalid_web_search_stream(
+                                "web-search message annotations conflicted",
+                            ))
+                        }
+                        (Some(value), _) | (None, Some(value)) => Some(value),
+                        (None, None) => None,
+                    };
+                    merged.push(WebTextAssertion {
+                        block_type: current.block_type,
+                        text,
+                        annotations,
+                    });
+                }
+                merged
+            };
+            Ok(WebOutputAssertion::Message {
+                id: merge_optional_item_field("id", id, incoming_id)?,
+                status: merge_item_status(status, incoming_status, incoming_phase)?,
+                role,
+                content,
+            })
+        }
+        (
+            WebOutputAssertion::WebSearchCall { id, status, query },
+            WebOutputAssertion::WebSearchCall {
+                id: incoming_id,
+                status: incoming_status,
+                query: incoming_query,
+            },
+        ) => Ok(WebOutputAssertion::WebSearchCall {
+            id: merge_optional_item_field("id", id, incoming_id)?,
+            status: merge_item_status(status, incoming_status, incoming_phase)?,
+            query: merge_optional_item_field("query", query, incoming_query)?,
+        }),
+        _ => Err(invalid_web_search_stream(
+            "web-search output item type conflicted",
+        )),
+    }
+}
+
+fn web_output_assertion_value(assertion: WebOutputAssertion) -> Value {
+    match assertion {
+        WebOutputAssertion::Message {
+            id,
+            status,
+            role,
+            content,
+        } => {
+            let mut value = Map::new();
+            value.insert("type".to_string(), Value::String("message".to_string()));
+            if let Some(id) = id {
+                value.insert("id".to_string(), Value::String(id));
+            }
+            value.insert("role".to_string(), Value::String(role));
+            if let Some(status) = status {
+                value.insert("status".to_string(), Value::String(status));
+            }
+            value.insert(
+                "content".to_string(),
+                Value::Array(
+                    content
+                        .into_iter()
+                        .map(|content| {
+                            let mut block = Map::new();
+                            block.insert("type".to_string(), Value::String(content.block_type));
+                            block.insert("text".to_string(), Value::String(content.text));
+                            if let Some(annotations) = content.annotations {
+                                block.insert("annotations".to_string(), Value::Array(annotations));
+                            }
+                            Value::Object(block)
+                        })
+                        .collect(),
+                ),
+            );
+            Value::Object(value)
+        }
+        WebOutputAssertion::WebSearchCall { id, status, query } => {
+            let mut value = Map::new();
+            value.insert(
+                "type".to_string(),
+                Value::String("web_search_call".to_string()),
+            );
+            if let Some(id) = id {
+                value.insert("id".to_string(), Value::String(id));
+            }
+            if let Some(status) = status {
+                value.insert("status".to_string(), Value::String(status));
+            }
+            if let Some(query) = query {
+                value.insert("action".to_string(), json!({"type":"search","query":query}));
+            }
+            Value::Object(value)
         }
     }
-    Ok(true)
+}
+
+#[allow(clippy::result_large_err)]
+fn merge_web_output_snapshot(
+    current: &mut Option<Vec<WebOutputAssertion>>,
+    incoming: Option<Vec<Value>>,
+    phase: OutputValidationPhase,
+    empty_is_assertion: bool,
+) -> Result<(), AppError> {
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    if incoming.is_empty() && !empty_is_assertion {
+        return Ok(());
+    }
+    let incoming: Vec<WebOutputAssertion> = incoming
+        .iter()
+        .map(|item| parse_web_output_assertion(item, phase))
+        .collect::<Result<_, _>>()?;
+    let Some(existing) = current.as_mut() else {
+        *current = Some(incoming);
+        return Ok(());
+    };
+    if existing.len() != incoming.len() {
+        return Err(invalid_web_search_stream(
+            "web-search output snapshot lengths conflicted",
+        ));
+    }
+    for (existing, incoming) in existing.iter_mut().zip(incoming) {
+        *existing = merge_web_output_assertion(existing.clone(), incoming, phase)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
 fn validated_snapshot_usage(
     snapshot: &Map<String, Value>,
-) -> Result<Option<(ValidatedResponsesUsage, Value)>, AppError> {
+) -> Result<Option<ValidatedResponsesUsage>, AppError> {
     let Some(usage) = snapshot.get("usage").filter(|usage| !usage.is_null()) else {
         return Ok(None);
     };
     let response = json!({"usage":usage});
     let validated = validate_raw_responses_usage(&response).map_err(invalid_web_search_stream)?;
-    Ok(Some((validated, usage.clone())))
+    Ok(Some(validated))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1228,13 +1606,78 @@ fn reconcile_snapshot_usage(
     let created_usage = validated_snapshot_usage(created)?;
     let terminal_usage = validated_snapshot_usage(terminal)?;
     match (created_usage, terminal_usage) {
-        (Some((created, _)), Some((terminal, _))) if created != terminal => Err(
-            invalid_web_search_stream("terminal usage conflicted with response.created"),
-        ),
-        (Some((_, raw)), _) => Ok(Some(raw)),
-        (None, Some((_, raw))) => Ok(Some(raw)),
+        (Some(created), Some(terminal)) => {
+            if created.input_tokens != terminal.input_tokens
+                || created.output_tokens != terminal.output_tokens
+            {
+                return Err(invalid_web_search_stream(
+                    "terminal required usage counters conflicted with response.created",
+                ));
+            }
+            let merge_optional = |field: &str, created: Option<i64>, terminal: Option<i64>| match (
+                created, terminal,
+            ) {
+                (Some(created), Some(terminal)) if created != terminal => {
+                    Err(invalid_web_search_stream(format_args!(
+                        "terminal usage {field} conflicted with response.created"
+                    )))
+                }
+                (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
+                (None, None) => Ok(None),
+            };
+            let cached_tokens = merge_optional(
+                "cached_tokens",
+                created.cached_input_tokens,
+                terminal.cached_input_tokens,
+            )?;
+            let reasoning_tokens = merge_optional(
+                "reasoning_tokens",
+                created.reasoning_output_tokens,
+                terminal.reasoning_output_tokens,
+            )?;
+            Ok(Some(merged_usage_value(
+                created.input_tokens,
+                created.output_tokens,
+                cached_tokens,
+                reasoning_tokens,
+            )))
+        }
+        (Some(usage), None) | (None, Some(usage)) => Ok(Some(merged_usage_value(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.reasoning_output_tokens,
+        ))),
         (None, None) => Ok(None),
     }
+}
+
+fn merged_usage_value(
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+) -> Value {
+    let mut usage = Map::new();
+    usage.insert("input_tokens".to_string(), Value::from(input_tokens));
+    if let Some(cached_tokens) = cached_tokens {
+        usage.insert(
+            "input_tokens_details".to_string(),
+            json!({"cached_tokens":cached_tokens}),
+        );
+    }
+    usage.insert("output_tokens".to_string(), Value::from(output_tokens));
+    if let Some(reasoning_tokens) = reasoning_tokens {
+        usage.insert(
+            "output_tokens_details".to_string(),
+            json!({"reasoning_tokens":reasoning_tokens}),
+        );
+    }
+    usage.insert(
+        "total_tokens".to_string(),
+        Value::from(input_tokens + output_tokens),
+    );
+    Value::Object(usage)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1244,62 +1687,26 @@ fn reconcile_web_search_output(
     lifecycle_initial: Option<Vec<Value>>,
     lifecycle_final: Option<Vec<Value>>,
 ) -> Result<Vec<Value>, AppError> {
-    let mut authoritative = match (terminal, lifecycle_final.clone()) {
-        (Some(terminal), Some(lifecycle)) => {
-            if !web_output_arrays_equivalent(
-                &terminal,
-                OutputValidationPhase::Done,
-                &lifecycle,
-                OutputValidationPhase::Done,
-            )? {
-                return Err(invalid_web_search_stream(
-                    "web-search output snapshots conflicted",
-                ));
-            }
-            Some(terminal)
-        }
-        (Some(terminal), None) => Some(terminal),
-        (None, Some(lifecycle)) => Some(lifecycle),
-        (None, None) => None,
-    };
-
-    if let Some(created) = created.filter(|created| !created.is_empty()) {
-        match authoritative.as_ref() {
-            None => authoritative = Some(created),
-            Some(final_output) => {
-                let matches_final = web_output_arrays_equivalent(
-                    &created,
-                    OutputValidationPhase::Added,
-                    final_output,
-                    OutputValidationPhase::Done,
-                )?;
-                let matches_lifecycle = match (lifecycle_initial.as_ref(), lifecycle_final.as_ref())
-                {
-                    (Some(initial), Some(final_lifecycle)) => {
-                        web_output_arrays_equivalent(
-                            &created,
-                            OutputValidationPhase::Added,
-                            initial,
-                            OutputValidationPhase::Added,
-                        )? && web_output_arrays_equivalent(
-                            final_output,
-                            OutputValidationPhase::Done,
-                            final_lifecycle,
-                            OutputValidationPhase::Done,
-                        )?
-                    }
-                    _ => false,
-                };
-                if !matches_final && !matches_lifecycle {
-                    return Err(invalid_web_search_stream(
-                        "response.created output conflicted with the terminal/lifecycle output",
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(authoritative.unwrap_or_default())
+    let mut merged = None;
+    merge_web_output_snapshot(&mut merged, created, OutputValidationPhase::Added, false)?;
+    merge_web_output_snapshot(
+        &mut merged,
+        lifecycle_initial,
+        OutputValidationPhase::Added,
+        true,
+    )?;
+    merge_web_output_snapshot(
+        &mut merged,
+        lifecycle_final,
+        OutputValidationPhase::Done,
+        true,
+    )?;
+    merge_web_output_snapshot(&mut merged, terminal, OutputValidationPhase::Done, true)?;
+    Ok(merged
+        .unwrap_or_default()
+        .into_iter()
+        .map(web_output_assertion_value)
+        .collect())
 }
 
 /// Merge a full `response.created` object with a source-valid partial terminal.
@@ -1308,6 +1715,7 @@ fn reconcile_web_search_output(
 #[allow(clippy::result_large_err)]
 fn build_web_search_responses_stream_result(
     state: &WebSearchResponsesStreamCollection,
+    requested_model: Option<&str>,
 ) -> Result<ResponsesResult, AppError> {
     let created = state
         .created_response
@@ -1368,16 +1776,34 @@ fn build_web_search_responses_stream_result(
     )?;
     let usage = reconcile_snapshot_usage(created, terminal)?;
     let metadata = reconcile_snapshot_value(created, terminal, "metadata")?;
+    let incomplete_details = reconcile_snapshot_value(created, terminal, "incomplete_details")?;
     let output_text = reconcile_snapshot_value(created, terminal, "output_text")?;
-    let model = reconcile_snapshot_value(created, terminal, "model")?;
+    let end_turn = reconcile_snapshot_value(created, terminal, "end_turn")?;
+    if end_turn
+        .as_ref()
+        .is_some_and(|end_turn| !end_turn.is_boolean())
+    {
+        return Err(invalid_web_search_stream(
+            "web-search end_turn assertion was not boolean or null",
+        ));
+    }
+    let model = match reconcile_snapshot_value(created, terminal, "model")? {
+        Some(model) => Some(model),
+        None => requested_model
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| Value::String(model.to_string())),
+    };
+    if model.is_none() {
+        return Err(invalid_web_search_stream(
+            "web-search response snapshots omitted model without requested model context",
+        ));
+    }
     let object = reconcile_snapshot_value(created, terminal, "object")?;
 
     let mut response = created.clone();
     for (key, value) in terminal {
-        if !matches!(
-            key.as_str(),
-            "id" | "model" | "object" | "status" | "output" | "output_text" | "usage" | "metadata"
-        ) && !value.is_null()
+        if snapshot_field_authority(key) == SnapshotFieldAuthority::IgnoredRaw
+            && !value.is_null()
             && response.get(key).is_none_or(Value::is_null)
         {
             response.insert(key.clone(), value.clone());
@@ -1389,6 +1815,8 @@ fn build_web_search_responses_stream_result(
         ("output_text", output_text),
         ("usage", usage),
         ("metadata", metadata),
+        ("incomplete_details", incomplete_details),
+        ("end_turn", end_turn),
     ] {
         match value {
             Some(value) => {
@@ -1416,6 +1844,7 @@ fn build_web_search_responses_stream_result(
 pub async fn collect_web_search_responses_stream_result(
     upstream: crate::services::copilot::create_responses::ResponsesEventStream,
     error_message_prefix: &str,
+    requested_model: Option<&str>,
 ) -> Result<ResponsesResult, AppError> {
     let mut state = WebSearchResponsesStreamCollection::default();
     let stream = upstream;
@@ -1449,7 +1878,7 @@ pub async fn collect_web_search_responses_stream_result(
     }
 
     if state.terminal_response.is_some() {
-        build_web_search_responses_stream_result(&state)
+        build_web_search_responses_stream_result(&state, requested_model)
     } else {
         Err(AppError::Other(anyhow::anyhow!(
             "{error_message_prefix} ended without a terminal event"
@@ -1619,10 +2048,14 @@ pub async fn handle_web_search_via_responses(
 
     let result = match upstream {
         CreateResponsesReturn::Stream(response) => {
-            collect_web_search_responses_stream_result(response, "Web search responses stream")
-                .await?
+            collect_web_search_responses_stream_result(
+                response,
+                "Web search responses stream",
+                Some(&options.web_search_model),
+            )
+            .await?
         }
-        CreateResponsesReturn::Result(result) => *result,
+        CreateResponsesReturn::Result(result) => result.parsed,
     };
     validate_web_search_result(&result)?;
 
