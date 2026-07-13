@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 24,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -121,6 +121,11 @@
       "iteration": 23,
       "verdict": "FAIL",
       "summary": "Refusal fragments, mirror/interleaving, bounds, unsafe-carrier removal, and provider/direct cases pass, but deferred tool content is counted as emitted before refusal suffix reconciliation and can reorder client-visible text."
+    },
+    {
+      "iteration": 24,
+      "verdict": "FAIL",
+      "summary": "Source-ordered scheduler, refusal/tool/reasoning ordering, terminal handling, bounds fixtures, and provider/direct cases pass, but direct reasoning and opaque output bypass the aggregate emitted-response size bound."
     }
   ]
 }
