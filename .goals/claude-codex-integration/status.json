@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 23,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -116,6 +116,11 @@
       "iteration": 22,
       "verdict": "FAIL",
       "summary": "Optional tool fragments, service-tier enums, logprobs rejection, and executed provider/direct fixtures pass, but refusal deltas are treated as complete values and JSON/SSE refusal preservation still diverges."
+    },
+    {
+      "iteration": 23,
+      "verdict": "FAIL",
+      "summary": "Refusal fragments, mirror/interleaving, bounds, unsafe-carrier removal, and provider/direct cases pass, but deferred tool content is counted as emitted before refusal suffix reconciliation and can reorder client-visible text."
     }
   ]
 }
