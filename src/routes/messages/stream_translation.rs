@@ -548,6 +548,7 @@ fn validate_finish_reason(
     value: Option<&Value>,
     delta: &DeltaView,
     state: &AnthropicStreamState,
+    reconciliation: RefusalReconciliation,
 ) -> Result<Option<String>, ()> {
     let finish = match value {
         None | Some(Value::Null) => return Ok(None),
@@ -578,12 +579,14 @@ fn validate_finish_reason(
             .as_deref()
             .is_some_and(|value| !value.is_empty())
         || !delta.tool_calls.is_empty();
-    let refusal_seen = state.chat_refusal_seen
-        || delta
-            .refusal
-            .as_deref()
-            .is_some_and(|value| !value.is_empty());
+    let refusal_seen = reconciliation.refusal_len > 0;
     if refusal_seen && finish != "content_filter" {
+        return Err(());
+    }
+    if refusal_seen
+        && reconciliation.content_len > 0
+        && reconciliation.content_len != reconciliation.refusal_len
+    {
         return Err(());
     }
     if !has_output {
@@ -612,44 +615,63 @@ fn parse_chunk_usage(
     Ok((Some(parsed), true))
 }
 
-fn reconcile_refusal_content(
-    delta: &mut DeltaView,
-    state: &AnthropicStreamState,
-) -> Result<(), ()> {
-    let content = delta.content.as_deref().filter(|value| !value.is_empty());
-    let refusal = delta.refusal.as_deref().filter(|value| !value.is_empty());
+/// OpenAI declares `refusal` on `ChoiceDelta`, so every present string is a
+/// fragment rather than a complete snapshot. Ordinary content and refusal may
+/// mirror one another. Aggregates must remain prefix-compatible while either
+/// carrier is incomplete and, when both exist, become identical at finish.
+#[derive(Debug, Clone, Copy)]
+struct RefusalReconciliation {
+    content_len: usize,
+    refusal_len: usize,
+}
 
-    if let Some(refusal) = refusal {
-        if state
-            .chat_refusal_text
-            .as_deref()
-            .is_some_and(|established| established != refusal)
-        {
-            return Err(());
-        }
-        if !state.chat_text_output.is_empty() {
-            if state.chat_text_output != refusal
-                || content.is_some_and(|content| content != refusal)
-            {
-                return Err(());
-            }
-            delta.content = None;
+fn reconcile_refusal_content(
+    delta: &DeltaView,
+    state: &AnthropicStreamState,
+) -> Result<RefusalReconciliation, ()> {
+    let content_fragment = delta.content.as_deref().unwrap_or_default();
+    let refusal_base = state.chat_refusal_text.as_deref().unwrap_or_default();
+    let refusal_fragment = delta.refusal.as_deref().unwrap_or_default();
+    let content_len = state
+        .chat_text_output
+        .len()
+        .checked_add(content_fragment.len())
+        .filter(|length| *length <= crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
+        .ok_or(())?;
+    let refusal_len = refusal_base
+        .len()
+        .checked_add(refusal_fragment.len())
+        .filter(|length| *length <= crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
+        .ok_or(())?;
+
+    // Previous aggregates were already prefix-checked. Compare only the newly
+    // overlapping bytes so long mirrored streams remain linear rather than
+    // rescanning or cloning their entire output for every fragment.
+    let compared = state.chat_text_output.len().min(refusal_base.len());
+    let newly_comparable = content_len.min(refusal_len);
+    let content_base = state.chat_text_output.as_bytes();
+    let content_fragment = content_fragment.as_bytes();
+    let refusal_base = refusal_base.as_bytes();
+    let refusal_fragment = refusal_fragment.as_bytes();
+    for index in compared..newly_comparable {
+        let content = if index < content_base.len() {
+            content_base[index]
         } else {
-            match content {
-                Some(content) if content != refusal => return Err(()),
-                Some(_) => {}
-                None => delta.content = Some(refusal.to_string()),
-            }
-        }
-    } else if let (Some(established), Some(content)) = (state.chat_refusal_text.as_deref(), content)
-    {
-        if state.chat_text_output == content && established == content {
-            delta.content = None;
+            content_fragment[index - content_base.len()]
+        };
+        let refusal = if index < refusal_base.len() {
+            refusal_base[index]
         } else {
+            refusal_fragment[index - refusal_base.len()]
+        };
+        if content != refusal {
             return Err(());
         }
     }
-    Ok(())
+    Ok(RefusalReconciliation {
+        content_len,
+        refusal_len,
+    })
 }
 
 fn validate_chat_chunk(
@@ -705,7 +727,7 @@ fn validate_chat_chunk(
             }
         }
         let tool_calls = validate_tool_deltas(delta, state)?;
-        let mut delta = DeltaView {
+        let delta = DeltaView {
             content: opt_string(delta.get("content")),
             reasoning_text: opt_string(delta.get("reasoning_text")),
             reasoning_content: opt_string(delta.get("reasoning_content")),
@@ -713,8 +735,9 @@ fn validate_chat_chunk(
             refusal: opt_string(delta.get("refusal")),
             tool_calls,
         };
-        reconcile_refusal_content(&mut delta, state)?;
-        let finish_reason = validate_finish_reason(choice.get("finish_reason"), &delta, state)?;
+        let reconciliation = reconcile_refusal_content(&delta, state)?;
+        let finish_reason =
+            validate_finish_reason(choice.get("finish_reason"), &delta, state, reconciliation)?;
         ValidatedChatChunk::Choice(ValidatedChoice {
             delta,
             finish_reason,
@@ -803,8 +826,13 @@ pub fn translate_chunk_to_anthropic_events(
     let (mut delta, finish_reason, usage, usage_present) = match validated {
         ValidatedChatChunk::UsageOnly(mut usage) => {
             // An include_usage chunk is only valid after a finish_reason queued
-            // the terminal message delta.
+            // the terminal message delta, and only once. Keep success pending
+            // until [DONE]/EOF so a later record cannot hide behind an already
+            // emitted message_stop.
             if state.pending_message_delta.is_some() {
+                if state.chat_terminal_usage_seen {
+                    return malformed_stream_error_events(state);
+                }
                 if usage.service_tier.is_none() {
                     usage.service_tier = state
                         .chat_service_tier
@@ -821,7 +849,8 @@ pub fn translate_chunk_to_anthropic_events(
                         .entry("chat_system_fingerprint".to_string())
                         .or_insert_with(|| json!(fingerprint));
                 }
-                complete_pending_message(state, &mut events, Some(&usage));
+                state.chat_terminal_usage_seen = true;
+                update_pending_message_usage(state, &usage);
                 return events;
             }
             return malformed_stream_error_events(state);
@@ -855,11 +884,7 @@ pub fn translate_chunk_to_anthropic_events(
         .as_deref()
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let refusal_text = delta
-        .refusal
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    let refusal_fragment = delta.refusal.clone();
 
     handle_thinking_text(&mut delta, state, &mut events);
 
@@ -867,18 +892,18 @@ pub fn translate_chunk_to_anthropic_events(
 
     handle_tool_calls(&delta, state, &mut events);
     state.chat_output_seen |= output_in_chunk;
-    state.chat_refusal_seen |= delta
-        .refusal
-        .as_deref()
-        .is_some_and(|value| !value.is_empty());
     if let Some(text) = emitted_text {
         state.chat_text_output.push_str(&text);
     }
-    if refusal_text.is_some() {
-        state.chat_refusal_text = refusal_text;
+    if let Some(fragment) = refusal_fragment {
+        state
+            .chat_refusal_text
+            .get_or_insert_with(String::new)
+            .push_str(&fragment);
     }
 
     if let Some(finish_reason) = finish_reason {
+        flush_reconciled_refusal(state, &mut events);
         handle_finish(
             &finish_reason,
             &delta,
@@ -887,13 +912,6 @@ pub fn translate_chunk_to_anthropic_events(
             usage.as_ref(),
             usage_present,
         );
-    } else if usage_present {
-        // A full usage object before the finishing choice is a stable assertion,
-        // but it cannot terminate the stream by itself.
-        if state.pending_message_delta.is_some() {
-            complete_pending_message(state, &mut events, usage.as_ref());
-            return events;
-        }
     }
 
     events
@@ -1044,6 +1062,16 @@ fn is_tool_block_open(state: &AnthropicStreamState) -> bool {
 }
 
 /// `completePendingMessage` — flush the queued `message_delta` then `message_stop`.
+fn update_pending_message_usage(state: &mut AnthropicStreamState, usage: &AnthropicUsage) {
+    if let Some(AnthropicStreamEventData::MessageDelta {
+        usage: pending_usage,
+        ..
+    }) = state.pending_message_delta.as_mut()
+    {
+        *pending_usage = Some(anthropic_delta_usage(usage));
+    }
+}
+
 fn complete_pending_message(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
@@ -1104,8 +1132,42 @@ fn close_stream_for_error(
     state.pending_message_delta = None;
 }
 
+fn flush_reconciled_refusal(
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) {
+    let refusal = state.chat_refusal_text.as_deref().unwrap_or_default();
+    if refusal.is_empty() || state.chat_text_output.starts_with(refusal) {
+        return;
+    }
+    let Some(suffix) = refusal.strip_prefix(&state.chat_text_output) else {
+        // Validation guarantees a prefix relation before a terminal chunk.
+        return;
+    };
+    if suffix.is_empty() {
+        return;
+    }
+    let suffix = suffix.to_string();
+    close_thinking_block_if_open(state, events);
+    if !state.content_block_open {
+        events.push(AnthropicStreamEventData::ContentBlockStart {
+            index: state.content_block_index,
+            content_block: json!({"type":"text","text":""}),
+        });
+        state.content_block_open = true;
+    }
+    events.push(AnthropicStreamEventData::ContentBlockDelta {
+        index: state.content_block_index,
+        delta: AnthropicContentBlockDelta::TextDelta {
+            text: suffix.clone(),
+        },
+    });
+    state.chat_text_output.push_str(&suffix);
+}
+
 /// `handleFinish` — on a finishing chunk, close the open block, flush deferred
-/// text, queue the `message_delta`, and (if usage is present) complete it.
+/// text, and queue the `message_delta`. Success is emitted only at [DONE]/EOF,
+/// after every trailing upstream record has been validated.
 fn handle_finish(
     finish_reason: &str,
     delta: &DeltaView,
@@ -1179,9 +1241,8 @@ fn handle_finish(
         usage: Some(anthropic_delta_usage(&effective_usage)),
     });
     state.chat_finish_reason = Some(finish_reason.to_string());
-
     if usage_present {
-        complete_pending_message(state, events, Some(&effective_usage));
+        state.chat_terminal_usage_seen = true;
     }
 }
 
@@ -1942,7 +2003,8 @@ mod tests {
             "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
             "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 },
         });
-        let ev = translate_chunk_to_anthropic_events(&finish, &mut state);
+        let mut ev = translate_chunk_to_anthropic_events(&finish, &mut state);
+        ev.extend(flush_pending_anthropic_stream_events(&mut state));
         let got = to_values(&ev);
         all.extend(got.clone());
 
@@ -2053,7 +2115,8 @@ mod tests {
             "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
             "usage": { "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10 },
         });
-        let ev = translate_chunk_to_anthropic_events(&c4, &mut state);
+        let mut ev = translate_chunk_to_anthropic_events(&c4, &mut state);
+        ev.extend(flush_pending_anthropic_stream_events(&mut state));
         let got = to_values(&ev);
         all.extend(got.clone());
         assert_eq!(
@@ -2123,6 +2186,9 @@ mod tests {
         all.extend(to_values(&translate_chunk_to_anthropic_events(
             &finish, &mut state,
         )));
+        all.extend(to_values(&flush_pending_anthropic_stream_events(
+            &mut state,
+        )));
 
         assert_single_open_block_invariant(&all);
         let starts: Vec<_> = all
@@ -2173,7 +2239,8 @@ mod tests {
             "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
             "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
         });
-        let ev = translate_chunk_to_anthropic_events(&c3, &mut state);
+        let mut ev = translate_chunk_to_anthropic_events(&c3, &mut state);
+        ev.extend(flush_pending_anthropic_stream_events(&mut state));
         let got = to_values(&ev);
         assert_eq!(
             got,
@@ -2915,7 +2982,7 @@ mod tests {
             assert!(translate_chunk_to_anthropic_events(&no_op, &mut state).is_empty());
         }
 
-        let finish = to_values(&translate_chunk_to_anthropic_events(
+        let mut finish = to_values(&translate_chunk_to_anthropic_events(
             &json!({
                 "choices": [{
                     "delta": {},
@@ -2930,6 +2997,9 @@ mod tests {
             }),
             &mut state,
         ));
+        finish.extend(to_values(&flush_pending_anthropic_stream_events(
+            &mut state,
+        )));
         assert_eq!(
             finish,
             vec![
@@ -3101,9 +3171,9 @@ mod tests {
     }
 
     #[test]
-    fn flush_is_idempotent_after_normal_finish() {
-        // After a normal finishing chunk emits message_stop, a follow-up flush
-        // must not emit a second terminal close.
+    fn flush_completes_normal_finish_once() {
+        // A normal finishing chunk remains pending until the upstream boundary,
+        // and repeated boundary flushes must not emit a second terminal close.
         let mut state = AnthropicStreamState::default();
 
         let start = json!({
@@ -3118,10 +3188,21 @@ mod tests {
             "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
         });
         let _ = translate_chunk_to_anthropic_events(&finish, &mut state);
-        assert!(state.message_stop_emitted);
+        assert!(!state.message_stop_emitted);
+        assert!(state.pending_message_delta.is_some());
 
         let got = to_values(&flush_pending_anthropic_stream_events(&mut state));
-        assert!(got.is_empty(), "flush after a clean finish must be a no-op");
+        assert_eq!(
+            got.iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1
+        );
+        assert!(state.message_stop_emitted);
+        assert!(
+            flush_pending_anthropic_stream_events(&mut state).is_empty(),
+            "a second flush after a clean finish must be a no-op"
+        );
     }
 
     #[test]
@@ -3146,7 +3227,10 @@ mod tests {
             "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
             "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 },
         });
-        let got = to_values(&translate_chunk_to_anthropic_events(&finish, &mut state));
+        let mut got = to_values(&translate_chunk_to_anthropic_events(&finish, &mut state));
+        got.extend(to_values(&flush_pending_anthropic_stream_events(
+            &mut state,
+        )));
         all.extend(got.clone());
 
         // The thinking block is closed before the message_delta/stop are emitted.
@@ -3173,7 +3257,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
-    fn empty_choices_completes_pending_with_usage() {
+    fn empty_choices_updates_pending_usage_until_stream_boundary() {
         let mut state = AnthropicStreamState::default();
         state.pending_message_delta = Some(AnthropicStreamEventData::MessageDelta {
             delta: AnthropicMessageDeltaBody {
@@ -3197,6 +3281,12 @@ mod tests {
         });
         let ev = translate_chunk_to_anthropic_events(&chunk, &mut state);
         let got = to_values(&ev);
+        assert!(got.is_empty());
+        assert!(state.pending_message_delta.is_some());
+        assert!(state.chat_terminal_usage_seen);
+        assert!(!state.message_stop_emitted);
+
+        let got = to_values(&flush_pending_anthropic_stream_events(&mut state));
         assert_eq!(
             got,
             vec![
@@ -3211,5 +3301,50 @@ mod tests {
         assert!(state.pending_message_delta.is_none());
         assert!(state.message_stop_emitted);
         assert!(state.terminal_event_emitted);
+    }
+
+    #[test]
+    fn refusal_accumulation_enforces_response_bound() {
+        let exact = "x".repeat(crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES);
+        let mut state = AnthropicStreamState {
+            chat_id: Some("bounded".to_string()),
+            chat_model: Some("m".to_string()),
+            chat_created: Some(1),
+            chat_refusal_text: Some(exact),
+            chat_output_seen: true,
+            ..Default::default()
+        };
+        let empty = DeltaView {
+            content: None,
+            reasoning_text: None,
+            reasoning_content: None,
+            reasoning_opaque: None,
+            refusal: None,
+            tool_calls: Vec::new(),
+        };
+        let reconciliation =
+            reconcile_refusal_content(&empty, &state).expect("exact bound is accepted");
+        assert_eq!(
+            reconciliation.refusal_len,
+            crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+        );
+
+        let events = to_values(&super::translate_chunk_to_anthropic_events(
+            &json!({
+                "id":"bounded",
+                "object":"chat.completion.chunk",
+                "created":1,
+                "model":"m",
+                "choices":[{
+                    "index":0,
+                    "delta":{"refusal":"x"},
+                    "finish_reason":null
+                }]
+            }),
+            &mut state,
+        ));
+        assert_eq!(events, vec![malformed_error_event()]);
+        assert!(state.terminal_event_emitted);
+        assert!(!state.message_stop_emitted);
     }
 }

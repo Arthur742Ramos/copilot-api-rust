@@ -465,10 +465,13 @@ pub struct AnthropicStreamState {
     pub chat_usage: Option<AnthropicUsage>,
     pub chat_usage_source: Option<Value>,
     pub chat_output_seen: bool,
-    pub chat_refusal_seen: bool,
     pub chat_refusal_text: Option<String>,
     pub chat_text_output: String,
     pub chat_finish_reason: Option<String>,
+    /// True after a finish chunk carried usage or one post-finish usage-only
+    /// chunk was accepted. Success stays pending until [DONE]/EOF so a later
+    /// chunk can still invalidate the stream.
+    pub chat_terminal_usage_seen: bool,
     pub message_start_sent: bool,
     pub content_block_index: i64,
     pub content_block_open: bool,

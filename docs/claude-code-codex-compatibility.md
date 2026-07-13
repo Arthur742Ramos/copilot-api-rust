@@ -306,17 +306,35 @@ non-empty id/name and complete object-valued JSON. Gaps, conflicts, late
 unemittable extras, missing terminal identity, scalar JSON, and size/count bound
 violations fail once.
 
-Chat refusal text maps to an Anthropic assistant text block and retains the
-`content_filter`/`refusal` terminal signal; separately streamed content/refusal
-must agree and is never duplicated. Non-null Chat logprobs have no lossless
-Anthropic Messages target and are rejected consistently in JSON and SSE, while
-absent/null values are no assertion. Top-level and nested usage `service_tier`
-share the official `{auto,default,flex,scale,priority}` enum, and late
-first-present values are retained in terminal usage while conflicts fail.
-Unrepresentable choice/delta extras fail explicitly. If the entire stream
-omits/nulls usage, the final Anthropic delta reports zero usage; any present
-usage object uses the same strict parser and preserves usage/detail extras as
-non-streaming.
+Every non-null streamed Chat `refusal` string is an incremental fragment,
+including an empty no-op fragment. Refusal fragments accumulate in source
+order. Accumulated ordinary content and refusal must remain prefix-compatible:
+refusal-only output is emitted once at finish, identical or interleaved mirrors
+emit no duplicate text, and both non-empty representations must be identical at
+finish. Divergent representations fail on the conflicting chunk; a strict
+prefix that remains at finish is incomplete and fails before success. A
+non-empty refusal requires `content_filter`; `content_filter` without
+representable text or refusal, late refusal after either a usage-bearing finish
+or usage-only terminal, malformed values, and repeated terminals fail once.
+The Anthropic `message_delta`/`message_stop` pair remains pending until
+upstream `[DONE]` or clean EOF, so trailing records cannot hide behind an
+already-emitted success.
+
+Both JSON and SSE intentionally expose the same SDK-safe semantic carrier:
+Anthropic assistant text plus `stop_reason: "refusal"`. The raw OpenAI
+`refusal` field is consumed rather than copied into
+`chat_message_extensions`, because Anthropic SSE has no verified extension
+carrier that can preserve it without risking Claude SDK compatibility; the
+[documented stream contract](https://platform.claude.com/docs/en/build-with-claude/streaming#content-block-delta-types)
+represents assistant text with `text_delta`.
+Non-null Chat logprobs likewise have no lossless Anthropic Messages target and
+are rejected consistently in JSON and SSE, while absent/null values are no
+assertion. Top-level and nested usage `service_tier` share the official
+`{auto,default,flex,scale,priority}` enum, and late first-present values are
+retained in terminal usage while conflicts fail. Unrepresentable choice/delta
+extras fail explicitly. If the entire stream omits/nulls usage, the final
+Anthropic delta reports zero usage; any present usage object uses the same
+strict parser and preserves usage/detail extras as non-streaming.
 
 `stop_sequences` has no field in either the audited Codex 0.144.1
 [`ResponsesApiRequest`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/common.rs)
@@ -743,7 +761,7 @@ Status means deterministic, credential-free evidence exists.
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
 | Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss | native Responses web-search output | request-policy, paired partial/terminal-only output, and conflict fixtures |
-| Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity and strict one-choice/tool/optional-usage state | not Codex 0.144.1's wire API | public provider/direct captures, split-carrier, malformed-body/chunk, status/header, usage, tool-state, and collision fixtures |
+| Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity, refusal-fragment reconciliation, and strict one-choice/tool/optional-usage state | not Codex 0.144.1's wire API | public provider/direct captures, split/interleaved refusal, split-carrier, malformed-body/chunk, status/header, usage, tool-state, and collision fixtures |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
 The detailed Claude-specific matrix remains in

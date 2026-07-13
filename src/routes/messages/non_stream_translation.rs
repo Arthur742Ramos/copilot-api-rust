@@ -1470,6 +1470,7 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
             "reasoning_content",
             "reasoning_opaque",
             "function_call",
+            "refusal",
         ],
         &[],
         "response.choices[0].message",
