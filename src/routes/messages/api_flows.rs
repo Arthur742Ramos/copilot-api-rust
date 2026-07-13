@@ -48,6 +48,7 @@ use crate::routes::messages::responses_stream_translation::{
 };
 use crate::routes::messages::responses_translation::{
     translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
+    validate_raw_responses_usage,
 };
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, malformed_stream_error_events,
@@ -471,9 +472,11 @@ pub async fn handle_with_responses_api(
                             // Idle-but-alive upstream: keep downstream warm with a
                             // ping. Not content — leaves timer/TTFT untouched.
                             Err(_) => {
-                                yield Ok(Bytes::from_static(
-                                    crate::libs::sse::ANTHROPIC_PING_FRAME,
-                                ));
+                                if !state.translation_failed {
+                                    yield Ok(Bytes::from_static(
+                                        crate::libs::sse::ANTHROPIC_PING_FRAME,
+                                    ));
+                                }
                                 continue;
                             }
                         },
@@ -499,7 +502,9 @@ pub async fn handle_with_responses_api(
                     if chunk.event.as_deref() == Some("ping") {
                         // Pings are keep-alives, not content — don't count them
                         // toward TTFT (they'd systematically under-report it).
-                        yield Ok(Bytes::from_static(crate::libs::sse::ANTHROPIC_PING_FRAME));
+                        if !state.translation_failed {
+                            yield Ok(Bytes::from_static(crate::libs::sse::ANTHROPIC_PING_FRAME));
+                        }
                         continue;
                     }
                     if chunk.data.is_empty() {
@@ -527,26 +532,42 @@ pub async fn handle_with_responses_api(
                             return;
                         }
                     };
-                    match response_event.get("type").and_then(Value::as_str) {
+                    let observed_terminal = matches!(
+                        response_event.get("type").and_then(Value::as_str),
                         Some("response.completed") | Some("response.failed")
-                        | Some("response.incomplete") => {
-                            usage = normalize_responses_usage(
-                                response_event.get("response").and_then(|r| r.get("usage")),
-                            );
+                            | Some("response.incomplete")
+                    );
+                    if observed_terminal {
+                        if let Some(response) = response_event.get("response") {
+                            if validate_raw_responses_usage(response).is_ok() {
+                                usage = normalize_responses_usage(response.get("usage"));
+                            }
                         }
-                        _ => {}
                     }
 
                     for event in translate_responses_stream_event(&response_event, &mut state) {
                         if let Some(frame) = emit_event(&event) {
-                            timer.on_content_frame();
+                            if !matches!(&event, AnthropicStreamEventData::Error { .. }) {
+                                timer.on_content_frame();
+                            }
                             yield Ok(frame);
                         }
                     }
 
                     if state.message_completed {
-                        timer.mark_finished();
-                        break;
+                        if state.translation_failed {
+                            timer.mark_error();
+                            // Preserve source-observed terminal usage for cost/quota
+                            // accounting even though translation failed. Once the
+                            // upstream terminal has been observed, finalization can
+                            // complete without reading any trailing frames.
+                            if observed_terminal {
+                                break;
+                            }
+                        } else {
+                            timer.mark_finished();
+                            break;
+                        }
                     }
                 }
 
@@ -572,14 +593,12 @@ pub async fn handle_with_responses_api(
             Ok(sse_response(stream))
         }
         CreateResponsesReturn::Result(response) => {
+            let raw_response = serde_json::to_value(&response.parsed).unwrap_or(Value::Null);
+            if validate_raw_responses_usage(&raw_response).is_ok() {
+                recorder.record(normalize_responses_usage(raw_response.get("usage")));
+            }
             let anthropic_response =
                 translate_responses_result_to_anthropic(&response.parsed, Some(&tool_search_name))?;
-            let usage_value = response
-                .parsed
-                .usage
-                .as_ref()
-                .map(|u| serde_json::to_value(u).unwrap_or(Value::Null));
-            recorder.record(normalize_responses_usage(usage_value.as_ref()));
             Ok(Json(anthropic_response).into_response())
         }
         CreateResponsesReturn::CompactResult(_) => Err(crate::libs::error::HttpError::internal(

@@ -6215,6 +6215,14 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                     "delta":"late"
                 }),
             ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":3,
+                    "response":{"id":"resp_web_partial","usage":usage}
+                }),
+            ),
         ],
         "gpt-web-terminal-failed" => vec![
             created,
@@ -7334,6 +7342,9 @@ fn responses_state_budget_stream_fixture(model: &str) -> Option<Response> {
             remaining -= filler_bytes;
             index += 1;
         }
+        if over > 0 {
+            events.push(("ping", json!({"type":"ping"})));
+        }
         events.push(terminal);
         return Some(sse_response(render_sse(&events)));
     }
@@ -7414,6 +7425,9 @@ fn responses_state_budget_stream_fixture(model: &str) -> Option<Response> {
         events.extend(added_events);
         events.extend(argument_events);
         events.extend(done_events);
+        if over > 0 {
+            events.push(("ping", json!({"type":"ping"})));
+        }
         events.push(terminal);
         return Some(sse_response(render_sse(&events)));
     }
@@ -7545,52 +7559,87 @@ fn responses_state_budget_stream_fixture(model: &str) -> Option<Response> {
             }),
         ));
     }
+    if mixed_over > 0 {
+        events.push(("ping", json!({"type":"ping"})));
+    }
     events.push(terminal);
     Some(sse_response(render_sse(&events)))
 }
 
 fn web_search_reconstructed_overflow_fixture(model: &str) -> Response {
-    let mut result = json!({
-        "id":"resp_web_budget",
-        "object":"response",
-        "created_at":1,
-        "status":"completed",
-        "model":model,
-        "output":[
-            {
-                "type":"web_search_call",
-                "status":"completed",
-                "action":{"type":"search","query":"budget"}
-            },
-            {
-                "type":"message",
-                "role":"assistant",
-                "status":"completed",
-                "content":[{
-                    "type":"output_text",
-                    "text":"",
-                    "annotations":[]
-                }]
-            }
-        ],
-        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+    let mut events = vec![
+        (
+            "response.created",
+            json!({
+                "type":"response.created",
+                "response":{
+                    "id":"resp_web_budget",
+                    "object":"response",
+                    "created_at":1,
+                    "status":"in_progress",
+                    "model":model
+                }
+            }),
+        ),
+        (
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"web_search_call",
+                    "status":"completed",
+                    "action":{"type":"search","query":"budget"}
+                }
+            }),
+        ),
+    ];
+    // Omitting each title is source-valid and makes reconstruction use the URL
+    // as both `url` and default `title`. Two generated ~5 MiB URLs therefore
+    // stay below the 16 MiB collector/frame cap but exceed the translated
+    // aggregate budget after this intentional semantic expansion.
+    let url_payload_bytes = 5 * 1024 * 1024;
+    let annotations = ["a", "b"]
+        .into_iter()
+        .map(|prefix| {
+            json!({
+                "type":"url_citation",
+                "url":format!("https://example.test/{prefix}/{}", prefix.repeat(url_payload_bytes))
+            })
+        })
+        .collect::<Vec<_>>();
+    let message_done = json!({
+        "type":"response.output_item.done",
+        "output_index":1,
+        "item":{
+            "type":"message",
+            "id":"web-overflow-message",
+            "role":"assistant",
+            "status":"completed",
+            "content":[{
+                "type":"output_text",
+                "text":"bounded source answer",
+                "annotations":annotations
+            }]
+        }
     });
-    let base = serde_json::to_vec(&result).expect("web overflow fixture");
-    let filler_bytes = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
-        .checked_sub(base.len())
-        .expect("web overflow fixture base fits");
-    result["output"][1]["content"][0]["text"] = json!("w".repeat(filler_bytes));
-    let body = serde_json::to_vec(&result).expect("web overflow fixture body");
-    assert_eq!(
-        body.len(),
-        copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+    assert!(
+        serde_json::to_vec(&message_done).unwrap().len()
+            < copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
     );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .header("content-length", body.len().to_string())
-        .body(Body::from(body))
-        .unwrap()
+    events.push(("response.output_item.done", message_done));
+    events.push((
+        "response.completed",
+        json!({
+            "type":"response.completed",
+            "response":{
+                "id":"resp_web_budget",
+                "status":"completed",
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+            }
+        }),
+    ));
+    sse_response(render_sse(&events))
 }
 
 fn responses_fixture(body: &Value) -> Response {
@@ -7598,7 +7647,10 @@ fn responses_fixture(body: &Value) -> Response {
     if model.starts_with("gpt-direct-compact-") {
         return compact_fixture(body);
     }
-    if model == "gpt-web-reconstructed-overflow" {
+    if matches!(
+        model,
+        "gpt-web-reconstructed-overflow" | "gpt-web-reconstructed-overflow-provider"
+    ) {
         return web_search_reconstructed_overflow_fixture(model);
     }
     match model {
@@ -8699,6 +8751,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-web-created-usage-details-malformed",
         "gpt-web-terminal-usage-details-malformed",
         "gpt-web-reconstructed-overflow",
+        "gpt-web-reconstructed-overflow-provider",
         "gpt-web-incomplete-details-created-only",
         "gpt-web-incomplete-details-terminal-only",
         "gpt-web-incomplete-details-matching",
@@ -10760,7 +10813,7 @@ async fn claude_malformed_usage_never_coerces_to_success() {
     let fixture = Fixture::start().await;
     configure(&fixture);
 
-    for model in [
+    let models = [
         "gpt-contract-created-partial-usage",
         "gpt-contract-usage-wrong-type",
         "gpt-contract-usage-missing-input",
@@ -10783,7 +10836,8 @@ async fn claude_malformed_usage_never_coerces_to_success() {
         "gpt-contract-usage-negative-reasoning",
         "gpt-contract-usage-cached-exceeds-input",
         "gpt-contract-usage-reasoning-exceeds-output",
-    ] {
+    ];
+    for model in models {
         let (status, body) = send(post_json(
             "/v1/messages",
             json!({
@@ -10818,6 +10872,15 @@ async fn claude_malformed_usage_never_coerces_to_success() {
             "{model}: malformed usage was coerced to success"
         );
     }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let usage_events =
+        copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day").items;
+    assert!(
+        !usage_events
+            .iter()
+            .any(|event| models.contains(&event.model.as_str())),
+        "malformed usage must not create cost rows: {usage_events:#?}"
+    );
 }
 
 #[tokio::test]
@@ -14471,6 +14534,14 @@ async fn claude_responses_state_budgets_cross_provider_and_direct_boundaries() {
         "gpt-responses-function-state-over",
         "gpt-responses-mixed-budget-over",
     ] {
+        let usage_before =
+            copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+                .items
+                .into_iter()
+                .filter(|event| event.model == model)
+                .count();
+        let error_before = stream_completion_count("provider_messages", "native", "error");
+        let ok_before = stream_completion_count("provider_messages", "native", "ok");
         let body = json!({
             "model":format!("responses-fixture/{model}"),
             "max_tokens":128,
@@ -14489,6 +14560,53 @@ async fn claude_responses_state_budgets_cross_provider_and_direct_boundaries() {
             "{model}"
         );
         assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}: downstream frames followed terminal error"
+        );
+        await_usage_event_count(model, usage_before + 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let usage: Vec<_> =
+            copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+                .items
+                .into_iter()
+                .filter(|event| event.model == model)
+                .collect();
+        assert_eq!(
+            usage.len(),
+            usage_before + 1,
+            "{model}: usage finalized more than once"
+        );
+        let usage = usage.first().expect("provider overflow usage");
+        assert_eq!(usage.endpoint, "provider_messages", "{model}");
+        assert_eq!(usage.source, "provider", "{model}");
+        assert_eq!(
+            usage.provider_name.as_deref(),
+            Some("responses-fixture"),
+            "{model}"
+        );
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (1, 1, 2),
+            "{model}"
+        );
+        assert!(
+            stream_completion_count("provider_messages", "native", "error") >= error_before + 1.0,
+            "{model}: missing error completion metric"
+        );
+        assert_eq!(
+            stream_completion_count("provider_messages", "native", "ok"),
+            ok_before,
+            "{model}: failed translation counted as successful completion"
+        );
+        let model_usage = copilot_api::libs::token_usage::get_token_usage_summary("day")
+            .by_model
+            .into_iter()
+            .find(|usage| usage.model == model)
+            .expect("provider overflow contributes to token-budget accounting");
+        assert_eq!(model_usage.totals.request_count, 1, "{model}");
+        assert_eq!(model_usage.totals.total_tokens, 2, "{model}");
     }
 
     configure_direct_copilot(&fixture);
@@ -14543,6 +14661,14 @@ async fn claude_responses_state_budgets_cross_provider_and_direct_boundaries() {
         "gpt-direct-responses-function-state-over",
         "gpt-direct-responses-mixed-budget-over",
     ] {
+        let usage_before =
+            copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+                .items
+                .into_iter()
+                .filter(|event| event.model == model)
+                .count();
+        let error_before = stream_completion_count("responses", "translated", "error");
+        let ok_before = stream_completion_count("responses", "translated", "ok");
         let body = json!({
             "model":model,
             "max_tokens":128,
@@ -14561,6 +14687,48 @@ async fn claude_responses_state_budgets_cross_provider_and_direct_boundaries() {
             "{model}"
         );
         assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}: downstream frames followed terminal error"
+        );
+        await_usage_event_count(model, usage_before + 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let usage: Vec<_> =
+            copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+                .items
+                .into_iter()
+                .filter(|event| event.model == model)
+                .collect();
+        assert_eq!(
+            usage.len(),
+            usage_before + 1,
+            "{model}: usage finalized more than once"
+        );
+        let usage = usage.first().expect("direct overflow usage");
+        assert_eq!(usage.endpoint, "responses", "{model}");
+        assert_eq!(usage.source, "copilot", "{model}");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (1, 1, 2),
+            "{model}"
+        );
+        assert!(
+            stream_completion_count("responses", "translated", "error") >= error_before + 1.0,
+            "{model}: missing error completion metric"
+        );
+        assert_eq!(
+            stream_completion_count("responses", "translated", "ok"),
+            ok_before,
+            "{model}: failed translation counted as successful completion"
+        );
+        let model_usage = copilot_api::libs::token_usage::get_token_usage_summary("day")
+            .by_model
+            .into_iter()
+            .find(|usage| usage.model == model)
+            .expect("direct overflow contributes to token-budget accounting");
+        assert_eq!(model_usage.totals.request_count, 1, "{model}");
+        assert_eq!(model_usage.totals.total_tokens, 2, "{model}");
     }
 }
 
@@ -15382,7 +15550,7 @@ async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
-async fn claude_web_search_overflow_precedes_usage_recording() {
+async fn claude_web_search_overflow_records_cost_without_translated_success() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
     let model = "gpt-web-reconstructed-overflow";
@@ -15444,18 +15612,85 @@ async fn claude_web_search_overflow_precedes_usage_recording() {
             .is_some_and(|message| !message.contains("w".repeat(128).as_str())));
     }
 
-    let after = copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
-        .items
+    let usage_events = await_usage_event_count(model, before + 2).await;
+    assert_eq!(
+        usage_events.len(),
+        before + 2,
+        "each failed reconstruction finalizes observed usage once"
+    );
+    for usage in usage_events.iter().take(2) {
+        assert_eq!(usage.endpoint, "responses");
+        assert_eq!(usage.source, "copilot");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (1, 1, 2)
+        );
+    }
+    let model_usage = copilot_api::libs::token_usage::get_token_usage_summary("day")
+        .by_model
         .into_iter()
-        .filter(|event| event.model == model)
-        .count();
-    assert_eq!(after, before, "overflow must not record token usage");
+        .find(|usage| usage.model == model)
+        .expect("web overflow contributes to token-budget accounting");
+    assert_eq!(model_usage.totals.request_count, 2);
+    assert_eq!(model_usage.totals.total_tokens, 4);
+
+    let provider_model = "gpt-web-reconstructed-overflow-provider";
+    configure_with_web_search_model(
+        &fixture,
+        Some(&format!("responses-fixture/{provider_model}")),
+    );
+    for stream in [false, true] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":"claude-sonnet-4-6",
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"provider overflow web reconstruction"}],
+                "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                "stream":stream
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert!(
+            status.is_server_error(),
+            "unexpected provider status {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let error = json_body(&body);
+        assert_eq!(error.as_object().map(Map::len), Some(2));
+        assert_eq!(error["type"], "error");
+        assert!(error["error"].is_object());
+    }
+    let provider_usage = await_usage_event_count(provider_model, 2).await;
+    assert_eq!(
+        provider_usage.len(),
+        2,
+        "provider reconstruction usage finalized more than once"
+    );
+    for usage in &provider_usage {
+        assert_eq!(usage.endpoint, "provider_messages");
+        assert_eq!(usage.source, "provider");
+        assert_eq!(usage.provider_name.as_deref(), Some("responses-fixture"));
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (1, 1, 2)
+        );
+    }
+    let provider_model_usage = copilot_api::libs::token_usage::get_token_usage_summary("day")
+        .by_model
+        .into_iter()
+        .find(|usage| usage.model == provider_model)
+        .expect("provider web overflow contributes to token-budget accounting");
+    assert_eq!(provider_model_usage.totals.request_count, 2);
+    assert_eq!(provider_model_usage.totals.total_tokens, 4);
+
     assert_eq!(
         metric_value("200"),
         success_before,
-        "overflow must not record reconstruction success"
+        "cost accounting must not record reconstruction success"
     );
-    assert!(metric_value("500") >= error_before + 2.0);
+    assert!(metric_value("500") >= error_before + 4.0);
     let in_flight_after = copilot_api::libs::metrics::render()
         .lines()
         .find(|line| line.starts_with("http_requests_in_flight "))
@@ -15717,6 +15952,43 @@ async fn claude_web_search_terminal_conflicts_fail_before_json_or_sse_success() 
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
+async fn claude_web_search_validation_failures_preserve_valid_terminal_cost() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+
+    for model in [
+        "gpt-web-terminal-output-malformed",
+        "gpt-web-delta-after-item-done",
+    ] {
+        configure_with_web_search_model(&fixture, Some(&format!("responses-fixture/{model}")));
+        let before = copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+            .items
+            .into_iter()
+            .filter(|event| event.model == model)
+            .count();
+        for stream in [false, true] {
+            let (status, body) = send(web_search_messages_request(stream)).await;
+            assert!(status.is_server_error(), "{model}/{stream}");
+            assert_eq!(json_body(&body)["type"], "error", "{model}/{stream}");
+        }
+        let usage = await_usage_event_count(model, before + 2).await;
+        assert_eq!(
+            usage.len(),
+            before + 2,
+            "valid terminal cost must survive pre-reconstruction validation failure"
+        );
+        assert!(usage.iter().take(2).all(|usage| {
+            usage.endpoint == "provider_messages"
+                && usage.source == "provider"
+                && usage.input_tokens == 5
+                && usage.output_tokens == 4
+                && usage.total_tokens == 10
+        }));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
 async fn native_responses_preserves_all_raw_output_variants() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
@@ -15837,6 +16109,54 @@ async fn await_usage_event(model: &str) -> copilot_api::libs::token_usage::Token
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for token usage event for {model}");
+}
+
+async fn await_usage_event_count(
+    model: &str,
+    expected: usize,
+) -> Vec<copilot_api::libs::token_usage::TokenUsageEventRecord> {
+    let mut observed = 0usize;
+    for _ in 0..200 {
+        let events: Vec<_> =
+            copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+                .items
+                .into_iter()
+                .filter(|event| event.model == model)
+                .collect();
+        observed = events.len();
+        if events.len() >= expected {
+            return events;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let stored_models: Vec<_> =
+        copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day")
+            .items
+            .into_iter()
+            .map(|event| event.model)
+            .collect();
+    let usage_metrics: Vec<_> = copilot_api::libs::metrics::render()
+        .lines()
+        .filter(|line| line.contains("token_usage"))
+        .map(str::to_string)
+        .collect();
+    panic!(
+        "timed out waiting for {expected} token usage events for {model}; observed {observed}; stored={stored_models:?}; metrics={usage_metrics:?}"
+    );
+}
+
+fn stream_completion_count(flow: &str, transport: &str, outcome: &str) -> f64 {
+    copilot_api::libs::metrics::render()
+        .lines()
+        .find(|line| {
+            line.starts_with("proxy_stream_complete_seconds_count{")
+                && line.contains(&format!("flow=\"{flow}\""))
+                && line.contains(&format!("transport=\"{transport}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        })
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0)
 }
 
 fn direct_compact_request(model: &str) -> Request<Body> {

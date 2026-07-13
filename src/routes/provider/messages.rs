@@ -40,7 +40,7 @@ use crate::routes::messages::responses_stream_translation::{
 };
 use crate::routes::messages::responses_translation::{
     translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
-    validate_responses_request_controls,
+    validate_raw_responses_usage, validate_responses_request_controls,
 };
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, malformed_stream_error_events,
@@ -48,9 +48,10 @@ use crate::routes::messages::stream_translation::{
     transport_stream_error_events,
 };
 use crate::routes::messages::web_search::fulfill::{
-    build_synthetic_stream_events, collect_web_search_responses_stream_result,
+    build_synthetic_stream_events, collect_web_search_responses_stream_result_with_usage_observer,
     has_web_search_server_tool, is_web_search_only_request, prepare_web_search_responses_payload,
-    reconstruct_web_search_response, strip_web_search_server_tool, validate_web_search_result,
+    reconstruct_web_search_response, strip_web_search_server_tool,
+    validate_reconstructed_payload_budget, validate_web_search_result,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
@@ -336,6 +337,7 @@ async fn handle_openai_responses_provider_web_search_messages(
 
     let is_codex = provider_config.name == "codex";
     let error_prefix = format!("{provider} web search responses stream");
+    let recorder = create_provider_messages_usage_recorder(&payload, provider);
 
     let body: ResponsesResult = if is_codex {
         let upstream_response =
@@ -350,12 +352,20 @@ async fn handle_openai_responses_provider_web_search_messages(
             .into());
         }
         let stream = Box::pin(crate::libs::sse::events(upstream_response));
-        collect_web_search_responses_stream_result(
+        let mut observed_usage = None;
+        let collected = collect_web_search_responses_stream_result_with_usage_observer(
             stream,
             &error_prefix,
             Some(&requested_response_model),
+            |terminal| {
+                observed_usage = Some(normalize_responses_usage(terminal.get("usage")));
+            },
         )
-        .await?
+        .await;
+        if let Some(usage) = observed_usage {
+            recorder.record(usage);
+        }
+        collected?
     } else {
         let upstream_response =
             forward_provider_responses(provider_config, &responses_payload, headers).await?;
@@ -373,14 +383,27 @@ async fn handle_openai_responses_provider_web_search_messages(
         let content_type = response_content_type(&upstream_response);
         if content_type.contains("text/event-stream") {
             let stream = Box::pin(crate::libs::sse::events(upstream_response));
-            collect_web_search_responses_stream_result(
+            let mut observed_usage = None;
+            let collected = collect_web_search_responses_stream_result_with_usage_observer(
                 stream,
                 &error_prefix,
                 Some(&requested_response_model),
+                |terminal| {
+                    observed_usage = Some(normalize_responses_usage(terminal.get("usage")));
+                },
             )
-            .await?
+            .await;
+            if let Some(usage) = observed_usage {
+                recorder.record(usage);
+            }
+            collected?
         } else {
-            read_responses_result(upstream_response).await?
+            let result = read_responses_result(upstream_response).await?;
+            let raw = serde_json::to_value(&result).unwrap_or(Value::Null);
+            if validate_raw_responses_usage(&raw).is_ok() {
+                recorder.record(normalize_responses_usage(raw.get("usage")));
+            }
+            result
         }
     };
 
@@ -446,9 +469,11 @@ fn stream_responses_provider_messages(
             };
 
             if chunk.event.as_deref() == Some("ping") {
-                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                    b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
-                ));
+                if !state.translation_failed {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                    ));
+                }
                 continue;
             }
 
@@ -488,20 +513,36 @@ fn stream_responses_provider_messages(
                 crate::libs::codex_rate_limit::log_codex_rate_limits_event(&parsed);
             }
 
-            match parsed.get("type").and_then(Value::as_str) {
+            let observed_terminal = matches!(
+                parsed.get("type").and_then(Value::as_str),
                 Some("response.completed") | Some("response.failed")
-                | Some("response.incomplete") => {
-                    usage = normalize_responses_usage(
-                        parsed.get("response").and_then(|r| r.get("usage")),
-                    );
+                    | Some("response.incomplete")
+            );
+            if observed_terminal {
+                if let Some(response) = parsed.get("response") {
+                    if validate_raw_responses_usage(response).is_ok() {
+                        usage = normalize_responses_usage(response.get("usage"));
+                    }
                 }
-                _ => {}
             }
 
             for event in translate_responses_stream_event(&parsed, &mut state) {
                 if let Some(frame) = emit_event(&event) {
-                    timer.on_content_frame();
+                    if !matches!(&event, AnthropicStreamEventData::Error { .. }) {
+                        timer.on_content_frame();
+                    }
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
+            }
+            if state.message_completed {
+                if state.translation_failed {
+                    timer.mark_error();
+                    if observed_terminal {
+                        break;
+                    }
+                } else {
+                    timer.mark_finished();
+                    break;
                 }
             }
         }
@@ -516,6 +557,8 @@ fn stream_responses_provider_messages(
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
             }
+        } else if state.translation_failed {
+            timer.mark_error();
         } else {
             timer.mark_finished();
         }
@@ -534,9 +577,10 @@ fn respond_responses_provider_messages_json(
     provider: &str,
 ) -> Result<Response, AppError> {
     let recorder = create_provider_messages_usage_recorder(payload, provider);
-    recorder.record(normalize_responses_usage(
-        responses_usage_value(body).as_ref(),
-    ));
+    let raw = serde_json::to_value(body).unwrap_or(Value::Null);
+    if validate_raw_responses_usage(&raw).is_ok() {
+        recorder.record(normalize_responses_usage(raw.get("usage")));
+    }
 
     let tool_search_name =
         resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
@@ -554,10 +598,6 @@ fn respond_web_search_provider_messages_json(
     provider: &str,
 ) -> Result<Response, AppError> {
     validate_web_search_result(body)?;
-    let recorder = create_provider_messages_usage_recorder(payload, provider);
-    recorder.record(normalize_responses_usage(
-        responses_usage_value(body).as_ref(),
-    ));
 
     let request_id = if body.id.is_empty() {
         format!("{provider}:{}", payload.model)
@@ -565,6 +605,7 @@ fn respond_web_search_provider_messages_json(
         body.id.clone()
     };
     let (_extract, response) = reconstruct_web_search_response(payload, body, &request_id);
+    validate_reconstructed_payload_budget(&response)?;
 
     if !payload.stream.unwrap_or(false) {
         return Ok(Json(response.to_json()).into_response());
@@ -606,13 +647,6 @@ async fn read_responses_result(response: reqwest::Response) -> Result<ResponsesR
                 "Failed to read or parse provider responses body: {e}"
             ))
         })
-}
-
-/// The `usage` from a [`ResponsesResult`] as a `Value`, for `normalize_responses_usage`.
-fn responses_usage_value(body: &ResponsesResult) -> Option<Value> {
-    body.usage
-        .as_ref()
-        .and_then(|u| serde_json::to_value(u).ok())
 }
 
 /// Mirrors `applyModelDefaults` for the Anthropic payload (typed top_k is i64;

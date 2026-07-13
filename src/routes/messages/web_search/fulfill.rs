@@ -36,9 +36,7 @@ use crate::libs::error::AppError;
 use crate::libs::models::find_endpoint_model;
 use crate::libs::provider_model::{parse_provider_model_alias, ProviderModelAlias};
 use crate::libs::subagent::{parse_subagent_marker_from_first_user, SubagentMarker};
-use crate::libs::token_usage::{
-    create_copilot_token_usage_recorder, normalize_responses_usage, UsageTokens,
-};
+use crate::libs::token_usage::{create_copilot_token_usage_recorder, normalize_responses_usage};
 use crate::libs::utils::{
     generate_request_id_from_payload, get_root_session_id, get_uuid, parse_user_id_metadata,
 };
@@ -2045,7 +2043,27 @@ pub async fn collect_web_search_responses_stream_result(
     error_message_prefix: &str,
     requested_model: Option<&str>,
 ) -> Result<ResponsesResult, AppError> {
+    collect_web_search_responses_stream_result_with_usage_observer(
+        upstream,
+        error_message_prefix,
+        requested_model,
+        |_| {},
+    )
+    .await
+}
+
+pub(crate) async fn collect_web_search_responses_stream_result_with_usage_observer<F>(
+    upstream: crate::services::copilot::create_responses::ResponsesEventStream,
+    error_message_prefix: &str,
+    requested_model: Option<&str>,
+    mut observe_valid_terminal_usage: F,
+) -> Result<ResponsesResult, AppError>
+where
+    F: FnMut(&Value),
+{
     let mut state = WebSearchResponsesStreamCollection::default();
+    let mut usage_observed = false;
+    let mut collection_error: Option<AppError> = None;
     let stream = upstream;
     futures_util::pin_mut!(stream);
 
@@ -2066,17 +2084,41 @@ pub async fn collect_web_search_responses_stream_result(
         let parsed: Value = serde_json::from_str(&event.data).map_err(|_| {
             invalid_web_search_stream("the provider emitted a malformed JSON event")
         })?;
+        let terminal = matches!(
+            event_type(&parsed),
+            Some("response.completed" | "response.incomplete" | "response.failed")
+        );
+        if !usage_observed && terminal {
+            if let Some(response) = parsed
+                .get("response")
+                .filter(|response| response.is_object())
+            {
+                if validate_raw_responses_usage(response).is_ok() {
+                    observe_valid_terminal_usage(response);
+                    usage_observed = true;
+                }
+            }
+        }
 
-        collect_web_search_responses_stream_event(&parsed, &mut state)?;
+        if collection_error.is_none() {
+            if let Err(error) = collect_web_search_responses_stream_event(&parsed, &mut state) {
+                collection_error = Some(error);
+            }
+        }
 
         if event_type(&parsed) == Some("error") {
             let message = get_stream_error_message(&parsed)
                 .unwrap_or_else(|| format!("{error_message_prefix} failed"));
             return Err(AppError::Other(anyhow::anyhow!(message)));
         }
+        if terminal && collection_error.is_some() {
+            break;
+        }
     }
 
-    if state.terminal_response.is_some() {
+    if let Some(error) = collection_error {
+        Err(error)
+    } else if state.terminal_response.is_some() {
         build_web_search_responses_stream_result(&state, requested_model)
     } else {
         Err(AppError::Other(anyhow::anyhow!(
@@ -2246,16 +2288,41 @@ pub async fn handle_web_search_via_responses(
     )
     .await?;
 
+    let mut recorder = create_copilot_token_usage_recorder(
+        "responses",
+        options.web_search_model.clone(),
+        options.session_id.clone(),
+    );
+    // The session id from the payload metadata overrides the recorder default.
+    recorder.session_id =
+        parse_user_id_metadata(payload.metadata.as_ref().and_then(|m| m.user_id.as_deref()))
+            .session_id;
+
     let result = match upstream {
         CreateResponsesReturn::Stream(response) => {
-            collect_web_search_responses_stream_result(
+            let mut observed_usage = None;
+            let collected = collect_web_search_responses_stream_result_with_usage_observer(
                 response,
                 "Web search responses stream",
                 Some(&options.web_search_model),
+                |terminal| {
+                    observed_usage = Some(normalize_responses_usage(terminal.get("usage")));
+                },
             )
-            .await?
+            .await;
+            if let Some(usage) = observed_usage {
+                recorder.record(usage);
+            }
+            collected?
         }
-        CreateResponsesReturn::Result(result) => result.parsed,
+        CreateResponsesReturn::Result(result) => {
+            let result = result.parsed;
+            let raw = serde_json::to_value(&result).unwrap_or(Value::Null);
+            if validate_raw_responses_usage(&raw).is_ok() {
+                recorder.record(normalize_responses_usage(raw.get("usage")));
+            }
+            result
+        }
         CreateResponsesReturn::CompactResult(_) => {
             return Err(crate::libs::error::HttpError::internal(
                 "Web-search Responses flow unexpectedly returned a compact result",
@@ -2278,28 +2345,11 @@ pub async fn handle_web_search_via_responses(
         &serde_json::to_value(&result).unwrap_or(Value::Null),
     );
 
+    // Usage represents observed upstream consumption, not translated success.
+    // Record it once even when the locally reconstructed Anthropic payload is
+    // rejected; HTTP/stream outcome metrics still classify that request as an
+    // error and no response content is emitted.
     validate_reconstructed_payload_budget(&response)?;
-
-    let recorder = create_copilot_token_usage_recorder(
-        "responses",
-        options.web_search_model.clone(),
-        options.session_id.clone(),
-    );
-    // The session id from the payload metadata overrides the recorder default.
-    let session_from_metadata =
-        parse_user_id_metadata(payload.metadata.as_ref().and_then(|m| m.user_id.as_deref()))
-            .session_id;
-    let recorder = TokenUsageRecorderWithSession {
-        recorder,
-        session_id: session_from_metadata,
-    };
-    recorder.record(normalize_responses_usage(
-        result
-            .usage
-            .as_ref()
-            .and_then(|u| serde_json::to_value(u).ok())
-            .as_ref(),
-    ));
 
     if !wants_stream {
         return Ok(Json(response.to_json()).into_response());
@@ -2309,7 +2359,7 @@ pub async fn handle_web_search_via_responses(
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_reconstructed_payload_budget(
+pub(crate) fn validate_reconstructed_payload_budget(
     response: &ReconstructedWebSearchResponse,
 ) -> Result<(), AppError> {
     let mut content_bytes = 0usize;
@@ -2368,21 +2418,6 @@ fn validate_reconstructed_payload_budget(
         ));
     }
     Ok(())
-}
-
-/// Small wrapper applying the `metadata.user_id` session id to a recorder, since
-/// `create_copilot_token_usage_recorder` only sets `fallback_session_id`.
-struct TokenUsageRecorderWithSession {
-    recorder: crate::libs::token_usage::TokenUsageRecorder,
-    session_id: Option<String>,
-}
-
-impl TokenUsageRecorderWithSession {
-    fn record(self, usage: UsageTokens) {
-        let mut recorder = self.recorder;
-        recorder.session_id = self.session_id;
-        recorder.record(usage);
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -608,7 +608,13 @@ owner: sequence snapshot, pending output item, lifecycle/id metadata, block/text
 key, function metadata/arguments, reasoning part, or output-text part. Reserving
 an existing owner, releasing a missing owner, integer overflow, and subtraction
 underflow fail closed; replacement computes the checked old/new difference
-atomically.
+atomically. Any transition touching both budgets first builds one immutable
+preflight plan: it checks the final output total and every retained
+reserve/replace/release against snapshots of both counters and the owner map.
+Only a completely valid plan commits either budget. Output-full/retained-room,
+retained-full/output-room, duplicate-owner, missing-owner, exact-limit, and +1
+failures therefore leave both counters and the owner map byte-for-byte unchanged;
+no output byte is charged until its paired state transition can commit.
 
 Active and inactive parallel function calls each own one current argument
 buffer. Deltas grow that owner only by their UTF-8 byte delta;
@@ -638,10 +644,16 @@ terminal-only, matching duplicate, and lifecycle-derived output are supported;
 well-typed conflicts fail. Failed/incomplete terminals, malformed JSON, and any
 event after a terminal fail before JSON or synthetic Anthropic SSE success.
 After reconstruction, the aggregate translated-payload budget is validated
-before the Messages web-search path creates or mutates its usage recorder and
-before JSON/SSE response construction. An overflow therefore returns exactly
-one native Anthropic HTTP error, records no token-budget usage or HTTP 200
-success, and completes normal in-flight request cleanup.
+before JSON/SSE response construction. Usage follows the project-wide
+observed-cost policy: valid upstream terminal counters are finalized exactly
+once even if local Anthropic translation or reconstruction then fails, because
+the provider/Copilot work was consumed and must count toward quota and cost.
+That accounting is not translated success. An overflow returns exactly one
+native Anthropic HTTP error, emits no response content, records no HTTP 200
+success, and completes normal in-flight request cleanup. Direct and configured-
+provider fixtures use a source-valid streamed result whose bounded citations
+expand during reconstruction, proving this is the reconstructed-output check
+rather than an upstream body/collector rejection.
 Output comparison canonicalizes only reconstruction semantics: optional null and
 absence are equivalent, ignored item/annotation extensions do not create false
 conflicts, citation URL/title and ordering remain authoritative, and cached
@@ -728,10 +740,17 @@ aliases are never metric labels. Successful compact usage is recorded under the
 malformed/oversized bodies are rejected before usage is recorded.
 For regular native Responses, direct non-stream usage is recorded only after the
 shared bounded full-result parser succeeds; configured-provider non-stream usage
-is recorded only after its bounded body read and JSON validation. Streaming
-direct/provider usage is finalized by the guarded terminal/error path rather
-than before stream validation. The translated Messages web-search path adds the
-stricter reconstructed-output check described above before any usage mutation.
+is recorded only after its bounded body read and JSON validation. For translated
+Responses and web-search, valid source-observed usage is cost accounting:
+streaming drivers may continue reading only until the terminal usage after an
+earlier translation error, then finalize once. Buffered translation records the
+already-consumed usage before returning a later translation failure. In every
+case the stream timer/request outcome is `error`, never `ok`, and no Anthropic
+success terminal or reconstructed body is emitted. Malformed or absent usage is
+never invented merely to create a cost row. The web collector retains its first
+validation error while reading only to a later terminal, records independently
+valid terminal usage, then returns the original error; malformed terminal usage
+creates no row.
 
 `response.completed` and `response.incomplete` cannot produce Anthropic success
 while an added output item, function call, or reasoning buffer is unfinished.
@@ -809,15 +828,15 @@ Status means deterministic, credential-free evidence exists.
 | Parallel/interleaved calls | serialized only where Anthropic requires it; inactive arguments own one replaceable buffer | native interleaved Responses events | stream ordering/ID assertions plus provider/direct near-limit argument replacement fixtures |
 | Prompt caching | `cache_control` and beta headers on native transports; top-level cache control is rejected for translated Responses/Chat transports | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
-| Usage | strict nonnegative input/output/cache mapping; malformed Responses usage errors once; reconstructed web overflow records no usage/success | OpenAI cached/reasoning token details | public valid/absent/partial/type/range/overflow usage fixtures and `claude_web_search_overflow_precedes_usage_recording` |
+| Usage | strict nonnegative input/output/cache mapping; malformed Responses usage errors once; valid observed consumption is recorded once on translation/reconstruction failure without an `ok` outcome or client success | OpenAI cached/reasoning token details | public valid/absent/partial/type/range/overflow fixtures, per-model quota totals, and `claude_web_search_overflow_records_cost_without_translated_success` |
 | Model routing | aliases, `[1m]`, provider models; model-less created events use validated request context | aliases and `provider/model` | model helpers and public model-less-created boundary tests |
 | Unknown fields/output variants | representable open-object extensions retain value/order; canonical collisions and scalar-target extensions fail explicitly; unsupported raw outputs fail explicitly | typed extensions and all raw variants preserved natively | captured tool/choice/content/config sentinels, collision fixtures, paired raw-variant failures, and native passthrough audit |
 | Cancellation | response-body drop releases admission/upstream resources | same | load-shedding and WebSocket cancellation tests |
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
-| Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss; reconstructed overflow fails before usage/response success | native Responses web-search output | request-policy, paired partial/terminal-only output, conflict, and JSON/SSE overflow fixtures |
+| Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss; reconstructed overflow records observed cost but fails before response success | native Responses web-search output | request-policy, paired partial/terminal-only output, conflict, and provider/direct JSON/SSE overflow fixtures |
 | Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity, source-ordered scheduling, and a shared aggregate translated-payload budget | not Codex 0.144.1's wire API | public provider/direct captures, split/partial/deferred/multi-tool refusal ordering, exact/overflow reasoning/opaque/mixed UTF-8 budgets, malformed chunks, status/header, usage, and collisions |
-| Responses-to-Messages budgets | independent checked retained/output ownership; exact/+1 UTF-8 text, reasoning/signature, parallel tool arguments, authoritative replacement, release, and terminal cleanup | native Responses remains protocol-native | `claude_responses_state_budgets_cross_provider_and_direct_boundaries` plus retained-owner unit invariants |
+| Responses-to-Messages budgets | transactionally coupled retained/output ownership; exact/+1 UTF-8 text, reasoning/signature, block keys, lifecycle metadata, parallel tool arguments, authoritative growth/shrink, release, and terminal cleanup | native Responses remains protocol-native | `claude_responses_state_budgets_cross_provider_and_direct_boundaries` plus 38 retained/cross-budget unit invariants |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
 The detailed Claude-specific matrix remains in
