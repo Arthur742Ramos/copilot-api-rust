@@ -25,7 +25,6 @@ use crate::libs::request_context::request_context_store;
 use crate::libs::tool_search::{
     format_tool_search_bridge_arguments, is_bridge_tool_search_name, is_deferred_tool_name,
     list_deferred_tool_names, normalize_tool_search_bridge_arguments,
-    parse_mcp_tool_search_sentinel, select_deferred_tools_by_names,
     should_enable_responses_tool_search, BRIDGE_TOOL_SEARCH_NAME,
 };
 use crate::libs::utils::parse_user_id_metadata;
@@ -202,14 +201,19 @@ fn build_prompt_cache_key(
 
 /// Serialize the typed Anthropic tools to `Value`s once, for interop with the
 /// `tool_search` helpers and the per-tool converters.
-fn tools_as_values(tools: Option<&Vec<AnthropicTool>>) -> Vec<Value> {
+#[allow(clippy::result_large_err)]
+fn tools_as_values(tools: Option<&Vec<AnthropicTool>>) -> Result<Vec<Value>, AppError> {
     tools
-        .map(|ts| {
-            ts.iter()
-                .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| {
+                    serde_json::to_value(tool)
+                        .map_err(|error| AppError::Other(anyhow::anyhow!("{error}")))
+                })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|| Ok(Vec::new()))
 }
 
 #[allow(clippy::result_large_err)]
@@ -220,7 +224,7 @@ pub fn translate_anthropic_messages_to_responses_payload(
     let mut input: Vec<ResponseInputItem> = Vec::new();
     let apply_phase = should_apply_phase(&payload.model);
 
-    let tool_values = tools_as_values(payload.tools.as_ref());
+    let tool_values = tools_as_values(payload.tools.as_ref())?;
     let tool_slice: Option<&[Value]> = if tool_values.is_empty() {
         None
     } else {
@@ -241,8 +245,8 @@ pub fn translate_anthropic_messages_to_responses_payload(
 
     let has_original_tools = payload.tools.as_ref().is_some_and(|t| !t.is_empty());
 
-    let translated_tools = convert_anthropic_tools(&tool_values, tool_search_enabled);
-    let tool_choice = convert_anthropic_tool_choice(payload, tool_search_enabled);
+    let translated_tools = convert_anthropic_tools(&tool_values, tool_search_enabled)?;
+    let tool_choice = convert_anthropic_tool_choice(payload, tool_search_enabled)?;
 
     // Remove safetyIdentifier to align with vscode copilot.
     let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
@@ -260,7 +264,9 @@ pub fn translate_anthropic_messages_to_responses_payload(
     let metadata_value = payload
         .metadata
         .as_ref()
-        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null));
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| AppError::Other(anyhow::anyhow!("{error}")))?;
 
     // `max_tokens` is required on a real /v1/messages request; default a
     // missing value to 0 so the 12800 floor applies.
@@ -281,7 +287,7 @@ pub fn translate_anthropic_messages_to_responses_payload(
 
     let mut responses_payload = ResponsesPayload {
         model: payload.model.clone(),
-        instructions: translate_system_prompt(payload.system.as_ref(), &payload.model),
+        instructions: translate_system_prompt(payload.system.as_ref(), &payload.model)?,
         input: Some(InputField::Items(input)),
         tools: translated_tools,
         tool_choice: Some(tool_choice),
@@ -323,12 +329,7 @@ fn translate_message(
     if message.role == "user" {
         translate_user_message(message, state)
     } else {
-        Ok(translate_assistant_message(
-            message,
-            model,
-            apply_phase,
-            state,
-        ))
+        translate_assistant_message(message, model, apply_phase, state)
     }
 }
 
@@ -346,7 +347,9 @@ fn translate_user_message(
     }
 
     let Some(blocks) = message.content.as_array() else {
-        return Ok(Vec::new());
+        return Err(AppError::BadRequest(
+            "user message content must be a string or array".to_string(),
+        ));
     };
 
     let mut items: Vec<ResponseInputItem> = Vec::new();
@@ -367,24 +370,27 @@ fn translate_user_message(
     Ok(items)
 }
 
+#[allow(clippy::result_large_err)]
 fn translate_assistant_message(
     message: &AnthropicInputMessage,
     model: &str,
     apply_phase: bool,
     state: &mut TranslationState,
-) -> Vec<ResponseInputItem> {
+) -> Result<Vec<ResponseInputItem>, AppError> {
     let assistant_phase = resolve_assistant_phase(model, &message.content, apply_phase);
 
     if let Some(text) = message.content.as_str() {
-        return vec![create_message(
+        return Ok(vec![create_message(
             "assistant",
             MessageContent::Text(text.to_string()),
             assistant_phase,
-        )];
+        )]);
     }
 
     let Some(blocks) = message.content.as_array() else {
-        return Vec::new();
+        return Err(AppError::BadRequest(
+            "assistant message content must be a string or array".to_string(),
+        ));
     };
 
     let mut items: Vec<ResponseInputItem> = Vec::new();
@@ -406,7 +412,7 @@ fn translate_assistant_message(
                 "assistant",
                 assistant_phase.clone(),
             );
-            items.push(create_tool_call(block, state));
+            items.push(create_tool_call(block, state)?);
             continue;
         }
 
@@ -436,44 +442,62 @@ fn translate_assistant_message(
                     );
                     items.push(ResponseInputItem::Reasoning(create_reasoning_content(
                         block,
-                    )));
+                    )?));
                     continue;
                 }
             }
         }
 
-        if let Some(converted) = translate_assistant_content_block(block) {
+        if let Some(converted) = translate_assistant_content_block(block)? {
             pending.push(converted);
         }
     }
 
     flush_pending_content(&mut pending, &mut items, "assistant", assistant_phase);
-    items
+    Ok(items)
 }
 
 #[allow(clippy::result_large_err)]
 fn translate_user_content_block(block: &Value) -> Result<Vec<ResponseInputContent>, AppError> {
     Ok(match block_type(block) {
-        Some("text") => vec![create_text_content(text_field(block))],
+        Some("text") => vec![create_text_content(text_field(block)?)],
         Some("image") => vec![ResponseInputContent::Image(create_image_content(block)?)],
         Some("document") => vec![ResponseInputContent::File(create_file_content(block)?)],
-        _ => Vec::new(),
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported user content block type \"{other}\""
+            )))
+        }
+        None => {
+            return Err(AppError::BadRequest(
+                "User content block type must be a non-empty string".to_string(),
+            ))
+        }
     })
 }
 
-fn translate_assistant_content_block(block: &Value) -> Option<ResponseInputContent> {
+#[allow(clippy::result_large_err)]
+fn translate_assistant_content_block(
+    block: &Value,
+) -> Result<Option<ResponseInputContent>, AppError> {
     match block_type(block) {
-        Some("text") => Some(create_output_text_content(text_field(block))),
-        _ => None,
+        Some("text") => Ok(Some(create_output_text_content(text_field(block)?))),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "Unsupported assistant content block type \"{other}\""
+        ))),
+        None => Err(AppError::BadRequest(
+            "Assistant content block type must be a non-empty string".to_string(),
+        )),
     }
 }
 
-fn text_field(block: &Value) -> String {
+#[allow(clippy::result_large_err)]
+fn text_field(block: &Value) -> Result<String, AppError> {
     block
         .get("text")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+        .map(str::to_string)
+        .ok_or_else(|| AppError::BadRequest("Text block must contain string text".to_string()))
 }
 
 fn flush_pending_content(
@@ -656,29 +680,33 @@ fn base64_data_url(block: &Value, kind: &str) -> Result<String, AppError> {
     }
 }
 
-fn create_reasoning_content(block: &Value) -> ResponseInputReasoning {
+#[allow(clippy::result_large_err)]
+fn create_reasoning_content(block: &Value) -> Result<ResponseInputReasoning, AppError> {
     let signature = block
         .get("signature")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .filter(|signature| !signature.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("thinking.signature must be a non-empty string".to_string())
+        })?;
     let (encrypted_content, id) = parse_reasoning_signature(signature);
     let raw_thinking = block
         .get("thinking")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .ok_or_else(|| AppError::BadRequest("thinking.thinking must be a string".to_string()))?;
     let thinking = if raw_thinking == THINKING_TEXT {
         ""
     } else {
         raw_thinking
     };
     let summary = create_reasoning_summary(thinking);
-    ResponseInputReasoning {
+    Ok(ResponseInputReasoning {
         id,
         item_type: "reasoning".to_string(),
         summary,
         encrypted_content,
         extra: Default::default(),
-    }
+    })
 }
 
 fn create_reasoning_summary(thinking: &str) -> Vec<ReasoningSummaryText> {
@@ -709,23 +737,37 @@ fn create_compaction_content(signature: &str) -> Option<ResponseInputCompaction>
 // Tool-call input items
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::result_large_err)]
 fn create_function_tool_call(
     block: &Value,
     state: &TranslationState,
-) -> ResponseFunctionToolCallItem {
-    let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+) -> Result<ResponseFunctionToolCallItem, AppError> {
+    let id = block
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("tool_use.id must be a non-empty string".to_string())
+        })?;
     let name = block
         .get("name")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    let arguments = serde_json::to_string(block.get("input").unwrap_or(&Value::Null))
-        .unwrap_or_else(|_| "null".to_string());
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("tool_use.name must be a non-empty string".to_string())
+        })?;
+    let input = block
+        .get("input")
+        .filter(|input| input.is_object())
+        .ok_or_else(|| AppError::BadRequest("tool_use.input must be an object".to_string()))?;
+    let arguments = serde_json::to_string(input)
+        .map_err(|error| AppError::Other(anyhow::anyhow!("{error}")))?;
     let namespace = if state.tool_search_enabled && is_deferred_tool_name(name) {
         Some(name.to_string())
     } else {
         None
     };
-    ResponseFunctionToolCallItem {
+    Ok(ResponseFunctionToolCallItem {
         item_type: "function_call".to_string(),
         call_id: id.to_string(),
         name: name.to_string(),
@@ -733,31 +775,52 @@ fn create_function_tool_call(
         status: Some("completed".to_string()),
         namespace,
         extra: Default::default(),
-    }
+    })
 }
 
-fn create_tool_search_call(block: &Value) -> ResponseToolSearchCallItem {
-    let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-    let input = block.get("input").cloned().unwrap_or(Value::Null);
-    ResponseToolSearchCallItem {
+#[allow(clippy::result_large_err)]
+fn create_tool_search_call(block: &Value) -> Result<ResponseToolSearchCallItem, AppError> {
+    let id = block
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("tool_use.id must be a non-empty string".to_string())
+        })?;
+    let input = block
+        .get("input")
+        .filter(|input| input.is_object())
+        .ok_or_else(|| AppError::BadRequest("tool_use.input must be an object".to_string()))?;
+    Ok(ResponseToolSearchCallItem {
         item_type: "tool_search_call".to_string(),
-        call_id: (!id.is_empty()).then(|| id.to_string()),
-        arguments: normalize_tool_search_bridge_arguments(&input),
+        call_id: Some(id.to_string()),
+        arguments: normalize_tool_search_bridge_arguments(input),
         execution: Some("client".to_string()),
         status: Some("completed".to_string()),
         extra: Default::default(),
-    }
+    })
 }
 
-fn create_tool_call(block: &Value, state: &TranslationState) -> ResponseInputItem {
+#[allow(clippy::result_large_err)]
+fn create_tool_call(
+    block: &Value,
+    state: &TranslationState,
+) -> Result<ResponseInputItem, AppError> {
     let name = block
         .get("name")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("tool_use.name must be a non-empty string".to_string())
+        })?;
     if state.tool_search_enabled && is_bridge_tool_search_name(name) {
-        ResponseInputItem::ToolSearchCall(create_tool_search_call(block))
+        Ok(ResponseInputItem::ToolSearchCall(create_tool_search_call(
+            block,
+        )?))
     } else {
-        ResponseInputItem::FunctionToolCall(create_function_tool_call(block, state))
+        Ok(ResponseInputItem::FunctionToolCall(
+            create_function_tool_call(block, state)?,
+        ))
     }
 }
 
@@ -766,11 +829,19 @@ fn create_function_call_output(block: &Value) -> Result<ResponseFunctionCallOutp
     let call_id = block
         .get("tool_use_id")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    let is_error = block
-        .get("is_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .filter(|call_id| !call_id.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("tool_result.tool_use_id must be a non-empty string".to_string())
+        })?;
+    let is_error = match block.get("is_error") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(is_error)) => *is_error,
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "tool_result.is_error must be a boolean or null".to_string(),
+            ))
+        }
+    };
     Ok(ResponseFunctionCallOutputItem {
         item_type: "function_call_output".to_string(),
         call_id: call_id.to_string(),
@@ -788,15 +859,22 @@ fn create_tool_call_output(
     let tool_use_id = block
         .get("tool_use_id")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .filter(|tool_use_id| !tool_use_id.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("tool_result.tool_use_id must be a non-empty string".to_string())
+        })?;
     let tool_use_name = state
         .tool_use_name_by_id
         .get(tool_use_id)
         .map(String::as_str)
-        .unwrap_or("");
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "tool_result.tool_use_id \"{tool_use_id}\" did not reference an earlier tool_use"
+            ))
+        })?;
     if state.tool_search_enabled && is_bridge_tool_search_name(tool_use_name) {
         Ok(ResponseInputItem::ToolSearchOutput(
-            create_tool_search_output(block, &state.original_tools),
+            create_tool_search_output(block, &state.original_tools)?,
         ))
     } else {
         Ok(ResponseInputItem::FunctionCallOutput(
@@ -805,96 +883,159 @@ fn create_tool_call_output(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn create_tool_search_output(
     block: &Value,
     original_tools: &[Value],
-) -> ResponseToolSearchOutputItem {
+) -> Result<ResponseToolSearchOutputItem, AppError> {
     let content = block.get("content");
     let call_id = block
         .get("tool_use_id")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    let is_error = block
-        .get("is_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .filter(|call_id| !call_id.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("tool_result.tool_use_id must be a non-empty string".to_string())
+        })?;
+    let is_error = match block.get("is_error") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(is_error)) => *is_error,
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "tool_result.is_error must be a boolean or null".to_string(),
+            ))
+        }
+    };
 
-    let referenced_tool_names = resolve_tool_search_referenced_tool_names(content, original_tools);
+    let referenced_tool_names = resolve_tool_search_referenced_tool_names(content, original_tools)?;
     let tools: Vec<Value> = referenced_tool_names
         .iter()
-        .map(|tool_name| {
-            let tool = resolve_deferred_tool(tool_name, original_tools);
+        .map(|tool_name| -> Result<Value, AppError> {
+            let tool = resolve_deferred_tool(tool_name, original_tools)?;
             convert_deferred_tool_to_namespace(&tool)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    ResponseToolSearchOutputItem {
+    Ok(ResponseToolSearchOutputItem {
         item_type: "tool_search_output".to_string(),
-        call_id: (!call_id.is_empty()).then(|| call_id.to_string()),
+        call_id: Some(call_id.to_string()),
         tools,
         execution: Some("client".to_string()),
         status: Some(if is_error { "incomplete" } else { "completed" }.to_string()),
         extra: Default::default(),
-    }
+    })
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_tool_search_referenced_tool_names(
     content: Option<&Value>,
     original_tools: &[Value],
-) -> Vec<String> {
-    let explicit = extract_tool_reference_names(content);
+) -> Result<Vec<String>, AppError> {
+    let explicit = extract_tool_reference_names(content)?;
     if !explicit.is_empty() {
-        return unique_tool_names(explicit);
+        return Ok(explicit);
     }
 
-    if let Some(sentinel) = extract_mcp_tool_search_sentinel(content) {
-        let names_value = Value::Array(sentinel.names.into_iter().map(Value::String).collect());
-        return select_deferred_tools_by_names(&names_value, original_tools)
-            .iter()
-            .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
-            .collect();
+    if let Some(sentinel) = extract_mcp_tool_search_sentinel(content)? {
+        for name in &sentinel.names {
+            resolve_deferred_tool(name, original_tools)?;
+        }
+        return Ok(sentinel.names);
     }
 
-    Vec::new()
+    Ok(Vec::new())
 }
 
-fn extract_tool_reference_names(content: Option<&Value>) -> Vec<String> {
-    let Some(arr) = content.and_then(Value::as_array) else {
-        return Vec::new();
+#[allow(clippy::result_large_err)]
+fn extract_tool_reference_names(content: Option<&Value>) -> Result<Vec<String>, AppError> {
+    let arr = match content {
+        None | Some(Value::Null | Value::String(_)) => return Ok(Vec::new()),
+        Some(Value::Array(array)) => array,
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "tool_result.content must be a string, array, or null".to_string(),
+            ))
+        }
     };
     arr.iter()
-        .filter(|b| block_type(b) == Some("tool_reference"))
-        .filter_map(|b| {
-            b.get("tool_name")
+        .filter(|block| block_type(block) == Some("tool_reference"))
+        .map(|block| {
+            block
+                .get("tool_name")
                 .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
                 .map(str::to_string)
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "tool_reference.tool_name must be a non-empty string".to_string(),
+                    )
+                })
         })
         .collect()
 }
 
+#[allow(clippy::result_large_err)]
 fn extract_mcp_tool_search_sentinel(
     content: Option<&Value>,
-) -> Option<crate::libs::tool_search::McpToolSearchSentinel> {
+) -> Result<Option<crate::libs::tool_search::McpToolSearchSentinel>, AppError> {
+    let parse = |text: &str| -> Result<Option<_>, AppError> {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return Ok(None);
+        };
+        if value.get("type").and_then(Value::as_str)
+            != Some(crate::libs::tool_search::MCP_TOOL_SEARCH_SENTINEL_TYPE)
+        {
+            return Ok(None);
+        }
+        let names = value.get("names").ok_or_else(|| {
+            AppError::BadRequest("tool search sentinel names field is required".to_string())
+        })?;
+        let names = names.as_array().ok_or_else(|| {
+            AppError::BadRequest("tool search sentinel names must be an array".to_string())
+        })?;
+        if names.is_empty() {
+            return Err(AppError::BadRequest(
+                "tool search sentinel names must not be empty".to_string(),
+            ));
+        }
+        let names = names
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "tool search sentinel names must contain non-empty strings".to_string(),
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Some(crate::libs::tool_search::McpToolSearchSentinel {
+            r#type: crate::libs::tool_search::MCP_TOOL_SEARCH_SENTINEL_TYPE.to_string(),
+            names,
+        }))
+    };
     match content {
-        Some(Value::String(s)) => parse_mcp_tool_search_sentinel(s),
+        Some(Value::String(s)) => parse(s),
         Some(Value::Array(arr)) => {
             for block in arr {
                 if block_type(block) != Some("text") {
                     continue;
                 }
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    if let Some(sentinel) = parse_mcp_tool_search_sentinel(text) {
-                        return Some(sentinel);
+                    if let Some(sentinel) = parse(text)? {
+                        return Ok(Some(sentinel));
                     }
                 }
             }
-            None
+            Ok(None)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
-fn resolve_deferred_tool(tool_name: &str, original_tools: &[Value]) -> Value {
+#[allow(clippy::result_large_err)]
+fn resolve_deferred_tool(tool_name: &str, original_tools: &[Value]) -> Result<Value, AppError> {
     let found = original_tools
         .iter()
         .find(|t| t.get("name").and_then(Value::as_str) == Some(tool_name));
@@ -904,69 +1045,71 @@ fn resolve_deferred_tool(tool_name: &str, original_tools: &[Value]) -> Value {
             .and_then(Value::as_str)
             .is_some_and(is_deferred_tool_name)
         {
-            return tool.clone();
+            return Ok(tool.clone());
         }
     }
-    // The TS throws an HTTPError(400). Pure-function port: emit a placeholder
-    // namespace tool with the requested name so downstream serialization stays
-    // total. (The real error path lands with the route handler in a later phase.)
-    json!({ "name": tool_name })
-}
-
-fn unique_tool_names(tool_names: Vec<String>) -> Vec<String> {
-    let mut set: indexmap::IndexSet<String> = indexmap::IndexSet::new();
-    for name in tool_names {
-        set.insert(name);
-    }
-    set.into_iter().collect()
+    Err(AppError::BadRequest(format!(
+        "tool_reference.tool_name \"{tool_name}\" did not reference a defined deferred tool"
+    )))
 }
 
 // ---------------------------------------------------------------------------
 // System prompt + tool conversion
 // ---------------------------------------------------------------------------
 
-fn translate_system_prompt(system: Option<&Value>, model: &str) -> Option<String> {
-    let system = system?;
+#[allow(clippy::result_large_err)]
+fn translate_system_prompt(
+    system: Option<&Value>,
+    model: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(system) = system else {
+        return Ok(None);
+    };
     if system.is_null() {
-        return None;
+        return Ok(None);
     }
 
     let extra_prompt = get_extra_prompt_for_model(model);
 
     if let Some(s) = system.as_str() {
         if s.is_empty() {
-            return None;
+            return Ok(None);
         }
-        return Some(format!("{s}{extra_prompt}"));
+        return Ok(Some(format!("{s}{extra_prompt}")));
     }
 
-    let blocks = system.as_array()?;
+    let blocks = system.as_array().ok_or_else(|| {
+        AppError::BadRequest("system must be a string, array, or null".to_string())
+    })?;
     let parts: Vec<String> = blocks
         .iter()
         .enumerate()
-        .map(|(index, block)| {
-            let text = block
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if index == 0 {
+        .map(|(index, block)| -> Result<String, AppError> {
+            let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                AppError::BadRequest(format!("system[{index}].text must be a string"))
+            })?;
+            Ok(if index == 0 {
                 format!("{text}\n\n{extra_prompt}\n\n")
             } else {
                 text.to_string()
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let text = parts.join(" ");
     if text.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(text)
+        Ok(Some(text))
     }
 }
 
-fn convert_anthropic_tools(tools: &[Value], tool_search_enabled: bool) -> Option<Vec<Value>> {
+#[allow(clippy::result_large_err)]
+fn convert_anthropic_tools(
+    tools: &[Value],
+    tool_search_enabled: bool,
+) -> Result<Option<Vec<Value>>, AppError> {
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut converted: Vec<Value> = Vec::new();
@@ -978,7 +1121,13 @@ fn convert_anthropic_tools(tools: &[Value], tool_search_enabled: bool) -> Option
     };
 
     for tool in tools {
-        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::BadRequest("tool.name must be a non-empty string".to_string())
+            })?;
 
         if is_bridge_tool_search_name(name) {
             if tool_search_enabled && !added_tool_search {
@@ -991,14 +1140,14 @@ fn convert_anthropic_tools(tools: &[Value], tool_search_enabled: bool) -> Option
         }
 
         if tool_search_enabled && is_deferred_tool_name(name) {
-            converted.push(convert_deferred_tool_to_namespace(tool));
+            converted.push(convert_deferred_tool_to_namespace(tool)?);
             continue;
         }
 
-        converted.push(convert_tool_to_function(tool));
+        converted.push(convert_tool_to_function(tool)?);
     }
 
-    Some(converted)
+    Ok(Some(converted))
 }
 
 fn create_responses_tool_search_definition(searchable_tool_names: &[String]) -> Value {
@@ -1025,9 +1174,18 @@ fn create_responses_tool_search_definition(searchable_tool_names: &[String]) -> 
     })
 }
 
-fn convert_tool_to_function(tool: &Value) -> Value {
-    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-    let parameters = normalize_tool_schema(tool.get("input_schema"));
+#[allow(clippy::result_large_err)]
+fn convert_tool_to_function(tool: &Value) -> Result<Value, AppError> {
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| AppError::BadRequest("tool.name must be a non-empty string".to_string()))?;
+    let schema = tool
+        .get("input_schema")
+        .filter(|schema| schema.is_object())
+        .ok_or_else(|| AppError::BadRequest("tool.input_schema must be an object".to_string()))?;
+    let parameters = normalize_tool_schema(Some(schema));
     let mut obj = Map::new();
     obj.insert("type".to_string(), json!("function"));
     obj.insert("name".to_string(), json!(name));
@@ -1038,12 +1196,25 @@ fn convert_tool_to_function(tool: &Value) -> Value {
             obj.insert("description".to_string(), json!(description));
         }
     }
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
-fn convert_deferred_tool_to_namespace(tool: &Value) -> Value {
-    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-    let parameters = normalize_tool_schema(tool.get("input_schema"));
+#[allow(clippy::result_large_err)]
+fn convert_deferred_tool_to_namespace(tool: &Value) -> Result<Value, AppError> {
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("deferred tool.name must be a non-empty string".to_string())
+        })?;
+    let schema = tool
+        .get("input_schema")
+        .filter(|schema| schema.is_object())
+        .ok_or_else(|| {
+            AppError::BadRequest("deferred tool.input_schema must be an object".to_string())
+        })?;
+    let parameters = normalize_tool_schema(Some(schema));
     let description = tool
         .get("description")
         .and_then(Value::as_str)
@@ -1069,36 +1240,47 @@ fn convert_deferred_tool_to_namespace(tool: &Value) -> Value {
         "tools".to_string(),
         Value::Array(vec![Value::Object(inner)]),
     );
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
+#[allow(clippy::result_large_err)]
 fn convert_anthropic_tool_choice(
     payload: &AnthropicMessagesPayload,
     tool_search_enabled: bool,
-) -> Value {
+) -> Result<Value, AppError> {
     let Some(choice) = payload.tool_choice.as_ref() else {
-        return json!("auto");
+        return Ok(json!("auto"));
     };
 
-    match choice.kind.as_str() {
+    Ok(match choice.kind.as_str() {
         "auto" => json!("auto"),
         "any" => json!("required"),
         "tool" => {
             if tool_search_enabled {
                 if let Some(name) = choice.name.as_deref() {
                     if is_bridge_tool_search_name(name) {
-                        return json!("auto");
+                        return Ok(json!("auto"));
                     }
                 }
             }
             match choice.name.as_deref() {
-                Some(name) => json!({ "type": "function", "name": name }),
-                None => json!("auto"),
+                Some(name) if !name.trim().is_empty() => {
+                    json!({ "type": "function", "name": name })
+                }
+                _ => {
+                    return Err(AppError::BadRequest(
+                        "tool_choice.name must be a non-empty string for type tool".to_string(),
+                    ))
+                }
             }
         }
         "none" => json!("none"),
-        _ => json!("auto"),
-    }
+        _ => {
+            return Err(AppError::BadRequest(
+                "tool_choice.type must be one of auto, any, tool, or none".to_string(),
+            ))
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2029,7 +2211,7 @@ fn convert_tool_result_content(
             let mut result: Vec<ResponseInputContent> = Vec::new();
             for block in arr {
                 match block_type(block) {
-                    Some("text") => result.push(create_text_content(text_field(block))),
+                    Some("text") => result.push(create_text_content(text_field(block)?)),
                     Some("image") => {
                         result.push(ResponseInputContent::Image(create_image_content(block)?))
                     }
@@ -2040,15 +2222,35 @@ fn convert_tool_result_content(
                         let tool_name = block
                             .get("tool_name")
                             .and_then(Value::as_str)
-                            .unwrap_or_default();
+                            .filter(|tool_name| !tool_name.trim().is_empty())
+                            .ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "tool_reference.tool_name must be a non-empty string"
+                                        .to_string(),
+                                )
+                            })?;
                         result.push(create_text_content(format!("Tool {tool_name} loaded")));
                     }
-                    _ => {}
+                    Some(other) => {
+                        return Err(AppError::BadRequest(format!(
+                            "Unsupported tool_result content block type \"{other}\""
+                        )))
+                    }
+                    None => {
+                        return Err(AppError::BadRequest(
+                            "tool_result content block type must be a non-empty string".to_string(),
+                        ))
+                    }
                 }
             }
             FunctionCallOutputContent::Blocks(result)
         }
-        _ => FunctionCallOutputContent::Text(String::new()),
+        None | Some(Value::Null) => FunctionCallOutputContent::Text(String::new()),
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "tool_result.content must be a string, array, or null".to_string(),
+            ))
+        }
     })
 }
 

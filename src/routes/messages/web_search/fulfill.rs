@@ -157,27 +157,39 @@ pub fn resolve_web_search_route(
 
 /// `extractWebSearchConfig`: pull the Anthropic-side tool config from the first
 /// `web_search` server tool.
-pub fn extract_web_search_config(payload: &AnthropicMessagesPayload) -> WebSearchToolConfig {
+#[allow(clippy::result_large_err)]
+pub fn extract_web_search_config(
+    payload: &AnthropicMessagesPayload,
+) -> Result<WebSearchToolConfig, AppError> {
     let tool = payload
         .tools
         .as_ref()
         .and_then(|tools| tools.iter().find(|t| is_web_search_server_tool(t)));
 
-    let extra_array = |key: &str| -> Option<Vec<String>> {
-        tool.and_then(|t| t.extra.get(key))
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-    };
-
-    WebSearchToolConfig {
-        allowed_domains: extra_array("allowed_domains"),
-        blocked_domains: extra_array("blocked_domains"),
-        user_location: tool.and_then(|t| t.extra.get("user_location")).cloned(),
+    if tool
+        .and_then(|tool| tool.allowed_callers.as_ref())
+        .is_some_and(|allowed_callers| !allowed_callers.is_empty())
+    {
+        return Err(AppError::BadRequest(
+            "web_search.allowed_callers is not supported by the Responses web-search bridge"
+                .to_string(),
+        ));
     }
+    if tool
+        .and_then(|tool| tool.response_inclusion.as_ref())
+        .is_some()
+    {
+        return Err(AppError::BadRequest(
+            "web_search.response_inclusion is not supported by the Responses web-search bridge"
+                .to_string(),
+        ));
+    }
+
+    Ok(WebSearchToolConfig {
+        allowed_domains: tool.and_then(|tool| tool.allowed_domains.clone()),
+        blocked_domains: tool.and_then(|tool| tool.blocked_domains.clone()),
+        user_location: tool.and_then(|tool| tool.user_location.clone()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +292,7 @@ pub fn prepare_web_search_responses_payload(
     model: Option<&str>,
     subagent_agent_id: Option<&str>,
 ) -> Result<ResponsesPayload, AppError> {
-    let config = extract_web_search_config(payload);
+    let config = extract_web_search_config(payload)?;
 
     let mut switched = payload.clone();
     if let Some(m) = model {
@@ -2462,7 +2474,7 @@ mod tests {
             "blocked_domains": ["c.com"],
             "user_location": { "type": "approximate", "country": "US" }
         }]));
-        let config = extract_web_search_config(&payload);
+        let config = extract_web_search_config(&payload).expect("valid config");
         assert_eq!(
             config.allowed_domains,
             Some(vec!["a.com".to_string(), "b.com".to_string()])

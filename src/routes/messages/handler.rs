@@ -26,6 +26,7 @@ use crate::routes::messages::preprocess::{
     merge_tool_result_for_claude, normalize_system_messages, prepare_messages_api_payload,
     sanitize_ide_tools, strip_tool_reference_turn_boundary,
 };
+use crate::routes::messages::request_validation::validate_messages_request_shape;
 use crate::routes::responses::utils::get_responses_transport_for_model;
 use crate::services::copilot::create_messages::CONTEXT_1M_BETA;
 use crate::services::copilot::get_models::Model;
@@ -65,6 +66,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
         ));
     }
     validate_generation_request(&payload)?;
+    validate_messages_request_shape(&payload)?;
 
     // 1. Resolve configured model mappings.
     let requested_model = model_of(&payload);

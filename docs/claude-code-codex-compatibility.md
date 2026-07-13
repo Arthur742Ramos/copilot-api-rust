@@ -163,6 +163,52 @@ content field is present (including an explicitly empty string); carrier-free
 aggregate-empty reasoning emits no fabricated
 Anthropic thinking/signature data.
 
+### Anthropic request validation policy
+
+Known Messages request collections and objects are validated before admission or
+provider dispatch. Unknown keys on open objects remain intact; malformed known
+fields never become omitted/defaulted values through `as_*`, `filter_map`, or
+empty-string fallbacks. A future content-block variant can still pass through a
+native Messages transport, but a Responses translation that cannot represent it
+fails explicitly instead of dropping it.
+
+The web-search policy follows Anthropic's
+[`web_search_20250305` definition](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool#tool-definition):
+
+- `allowed_domains` and `blocked_domains` may be absent, `null`, or arrays of
+  non-blank strings. Empty arrays mean no restriction and are omitted from the
+  Responses tool. Non-empty values retain exact order and duplicates. Both lists
+  cannot be non-empty. The source contract publishes no narrower count/string
+  limit, so the normal 32 MiB request-body bound remains the size ceiling.
+- `user_location` may be absent/null or an object. Its required `type` is
+  `approximate`; at least one non-blank `city`, `region`, two-letter `country`,
+  or `timezone` is required. Known fields are string/null only; unknown object
+  keys are preserved.
+- `max_uses` is positive when present (the bridge performs one search).
+  `allowed_callers` and `response_inclusion` cannot be represented by this
+  Responses bridge and therefore fail explicitly rather than being discarded.
+
+Custom/deferred tools require a non-empty unique name and object
+`input_schema`; consumed schema fields (`type`, `properties`, `required`) are
+shape-validated while unknown schema keys survive conversion. `tool_choice`,
+system blocks, metadata, thinking/output configuration, stop sequences, cache
+controls, text/image/document sources, tool-use inputs, and tool-result content
+all validate their known container and scalar types before translation.
+
+Anthropic
+[`tool_reference`](https://github.com/anthropics/anthropic-sdk-python/blob/d2f6543ee7995adcae74666a5d37b3d9743debfe/src/anthropic/types/tool_reference_block_param.py)
+blocks are valid only inside a `tool_result`; `type` and a non-blank
+`tool_name` are required, and the name must identify a supplied tool with
+`defer_loading: true`. Omitted tool-result content and an empty block list mean
+that no tools were loaded. Explicit references and validated internal sentinel
+name arrays preserve order and duplicates; unknown block/schema keys remain
+allowed. Exact public evidence is in
+`claude_web_search_request_policy_rejects_malformed_before_dispatch`,
+`claude_web_search_request_policy_preserves_valid_empty_duplicate_and_unknown_values`,
+`claude_known_request_collections_fail_closed_before_provider_dispatch`,
+`claude_deferred_tool_references_reject_malformed_collections_before_dispatch`,
+and `claude_deferred_tool_empty_duplicate_and_unknown_extensions_are_explicit`.
+
 ### Reasoning framing and stream lifecycle policy
 
 One policy is shared by JSON and SSE translations:
@@ -515,7 +561,7 @@ Status means deterministic, credential-free evidence exists.
 | Streaming and non-streaming | Supported | Supported | fixture captures and native response assertions |
 | Instructions/system variants | string and structured system blocks | `instructions` plus input messages | request captures |
 | Text and structured input | Messages content blocks | string/array input; images with optional `detail` | typed audit and provider-boundary captures |
-| Tool definitions/results | tool use/result, multi-turn; malformed identities/arguments fail before empty blocks; late tool-search IDs are transport-stable | function/custom/tool-search calls and outputs, including optional IDs | optional-item and paired JSON/SSE scalar-family boundary audits |
+| Tool definitions/results | tool use/result, multi-turn; deferred references are defined/non-empty and preserve explicit order/duplicates; malformed definitions, schemas, identities, arguments, and result collections fail before dispatch | function/custom/tool-search calls and outputs, including optional IDs | request collection, deferred reference, optional-item, and paired JSON/SSE boundary audits |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
 | Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
@@ -525,7 +571,7 @@ Status means deterministic, credential-free evidence exists.
 | Cancellation | response-body drop releases admission/upstream resources | same | load-shedding and WebSocket cancellation tests |
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
-| Web search | native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss | native Responses web-search output | paired partial/terminal-only output and conflict fixtures |
+| Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss | native Responses web-search output | request-policy, paired partial/terminal-only output, and conflict fixtures |
 | Chat Completions | translation fallback retained | not Codex 0.144.1's wire API | existing Chat Completions suite |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
@@ -540,6 +586,7 @@ authentication, body limits, admission, and JSON parsing:
 | Failure | `/v1/messages` | `/v1/responses` and compact |
 |---|---|---|
 | malformed/invalid request | Anthropic `type:error` + `invalid_request_error` | OpenAI `{error:{message,type,param,code}}` |
+| malformed known request collection/object | Anthropic HTTP 400 before admission/provider dispatch; no partial policy/tool forwarding | route-specific OpenAI validation error |
 | bad/missing client key | Anthropic `authentication_error` | OpenAI `authentication_error` / `invalid_api_key` |
 | request too large | Anthropic `request_too_large` | OpenAI `request_too_large` code |
 | rate limit/overload | Anthropic retryable error + `Retry-After` | OpenAI rate/server error + retry metadata |

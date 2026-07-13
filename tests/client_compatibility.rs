@@ -6724,6 +6724,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
     .collect();
     let response_models = [
         "gpt-fixture",
+        "gpt-5.4",
         "gpt-rate-limit",
         "gpt-upstream-500",
         "gpt-forbidden",
@@ -9396,6 +9397,684 @@ fn web_search_messages_request(stream: bool) -> Request<Body> {
         }),
         Some(CLIENT_KEY),
     )
+}
+
+fn web_search_policy_request(tool: Value) -> Request<Body> {
+    post_json(
+        "/v1/messages",
+        json!({
+            "model":"claude-sonnet-4-6",
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"Search with this policy"}],
+            "tools":[tool],
+            "stream":false
+        }),
+        Some(CLIENT_KEY),
+    )
+}
+
+fn assert_anthropic_invalid_request(body: &[u8], label: &str) {
+    let error = json_body(body);
+    assert_eq!(error.as_object().map(Map::len), Some(2), "{label}");
+    assert_eq!(error["type"], "error", "{label}");
+    assert_eq!(error["error"].as_object().map(Map::len), Some(2), "{label}");
+    assert_eq!(error["error"]["type"], "invalid_request_error", "{label}");
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| !message.is_empty()));
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_web_search_request_policy_rejects_malformed_before_dispatch() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure_with_web_search_model(
+        &fixture,
+        Some("responses-fixture/gpt-web-partial-completed"),
+    );
+
+    for (label, tool) in [
+        (
+            "allowed scalar",
+            json!({"type":"web_search_20250305","name":"web_search","allowed_domains":"x.test"}),
+        ),
+        (
+            "allowed mixed",
+            json!({"type":"web_search_20250305","name":"web_search","allowed_domains":[42,"x.test"]}),
+        ),
+        (
+            "allowed blank",
+            json!({"type":"web_search_20250305","name":"web_search","allowed_domains":["  "]}),
+        ),
+        (
+            "blocked scalar",
+            json!({"type":"web_search_20250305","name":"web_search","blocked_domains":{"x":true}}),
+        ),
+        (
+            "blocked mixed",
+            json!({"type":"web_search_20250305","name":"web_search","blocked_domains":["x.test",null]}),
+        ),
+        (
+            "both domain policies",
+            json!({
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["allowed.test"],
+                "blocked_domains":["blocked.test"]
+            }),
+        ),
+        (
+            "location scalar",
+            json!({"type":"web_search_20250305","name":"web_search","user_location":"US"}),
+        ),
+        (
+            "location missing type",
+            json!({"type":"web_search_20250305","name":"web_search","user_location":{"country":"US"}}),
+        ),
+        (
+            "location wrong type",
+            json!({"type":"web_search_20250305","name":"web_search","user_location":{"type":"exact","country":"US"}}),
+        ),
+        (
+            "location empty",
+            json!({"type":"web_search_20250305","name":"web_search","user_location":{"type":"approximate"}}),
+        ),
+        (
+            "location field type",
+            json!({"type":"web_search_20250305","name":"web_search","user_location":{"type":"approximate","city":42}}),
+        ),
+        (
+            "location blank",
+            json!({"type":"web_search_20250305","name":"web_search","user_location":{"type":"approximate","city":"  "}}),
+        ),
+        (
+            "country code",
+            json!({"type":"web_search_20250305","name":"web_search","user_location":{"type":"approximate","country":"USA"}}),
+        ),
+        (
+            "allowed callers mixed",
+            json!({"type":"web_search_20250305","name":"web_search","allowed_callers":["direct",7]}),
+        ),
+        (
+            "allowed callers unsupported",
+            json!({"type":"web_search_20250305","name":"web_search","allowed_callers":["direct"]}),
+        ),
+        (
+            "response inclusion unsupported",
+            json!({"type":"web_search_20250305","name":"web_search","response_inclusion":"full"}),
+        ),
+        (
+            "strict type",
+            json!({"type":"web_search_20250305","name":"web_search","strict":"yes"}),
+        ),
+        (
+            "max uses",
+            json!({"type":"web_search_20250305","name":"web_search","max_uses":0}),
+        ),
+    ] {
+        let before = fixture.requests().len();
+        let (status, body) = send(web_search_policy_request(tool)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_anthropic_invalid_request(&body, label);
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_web_search_request_policy_preserves_valid_empty_duplicate_and_unknown_values() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure_with_web_search_model(
+        &fixture,
+        Some("responses-fixture/gpt-web-partial-completed"),
+    );
+
+    let (status, _) = send(web_search_policy_request(json!({
+        "type":"web_search_20250305",
+        "name":"web_search",
+        "allowed_domains":["b.example/path","a.example","b.example/path"],
+        "blocked_domains":null,
+        "user_location":{
+            "type":"approximate",
+            "city":"Seattle",
+            "country":"US",
+            "future_location_key":{"keep":true}
+        },
+        "future_tool_key":{"keep":true}
+    })))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("web-search policy capture");
+    assert_eq!(
+        capture.body["tools"][0]["filters"]["allowed_domains"],
+        json!(["b.example/path", "a.example", "b.example/path"])
+    );
+    assert_eq!(capture.body["tools"][0]["user_location"]["city"], "Seattle");
+    assert_eq!(capture.body["tools"][0]["user_location"]["country"], "US");
+    assert_eq!(
+        capture.body["tools"][0]["user_location"]["future_location_key"]["keep"],
+        true
+    );
+
+    let before = fixture.requests().len();
+    let (status, _) = send(web_search_policy_request(json!({
+        "type":"web_search_20250305",
+        "name":"web_search",
+        "allowed_domains":[],
+        "blocked_domains":[],
+        "user_location":null
+    })))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let captures = fixture.requests();
+    assert_eq!(captures.len(), before + 1);
+    let capture = captures.last().expect("empty web-search policy capture");
+    assert!(capture.body["tools"][0].get("filters").is_none());
+    assert!(capture.body["tools"][0].get("user_location").is_none());
+
+    let (status, _) = send(web_search_policy_request(json!({
+        "type":"web_search_20250305",
+        "name":"web_search",
+        "allowed_domains":null,
+        "blocked_domains":["b.example","a.example","b.example"]
+    })))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("blocked-domain policy capture");
+    assert_eq!(
+        capture.body["tools"][0]["filters"]["blocked_domains"],
+        json!(["b.example", "a.example", "b.example"])
+    );
+}
+
+fn base_provider_messages_body() -> Value {
+    json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "messages":[{"role":"user","content":"Validate this request"}],
+        "stream":false
+    })
+}
+
+fn tool_result_messages_body(tool_result: Value) -> Value {
+    json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "messages":[
+            {
+                "role":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call",
+                    "name":"tool",
+                    "input":{}
+                }]
+            },
+            {"role":"user","content":[tool_result]}
+        ],
+        "stream":false
+    })
+}
+
+fn deferred_reference_body(content: Option<Value>, defer_loading: bool) -> Value {
+    let mut tool_result = json!({
+        "type":"tool_result",
+        "tool_use_id":"search-call",
+        "is_error":false
+    });
+    if let Some(content) = content {
+        tool_result["content"] = content;
+    }
+    json!({
+        "model":"responses-fixture/gpt-5.4",
+        "max_tokens":128,
+        "tools":[
+            {
+                "name":"mcp__tool_search__search",
+                "description":"Load deferred tools",
+                "input_schema":{
+                    "type":"object",
+                    "properties":{"names":{"type":"array","items":{"type":"string"}}},
+                    "required":["names"]
+                }
+            },
+            {
+                "name":"mcp__weather",
+                "description":"Get weather",
+                "defer_loading":defer_loading,
+                "input_schema":{
+                    "type":"object",
+                    "properties":{"city":{"type":"string"}},
+                    "required":["city"],
+                    "future_schema_key":{"keep":true}
+                },
+                "future_tool_key":{"keep":true}
+            },
+            {
+                "name":"mcp__forecast",
+                "description":"Get forecast",
+                "defer_loading":true,
+                "input_schema":{
+                    "type":"object",
+                    "properties":{"days":{"type":"integer"}},
+                    "required":["days"]
+                }
+            }
+        ],
+        "messages":[
+            {
+                "role":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"search-call",
+                    "name":"mcp__tool_search__search",
+                    "input":{"names":["mcp__weather"]}
+                }]
+            },
+            {"role":"user","content":[tool_result]}
+        ],
+        "stream":false
+    })
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_known_request_collections_fail_closed_before_provider_dispatch() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let mut invalid = Vec::new();
+    let mut body = base_provider_messages_body();
+    body["tools"] = json!("wrong");
+    invalid.push(("tools scalar", body));
+    let mut body = base_provider_messages_body();
+    body["tools"] = json!([1]);
+    invalid.push(("tool entry scalar", body));
+    let mut body = base_provider_messages_body();
+    body["tools"] = json!([{"input_schema":{"type":"object"}}]);
+    invalid.push(("tool missing name", body));
+    let mut body = base_provider_messages_body();
+    body["tools"] = json!([{"name":"broken","input_schema":"wrong"}]);
+    invalid.push(("tool schema scalar", body));
+    let mut body = base_provider_messages_body();
+    body["tools"] = json!([{
+        "name":"broken",
+        "input_schema":{"type":"object","required":["ok",4]}
+    }]);
+    invalid.push(("schema required mixed", body));
+    let mut body = base_provider_messages_body();
+    body["tools"] = json!([{
+        "name":"broken",
+        "input_schema":{"type":"object","required":null}
+    }]);
+    invalid.push(("schema required null", body));
+    let mut body = base_provider_messages_body();
+    body["tools"] = json!([
+        {"name":"duplicate","input_schema":{"type":"object"}},
+        {"name":"duplicate","input_schema":{"type":"object"}}
+    ]);
+    invalid.push(("duplicate tool names", body));
+    let mut body = base_provider_messages_body();
+    body["tools"] = json!([{
+        "name":"broken",
+        "defer_loading":"yes",
+        "input_schema":{"type":"object"}
+    }]);
+    invalid.push(("defer loading type", body));
+    let mut body = base_provider_messages_body();
+    body["tool_choice"] = json!({"type":"future"});
+    invalid.push(("tool choice type", body));
+    let mut body = base_provider_messages_body();
+    body["tool_choice"] = json!({"type":"tool"});
+    invalid.push(("tool choice missing name", body));
+    let mut body = base_provider_messages_body();
+    body["system"] = json!({"type":"text","text":"wrong container"});
+    invalid.push(("system object", body));
+    let mut body = base_provider_messages_body();
+    body["system"] = json!([{"type":"text","text":7}]);
+    invalid.push(("system text type", body));
+    let mut body = base_provider_messages_body();
+    body["metadata"] = json!("wrong");
+    invalid.push(("metadata scalar", body));
+    let mut body = base_provider_messages_body();
+    body["metadata"] = json!({"user_id":7});
+    invalid.push(("metadata user id", body));
+    let mut body = base_provider_messages_body();
+    body["thinking"] = json!("wrong");
+    invalid.push(("thinking scalar", body));
+    let mut body = base_provider_messages_body();
+    body["thinking"] = json!({"type":"future"});
+    invalid.push(("thinking type", body));
+    let mut body = base_provider_messages_body();
+    body["thinking"] = json!({"type":"enabled","budget_tokens":0});
+    invalid.push(("thinking budget", body));
+    let mut body = base_provider_messages_body();
+    body["output_config"] = json!({"effort":7});
+    invalid.push(("output config effort", body));
+    let mut body = base_provider_messages_body();
+    body["stop_sequences"] = json!(["stop", 7]);
+    invalid.push(("stop sequences mixed", body));
+    let mut body = base_provider_messages_body();
+    body["cache_control"] = json!("wrong");
+    invalid.push(("top cache control", body));
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["content"] = json!({"type":"text","text":"wrong container"});
+    invalid.push(("message content object", body));
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["content"] = json!([1]);
+    invalid.push(("content block scalar", body));
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["content"] = json!([{"type":"text","text":7}]);
+    invalid.push(("text value type", body));
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["content"] = json!([{"type":"future_content","value":true}]);
+    invalid.push(("unsupported content variant", body));
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["content"] = json!([{"type":"image","source":"not-an-object"}]);
+    invalid.push(("image source scalar", body));
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["content"] = json!([{
+        "type":"document",
+        "title":7,
+        "source":{"type":"url","url":"https://example.test/doc.pdf"}
+    }]);
+    invalid.push(("document title type", body));
+    let mut body = base_provider_messages_body();
+    body["messages"] = json!([{
+        "role":"assistant",
+        "content":[{"type":"tool_use","name":"tool","input":{}}]
+    }]);
+    invalid.push(("tool use missing id", body));
+    let mut body = base_provider_messages_body();
+    body["messages"] = json!([{
+        "role":"assistant",
+        "content":[{"type":"tool_use","id":"call","name":"tool","input":"wrong"}]
+    }]);
+    invalid.push(("tool use input type", body));
+    let body = tool_result_messages_body(json!({
+        "type":"tool_result",
+        "content":"missing id"
+    }));
+    invalid.push(("tool result missing id", body));
+    let body = tool_result_messages_body(json!({
+        "type":"tool_result",
+        "tool_use_id":"call",
+        "is_error":"wrong",
+        "content":"result"
+    }));
+    invalid.push(("tool result error type", body));
+    let body = tool_result_messages_body(json!({
+        "type":"tool_result",
+        "tool_use_id":"call",
+        "content":42
+    }));
+    invalid.push(("tool result content type", body));
+    let body = tool_result_messages_body(json!({
+        "type":"tool_result",
+        "tool_use_id":"call",
+        "content":[{"type":"future_result","value":true}]
+    }));
+    invalid.push(("tool result content variant", body));
+    let body = tool_result_messages_body(json!({
+        "type":"tool_result",
+        "tool_use_id":"unknown",
+        "content":"result"
+    }));
+    invalid.push(("tool result unknown id", body));
+    let mut body = base_provider_messages_body();
+    body["messages"][0]["content"] = json!([{
+        "type":"text",
+        "text":"cache",
+        "cache_control":{"type":"wrong"}
+    }]);
+    invalid.push(("cache control type", body));
+    let mut body = base_provider_messages_body();
+    body["messages"] = json!([{
+        "role":"assistant",
+        "content":[{"type":"thinking","thinking":"x","signature":7}]
+    }]);
+    invalid.push(("thinking signature type", body));
+
+    for (label, body) in invalid {
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_anthropic_invalid_request(&response, label);
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_deferred_tool_references_reject_malformed_collections_before_dispatch() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (label, body) in [
+        (
+            "missing tool name",
+            deferred_reference_body(Some(json!([{"type":"tool_reference"}])), true),
+        ),
+        (
+            "null tool name",
+            deferred_reference_body(
+                Some(json!([{"type":"tool_reference","tool_name":null}])),
+                true,
+            ),
+        ),
+        (
+            "wrong tool name",
+            deferred_reference_body(Some(json!([{"type":"tool_reference","tool_name":7}])), true),
+        ),
+        (
+            "empty tool name",
+            deferred_reference_body(
+                Some(json!([{"type":"tool_reference","tool_name":"  "}])),
+                true,
+            ),
+        ),
+        (
+            "unknown tool name",
+            deferred_reference_body(
+                Some(json!([{"type":"tool_reference","tool_name":"mcp__unknown"}])),
+                true,
+            ),
+        ),
+        (
+            "non-deferred tool",
+            deferred_reference_body(
+                Some(json!([{"type":"tool_reference","tool_name":"mcp__weather"}])),
+                false,
+            ),
+        ),
+        (
+            "mixed reference collection",
+            deferred_reference_body(
+                Some(json!([
+                    {"type":"tool_reference","tool_name":"mcp__weather"},
+                    {"type":"tool_reference","tool_name":7}
+                ])),
+                true,
+            ),
+        ),
+        (
+            "sentinel names scalar",
+            deferred_reference_body(
+                Some(Value::String(
+                    json!({"type":"copilot_api_tool_search","names":"mcp__weather"}).to_string(),
+                )),
+                true,
+            ),
+        ),
+        (
+            "sentinel names mixed",
+            deferred_reference_body(
+                Some(Value::String(
+                    json!({"type":"copilot_api_tool_search","names":["mcp__weather",7]})
+                        .to_string(),
+                )),
+                true,
+            ),
+        ),
+        (
+            "sentinel names empty",
+            deferred_reference_body(
+                Some(Value::String(
+                    json!({"type":"copilot_api_tool_search","names":[]}).to_string(),
+                )),
+                true,
+            ),
+        ),
+        (
+            "sentinel unknown tool",
+            deferred_reference_body(
+                Some(Value::String(
+                    json!({"type":"copilot_api_tool_search","names":["mcp__unknown"]}).to_string(),
+                )),
+                true,
+            ),
+        ),
+    ] {
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_anthropic_invalid_request(&response, label);
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_deferred_tool_empty_duplicate_and_unknown_extensions_are_explicit() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let duplicate_references = deferred_reference_body(
+        Some(json!([
+            {
+                "type":"tool_reference",
+                "tool_name":"mcp__weather",
+                "future_reference_key":{"keep":true}
+            },
+            {"type":"tool_reference","tool_name":"mcp__forecast"},
+            {"type":"tool_reference","tool_name":"mcp__weather"}
+        ])),
+        true,
+    );
+    let (status, _) = send(post_json(
+        "/v1/messages",
+        duplicate_references,
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("duplicate tool-reference capture");
+    let output = capture.body["input"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["type"] == "tool_search_output")
+        })
+        .expect("tool-search output");
+    assert_eq!(output["tools"].as_array().map(Vec::len), Some(3));
+    assert_eq!(output["tools"][0]["name"], "mcp__weather");
+    assert_eq!(output["tools"][1]["name"], "mcp__forecast");
+    assert_eq!(output["tools"][2]["name"], "mcp__weather");
+    assert_eq!(
+        output["tools"][0]["tools"][0]["parameters"]["future_schema_key"]["keep"],
+        true
+    );
+
+    let (status, _) = send(post_json(
+        "/v1/messages",
+        deferred_reference_body(
+            Some(Value::String(
+                json!({
+                    "type":"copilot_api_tool_search",
+                    "names":["mcp__weather","mcp__weather"]
+                })
+                .to_string(),
+            )),
+            true,
+        ),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("duplicate sentinel capture");
+    let output = capture.body["input"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["type"] == "tool_search_output")
+        })
+        .expect("sentinel tool-search output");
+    assert_eq!(output["tools"].as_array().map(Vec::len), Some(2));
+
+    for content in [Some(json!([])), None] {
+        let before = fixture.requests().len();
+        let (status, _) = send(post_json(
+            "/v1/messages",
+            deferred_reference_body(content, true),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let captures = fixture.requests();
+        assert_eq!(captures.len(), before + 1);
+        let output = captures
+            .last()
+            .and_then(|capture| capture.body["input"].as_array())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["type"] == "tool_search_output")
+            })
+            .expect("empty tool-search output");
+        assert_eq!(output["tools"], json!([]));
+    }
 }
 
 #[tokio::test]

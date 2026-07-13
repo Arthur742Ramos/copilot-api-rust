@@ -122,6 +122,20 @@ pub struct AnthropicTool {
     pub defer_loading: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_location: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_inclusion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(flatten)]
@@ -135,6 +149,8 @@ pub struct AnthropicToolChoice {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `thinking`: `{ type: "enabled"|"adaptive"; budget_tokens?; display? }`.
@@ -146,6 +162,8 @@ pub struct AnthropicThinkingConfig {
     pub budget_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `output_config`: `{ effort? }`.
@@ -153,6 +171,8 @@ pub struct AnthropicThinkingConfig {
 pub struct AnthropicOutputConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `metadata`: `{ user_id? }`. Open shape.

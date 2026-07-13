@@ -1214,6 +1214,7 @@ mod tests {
             kind: "enabled".to_string(),
             budget_tokens: Some(10000),
             display: None,
+            extra: Default::default(),
         };
         assert_eq!(
             thinking_budget_from_model(Some(&thinking), Some(&model)),
@@ -1225,6 +1226,7 @@ mod tests {
             kind: "enabled".to_string(),
             budget_tokens: Some(100),
             display: None,
+            extra: Default::default(),
         };
         assert_eq!(
             thinking_budget_from_model(Some(&thinking_low), Some(&model)),
@@ -1241,6 +1243,7 @@ mod tests {
             kind: "enabled".to_string(),
             budget_tokens: Some(500),
             display: None,
+            extra: Default::default(),
         };
         assert_eq!(
             thinking_budget_from_model(Some(&thinking), Some(&model)),
@@ -1330,6 +1333,7 @@ mod tests {
         let auto = AnthropicToolChoice {
             kind: "auto".to_string(),
             name: None,
+            extra: Default::default(),
         };
         assert_eq!(
             translate_anthropic_tool_choice_to_openai(Some(&auto)),
@@ -1338,6 +1342,7 @@ mod tests {
         let any = AnthropicToolChoice {
             kind: "any".to_string(),
             name: None,
+            extra: Default::default(),
         };
         assert_eq!(
             translate_anthropic_tool_choice_to_openai(Some(&any)),
@@ -1346,6 +1351,7 @@ mod tests {
         let tool = AnthropicToolChoice {
             kind: "tool".to_string(),
             name: Some("t".to_string()),
+            extra: Default::default(),
         };
         assert_eq!(
             translate_anthropic_tool_choice_to_openai(Some(&tool)),
@@ -1354,6 +1360,7 @@ mod tests {
         let none = AnthropicToolChoice {
             kind: "none".to_string(),
             name: None,
+            extra: Default::default(),
         };
         assert_eq!(
             translate_anthropic_tool_choice_to_openai(Some(&none)),
