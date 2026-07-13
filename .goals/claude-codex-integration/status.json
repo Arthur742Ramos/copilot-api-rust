@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 18,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -91,6 +91,11 @@
       "iteration": 17,
       "verdict": "FAIL",
       "summary": "Schema semantics, catalog choices, collision checks, and extension preservation mostly pass, but top-level/message extras and stop_sequences are still dropped and empty schema name arrays remain accepted."
+    },
+    {
+      "iteration": 18,
+      "verdict": "FAIL",
+      "summary": "Responses extensions, route-aware stop_sequences, schema empty arrays, and gates pass, but the supported Chat Completions Messages bridge still silently drops top-level, message, and structured-system extras without public regressions."
     }
   ]
 }
