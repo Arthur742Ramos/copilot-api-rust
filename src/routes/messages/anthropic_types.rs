@@ -301,6 +301,8 @@ pub struct AnthropicMessageStart {
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
     pub usage: AnthropicUsage,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl Default for AnthropicMessageStart {
@@ -314,6 +316,7 @@ impl Default for AnthropicMessageStart {
             stop_reason: None,
             stop_sequence: None,
             usage: AnthropicUsage::default(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -358,6 +361,10 @@ pub struct AnthropicMessageDeltaUsage {
     pub cache_creation_input_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `error` event body.
@@ -437,6 +444,10 @@ pub struct AnthropicStreamToolCall {
     /// tool block is active. Anthropic content blocks are strictly sequential,
     /// while OpenAI may interleave parallel tool-call indices.
     pub buffered_arguments: Vec<String>,
+    /// Full ordered argument text used to validate the terminal JSON object.
+    pub arguments: String,
+    /// First-delta tool/function extensions preserved on the tool_use block.
+    pub extra: serde_json::Map<String, Value>,
     pub started: bool,
 }
 
@@ -444,6 +455,17 @@ pub struct AnthropicStreamToolCall {
 /// translator. NOT a wire type (no serde).
 #[derive(Debug, Clone, Default)]
 pub struct AnthropicStreamState {
+    /// Stable OpenAI chunk identity established by the first chunk.
+    pub chat_id: Option<String>,
+    pub chat_model: Option<String>,
+    pub chat_created: Option<i64>,
+    pub chat_service_tier: Option<Option<String>>,
+    pub chat_system_fingerprint: Option<Option<String>>,
+    pub chat_top_level_extras: serde_json::Map<String, Value>,
+    pub chat_usage: Option<AnthropicUsage>,
+    pub chat_usage_source: Option<Value>,
+    pub chat_output_seen: bool,
+    pub chat_finish_reason: Option<String>,
     pub message_start_sent: bool,
     pub content_block_index: i64,
     pub content_block_open: bool,

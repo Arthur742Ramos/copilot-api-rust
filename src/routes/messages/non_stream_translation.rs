@@ -1468,12 +1468,10 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
         );
     }
 
-    let usage = map_openai_chat_completion_usage(
-        object
-            .get("usage")
-            .ok_or_else(|| malformed_chat_response("response.usage was missing"))?,
-        top_service_tier.as_deref(),
-    )?;
+    let usage = match object.get("usage") {
+        None | Some(Value::Null) => empty_chat_completion_usage(top_service_tier.as_deref()),
+        Some(usage) => map_openai_chat_completion_usage(usage, top_service_tier.as_deref())?,
+    };
     Ok(AnthropicResponse {
         id: id.to_string(),
         kind: "message".to_string(),
@@ -1760,7 +1758,7 @@ fn translate_chat_tool_calls(tool_calls: Option<&Value>) -> Result<Vec<Value>, H
 }
 
 #[allow(clippy::result_large_err)]
-fn map_openai_chat_completion_usage(
+pub(crate) fn map_openai_chat_completion_usage(
     usage: &Value,
     top_service_tier: Option<&str>,
 ) -> Result<AnthropicUsage, HttpError> {
@@ -1910,6 +1908,17 @@ fn map_openai_chat_completion_usage(
         service_tier: usage_service_tier.or_else(|| top_service_tier.map(str::to_string)),
         extra,
     })
+}
+
+pub(crate) fn empty_chat_completion_usage(service_tier: Option<&str>) -> AnthropicUsage {
+    AnthropicUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+        service_tier: service_tier.map(str::to_string),
+        extra: Map::new(),
+    }
 }
 
 #[allow(clippy::result_large_err)]

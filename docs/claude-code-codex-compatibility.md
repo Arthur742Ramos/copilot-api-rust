@@ -267,7 +267,9 @@ The reverse non-streaming Chat boundary is fail-closed. A successful response
 must be a `chat.completion` object with non-empty `id`/`model`, one choice at
 index zero, an assistant message, a supported finish reason, representable
 content, valid function tool calls with object-valued JSON arguments, and a
-strict usage object whose non-negative counters and totals agree. Extra choices,
+usage field that is optional as a whole. Absent/null usage maps to the required
+Anthropic zero-usage object; when present, all non-negative counters, details,
+and totals must agree. Extra choices,
 legacy function calls, unsupported structured parts, conflicting reasoning,
 malformed details, negative/overflowing counters, and empty fabricated output
 become one sanitized Anthropic `502 api_error`. A top-level Chat `error` in an
@@ -283,6 +285,26 @@ extras remain on text blocks; usage and prompt-detail extras remain in
 `tool_use` block (function scope uses `chat_function_extensions`). Canonical
 target collisions fail rather than overriding response authority. Explicit
 nulls, nested values, and source order are retained.
+
+Chat SSE uses the same contract. Every accepted
+[`ChatCompletionChunk`](https://github.com/openai/openai-python/blob/v1.109.0/src/openai/types/chat/chat_completion_chunk.py)
+has a non-empty stable `id`/`model`, exact `chat.completion.chunk` object,
+stable non-negative `created`, and compatible optional service-tier/fingerprint
+assertions. Content chunks contain exactly one choice at index zero; only the
+post-finish strict usage chunk may use `choices: []`. Multiple choices,
+unknown/legacy `function_call` finishes, finish/tool conflicts, late identity
+or extension conflicts, and partial usage terminate once with an Anthropic
+error and suppress every later success.
+
+Streamed function calls require a non-negative index on every fragment. A first
+index is contiguous and establishes non-empty id, `function` type/name, and
+optional first arguments; continuation fragments cannot repeat or change
+identity. Argument fragments retain wire order, and every call must end as a
+JSON object before `tool_calls` can succeed. First-delta tool/function extras
+are retained on the generated `tool_use`; unrepresentable choice/delta or late
+chunk extras fail explicitly. If the entire stream omits/nulls usage, the final
+Anthropic delta reports zero usage; any present usage object uses the same
+strict parser and preserves usage/detail extras as non-streaming.
 
 `stop_sequences` has no field in either the audited Codex 0.144.1
 [`ResponsesApiRequest`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/common.rs)
@@ -339,6 +361,9 @@ allowed. Exact public evidence is in
 `claude_chat_response_extensions_and_usage_survive_provider_boundary`,
 `claude_chat_malformed_provider_responses_fail_as_sanitized_bad_gateway`,
 `claude_chat_upstream_status_and_direct_failures_preserve_safe_semantics`,
+`claude_chat_sse_strict_identity_usage_extras_and_tools_cross_public_boundary`,
+`claude_chat_sse_malformed_matrix_errors_once_without_later_success`,
+`claude_direct_chat_sse_matches_provider_identity_and_optional_usage_policy`,
 `claude_stop_sequences_reject_responses_but_preserve_native_anthropic_support`,
 `claude_responses_controls_preserve_supported_and_reject_unrepresentable_values`,
 and `claude_unsupported_source_types_fail_before_admission_or_dispatch`.
@@ -706,7 +731,7 @@ Status means deterministic, credential-free evidence exists.
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
 | Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss | native Responses web-search output | request-policy, paired partial/terminal-only output, and conflict fixtures |
-| Chat Completions | lossless representable request/response extensions; explicit request 400 or malformed-upstream 502; strict one-choice/tool/usage validation | not Codex 0.144.1's wire API | public provider/direct captures, split-carrier, malformed-body, status/header, and collision fixtures |
+| Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity and strict one-choice/tool/optional-usage state | not Codex 0.144.1's wire API | public provider/direct captures, split-carrier, malformed-body/chunk, status/header, usage, tool-state, and collision fixtures |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
 The detailed Claude-specific matrix remains in

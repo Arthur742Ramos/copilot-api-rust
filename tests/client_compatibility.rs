@@ -135,6 +135,9 @@ async fn fixture_handler(
 
 fn chat_completions_fixture(body: &Value) -> Response {
     let model = body["model"].as_str().unwrap_or_default();
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        return chat_completions_stream_fixture(model);
+    }
     if matches!(
         model,
         "gpt-chat-response-malformed-json" | "gpt-direct-chat-malformed-json"
@@ -375,6 +378,7 @@ fn chat_completions_fixture(body: &Value) -> Response {
         "gpt-chat-response-no-usage" => {
             response.as_object_mut().unwrap().remove("usage");
         }
+        "gpt-chat-response-usage-null" => response["usage"] = Value::Null,
         "gpt-chat-response-usage-wrong" => response["usage"] = json!([]),
         "gpt-chat-response-usage-negative" => response["usage"]["prompt_tokens"] = json!(-1),
         "gpt-chat-response-usage-total" => response["usage"]["total_tokens"] = json!(99),
@@ -436,6 +440,330 @@ fn chat_completions_fixture(body: &Value) -> Response {
             .expect("Chat response fixture");
     }
     Json(response).into_response()
+}
+
+fn chat_completions_stream_fixture(model: &str) -> Response {
+    let chunk = |choices: Value, usage: Value| {
+        json!({
+            "id":"chatcmpl-stream",
+            "object":"chat.completion.chunk",
+            "created":1,
+            "model":model,
+            "choices":choices,
+            "usage":usage
+        })
+    };
+    let text = || {
+        chunk(
+            json!([{
+                "index":0,
+                "delta":{"role":"assistant","content":"Hello"},
+                "finish_reason":null
+            }]),
+            Value::Null,
+        )
+    };
+    let finish = || {
+        chunk(
+            json!([{
+                "index":0,
+                "delta":{},
+                "finish_reason":"stop"
+            }]),
+            Value::Null,
+        )
+    };
+    let usage = || {
+        chunk(
+            json!([]),
+            json!({
+                "prompt_tokens":4,
+                "completion_tokens":2,
+                "total_tokens":6,
+                "prompt_tokens_details":{
+                    "cached_tokens":1,
+                    "future_prompt":null
+                },
+                "future_usage":{"keep":true}
+            }),
+        )
+    };
+    let mut chunks = match model {
+        "gpt-chat-stream-strict" | "gpt-direct-chat-stream-strict" => {
+            let mut first = text();
+            first["system_fingerprint"] = Value::Null;
+            first["future_chunk"] = json!({"keep":true,"null":null});
+            vec![first, finish(), usage()]
+        }
+        "gpt-chat-stream-no-usage" | "gpt-direct-chat-stream-no-usage" => {
+            vec![text(), finish()]
+        }
+        "gpt-chat-stream-tools" => {
+            vec![
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{
+                            "tool_calls":[{
+                                "index":0,
+                                "id":"call-stream",
+                                "type":"function",
+                                "future_tool":{"keep":true,"null":null},
+                                "function":{
+                                    "name":"actual",
+                                    "arguments":"{\"value\":",
+                                    "future_function":{"keep":true,"null":null}
+                                }
+                            }]
+                        },
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{
+                            "tool_calls":[{
+                                "index":0,
+                                "function":{"arguments":"1}"}
+                            }]
+                        },
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{},
+                        "finish_reason":"tool_calls"
+                    }]),
+                    json!({
+                        "prompt_tokens":3,
+                        "completion_tokens":2,
+                        "total_tokens":5
+                    }),
+                ),
+            ]
+        }
+        "gpt-chat-stream-bad-missing-id" | "gpt-direct-chat-stream-bad-identity" => {
+            let mut first = text();
+            first.as_object_mut().unwrap().remove("id");
+            vec![first]
+        }
+        "gpt-chat-stream-bad-object" => {
+            let mut first = text();
+            first["object"] = json!("chat.completion");
+            vec![first]
+        }
+        "gpt-chat-stream-bad-created" => {
+            let mut first = text();
+            first["created"] = json!(-1);
+            vec![first]
+        }
+        "gpt-chat-stream-bad-model" => {
+            let mut first = text();
+            first["model"] = json!("");
+            vec![first]
+        }
+        "gpt-chat-stream-bad-id-conflict" => {
+            let mut second = finish();
+            second["id"] = json!("conflict");
+            vec![text(), second]
+        }
+        "gpt-chat-stream-bad-service" => {
+            let mut first = text();
+            first["service_tier"] = json!("unsupported");
+            vec![first]
+        }
+        "gpt-chat-stream-bad-service-conflict" => {
+            let mut first = text();
+            first["service_tier"] = json!("default");
+            let mut second = finish();
+            second["service_tier"] = json!("priority");
+            vec![first, second]
+        }
+        "gpt-chat-stream-bad-fingerprint" => {
+            let mut first = text();
+            first["system_fingerprint"] = json!("one");
+            let mut second = finish();
+            second["system_fingerprint"] = json!("two");
+            vec![first, second]
+        }
+        "gpt-chat-stream-bad-choices" => {
+            let mut first = text();
+            let choice = first["choices"][0].clone();
+            first["choices"] = json!([choice.clone(), choice]);
+            vec![first]
+        }
+        "gpt-chat-stream-bad-choice-index" => {
+            let mut first = text();
+            first["choices"][0]["index"] = json!(1);
+            vec![first]
+        }
+        "gpt-chat-stream-bad-finish" => {
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("unknown");
+            vec![text(), terminal]
+        }
+        "gpt-chat-stream-bad-function-finish" => {
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("function_call");
+            vec![text(), terminal]
+        }
+        "gpt-chat-stream-bad-tool-finish" => {
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("tool_calls");
+            vec![text(), terminal]
+        }
+        "gpt-chat-stream-bad-stop-tool" => {
+            let announced = chunk(
+                json!([{
+                    "index":0,
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call",
+                        "type":"function",
+                        "function":{"name":"actual","arguments":"{}"}
+                    }]},
+                    "finish_reason":null
+                }]),
+                Value::Null,
+            );
+            vec![announced, finish()]
+        }
+        "gpt-chat-stream-bad-tool-index"
+        | "gpt-chat-stream-bad-tool-gap"
+        | "gpt-chat-stream-bad-tool-id" => {
+            let mut call = json!({
+                "index":0,
+                "id":"call",
+                "type":"function",
+                "function":{"name":"actual","arguments":"{}"}
+            });
+            match model {
+                "gpt-chat-stream-bad-tool-index" => {
+                    call.as_object_mut().unwrap().remove("index");
+                }
+                "gpt-chat-stream-bad-tool-gap" => call["index"] = json!(1),
+                "gpt-chat-stream-bad-tool-id" => call["id"] = Value::Null,
+                _ => unreachable!(),
+            }
+            vec![chunk(
+                json!([{
+                    "index":0,
+                    "delta":{"tool_calls":[call]},
+                    "finish_reason":null
+                }]),
+                Value::Null,
+            )]
+        }
+        "gpt-chat-stream-bad-tool-duplicate-id" => {
+            let announced = chunk(
+                json!([{
+                    "index":0,
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call",
+                        "type":"function",
+                        "function":{"name":"actual","arguments":"{"}
+                    }]},
+                    "finish_reason":null
+                }]),
+                Value::Null,
+            );
+            let duplicate = chunk(
+                json!([{
+                    "index":0,
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call",
+                        "function":{"arguments":"}"}
+                    }]},
+                    "finish_reason":null
+                }]),
+                Value::Null,
+            );
+            vec![announced, duplicate]
+        }
+        "gpt-chat-stream-bad-tool-incomplete" | "gpt-chat-stream-bad-tool-scalar" => {
+            let arguments = if model.ends_with("scalar") {
+                "[]"
+            } else {
+                "{\"x\":"
+            };
+            let announced = chunk(
+                json!([{
+                    "index":0,
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call",
+                        "type":"function",
+                        "function":{"name":"actual","arguments":arguments}
+                    }]},
+                    "finish_reason":null
+                }]),
+                Value::Null,
+            );
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("tool_calls");
+            vec![announced, terminal]
+        }
+        "gpt-chat-stream-bad-usage-partial"
+        | "gpt-chat-stream-bad-usage-total"
+        | "gpt-chat-stream-bad-usage-details" => {
+            let mut terminal = finish();
+            terminal["usage"] = match model {
+                "gpt-chat-stream-bad-usage-partial" => json!({"prompt_tokens":1}),
+                "gpt-chat-stream-bad-usage-total" => {
+                    json!({"prompt_tokens":1,"completion_tokens":1,"total_tokens":9})
+                }
+                "gpt-chat-stream-bad-usage-details" => json!({
+                    "prompt_tokens":1,
+                    "completion_tokens":1,
+                    "total_tokens":2,
+                    "prompt_tokens_details":{"cached_tokens":2}
+                }),
+                _ => unreachable!(),
+            };
+            vec![text(), terminal]
+        }
+        "gpt-chat-stream-bad-usage-orphan" => vec![usage()],
+        "gpt-chat-stream-bad-choice-extra" => {
+            let mut first = text();
+            first["choices"][0]["future_choice"] = json!(true);
+            vec![first]
+        }
+        "gpt-chat-stream-bad-delta-extra" => {
+            let mut first = text();
+            first["choices"][0]["delta"]["future_delta"] = json!(true);
+            vec![first]
+        }
+        "gpt-chat-stream-bad-later-extra" => {
+            let mut second = finish();
+            second["future_late"] = json!(true);
+            vec![text(), second]
+        }
+        _ => vec![text(), finish(), usage()],
+    };
+
+    if model.starts_with("gpt-chat-stream-bad-") || model == "gpt-direct-chat-stream-bad-identity" {
+        let mut late = finish();
+        late["choices"][0]["delta"]["content"] = json!("late success");
+        late["usage"] = json!({
+            "prompt_tokens":1,
+            "completion_tokens":1,
+            "total_tokens":2
+        });
+        chunks.push(late);
+    }
+    let mut body: String = chunks
+        .into_iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect();
+    body.push_str("data: [DONE]\n\n");
+    sse_response(body)
 }
 
 fn compact_fixture(body: &Value) -> Response {
@@ -6997,6 +7325,9 @@ fn configure_direct_copilot(fixture: &Fixture) {
         "gpt-direct-chat-malformed-json",
         "gpt-direct-chat-bad-choices",
         "gpt-direct-chat-429",
+        "gpt-direct-chat-stream-strict",
+        "gpt-direct-chat-stream-no-usage",
+        "gpt-direct-chat-stream-bad-identity",
     ];
     let models = ModelsResponse {
         object: "list".to_string(),
@@ -7392,6 +7723,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-chat-response-tool-arguments-scalar",
         "gpt-chat-response-tool-collision",
         "gpt-chat-response-no-usage",
+        "gpt-chat-response-usage-null",
         "gpt-chat-response-usage-wrong",
         "gpt-chat-response-usage-negative",
         "gpt-chat-response-usage-total",
@@ -7403,6 +7735,36 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-chat-response-reasoning-conflict",
         "gpt-chat-response-reasoning-no-signature",
         "gpt-chat-response-refusal",
+        "gpt-chat-stream-strict",
+        "gpt-chat-stream-no-usage",
+        "gpt-chat-stream-tools",
+        "gpt-chat-stream-bad-missing-id",
+        "gpt-chat-stream-bad-object",
+        "gpt-chat-stream-bad-created",
+        "gpt-chat-stream-bad-model",
+        "gpt-chat-stream-bad-id-conflict",
+        "gpt-chat-stream-bad-service",
+        "gpt-chat-stream-bad-service-conflict",
+        "gpt-chat-stream-bad-fingerprint",
+        "gpt-chat-stream-bad-choices",
+        "gpt-chat-stream-bad-choice-index",
+        "gpt-chat-stream-bad-finish",
+        "gpt-chat-stream-bad-function-finish",
+        "gpt-chat-stream-bad-tool-finish",
+        "gpt-chat-stream-bad-stop-tool",
+        "gpt-chat-stream-bad-tool-index",
+        "gpt-chat-stream-bad-tool-gap",
+        "gpt-chat-stream-bad-tool-id",
+        "gpt-chat-stream-bad-tool-duplicate-id",
+        "gpt-chat-stream-bad-tool-incomplete",
+        "gpt-chat-stream-bad-tool-scalar",
+        "gpt-chat-stream-bad-usage-partial",
+        "gpt-chat-stream-bad-usage-total",
+        "gpt-chat-stream-bad-usage-details",
+        "gpt-chat-stream-bad-usage-orphan",
+        "gpt-chat-stream-bad-choice-extra",
+        "gpt-chat-stream-bad-delta-extra",
+        "gpt-chat-stream-bad-later-extra",
     ]
     .into_iter()
     .map(|model| {
@@ -11807,6 +12169,19 @@ async fn claude_chat_response_extensions_and_usage_survive_provider_boundary() {
     assert_eq!(refusal["stop_reason"], "refusal");
     assert_eq!(refusal["content"], json!([]));
     assert_eq!(refusal["chat_message_extensions"]["refusal"], "blocked");
+
+    for model in ["gpt-chat-response-no-usage", "gpt-chat-response-usage-null"] {
+        let body = json!({
+            "model":format!("chat-fixture/{model}"),
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"optional usage"}]
+        });
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let response = json_body(&response);
+        assert_eq!(response["usage"]["input_tokens"], 0, "{model}");
+        assert_eq!(response["usage"]["output_tokens"], 0, "{model}");
+    }
 }
 
 #[tokio::test]
@@ -11843,7 +12218,6 @@ async fn claude_chat_malformed_provider_responses_fail_as_sanitized_bad_gateway(
         "gpt-chat-response-tool-arguments-json",
         "gpt-chat-response-tool-arguments-scalar",
         "gpt-chat-response-tool-collision",
-        "gpt-chat-response-no-usage",
         "gpt-chat-response-usage-wrong",
         "gpt-chat-response-usage-negative",
         "gpt-chat-response-usage-total",
@@ -12011,6 +12385,237 @@ async fn claude_chat_upstream_status_and_direct_failures_preserve_safe_semantics
         Some("4")
     );
     assert!(headers.get("x-unsafe-secret").is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_chat_sse_strict_identity_usage_extras_and_tools_cross_public_boundary() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let request = |model: &str| {
+        json!({
+            "model":format!("chat-fixture/{model}"),
+            "max_tokens":128,
+            "stream":true,
+            "tools":[{
+                "name":"actual",
+                "input_schema":{"type":"object"}
+            }],
+            "messages":[{"role":"user","content":"stream"}]
+        })
+    };
+    let (status, body) = send(post_json(
+        "/v1/messages",
+        request("gpt-chat-stream-strict"),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    assert_eq!(
+        events[0]["message"]["future_chunk"],
+        json!({"keep":true,"null":null})
+    );
+    assert_eq!(events[0]["message"]["system_fingerprint"], Value::Null);
+    let terminal_usage = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .expect("strict Chat terminal usage");
+    assert_eq!(terminal_usage["usage"]["input_tokens"], 3);
+    assert_eq!(terminal_usage["usage"]["output_tokens"], 2);
+    assert_eq!(terminal_usage["usage"]["cache_read_input_tokens"], 1);
+    assert_eq!(
+        terminal_usage["usage"]["future_usage"],
+        json!({"keep":true})
+    );
+    assert_eq!(
+        terminal_usage["usage"]["chat_prompt_tokens_details"],
+        json!({"future_prompt":null})
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| event["type"] == "error"));
+
+    let (status, body) = send(post_json(
+        "/v1/messages",
+        request("gpt-chat-stream-no-usage"),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let terminal = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .expect("usage-optional terminal");
+    assert_eq!(terminal["usage"]["input_tokens"], 0);
+    assert_eq!(terminal["usage"]["output_tokens"], 0);
+    assert_eq!(events.last().unwrap()["type"], "message_stop");
+
+    let (status, body) = send(post_json(
+        "/v1/messages",
+        request("gpt-chat-stream-tools"),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let start = events
+        .iter()
+        .find(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "tool_use"
+        })
+        .expect("stream tool start");
+    assert_eq!(start["content_block"]["id"], "call-stream");
+    assert_eq!(
+        start["content_block"]["future_tool"],
+        json!({"keep":true,"null":null})
+    );
+    assert_eq!(
+        start["content_block"]["chat_function_extensions"],
+        json!({"future_function":{"keep":true,"null":null}})
+    );
+    let arguments: String = events
+        .iter()
+        .filter_map(|event| event.pointer("/delta/partial_json").and_then(Value::as_str))
+        .collect();
+    assert_eq!(arguments, "{\"value\":1}");
+    assert_eq!(events.last().unwrap()["type"], "message_stop");
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_chat_sse_malformed_matrix_errors_once_without_later_success() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let models = [
+        "gpt-chat-stream-bad-missing-id",
+        "gpt-chat-stream-bad-object",
+        "gpt-chat-stream-bad-created",
+        "gpt-chat-stream-bad-model",
+        "gpt-chat-stream-bad-id-conflict",
+        "gpt-chat-stream-bad-service",
+        "gpt-chat-stream-bad-service-conflict",
+        "gpt-chat-stream-bad-fingerprint",
+        "gpt-chat-stream-bad-choices",
+        "gpt-chat-stream-bad-choice-index",
+        "gpt-chat-stream-bad-finish",
+        "gpt-chat-stream-bad-function-finish",
+        "gpt-chat-stream-bad-tool-finish",
+        "gpt-chat-stream-bad-stop-tool",
+        "gpt-chat-stream-bad-tool-index",
+        "gpt-chat-stream-bad-tool-gap",
+        "gpt-chat-stream-bad-tool-id",
+        "gpt-chat-stream-bad-tool-duplicate-id",
+        "gpt-chat-stream-bad-tool-incomplete",
+        "gpt-chat-stream-bad-tool-scalar",
+        "gpt-chat-stream-bad-usage-partial",
+        "gpt-chat-stream-bad-usage-total",
+        "gpt-chat-stream-bad-usage-details",
+        "gpt-chat-stream-bad-usage-orphan",
+        "gpt-chat-stream-bad-choice-extra",
+        "gpt-chat-stream-bad-delta-extra",
+        "gpt-chat-stream-bad-later-extra",
+    ];
+    for model in models {
+        let body = json!({
+            "model":format!("chat-fixture/{model}"),
+            "max_tokens":128,
+            "stream":true,
+            "tools":[{
+                "name":"actual",
+                "input_schema":{"type":"object"}
+            }],
+            "messages":[{"role":"user","content":"malformed stream"}]
+        });
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&response);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            0,
+            "{model}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.pointer("/delta/text").and_then(Value::as_str) == Some("late success")
+            }),
+            "{model}"
+        );
+        assert_eq!(events.last().unwrap()["type"], "error", "{model}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_policy() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure_direct_copilot(&fixture);
+    for model in [
+        "gpt-direct-chat-stream-strict",
+        "gpt-direct-chat-stream-no-usage",
+    ] {
+        let body = json!({
+            "model":model,
+            "max_tokens":128,
+            "stream":true,
+            "messages":[{"role":"user","content":"direct stream"}]
+        });
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&response);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+        assert!(
+            !events.iter().any(|event| event["type"] == "error"),
+            "{model}"
+        );
+    }
+
+    let body = json!({
+        "model":"gpt-direct-chat-stream-bad-identity",
+        "max_tokens":128,
+        "stream":true,
+        "messages":[{"role":"user","content":"direct malformed stream"}]
+    });
+    let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&response);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "error")
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| event["type"] == "message_stop"));
 }
 
 fn binary_schema(depth: usize) -> Value {

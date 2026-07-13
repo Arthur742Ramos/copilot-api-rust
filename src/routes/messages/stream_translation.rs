@@ -12,13 +12,19 @@
 //! one delta we care about into a small mutable [`DeltaView`], reproducing the
 //! TS `delta.content = …` mutation in `handleThinkingText`.
 
-use serde_json::Value;
+use std::collections::HashSet;
+
+use serde_json::{json, Map, Value};
 
 use super::anthropic_types::{
     AnthropicContentBlockDelta, AnthropicMessageDeltaBody, AnthropicMessageDeltaUsage,
     AnthropicMessageStart, AnthropicStreamEventData, AnthropicStreamState, AnthropicStreamToolCall,
     AnthropicUsage,
 };
+use super::non_stream_translation::{
+    empty_chat_completion_usage, map_openai_chat_completion_usage,
+};
+use super::request_validation::collect_open_object_extensions;
 use super::utils::map_openai_stop_reason_to_anthropic;
 
 /// Imported from [`super::utils`] so all translation modules share one source of
@@ -39,24 +45,10 @@ struct DeltaView {
     reasoning_text: Option<String>,
     reasoning_content: Option<String>,
     reasoning_opaque: Option<String>,
-    tool_calls: Vec<Value>,
+    tool_calls: Vec<ValidatedToolDelta>,
 }
 
 impl DeltaView {
-    fn from_delta(delta: &Value) -> Self {
-        Self {
-            content: opt_string(delta.get("content")),
-            reasoning_text: opt_string(delta.get("reasoning_text")),
-            reasoning_content: opt_string(delta.get("reasoning_content")),
-            reasoning_opaque: opt_string(delta.get("reasoning_opaque")),
-            tool_calls: delta
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default(),
-        }
-    }
-
     /// JS `delta.content && delta.content.length > 0`.
     fn has_content(&self) -> bool {
         self.content.as_deref().is_some_and(|c| !c.is_empty())
@@ -66,6 +58,16 @@ impl DeltaView {
     fn has_tool_call_delta(&self) -> bool {
         !self.tool_calls.is_empty()
     }
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedToolDelta {
+    index: i64,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+    extra: Map<String, Value>,
+    first: bool,
 }
 
 /// `string | null | undefined` -> `Option<String>`. Empty string stays `Some("")`
@@ -93,14 +95,6 @@ fn validate_optional_string(v: Option<&Value>) -> Result<(), ()> {
 /// and truncate it while extracting the value.
 pub(crate) fn nonnegative_i64(v: &Value) -> Option<i64> {
     v.as_i64().filter(|value| *value >= 0)
-}
-
-fn validate_optional_nonnegative_i64(v: Option<&Value>) -> Result<(), ()> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(value) if nonnegative_i64(value).is_some() => Ok(()),
-        Some(_) => Err(()),
-    }
 }
 
 const DEFAULT_UPSTREAM_ERROR_TYPE: &str = "api_error";
@@ -152,116 +146,473 @@ pub(crate) fn safe_upstream_error_message(value: Option<&Value>) -> Option<Strin
     Some(value.to_string())
 }
 
-struct ValidatedChoice<'a> {
-    choice: &'a Value,
-    delta: &'a Value,
+struct ValidatedChoice {
+    delta: DeltaView,
+    finish_reason: Option<String>,
+    usage: Option<AnthropicUsage>,
+    usage_present: bool,
 }
 
-enum ValidatedChatChunk<'a> {
-    Choice(ValidatedChoice<'a>),
-    UsageOnly,
+enum ValidatedChatChunk {
+    Choice(ValidatedChoice),
+    UsageOnly(AnthropicUsage),
 }
 
-fn validate_tool_call(tool_call: &Value) -> Result<(), ()> {
-    let tool_call = tool_call.as_object().ok_or(())?;
-    validate_optional_nonnegative_i64(tool_call.get("index"))?;
-    validate_optional_string(tool_call.get("id"))?;
+const MESSAGE_START_CANONICAL_FIELDS: &[&str] = &[
+    "id",
+    "type",
+    "role",
+    "content",
+    "model",
+    "stop_reason",
+    "stop_sequence",
+    "usage",
+];
 
-    let Some(function) = tool_call.get("function") else {
-        return Ok(());
-    };
-    if function.is_null() {
-        return Ok(());
-    }
-    let function = function.as_object().ok_or(())?;
-    validate_optional_string(function.get("name"))?;
-    validate_optional_string(function.get("arguments"))
+struct ChunkIdentity {
+    id: String,
+    model: String,
+    created: i64,
+    service_tier: Option<Option<String>>,
+    system_fingerprint: Option<Option<String>>,
+    extras: Map<String, Value>,
 }
 
-fn validate_delta(delta: &Value) -> Result<(), ()> {
-    for field in [
-        "content",
-        "reasoning_text",
-        "reasoning_content",
-        "reasoning_opaque",
-    ] {
-        validate_optional_string(delta.get(field))?;
-    }
-
-    match delta.get("tool_calls") {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::Array(tool_calls)) => tool_calls.iter().try_for_each(validate_tool_call),
+fn asserted_optional_string(value: Option<&Value>) -> Result<Option<Option<String>>, ()> {
+    match value {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) => Ok(Some(Some(value.clone()))),
         Some(_) => Err(()),
     }
 }
 
-/// Validate every OpenAI Chat Completions usage field consumed by either the
-/// Anthropic wire translator or the translated-flow token recorder. Unknown
-/// usage fields remain allowed. Omitted/null optional counts retain the
-/// existing zero/default semantics, while present counts must be non-negative
-/// JSON integers.
-fn validate_usage(usage: &Value) -> Result<(), ()> {
-    let usage = usage.as_object().ok_or(())?;
-    for field in ["prompt_tokens", "completion_tokens", "total_tokens"] {
-        validate_optional_nonnegative_i64(usage.get(field))?;
+fn validate_service_tier(value: Option<&Value>) -> Result<Option<Option<String>>, ()> {
+    let value = asserted_optional_string(value)?;
+    if let Some(Some(tier)) = &value {
+        if !matches!(
+            tier.as_str(),
+            "auto" | "default" | "flex" | "scale" | "priority"
+        ) {
+            return Err(());
+        }
     }
+    Ok(value)
+}
 
-    let Some(prompt_details) = usage.get("prompt_tokens_details") else {
-        return Ok(());
-    };
-    if prompt_details.is_null() {
-        return Ok(());
+fn validate_chunk_identity(
+    chunk: &Map<String, Value>,
+    state: &AnthropicStreamState,
+) -> Result<ChunkIdentity, ()> {
+    let id = chunk
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(())?
+        .to_string();
+    let model = chunk
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(())?
+        .to_string();
+    if chunk.get("object").and_then(Value::as_str) != Some("chat.completion.chunk") {
+        return Err(());
     }
-    let prompt_details = prompt_details.as_object().ok_or(())?;
-    for field in ["cached_tokens", "cache_creation_input_tokens"] {
-        validate_optional_nonnegative_i64(prompt_details.get(field))?;
+    let created = chunk.get("created").and_then(nonnegative_i64).ok_or(())?;
+    let service_tier = validate_service_tier(chunk.get("service_tier"))?;
+    let system_fingerprint = asserted_optional_string(chunk.get("system_fingerprint"))?;
+    let extras = collect_open_object_extensions(
+        chunk,
+        &[
+            "id",
+            "object",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "error",
+            "service_tier",
+        ],
+        MESSAGE_START_CANONICAL_FIELDS,
+        "chunk",
+    )
+    .map_err(|_| ())?;
+
+    if let Some(expected) = state.chat_id.as_deref() {
+        if id != expected
+            || state.chat_model.as_deref() != Some(model.as_str())
+            || state.chat_created != Some(created)
+        {
+            return Err(());
+        }
+        validate_optional_assertion(&state.chat_service_tier, &service_tier)?;
+        validate_optional_assertion(&state.chat_system_fingerprint, &system_fingerprint)?;
+        for (key, value) in &extras {
+            if key == "system_fingerprint" && value.is_null() {
+                continue;
+            }
+            if state.chat_top_level_extras.get(key) != Some(value) {
+                return Err(());
+            }
+        }
+    }
+    Ok(ChunkIdentity {
+        id,
+        model,
+        created,
+        service_tier,
+        system_fingerprint,
+        extras,
+    })
+}
+
+fn validate_optional_assertion(
+    established: &Option<Option<String>>,
+    current: &Option<Option<String>>,
+) -> Result<(), ()> {
+    if let Some(Some(current)) = current {
+        if established.as_ref().and_then(|value| value.as_ref()) != Some(current) {
+            return Err(());
+        }
     }
     Ok(())
 }
 
-/// Validate the structural fields that drive the translated stream state
-/// machine. Missing data and a value of the wrong JSON type must not collapse
-/// into the same branch as a legitimate empty array: doing so can turn upstream
-/// corruption into a successful Anthropic completion.
-fn validate_chat_chunk(chunk: &Value) -> Result<ValidatedChatChunk<'_>, ()> {
-    let object = chunk.as_object().ok_or(())?;
-    let choices = object.get("choices").and_then(Value::as_array).ok_or(())?;
-
-    if choices.is_empty() {
-        // OpenAI's final include_usage record has an explicitly empty choices
-        // array and a usage object. A bare `choices: []`, null usage, or a usage
-        // value of another type is not that record.
-        let usage = object.get("usage").ok_or(())?;
-        validate_usage(usage)?;
-        return Ok(ValidatedChatChunk::UsageOnly);
+fn validate_choice_extras(choice: &Map<String, Value>) -> Result<(), ()> {
+    if choice.get("logprobs").is_some_and(|value| !value.is_null()) {
+        return Err(());
     }
-
-    // Usage is optional/null on ordinary chunks, but a present non-null value
-    // must retain the object shape consumed by the accounting helpers.
-    if let Some(usage) = object.get("usage").filter(|usage| !usage.is_null()) {
-        validate_usage(usage)?;
+    let extras = collect_open_object_extensions(
+        choice,
+        &["index", "delta", "finish_reason", "logprobs"],
+        &[],
+        "choice",
+    )
+    .map_err(|_| ())?;
+    if extras.is_empty() {
+        Ok(())
+    } else {
+        Err(())
     }
+}
 
-    for choice in choices {
-        let choice = choice.as_object().ok_or(())?;
-        let delta = choice
-            .get("delta")
-            .filter(|delta| delta.is_object())
-            .ok_or(())?;
-        validate_delta(delta)?;
-        if choice
-            .get("finish_reason")
-            .is_some_and(|reason| !reason.is_null() && !reason.is_string())
-        {
+fn validate_delta_extras(delta: &Map<String, Value>) -> Result<(), ()> {
+    if delta
+        .get("role")
+        .is_some_and(|role| !role.is_null() && role.as_str() != Some("assistant"))
+        || delta.get("refusal").is_some_and(|value| !value.is_null())
+        || delta
+            .get("function_call")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err(());
+    }
+    let extras = collect_open_object_extensions(
+        delta,
+        &[
+            "role",
+            "content",
+            "reasoning_text",
+            "reasoning_content",
+            "reasoning_opaque",
+            "tool_calls",
+            "refusal",
+            "function_call",
+        ],
+        &[],
+        "choice.delta",
+    )
+    .map_err(|_| ())?;
+    if extras.is_empty() {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+fn validate_tool_deltas(
+    delta: &Map<String, Value>,
+    state: &AnthropicStreamState,
+) -> Result<Vec<ValidatedToolDelta>, ()> {
+    let calls = match delta.get("tool_calls") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(calls)) => calls,
+        Some(_) => return Err(()),
+    };
+    let mut seen = HashSet::new();
+    let mut next_index = state.tool_calls.len() as i64;
+    let mut validated = Vec::with_capacity(calls.len());
+    for call in calls {
+        let source = call.as_object().ok_or(())?;
+        let index = source.get("index").and_then(nonnegative_i64).ok_or(())?;
+        if !seen.insert(index) {
+            return Err(());
+        }
+        let existing = state.tool_calls.get(&index);
+        let first = existing.is_none();
+        if first && index != next_index {
+            return Err(());
+        }
+        let function = source.get("function").and_then(Value::as_object);
+        if first {
+            if source.get("type").and_then(Value::as_str) != Some("function") {
+                return Err(());
+            }
+            let id = source
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(())?
+                .to_string();
+            let function = function.ok_or(())?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(())?
+                .to_string();
+            validate_optional_string(function.get("arguments"))?;
+            let function_extensions = collect_open_object_extensions(
+                function,
+                &["name", "arguments"],
+                &[],
+                "tool_call.function",
+            )
+            .map_err(|_| ())?;
+            let mut extra = collect_open_object_extensions(
+                source,
+                &["index", "id", "type", "function"],
+                &["type", "id", "name", "input", "chat_function_extensions"],
+                "tool_call",
+            )
+            .map_err(|_| ())?;
+            if !function_extensions.is_empty() {
+                extra.insert(
+                    "chat_function_extensions".to_string(),
+                    Value::Object(function_extensions),
+                );
+            }
+            validated.push(ValidatedToolDelta {
+                index,
+                id: Some(id),
+                name: Some(name),
+                arguments: function
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                extra,
+                first: true,
+            });
+            next_index += 1;
+        } else {
+            if source.get("id").is_some() || source.get("type").is_some() {
+                return Err(());
+            }
+            let function = function.ok_or(())?;
+            if function.get("name").is_some() {
+                return Err(());
+            }
+            let arguments = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .ok_or(())?
+                .to_string();
+            if source
+                .keys()
+                .any(|key| !matches!(key.as_str(), "index" | "function"))
+                || function.keys().any(|key| key != "arguments")
+            {
+                return Err(());
+            }
+            validated.push(ValidatedToolDelta {
+                index,
+                id: None,
+                name: None,
+                arguments: Some(arguments),
+                extra: Map::new(),
+                first: false,
+            });
+        }
+    }
+    Ok(validated)
+}
+
+fn validate_terminal_tools(
+    finish_reason: &str,
+    deltas: &[ValidatedToolDelta],
+    state: &AnthropicStreamState,
+) -> Result<(), ()> {
+    let mut arguments: std::collections::HashMap<i64, String> = state
+        .tool_calls
+        .iter()
+        .map(|(index, call)| (*index, call.arguments.clone()))
+        .collect();
+    for delta in deltas {
+        if delta.first {
+            arguments.insert(delta.index, String::new());
+        }
+        if let Some(fragment) = &delta.arguments {
+            arguments.entry(delta.index).or_default().push_str(fragment);
+        }
+    }
+    if finish_reason == "tool_calls" {
+        if arguments.is_empty() {
+            return Err(());
+        }
+        for index in 0..arguments.len() as i64 {
+            let value: Value =
+                serde_json::from_str(arguments.get(&index).ok_or(())?).map_err(|_| ())?;
+            if !value.is_object() {
+                return Err(());
+            }
+        }
+    } else if !arguments.is_empty() {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_finish_reason(
+    value: Option<&Value>,
+    delta: &DeltaView,
+    state: &AnthropicStreamState,
+) -> Result<Option<String>, ()> {
+    let finish = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => value,
+        _ => return Err(()),
+    };
+    if finish == "function_call"
+        || !matches!(
+            finish.as_str(),
+            "stop" | "length" | "content_filter" | "tool_calls"
+        )
+    {
+        return Err(());
+    }
+    validate_terminal_tools(finish, &delta.tool_calls, state)?;
+    let has_output = state.chat_output_seen
+        || delta.has_content()
+        || delta
+            .reasoning_text
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || delta
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || !delta.tool_calls.is_empty();
+    if !has_output {
+        return Err(());
+    }
+    Ok(Some(finish.to_string()))
+}
+
+fn parse_chunk_usage(
+    chunk: &Map<String, Value>,
+    service_tier: Option<&str>,
+    state: &AnthropicStreamState,
+) -> Result<(Option<AnthropicUsage>, bool), ()> {
+    let Some(usage) = chunk.get("usage") else {
+        return Ok((None, false));
+    };
+    if usage.is_null() {
+        return Ok((None, false));
+    }
+    let parsed = map_openai_chat_completion_usage(usage, service_tier).map_err(|_| ())?;
+    if let Some(existing) = &state.chat_usage_source {
+        if existing != usage {
             return Err(());
         }
     }
+    Ok((Some(parsed), true))
+}
 
-    let choice = &choices[0];
-    Ok(ValidatedChatChunk::Choice(ValidatedChoice {
-        choice,
-        delta: choice.get("delta").ok_or(())?,
-    }))
+fn validate_chat_chunk(
+    chunk: &Value,
+    state: &mut AnthropicStreamState,
+) -> Result<ValidatedChatChunk, ()> {
+    let object = chunk.as_object().ok_or(())?;
+    let identity = validate_chunk_identity(object, state)?;
+    let service_tier = identity
+        .service_tier
+        .as_ref()
+        .and_then(|value| value.as_deref())
+        .or_else(|| {
+            state
+                .chat_service_tier
+                .as_ref()
+                .and_then(|value| value.as_deref())
+        });
+    let (usage, usage_present) = parse_chunk_usage(object, service_tier, state)?;
+    let choices = object.get("choices").and_then(Value::as_array).ok_or(())?;
+
+    let validated = if choices.is_empty() {
+        if !usage_present {
+            return Err(());
+        }
+        ValidatedChatChunk::UsageOnly(usage.clone().ok_or(())?)
+    } else {
+        if choices.len() != 1 || state.pending_message_delta.is_some() {
+            return Err(());
+        }
+        let choice = choices[0].as_object().ok_or(())?;
+        if choice.get("index").and_then(nonnegative_i64) != Some(0) {
+            return Err(());
+        }
+        validate_choice_extras(choice)?;
+        let delta = choice.get("delta").and_then(Value::as_object).ok_or(())?;
+        validate_delta_extras(delta)?;
+        for field in [
+            "content",
+            "reasoning_text",
+            "reasoning_content",
+            "reasoning_opaque",
+        ] {
+            validate_optional_string(delta.get(field))?;
+        }
+        if let (Some(left), Some(right)) = (
+            delta.get("reasoning_text").and_then(Value::as_str),
+            delta.get("reasoning_content").and_then(Value::as_str),
+        ) {
+            if left != right {
+                return Err(());
+            }
+        }
+        let tool_calls = validate_tool_deltas(delta, state)?;
+        let mut delta = DeltaView {
+            content: opt_string(delta.get("content")),
+            reasoning_text: opt_string(delta.get("reasoning_text")),
+            reasoning_content: opt_string(delta.get("reasoning_content")),
+            reasoning_opaque: opt_string(delta.get("reasoning_opaque")),
+            tool_calls,
+        };
+        let finish_reason = validate_finish_reason(choice.get("finish_reason"), &delta, state)?;
+        // Keep the same mutable projection used by the existing reasoning
+        // handler; validation above guarantees every consumed field's type.
+        delta.content = delta.content.take();
+        ValidatedChatChunk::Choice(ValidatedChoice {
+            delta,
+            finish_reason,
+            usage: usage.clone(),
+            usage_present,
+        })
+    };
+
+    if state.chat_id.is_none() {
+        state.chat_id = Some(identity.id);
+        state.chat_model = Some(identity.model);
+        state.chat_created = Some(identity.created);
+        state.chat_service_tier = identity.service_tier;
+        state.chat_system_fingerprint = identity.system_fingerprint;
+        state.chat_top_level_extras = identity.extras;
+    }
+    if let Some(usage) = usage {
+        state.chat_usage = Some(usage);
+        state.chat_usage_source = object.get("usage").cloned();
+    }
+    Ok(validated)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,38 +639,67 @@ pub fn translate_chunk_to_anthropic_events(
         return terminal_stream_error_events(state, error);
     }
 
-    let validated = match validate_chat_chunk(chunk) {
+    let validated = match validate_chat_chunk(chunk, state) {
         Ok(validated) => validated,
         Err(()) => return malformed_stream_error_events(state),
     };
 
     let mut events: Vec<AnthropicStreamEventData> = Vec::new();
-    let ValidatedChatChunk::Choice(ValidatedChoice {
-        choice,
-        delta: delta_value,
-    }) = validated
-    else {
-        // An include_usage chunk is only valid after a finish_reason queued the
-        // terminal message delta. An orphan usage record would otherwise be
-        // silently ignored and allow the malformed stream to continue.
-        if state.pending_message_delta.is_some() {
-            complete_pending_message(state, &mut events, Some(chunk));
-            return events;
+    let (mut delta, finish_reason, usage, usage_present) = match validated {
+        ValidatedChatChunk::UsageOnly(usage) => {
+            // An include_usage chunk is only valid after a finish_reason queued
+            // the terminal message delta.
+            if state.pending_message_delta.is_some() {
+                complete_pending_message(state, &mut events, Some(&usage));
+                return events;
+            }
+            return malformed_stream_error_events(state);
         }
-        return malformed_stream_error_events(state);
+        ValidatedChatChunk::Choice(ValidatedChoice {
+            delta,
+            finish_reason,
+            usage,
+            usage_present,
+        }) => (delta, finish_reason, usage, usage_present),
     };
 
-    let mut delta = DeltaView::from_delta(delta_value);
+    handle_message_start(state, &mut events);
 
-    handle_message_start(state, &mut events, chunk);
+    let output_in_chunk = delta.has_content()
+        || delta
+            .reasoning_text
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || delta
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || !delta.tool_calls.is_empty();
 
     handle_thinking_text(&mut delta, state, &mut events);
 
     handle_content(&delta, state, &mut events);
 
     handle_tool_calls(&delta, state, &mut events);
+    state.chat_output_seen |= output_in_chunk;
 
-    handle_finish(choice, &delta, state, &mut events, chunk);
+    if let Some(finish_reason) = finish_reason {
+        handle_finish(
+            &finish_reason,
+            &delta,
+            state,
+            &mut events,
+            usage.as_ref(),
+            usage_present,
+        );
+    } else if usage_present {
+        // A full usage object before the finishing choice is a stable assertion,
+        // but it cannot terminate the stream by itself.
+        if state.pending_message_delta.is_some() {
+            complete_pending_message(state, &mut events, usage.as_ref());
+            return events;
+        }
+    }
 
     events
 }
@@ -472,7 +852,7 @@ fn is_tool_block_open(state: &AnthropicStreamState) -> bool {
 fn complete_pending_message(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-    chunk: Option<&Value>,
+    usage: Option<&AnthropicUsage>,
 ) {
     if state.terminal_event_emitted {
         state.pending_message_delta = None;
@@ -483,12 +863,11 @@ fn complete_pending_message(
         return;
     };
 
-    // `if (chunk?.usage)` -> refresh the usage on the pending delta.
-    let pending = match (chunk, pending) {
-        (Some(c), AnthropicStreamEventData::MessageDelta { delta, usage: _ }) if has_usage(c) => {
+    let pending = match (usage, pending) {
+        (Some(usage), AnthropicStreamEventData::MessageDelta { delta, usage: _ }) => {
             AnthropicStreamEventData::MessageDelta {
                 delta,
-                usage: Some(get_anthropic_usage_from_openai_chunk(c)),
+                usage: Some(anthropic_delta_usage(usage)),
             }
         }
         (_, pending) => pending,
@@ -498,6 +877,17 @@ fn complete_pending_message(
     events.push(AnthropicStreamEventData::MessageStop);
     state.message_stop_emitted = true;
     state.terminal_event_emitted = true;
+}
+
+fn anthropic_delta_usage(usage: &AnthropicUsage) -> AnthropicMessageDeltaUsage {
+    AnthropicMessageDeltaUsage {
+        input_tokens: Some(usage.input_tokens),
+        output_tokens: usage.output_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        service_tier: usage.service_tier.clone(),
+        extra: usage.extra.clone(),
+    }
 }
 
 fn close_stream_for_error(
@@ -522,17 +912,13 @@ fn close_stream_for_error(
 /// `handleFinish` — on a finishing chunk, close the open block, flush deferred
 /// text, queue the `message_delta`, and (if usage is present) complete it.
 fn handle_finish(
-    choice: &Value,
+    finish_reason: &str,
     delta: &DeltaView,
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-    chunk: &Value,
+    usage: Option<&AnthropicUsage>,
+    usage_present: bool,
 ) {
-    let finish_reason = opt_string(choice.get("finish_reason"));
-    let Some(finish_reason) = finish_reason.filter(|s| !s.is_empty()) else {
-        return;
-    };
-
     // Already terminated: a well-behaved upstream sends one finishing chunk, but
     // an aggregator could send a second usage-bearing one. Ignore it so we never
     // emit a second message_delta/message_stop after the terminal stop.
@@ -562,55 +948,30 @@ fn handle_finish(
     flush_buffered_tool_calls(state, events);
     flush_deferred_content(state, events);
 
+    let effective_usage = usage
+        .cloned()
+        .or_else(|| state.chat_usage.clone())
+        .unwrap_or_else(|| {
+            empty_chat_completion_usage(
+                state
+                    .chat_service_tier
+                    .as_ref()
+                    .and_then(|value| value.as_deref()),
+            )
+        });
     state.pending_message_delta = Some(AnthropicStreamEventData::MessageDelta {
         delta: AnthropicMessageDeltaBody {
-            stop_reason: map_openai_stop_reason_to_anthropic(Some(finish_reason.as_str()))
+            stop_reason: map_openai_stop_reason_to_anthropic(Some(finish_reason))
                 .map(|s| s.to_string()),
             stop_sequence: None,
         },
-        usage: Some(get_anthropic_usage_from_openai_chunk(chunk)),
+        usage: Some(anthropic_delta_usage(&effective_usage)),
     });
+    state.chat_finish_reason = Some(finish_reason.to_string());
 
-    if has_usage(chunk) {
-        complete_pending_message(state, events, Some(chunk));
+    if usage_present {
+        complete_pending_message(state, events, Some(&effective_usage));
     }
-}
-
-/// `getAnthropicUsageFromOpenAIChunk`.
-fn get_anthropic_usage_from_openai_chunk(chunk: &Value) -> AnthropicMessageDeltaUsage {
-    let (cache_creation_tokens, cached_tokens, input_tokens) = get_openai_chunk_usage_tokens(chunk);
-
-    AnthropicMessageDeltaUsage {
-        input_tokens: Some(input_tokens),
-        output_tokens: usage_num(chunk, &["usage", "completion_tokens"]),
-        cache_creation_input_tokens: usage_field_present(chunk, "cache_creation_input_tokens")
-            .then_some(cache_creation_tokens),
-        cache_read_input_tokens: usage_field_present(chunk, "cached_tokens")
-            .then_some(cached_tokens),
-    }
-}
-
-/// `getOpenAIChunkUsageTokens` -> (cacheCreationTokens, cachedTokens, inputTokens).
-fn get_openai_chunk_usage_tokens(chunk: &Value) -> (i64, i64, i64) {
-    let prompt_tokens = usage_num(chunk, &["usage", "prompt_tokens"]);
-    let cached_tokens = usage_num(chunk, &["usage", "prompt_tokens_details", "cached_tokens"]);
-    let cache_creation_tokens = usage_num(
-        chunk,
-        &[
-            "usage",
-            "prompt_tokens_details",
-            "cache_creation_input_tokens",
-        ],
-    );
-
-    (
-        cache_creation_tokens,
-        cached_tokens,
-        prompt_tokens
-            .saturating_sub(cached_tokens)
-            .saturating_sub(cache_creation_tokens)
-            .max(0),
-    )
 }
 
 /// `handleToolCalls`.
@@ -628,31 +989,21 @@ fn handle_tool_calls(
     handle_reasoning_opaque_in_tool_calls(state, events, delta);
 
     for tool_call in &delta.tool_calls {
-        let index = tool_call
-            .get("index")
-            .and_then(nonnegative_i64)
-            .unwrap_or(0);
-        let id = opt_string(tool_call.get("id")).filter(|s| !s.is_empty());
-        let name = tool_call
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|v| opt_string(Some(v)))
-            .filter(|s| !s.is_empty());
-
-        if let (Some(id), Some(name)) = (id, name) {
-            if !state.tool_calls.contains_key(&index) {
-                state.tool_call_order.push(index);
-                state.tool_calls.insert(
-                    index,
-                    AnthropicStreamToolCall {
-                        id,
-                        name,
-                        anthropic_block_index: -1,
-                        buffered_arguments: Vec::new(),
-                        started: false,
-                    },
-                );
-            }
+        let index = tool_call.index;
+        if tool_call.first {
+            state.tool_call_order.push(index);
+            state.tool_calls.insert(
+                index,
+                AnthropicStreamToolCall {
+                    id: tool_call.id.clone().expect("validated tool id"),
+                    name: tool_call.name.clone().expect("validated tool name"),
+                    anthropic_block_index: -1,
+                    buffered_arguments: Vec::new(),
+                    arguments: String::new(),
+                    extra: tool_call.extra.clone(),
+                    started: false,
+                },
+            );
 
             // Anthropic allows only one content block to be active at a time.
             // Stream the first OpenAI tool call immediately; later parallel
@@ -668,14 +1019,16 @@ fn handle_tool_calls(
                 if let Some(info) = state.tool_calls.get_mut(&index) {
                     info.anthropic_block_index = state.content_block_index;
                     info.started = true;
+                    let mut block = Map::from_iter([
+                        ("type".to_string(), json!("tool_use")),
+                        ("id".to_string(), json!(info.id)),
+                        ("name".to_string(), json!(info.name)),
+                        ("input".to_string(), json!({})),
+                    ]);
+                    block.extend(info.extra.clone());
                     events.push(AnthropicStreamEventData::ContentBlockStart {
                         index: info.anthropic_block_index,
-                        content_block: serde_json::json!({
-                            "type": "tool_use",
-                            "id": info.id,
-                            "name": info.name,
-                            "input": {},
-                        }),
+                        content_block: Value::Object(block),
                     });
                 }
                 state.active_tool_call_index = Some(index);
@@ -683,24 +1036,19 @@ fn handle_tool_calls(
             }
         }
 
-        let arguments = tool_call
-            .get("function")
-            .and_then(|f| f.get("arguments"))
-            .and_then(|v| opt_string(Some(v)))
-            .filter(|s| !s.is_empty());
-
-        if let Some(arguments) = arguments {
-            if state.active_tool_call_index == Some(index) {
-                if let Some(info) = state.tool_calls.get(&index) {
+        if let Some(arguments) = &tool_call.arguments {
+            if let Some(info) = state.tool_calls.get_mut(&index) {
+                info.arguments.push_str(arguments);
+                if state.active_tool_call_index == Some(index) {
                     events.push(AnthropicStreamEventData::ContentBlockDelta {
                         index: info.anthropic_block_index,
                         delta: AnthropicContentBlockDelta::InputJsonDelta {
-                            partial_json: arguments,
+                            partial_json: arguments.clone(),
                         },
                     });
+                } else {
+                    info.buffered_arguments.push(arguments.clone());
                 }
-            } else if let Some(info) = state.tool_calls.get_mut(&index) {
-                info.buffered_arguments.push(arguments);
             }
         }
     }
@@ -724,14 +1072,16 @@ fn flush_buffered_tool_calls(
 
         let block_index = state.content_block_index;
         state.content_block_index += 1;
+        let mut block = Map::from_iter([
+            ("type".to_string(), json!("tool_use")),
+            ("id".to_string(), json!(snapshot.id)),
+            ("name".to_string(), json!(snapshot.name)),
+            ("input".to_string(), json!({})),
+        ]);
+        block.extend(snapshot.extra.clone());
         events.push(AnthropicStreamEventData::ContentBlockStart {
             index: block_index,
-            content_block: serde_json::json!({
-                "type": "tool_use",
-                "id": snapshot.id,
-                "name": snapshot.name,
-                "input": {},
-            }),
+            content_block: Value::Object(block),
         });
         for partial_json in snapshot.buffered_arguments {
             events.push(AnthropicStreamEventData::ContentBlockDelta {
@@ -855,40 +1205,29 @@ fn flush_deferred_content(
 fn handle_message_start(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-    chunk: &Value,
 ) {
     if state.message_start_sent {
         return;
     }
 
-    let (cache_creation_tokens, cached_tokens, input_tokens) = get_openai_chunk_usage_tokens(chunk);
-
+    let usage = state.chat_usage.clone().unwrap_or_else(|| {
+        empty_chat_completion_usage(
+            state
+                .chat_service_tier
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+        )
+    });
     let message = AnthropicMessageStart {
-        id: chunk
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+        id: state.chat_id.clone().expect("validated chat id"),
         kind: "message".to_string(),
         role: "assistant".to_string(),
         content: Vec::new(),
-        model: chunk
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+        model: state.chat_model.clone().expect("validated chat model"),
         stop_reason: None,
         stop_sequence: None,
-        usage: AnthropicUsage {
-            input_tokens,
-            output_tokens: 0, // Will be updated in message_delta when finished
-            cache_creation_input_tokens: usage_field_present(chunk, "cache_creation_input_tokens")
-                .then_some(cache_creation_tokens),
-            cache_read_input_tokens: usage_field_present(chunk, "cached_tokens")
-                .then_some(cached_tokens),
-            service_tier: None,
-            extra: serde_json::Map::new(),
-        },
+        usage,
+        extra: state.chat_top_level_extras.clone(),
     };
 
     events.push(AnthropicStreamEventData::MessageStart { message });
@@ -991,38 +1330,6 @@ fn close_thinking_block_if_open(
 }
 
 // ---------------------------------------------------------------------------
-// Usage helpers over the dynamic chunk Value
-// ---------------------------------------------------------------------------
-
-/// `chunk?.usage` is present and is an object.
-fn has_usage(chunk: &Value) -> bool {
-    chunk.get("usage").is_some_and(Value::is_object)
-}
-
-/// Navigate a previously validated usage path and read its non-negative integer
-/// value, retaining the existing `?? 0` behavior for omitted/null fields.
-fn usage_num(chunk: &Value, path: &[&str]) -> i64 {
-    let mut cur = chunk;
-    for key in path {
-        match cur.get(key) {
-            Some(v) => cur = v,
-            None => return 0,
-        }
-    }
-    nonnegative_i64(cur).unwrap_or(0)
-}
-
-/// `chunk.usage?.prompt_tokens_details?.<key> !== undefined` — the key exists
-/// (even if its value is `null`).
-fn usage_field_present(chunk: &Value, key: &str) -> bool {
-    chunk
-        .get("usage")
-        .and_then(|u| u.get("prompt_tokens_details"))
-        .and_then(|d| d.get(key))
-        .is_some()
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1030,6 +1337,60 @@ fn usage_field_present(chunk: &Value, key: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Older focused state-machine tests predate the audited
+    /// ChatCompletionChunk envelope. Supply only the required stable envelope
+    /// and first tool-call discriminator so those tests keep focusing on their
+    /// intended lifecycle assertion. New contract tests call `super::` directly.
+    fn translate_chunk_to_anthropic_events(
+        chunk: &Value,
+        state: &mut AnthropicStreamState,
+    ) -> Vec<AnthropicStreamEventData> {
+        if chunk.get("error").is_some_and(|error| !error.is_null()) {
+            return super::translate_chunk_to_anthropic_events(chunk, state);
+        }
+        let mut chunk = chunk.clone();
+        let Some(object) = chunk.as_object_mut() else {
+            return super::translate_chunk_to_anthropic_events(&chunk, state);
+        };
+        object
+            .entry("id")
+            .or_insert_with(|| json!(state.chat_id.as_deref().unwrap_or("test-chunk")));
+        object
+            .entry("object")
+            .or_insert_with(|| json!("chat.completion.chunk"));
+        object
+            .entry("created")
+            .or_insert_with(|| json!(state.chat_created.unwrap_or(1)));
+        object
+            .entry("model")
+            .or_insert_with(|| json!(state.chat_model.as_deref().unwrap_or("test-model")));
+        if let Some(choices) = object.get_mut("choices").and_then(Value::as_array_mut) {
+            for choice in choices {
+                if let Some(choice_object) = choice.as_object_mut() {
+                    choice_object.entry("index").or_insert_with(|| json!(0));
+                }
+                let Some(tool_calls) = choice
+                    .get_mut("delta")
+                    .and_then(|delta| delta.get_mut("tool_calls"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                for tool_call in tool_calls {
+                    let Some(index) = tool_call.get("index").and_then(nonnegative_i64) else {
+                        continue;
+                    };
+                    if !state.tool_calls.contains_key(&index) {
+                        if let Some(tool_call) = tool_call.as_object_mut() {
+                            tool_call.entry("type").or_insert_with(|| json!("function"));
+                        }
+                    }
+                }
+            }
+        }
+        super::translate_chunk_to_anthropic_events(&chunk, state)
+    }
 
     fn to_values(events: &[AnthropicStreamEventData]) -> Vec<Value> {
         events
@@ -1498,7 +1859,7 @@ mod tests {
 
         let finish = json!({
             "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
-            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6 }
         });
         all.extend(to_values(&translate_chunk_to_anthropic_events(
             &finish, &mut state,
@@ -1532,7 +1893,7 @@ mod tests {
         let c1 = json!({
             "id": "x", "model": "m",
             "choices": [{ "index": 0, "delta": { "tool_calls": [{
-                "index": 0, "id": "call_1", "function": { "name": "f" }
+                "index": 0, "id": "call_1", "function": { "name": "f", "arguments": "{}" }
             }] }, "finish_reason": null }],
         });
         translate_chunk_to_anthropic_events(&c1, &mut state);
@@ -2212,7 +2573,7 @@ mod tests {
                         "reasoning_content": null,
                         "reasoning_opaque": null,
                         "tool_calls": [{
-                            "index": null,
+                            "index": 0,
                             "id": "call_1",
                             "function": {
                                 "name": "lookup",
@@ -2232,18 +2593,17 @@ mod tests {
         assert_eq!(announced[1]["content_block"]["id"], "call_1");
         assert_eq!(state.active_tool_call_index, Some(0));
 
-        // Later argument fragments may omit index, id, and name. Explicit nulls
-        // carry the same optional-field meaning and must not be rejected.
+        // Later argument fragments retain the required index while omitting
+        // first-delta identity fields.
         for (fragment, expected) in [
             (
-                json!({ "function": { "arguments": "{\"city\":" } }),
+                json!({ "index": 0, "function": { "arguments": "{\"city\":" } }),
                 "{\"city\":",
             ),
             (
                 json!({
-                    "index": null,
-                    "id": null,
-                    "function": { "name": null, "arguments": "\"Paris\"}" }
+                    "index": 0,
+                    "function": { "arguments": "\"Paris\"}" }
                 }),
                 "\"Paris\"}",
             ),
@@ -2282,16 +2642,12 @@ mod tests {
                     },
                     "finish_reason": null
                 }],
-                "usage": { "prompt_tokens_details": null }
+                "usage": null
             }),
             json!({
                 "choices": [{
                     "delta": {
-                        "tool_calls": [{
-                            "index": null,
-                            "id": null,
-                            "function": null
-                        }]
+                        "tool_calls": null
                     },
                     "finish_reason": null
                 }]
@@ -2307,13 +2663,10 @@ mod tests {
                     "finish_reason": "tool_calls"
                 }],
                 "usage": {
-                    "prompt_tokens": null,
-                    "completion_tokens": null,
-                    "total_tokens": null,
-                    "prompt_tokens_details": {
-                        "cached_tokens": null,
-                        "cache_creation_input_tokens": null
-                    }
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "prompt_tokens_details": null
                 }
             }),
             &mut state,
@@ -2328,8 +2681,7 @@ mod tests {
                     "usage": {
                         "input_tokens": 0,
                         "output_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0
+                        "chat_prompt_tokens_details": null
                     }
                 }),
                 json!({ "type": "message_stop" }),
@@ -2574,6 +2926,8 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                service_tier: None,
+                extra: Map::new(),
             }),
         });
 

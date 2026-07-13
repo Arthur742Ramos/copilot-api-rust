@@ -993,6 +993,7 @@ fn message_start(
                 service_tier: None,
                 extra: serde_json::Map::new(),
             },
+            extra: serde_json::Map::new(),
         },
     }]
 }
@@ -2669,6 +2670,8 @@ fn map_responses_usage_delta(usage: ValidatedResponsesUsage) -> AnthropicMessage
         output_tokens: usage.output_tokens,
         cache_creation_input_tokens: None,
         cache_read_input_tokens: usage.cached_input_tokens,
+        service_tier: None,
+        extra: serde_json::Map::new(),
     }
 }
 
