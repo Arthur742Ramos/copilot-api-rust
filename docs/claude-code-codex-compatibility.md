@@ -211,8 +211,13 @@ The canonical
 [`ev_response_created`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/core/tests/common/responses.rs#L658-L666)
 contains only a non-empty response id—no model. The bridge therefore uses the
 already validated requested/resolved provider model for Anthropic
-`message_start` when model is absent; a non-empty upstream model, when present,
-is retained instead.
+`message_start` when model is absent or explicitly `null`; a non-empty upstream
+model, when present, is retained instead. For created/completed/incomplete/
+failed snapshots, absent and explicit-null unmodeled fields follow the same
+Codex serde semantics. Status is checked only when it is a non-null string:
+matching lifecycle values are accepted, while wrong strings or non-string,
+non-null values fail. Fields the audited client and bridge do not consume remain
+raw and are not type-gated.
 
 Codex's typed
 [`ResponseCompletedUsage`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/sse/responses.rs#L122-L157)
@@ -255,12 +260,29 @@ SSE item closes any open block and emits exactly one Anthropic error:
   metadata are accepted only with their source-defined string/null or object
   shapes.
 
-Complete result identity, model, terminal status, metadata, item IDs, tool-call
-IDs, item statuses, and usage counters are also validated. Duplicate identities
-or an incomplete item inside a completed response cannot become an empty
-`end_turn`. Unknown item variants remain raw/lifecycle-preserved, and optional
-fields are omitted rather than serialized as synthetic empty values. These
-translated validation rules do not alter native `/v1/responses` forwarding.
+Complete result identity, model, terminal status, item IDs, tool-call IDs, item
+statuses, and usage counters are also validated. Duplicate identities or an
+incomplete item inside a completed response cannot become an empty `end_turn`.
+Client-ignored complete-response extras remain raw rather than being coerced or
+type-gated.
+
+Codex raw output variants have an explicit transport classification:
+
+- Native `/v1/responses` JSON/SSE preserves `additional_tools`,
+  `agent_message`, `local_shell_call`, function/custom-tool outputs,
+  `web_search_call`, `image_generation_call`, `context_compaction`,
+  `compaction_trigger`, and future unknown variants byte-semantically unchanged.
+- Generic Responses-to-Anthropic Messages translation cannot preserve their
+  author/recipient, executed-tool, image, compaction-control, or future semantics,
+  so JSON and SSE fail once with an unsupported-output error rather than
+  returning an empty `end_turn`.
+- The dedicated Messages web-search flow is the sole exception:
+  one completed (or status-omitted/null) `web_search_call` with exactly one
+  non-empty search query maps losslessly to `server_tool_use`, retaining its
+  source ID, followed by the reconstructed `web_search_tool_result` and cited
+  text. Other raw variants, incomplete calls, multiple/empty queries, multiple
+  calls, or unrepresentable web actions fail before JSON or synthetic-SSE
+  success.
 
 Every incrementally streamed item must first have an active
 `response.output_item.added` at its non-negative output index. Optional item IDs
@@ -275,6 +297,10 @@ text and function-call arguments are rendered from that item exactly once.
 Streamed message text and function arguments are reconciled with their complete
 `done` values: a verified missing suffix is emitted, while a conflicting value
 terminates with an error rather than returning truncated text or JSON.
+If `response.created` carries output, it must match the lifecycle's normalized
+added or done snapshot; non-empty created-only output cannot be silently turned
+into `end_turn`. Optional null item fields normalize to omission, while tool
+arguments and other semantic payload data remain exact.
 
 When provider events include OpenAI `sequence_number`, it must increase
 monotonically; an immediately replayed identical frame is ignored, while reused
@@ -290,16 +316,17 @@ explicit omission or conflicts fail closed.
 The SSE event type—not `response.status`—is the terminal discriminator:
 
 - `response.completed` requires the Codex-required response `id`. Optional
-  status is accepted only when it is `completed`; usage is optional and maps to
-  zero when absent. `end_turn: false` maps to Anthropic `pause_turn`
+  status may be absent, `null`, or `completed`; usage is optional and maps to
+  zero when absent/null. `end_turn: false` maps to Anthropic `pause_turn`
   ([Codex requests follow-up inference](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/core/src/session/turn.rs#L2288-L2303)),
   while true/absent values retain normal `end_turn` or `tool_use` behavior.
-- `response.incomplete` accepts absent status and maps
+- `response.incomplete` accepts absent/null status and maps
   `max_output_tokens` to Anthropic `max_tokens` and `content_filter` to
   `refusal`. Unknown or missing truncation reasons terminate with one
-  Anthropic error rather than fabricating success. If status is present it must
-  be `incomplete`.
-- `response.failed` and top-level `error` terminate with one Anthropic error.
+  Anthropic error rather than fabricating success. A non-null status must be
+  `incomplete`.
+- `response.failed` accepts absent/null or matching status and, like top-level
+  `error`, terminates with one Anthropic error.
   Any repeated or later terminal event is ignored.
 
 Created and terminal identities are non-empty and stable: completed and
@@ -319,15 +346,23 @@ reconciliation data, and queued function arguments share the existing 16 MiB
 upstream-response budget. Exceeding a bound uses the same one-error terminal
 cleanup instead of allowing an unfinished stream to grow memory without limit.
 
-The web-search collector follows the same rules. A full `response.created` is
-the merge base; source-valid `response.completed` partials may supply only their
-required ID and authoritative terminal fields. IDs and any repeated
-model/object/status values must agree, usage must pass the strict counter
-contract, completed output-item indices must be contiguous, and terminal output
-must agree with collected `output_item.done` values. Terminal-only output is
-preserved. Failed/incomplete terminals, malformed JSON, conflicting output, or
-malformed usage fail before either a JSON response or synthetic Anthropic SSE
-success is emitted.
+The web-search collector reconciles three snapshots before replying: the full
+`response.created`, optional item lifecycle, and partial terminal. Missing/null
+model, object, output, output text, usage, and metadata are filled without
+overwriting existing values. Repeated model/object/output-text/metadata must
+match; valid usage counters (including cached/reasoning details) must be
+semantically equal. Non-empty created output must semantically match final output, or
+match the lifecycle's added snapshot while the terminal matches its authoritative
+done snapshot. Terminal and lifecycle output must agree under the same canonical
+form. Created-only,
+terminal-only, matching duplicate, and lifecycle-derived output are supported;
+well-typed conflicts fail. Failed/incomplete terminals, malformed JSON, and any
+event after a terminal fail before JSON or synthetic Anthropic SSE success.
+Output comparison canonicalizes only reconstruction semantics: optional null and
+absence are equivalent, ignored item/annotation extensions do not create false
+conflicts, citation URL/title/text and ordering remain authoritative, and cached
+plus reasoning usage details are compared. A representable web-search call keeps
+its original Responses item ID as the Anthropic server-tool ID.
 
 `response.completed` and `response.incomplete` cannot produce Anthropic success
 while an added output item, function call, or reasoning buffer is unfinished.
@@ -342,6 +377,7 @@ evidence is in
 `claude_incomplete_terminals_preserve_truncation_semantics_without_status`,
 `claude_failed_and_error_terminals_suppress_all_later_terminals`,
 `claude_model_less_created_uses_resolved_model_context`,
+`claude_created_output_requires_matching_rendered_lifecycle`,
 `claude_created_and_terminal_identity_fields_fail_closed`,
 `claude_usage_contract_preserves_valid_details_and_omission`,
 `claude_malformed_usage_never_coerces_to_success`,
@@ -352,6 +388,8 @@ evidence is in
 `claude_tool_search_late_identity_corruption_fails_once_after_closing_block`,
 `claude_web_search_partial_terminals_preserve_output_in_json_and_sse`,
 `claude_web_search_terminal_conflicts_fail_before_json_or_sse_success`,
+`claude_raw_output_variants_fail_explicitly_in_json_and_sse`,
+`native_responses_preserves_all_raw_output_variants`,
 and
 `claude_incomplete_or_out_of_order_response_items_fail_once_without_success`,
 in addition to the JSON/SSE framing regressions.
@@ -394,7 +432,7 @@ Status means deterministic, credential-free evidence exists.
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
 | Usage | strict nonnegative input/output/cache mapping; malformed Responses usage errors once | OpenAI cached/reasoning token details | public valid/absent/partial/type/range/overflow usage fixtures |
 | Model routing | aliases, `[1m]`, provider models; model-less created events use validated request context | aliases and `provider/model` | model helpers and public model-less-created boundary tests |
-| Unknown fields | retained in known top-level/items | retained in typed items; uninspected variants raw-preserved | captured extension sentinels and complete `ResponseItem` audit |
+| Unknown fields/output variants | known-field extensions retained; unsupported raw outputs fail explicitly in Messages | typed extensions and all raw variants preserved natively | captured sentinels, paired raw-variant failures, and native passthrough audit |
 | Cancellation | response-body drop releases admission/upstream resources | same | load-shedding and WebSocket cancellation tests |
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
@@ -421,9 +459,10 @@ authentication, body limits, admission, and JSON parsing:
 | premature EOF/transport reset | one retryable terminal error | one terminal OpenAI error; no completion |
 | incomplete/conflicting output-item lifecycle | one terminal Anthropic `error`; open blocks close; later events ignored | native Responses stream is forwarded unchanged |
 | malformed handled item/event scalar | JSON fails before `end_turn`; SSE emits one terminal Anthropic `error`; no empty block or success terminal | forwarded unchanged |
+| raw/unrepresentable output variant | one explicit unsupported-output error in JSON/SSE; dedicated single-query web search is mapped | forwarded unchanged in native JSON/SSE |
 | conflicting/malformed web-search terminal | Anthropic HTTP error before JSON or synthetic-SSE success | forwarded unchanged outside the Messages bridge |
 | empty/mismatched response id or malformed usage | one terminal Anthropic `error`; no success terminal | forwarded unchanged |
-| statusless `response.completed` | one `end_turn`/`tool_use` terminal; usage optional | forwarded unchanged |
+| absent/null-status `response.completed` | one `end_turn`/`tool_use` terminal; usage optional | forwarded unchanged |
 | `response.incomplete` | known truncation reason becomes one Anthropic terminal; unknown reason errors once | forwarded once as terminal incomplete |
 | `response.failed` / `error` | one Anthropic error; later terminals ignored | forwarded in native Responses shape |
 

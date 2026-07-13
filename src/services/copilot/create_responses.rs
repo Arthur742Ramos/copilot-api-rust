@@ -37,6 +37,7 @@ use crate::libs::subagent::SubagentMarker;
 /// so the body round-trips unchanged to the upstream API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesPayload {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -364,10 +365,10 @@ where
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponsesResult {
     pub id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub object: String,
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
-    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub object: Value,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub created_at: Value,
     pub model: String,
     pub output: Vec<ResponseOutputItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -383,22 +384,18 @@ pub struct ResponsesResult {
     pub instructions: Value,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub metadata: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub parallel_tool_calls: Value,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub temperature: Value,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub tool_choice: Value,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub tools: Value,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub top_p: Value,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
-}
-
-fn is_zero_i64(value: &i64) -> bool {
-    *value == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1198,10 @@ mod tests {
             "sequence_number":2,
             "response":{
                 "id":"resp_partial",
+                "status":null,
+                "object":42,
+                "created_at":"ignored",
+                "metadata":["ignored"],
                 "usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}
             }
         }))
@@ -1208,12 +1209,41 @@ mod tests {
         match event {
             ResponseStreamEvent::Completed { response, .. } => {
                 assert_eq!(response["id"], "resp_partial");
+                assert!(response["status"].is_null());
+                assert_eq!(response["object"], 42);
                 assert!(response.get("model").is_none());
                 assert!(response.get("output").is_none());
                 assert!(serde_json::from_value::<ResponsesResult>(response).is_err());
             }
             other => panic!("expected completed event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ignored_complete_response_extras_do_not_get_type_gated() {
+        let result: ResponsesResult = serde_json::from_value(json!({
+            "id":"resp_extras",
+            "model":"gpt-5.4",
+            "status":"completed",
+            "output":[],
+            "object":null,
+            "created_at":"provider-extension",
+            "metadata":["ignored-by-bridge"],
+            "instructions":{"ignored":true},
+            "parallel_tool_calls":"ignored",
+            "tools":{"ignored":true},
+            "temperature":"ignored",
+            "top_p":false
+        }))
+        .expect("client-ignored response extras remain raw");
+        assert!(result.object.is_null());
+        assert_eq!(result.created_at, "provider-extension");
+        assert_eq!(result.parallel_tool_calls, "ignored");
+        assert_eq!(result.tools["ignored"], true);
+        let serialized = serde_json::to_value(result).expect("serialize raw extras");
+        assert!(serialized.get("object").is_none());
+        assert_eq!(serialized["created_at"], "provider-extension");
+        assert_eq!(serialized["metadata"][0], "ignored-by-bridge");
     }
 
     #[test]
@@ -1254,7 +1284,7 @@ mod tests {
         let result: ResponsesResult = serde_json::from_str(raw).expect("parse result");
         assert_eq!(result.id, "resp_456");
         assert_eq!(result.model, "gpt-5-codex");
-        assert_eq!(result.parallel_tool_calls, Some(true));
+        assert_eq!(result.parallel_tool_calls, json!(true));
         assert_eq!(result.output.len(), 1);
         match &result.output[0] {
             ResponseOutputItem::FunctionCall(fc) => {

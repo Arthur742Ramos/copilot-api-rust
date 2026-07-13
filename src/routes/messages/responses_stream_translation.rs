@@ -47,11 +47,12 @@ use super::utils::THINKING_TEXT;
 /// signature must match exactly for Copilot cache hits, so a divergent second
 /// copy would silently corrupt them.
 use super::responses_translation::{
-    effective_reasoning_text, encode_compaction_carrier_signature, encode_reasoning_signature,
-    parse_and_validate_output_item, stable_tool_use_id, validate_function_arguments,
-    validate_output_item_reconciliation, validate_raw_response_fields,
-    validate_raw_responses_usage, validate_terminal_status, OutputValidationPhase,
-    ResponsesTerminalKind, ValidatedResponsesUsage,
+    canonical_anthropic_output_item, effective_reasoning_text, encode_compaction_carrier_signature,
+    encode_reasoning_signature, optional_nonnull_string_field,
+    parse_and_validate_anthropic_output_item, stable_tool_use_id, validate_created_status,
+    validate_function_arguments, validate_output_item_reconciliation, validate_raw_responses_usage,
+    validate_terminal_status, OutputValidationPhase, ResponsesTerminalKind,
+    ValidatedResponsesUsage,
 };
 
 // ---------------------------------------------------------------------------
@@ -102,6 +103,7 @@ pub struct ResponsesStreamState {
     pub message_start_sent: bool,
     pub message_completed: bool,
     pub created_response_id: Option<String>,
+    pub created_output: Option<Vec<Value>>,
     pub fallback_model: Option<String>,
     pub next_content_block_index: i64,
     pub block_index_by_key: HashMap<String, i64>,
@@ -139,6 +141,7 @@ impl ResponsesStreamState {
             message_start_sent: false,
             message_completed: false,
             created_response_id: None,
+            created_output: None,
             fallback_model: fallback_model.filter(|model| !model.trim().is_empty()),
             next_content_block_index: 0,
             block_index_by_key: HashMap::new(),
@@ -397,6 +400,25 @@ fn indices_are_contiguous<T>(parts: &BTreeMap<i64, T>) -> bool {
         .all(|(expected, actual)| i64::try_from(expected).ok() == Some(*actual))
 }
 
+fn output_arrays_equivalent(
+    left: &[Value],
+    left_phase: OutputValidationPhase,
+    right: &[Value],
+    right_phase: OutputValidationPhase,
+) -> Result<bool, &'static str> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left.iter().zip(right) {
+        if canonical_anthropic_output_item(left, left_phase)?
+            != canonical_anthropic_output_item(right, right_phase)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn reserve_reasoning_part(
     state: &mut ResponsesStreamState,
     output_index: i64,
@@ -483,7 +505,7 @@ fn validate_known_output_item(
     _item_type: &str,
     phase: OutputValidationPhase,
 ) -> Result<(), &'static str> {
-    parse_and_validate_output_item(item, phase).map(|_| ())
+    parse_and_validate_anthropic_output_item(item, phase).map(|_| ())
 }
 
 /// A non-empty namespace wins over the required function name.
@@ -570,6 +592,7 @@ fn close_all_open_blocks(
     state.tracked_text_parts = 0;
     state.output_text_by_key.clear();
     state.output_text_done_by_key.clear();
+    state.created_output = None;
 }
 
 /// Mirrors `openTextBlockIfNeeded`.
@@ -873,20 +896,12 @@ fn handle_response_created(
             build_error_event("A response.created event had a missing or empty response id."),
         );
     };
-    if let Err(message) = validate_raw_response_fields(response) {
+    if let Err(message) = validate_created_status(response) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
-    if let Some(status) = response.get("status") {
-        if status.as_str() != Some("in_progress") {
-            return terminate_responses_stream_with_error(
-                state,
-                build_error_event("A response.created event had an inconsistent response status."),
-            );
-        }
-    }
-    let model = match response.get("model") {
-        Some(Value::String(model)) if !model.trim().is_empty() => model.clone(),
-        None => match state.fallback_model.clone() {
+    let model = match optional_nonnull_string_field(response, "model") {
+        Ok(Some(model)) if !model.trim().is_empty() => model.to_string(),
+        Ok(None) => match state.fallback_model.clone() {
             Some(model) => model,
             None => {
                 return terminate_responses_stream_with_error(
@@ -897,11 +912,14 @@ fn handle_response_created(
                 )
             }
         },
-        _ => {
+        Ok(Some(_)) => {
             return terminate_responses_stream_with_error(
                 state,
-                build_error_event("A response.created event contained an invalid model."),
+                build_error_event("A response.created event contained an empty model."),
             )
+        }
+        Err(message) => {
+            return terminate_responses_stream_with_error(state, build_error_event(message))
         }
     };
     let usage = match validate_raw_responses_usage(response) {
@@ -910,7 +928,40 @@ fn handle_response_created(
             return terminate_responses_stream_with_error(state, build_error_event(message))
         }
     };
+    let created_output = match response.get("output") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(output)) => {
+            if output.len() > MAX_TRACKED_OUTPUT_ITEMS {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event("response.created contained too many output items."),
+                );
+            }
+            for item in output {
+                if let Err(message) =
+                    parse_and_validate_anthropic_output_item(item, OutputValidationPhase::Added)
+                {
+                    return terminate_responses_stream_with_error(
+                        state,
+                        build_error_event(message),
+                    );
+                }
+            }
+            let raw_output = Value::Array(output.clone());
+            if let Err(message) = reserve_json_value(state, &raw_output) {
+                return terminate_responses_stream_with_error(state, build_error_event(message));
+            }
+            Some(output.clone())
+        }
+        Some(_) => {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event("response.created contained non-array output."),
+            )
+        }
+    };
     state.created_response_id = Some(id.to_string());
+    state.created_output = created_output;
     message_start(state, id, &model, usage)
 }
 
@@ -2295,9 +2346,6 @@ fn handle_response_completed(
             build_error_event("A terminal Responses event had a missing or empty response id."),
         );
     };
-    if let Err(message) = validate_raw_response_fields(response) {
-        return terminate_responses_stream_with_error(state, build_error_event(message));
-    }
     if state.created_response_id.as_deref() != Some(terminal_id) {
         return terminate_responses_stream_with_error(
             state,
@@ -2339,19 +2387,79 @@ fn handle_response_completed(
             .ok()
             .is_some_and(|index| state.output_items_by_index.contains_key(&index))
     });
-    let terminal_output_mismatch = match response.get("output") {
-        None => false,
-        Some(Value::Array(output)) => {
-            output.len() != state.output_items_by_index.len()
-                || output.iter().enumerate().any(|(index, item)| {
-                    i64::try_from(index).ok().is_none_or(|index| {
-                        state
-                            .output_items_by_index
-                            .get(&index)
-                            .is_none_or(|lifecycle| lifecycle.done_item.as_ref() != Some(item))
-                    })
-                })
+    let lifecycle_initial: Vec<Value> = if output_indices_contiguous {
+        (0..state.output_items_by_index.len())
+            .filter_map(|index| {
+                let index = i64::try_from(index).ok()?;
+                let lifecycle = state.output_items_by_index.get(&index)?;
+                lifecycle
+                    .added_item
+                    .as_ref()
+                    .or(lifecycle.done_item.as_ref())
+                    .cloned()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let lifecycle_final: Vec<Value> = if output_indices_contiguous {
+        (0..state.output_items_by_index.len())
+            .filter_map(|index| {
+                let index = i64::try_from(index).ok()?;
+                state.output_items_by_index.get(&index)?.done_item.clone()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let created_output_mismatch = if let Some(created) = state
+        .created_output
+        .as_ref()
+        .filter(|output| !output.is_empty())
+    {
+        if lifecycle_final.is_empty() {
+            true
+        } else {
+            let matches_initial = match output_arrays_equivalent(
+                created,
+                OutputValidationPhase::Added,
+                &lifecycle_initial,
+                OutputValidationPhase::Added,
+            ) {
+                Ok(matches) => matches,
+                Err(message) => {
+                    return terminate_responses_stream_with_error(state, build_error_event(message))
+                }
+            };
+            let matches_final = match output_arrays_equivalent(
+                created,
+                OutputValidationPhase::Added,
+                &lifecycle_final,
+                OutputValidationPhase::Done,
+            ) {
+                Ok(matches) => matches,
+                Err(message) => {
+                    return terminate_responses_stream_with_error(state, build_error_event(message))
+                }
+            };
+            !matches_initial && !matches_final
         }
+    } else {
+        false
+    };
+    let terminal_output_mismatch = match response.get("output") {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(output)) => match output_arrays_equivalent(
+            output,
+            OutputValidationPhase::Done,
+            &lifecycle_final,
+            OutputValidationPhase::Done,
+        ) {
+            Ok(matches) => !matches,
+            Err(message) => {
+                return terminate_responses_stream_with_error(state, build_error_event(message))
+            }
+        },
         Some(_) => true,
     };
     let terminal_item_status_mismatch = terminal_kind == ResponsesTerminalKind::Completed
@@ -2367,6 +2475,7 @@ fn handle_response_completed(
         || pending_function_call
         || !state.reasoning_state_by_output_index.is_empty()
         || !output_indices_contiguous
+        || created_output_mismatch
         || terminal_output_mismatch
         || terminal_item_status_mismatch
     {
@@ -2422,9 +2531,6 @@ fn handle_response_failed(
             build_error_event("A response.failed event had a missing or empty response id."),
         );
     };
-    if let Err(message) = validate_raw_response_fields(response) {
-        return terminate_responses_stream_with_error(state, build_error_event(message));
-    }
     if state
         .created_response_id
         .as_deref()
@@ -2435,13 +2541,8 @@ fn handle_response_failed(
             build_error_event("A response.failed event id did not match its response.created id."),
         );
     }
-    if let Some(status) = response.get("status") {
-        if status.as_str() != Some("failed") {
-            return terminate_responses_stream_with_error(
-                state,
-                build_error_event("A response.failed event had an inconsistent response status."),
-            );
-        }
+    if let Err(message) = validate_terminal_status(response, ResponsesTerminalKind::Failed) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     let mut events = Vec::new();
     close_all_open_blocks(state, &mut events);

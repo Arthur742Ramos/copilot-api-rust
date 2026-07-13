@@ -20,7 +20,7 @@
 //!   provider-forward callback as a generic and calls
 //!   [`crate::services::copilot::create_responses::create_responses`] directly.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 
 use axum::body::Body;
@@ -45,10 +45,11 @@ use crate::libs::utils::{
 use crate::routes::messages::anthropic_types::{AnthropicMessagesPayload, AnthropicTool};
 use crate::routes::messages::preprocess::{get_compact_type, normalize_system_messages};
 use crate::routes::messages::responses_translation::{
-    parse_and_validate_output_item, translate_anthropic_messages_to_responses_payload,
-    validate_complete_responses_result, validate_output_item_reconciliation,
-    validate_raw_response_fields, validate_raw_responses_usage, validate_terminal_status,
-    OutputValidationPhase, ResponsesTerminalKind,
+    optional_nonnull_string_field, parse_and_validate_output_item,
+    translate_anthropic_messages_to_responses_payload, validate_created_status,
+    validate_output_item_reconciliation, validate_raw_responses_usage, validate_terminal_status,
+    validate_typed_output_items_and_usage, OutputValidationPhase, ResponsesTerminalKind,
+    ValidatedResponsesUsage,
 };
 use crate::routes::messages::web_search::backend::{
     build_responses_web_search_tool, extract_web_search_result, WebSearchExtract,
@@ -58,8 +59,8 @@ use crate::routes::responses::utils::{
     get_responses_request_options, get_responses_transport_for_model,
 };
 use crate::services::copilot::create_responses::{
-    create_responses, CreateResponsesReturn, ResponsesPayload, ResponsesRequestOptions,
-    ResponsesResult, ResponsesTransport,
+    create_responses, CreateResponsesReturn, ResponseOutputContentBlock, ResponseOutputItem,
+    ResponsesPayload, ResponsesRequestOptions, ResponsesResult, ResponsesTransport,
 };
 
 const LOG_TAG: &str = "messages-web-search";
@@ -253,7 +254,10 @@ fn build_response_content(request_id: &str, extract: &WebSearchExtract) -> Vec<V
     let mut blocks: Vec<Value> = Vec::new();
     let query = extract.queries.first().cloned().unwrap_or_default();
     if !extract.sources.is_empty() || !query.is_empty() {
-        let tool_use_id = format!("srvtoolu_{}", get_uuid(request_id));
+        let tool_use_id = extract
+            .tool_use_id
+            .clone()
+            .unwrap_or_else(|| format!("srvtoolu_{}", get_uuid(request_id)));
         blocks.push(json!({
             "type": "server_tool_use",
             "id": tool_use_id,
@@ -333,12 +337,100 @@ pub fn reconstruct_web_search_response(
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(), AppError> {
-    validate_complete_responses_result(result)?;
-    if result.status != "completed" {
+fn representable_web_search_query(raw: &Value) -> Result<String, AppError> {
+    let action = raw
+        .get("action")
+        .and_then(Value::as_object)
+        .filter(|action| action.get("type").and_then(Value::as_str) == Some("search"))
+        .ok_or_else(|| {
+            invalid_web_search_stream(
+                "the web-search call action cannot be represented by Anthropic web_search",
+            )
+        })?;
+    let fallback_query = || {
+        action
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|query| !query.is_empty())
+            .map(|query| vec![query])
+            .unwrap_or_default()
+    };
+    let queries: Vec<&str> = match action.get("queries") {
+        None | Some(Value::Null) => fallback_query(),
+        Some(Value::Array(queries)) if queries.is_empty() => fallback_query(),
+        Some(Value::Array(queries))
+            if queries
+                .iter()
+                .all(|query| query.as_str().is_some_and(|query| !query.is_empty())) =>
+        {
+            queries.iter().filter_map(Value::as_str).collect()
+        }
+        Some(_) => {
+            return Err(invalid_web_search_stream(
+                "the web-search call queries field was invalid",
+            ))
+        }
+    };
+    if queries.len() != 1 {
         return Err(invalid_web_search_stream(
-            "the web-search response did not complete successfully",
+            "the web-search call did not contain exactly one representable query",
         ));
+    }
+    Ok(queries[0].to_string())
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(), AppError> {
+    if result.id.trim().is_empty() || result.status != "completed" {
+        return Err(invalid_web_search_stream(
+            "the web-search response had invalid identity or completion status",
+        ));
+    }
+    validate_typed_output_items_and_usage(result)?;
+
+    let mut web_search_calls = 0_usize;
+    for item in &result.output {
+        let raw = match item {
+            ResponseOutputItem::Message(message) => {
+                if message.content.iter().any(|block| {
+                    !matches!(
+                        block,
+                        ResponseOutputContentBlock::Text(text)
+                            if text.block_type == "output_text"
+                    )
+                }) {
+                    return Err(invalid_web_search_stream(
+                        "the web-search response contained unsupported message content",
+                    ));
+                }
+                continue;
+            }
+            ResponseOutputItem::Other(raw) => raw,
+            _ => return Err(invalid_web_search_stream(
+                "the web-search response contained an output item unsupported by reconstruction",
+            )),
+        };
+        if raw.get("type").and_then(Value::as_str) != Some("web_search_call") {
+            return Err(invalid_web_search_stream(
+                "the web-search response contained an unsupported raw output variant",
+            ));
+        }
+        web_search_calls += 1;
+        if web_search_calls > 1 {
+            return Err(invalid_web_search_stream(
+                "multiple web-search calls cannot be represented losslessly",
+            ));
+        }
+        optional_nonnull_string_field(raw, "id").map_err(invalid_web_search_stream)?;
+        if optional_nonnull_string_field(raw, "status")
+            .map_err(invalid_web_search_stream)?
+            .is_some_and(|status| status != "completed")
+        {
+            return Err(invalid_web_search_stream(
+                "the completed web-search call had a non-completed status",
+            ));
+        }
+        representable_web_search_query(raw)?;
     }
     Ok(())
 }
@@ -421,12 +513,50 @@ fn optional_event_string<'a>(value: &'a Value, field: &str) -> Result<Option<&'a
     }
 }
 
-/// `isResponsesTerminalEvent`.
-fn is_responses_terminal_event(event: &Value) -> bool {
-    matches!(
-        event_type(event),
-        Some("response.completed") | Some("response.failed") | Some("response.incomplete")
-    ) && event.get("response").map(Value::is_object).unwrap_or(false)
+#[allow(clippy::result_large_err)]
+fn validate_web_search_snapshot_fields(
+    response: &Value,
+    phase: OutputValidationPhase,
+) -> Result<(), AppError> {
+    if optional_nonnull_string_field(response, "model")
+        .map_err(invalid_web_search_stream)?
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        return Err(invalid_web_search_stream(
+            "a web-search response snapshot had an empty model",
+        ));
+    }
+    if optional_nonnull_string_field(response, "object")
+        .map_err(invalid_web_search_stream)?
+        .is_some_and(|object| object != "response")
+    {
+        return Err(invalid_web_search_stream(
+            "a web-search response snapshot had an invalid object",
+        ));
+    }
+    match response.get("output") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(output)) => {
+            for item in output {
+                parse_and_validate_output_item(item, phase).map_err(invalid_web_search_stream)?;
+            }
+        }
+        Some(_) => {
+            return Err(invalid_web_search_stream(
+                "a web-search response snapshot had non-array output",
+            ))
+        }
+    }
+    if response
+        .get("output_text")
+        .is_some_and(|output_text| !output_text.is_null() && !output_text.is_string())
+    {
+        return Err(invalid_web_search_stream(
+            "a web-search response snapshot had invalid output_text",
+        ));
+    }
+    validate_raw_responses_usage(response).map_err(invalid_web_search_stream)?;
+    Ok(())
 }
 
 /// `getStreamErrorMessage`.
@@ -544,6 +674,11 @@ fn collect_web_search_responses_stream_event(
 ) -> Result<(), AppError> {
     let event_type = event_type(event)
         .ok_or_else(|| invalid_web_search_stream("an event had a missing or invalid type"))?;
+    if state.terminal_response.is_some() {
+        return Err(invalid_web_search_stream(
+            "an event arrived after the terminal Responses event",
+        ));
+    }
     if state.created_response.is_none() && !matches!(event_type, "response.created" | "error") {
         return Err(invalid_web_search_stream(
             "an event arrived before response.created",
@@ -569,15 +704,8 @@ fn collect_web_search_responses_stream_event(
                 .ok_or_else(|| {
                     invalid_web_search_stream("response.created had an invalid response id")
                 })?;
-            if let Some(status) = response.get("status") {
-                if status.as_str() != Some("in_progress") {
-                    return Err(invalid_web_search_stream(
-                        "response.created had an inconsistent status",
-                    ));
-                }
-            }
-            validate_raw_response_fields(response).map_err(invalid_web_search_stream)?;
-            validate_raw_responses_usage(response).map_err(invalid_web_search_stream)?;
+            validate_created_status(response).map_err(invalid_web_search_stream)?;
+            validate_web_search_snapshot_fields(response, OutputValidationPhase::Added)?;
             state.created_response = Some(response.clone());
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
@@ -594,9 +722,10 @@ fn collect_web_search_responses_stream_event(
                 })?;
             let terminal_kind = ResponsesTerminalKind::from_event_type(event_type)
                 .expect("matched terminal event type");
-            validate_raw_response_fields(response).map_err(invalid_web_search_stream)?;
             validate_terminal_status(response, terminal_kind).map_err(invalid_web_search_stream)?;
-            validate_raw_responses_usage(response).map_err(invalid_web_search_stream)?;
+            if terminal_kind == ResponsesTerminalKind::Completed {
+                validate_web_search_snapshot_fields(response, OutputValidationPhase::Done)?;
+            }
             state.terminal_response = Some(response.clone());
             state.terminal_kind = Some(terminal_kind);
         }
@@ -887,6 +1016,30 @@ fn build_collected_web_search_output(
 }
 
 #[allow(clippy::result_large_err)]
+fn build_lifecycle_initial_output(
+    state: &WebSearchResponsesStreamCollection,
+) -> Result<Option<Vec<Value>>, AppError> {
+    if state.output_items_by_index.is_empty() {
+        return Ok(None);
+    }
+    let mut output = Vec::with_capacity(state.output_items_by_index.len());
+    for (expected, (output_index, lifecycle)) in state.output_items_by_index.iter().enumerate() {
+        if i64::try_from(expected).ok() != Some(*output_index) {
+            return Err(invalid_web_search_stream(
+                "output item indices were sparse or out of order",
+            ));
+        }
+        let item = lifecycle
+            .added
+            .as_ref()
+            .or(lifecycle.done.as_ref())
+            .ok_or_else(|| invalid_web_search_stream("an output lifecycle had no item snapshot"))?;
+        output.push(item.clone());
+    }
+    Ok(Some(output))
+}
+
+#[allow(clippy::result_large_err)]
 fn validate_reconciled_response_identity(
     created: &Map<String, Value>,
     terminal: &Map<String, Value>,
@@ -907,18 +1060,13 @@ fn validate_reconciled_response_identity(
         ));
     }
     for field in ["model", "object"] {
-        if let Some(terminal_value) = terminal.get(field) {
-            let terminal_value = terminal_value.as_str().ok_or_else(|| {
-                invalid_web_search_stream(format_args!(
-                    "the terminal response {field} was not a string"
-                ))
-            })?;
-            if let Some(created_value) = created.get(field).and_then(Value::as_str) {
-                if created_value != terminal_value {
-                    return Err(invalid_web_search_stream(format_args!(
-                        "the terminal response {field} conflicted with response.created"
-                    )));
-                }
+        let created_value = created.get(field).filter(|value| !value.is_null());
+        let terminal_value = terminal.get(field).filter(|value| !value.is_null());
+        if let (Some(created_value), Some(terminal_value)) = (created_value, terminal_value) {
+            if created_value != terminal_value {
+                return Err(invalid_web_search_stream(format_args!(
+                    "the terminal response {field} conflicted with response.created"
+                )));
             }
         }
     }
@@ -926,20 +1074,232 @@ fn validate_reconciled_response_identity(
 }
 
 #[allow(clippy::result_large_err)]
-fn validated_terminal_output(
-    terminal: &Map<String, Value>,
+fn validated_snapshot_output(
+    snapshot: &Map<String, Value>,
+    phase: OutputValidationPhase,
 ) -> Result<Option<Vec<Value>>, AppError> {
-    let Some(output) = terminal.get("output") else {
+    let Some(output) = snapshot.get("output").filter(|output| !output.is_null()) else {
         return Ok(None);
     };
     let output = output
         .as_array()
         .ok_or_else(|| invalid_web_search_stream("terminal output was not an array"))?;
     for item in output {
-        parse_and_validate_output_item(item, OutputValidationPhase::Done)
-            .map_err(invalid_web_search_stream)?;
+        parse_and_validate_output_item(item, phase).map_err(invalid_web_search_stream)?;
     }
     Ok(Some(output.clone()))
+}
+
+fn canonical_web_annotations(annotations: &[Value]) -> Vec<Value> {
+    let mut seen_urls = HashSet::new();
+    let mut canonical = Vec::new();
+    for annotation in annotations {
+        if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+            continue;
+        }
+        let Some(url) = annotation
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+        else {
+            continue;
+        };
+        if !seen_urls.insert(url.to_string()) {
+            continue;
+        }
+        let title = annotation
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(url);
+        canonical.push(json!({"type":"url_citation","url":url,"title":title}));
+    }
+    canonical
+}
+
+#[allow(clippy::result_large_err)]
+fn canonical_web_output_item(
+    value: &Value,
+    phase: OutputValidationPhase,
+) -> Result<Value, AppError> {
+    match parse_and_validate_output_item(value, phase).map_err(invalid_web_search_stream)? {
+        ResponseOutputItem::Message(message) => {
+            let mut canonical = Map::new();
+            canonical.insert("type".to_string(), Value::String("message".to_string()));
+            if let Some(id) = message.id {
+                canonical.insert("id".to_string(), Value::String(id));
+            }
+            canonical.insert("role".to_string(), Value::String(message.role));
+            let mut content = Vec::with_capacity(message.content.len());
+            for block in message.content {
+                let ResponseOutputContentBlock::Text(text) = block else {
+                    return Err(invalid_web_search_stream(
+                        "web-search message content was unsupported",
+                    ));
+                };
+                content.push(json!({
+                    "type":text.block_type,
+                    "text":text.text,
+                    "annotations":canonical_web_annotations(&text.annotations)
+                }));
+            }
+            canonical.insert("content".to_string(), Value::Array(content));
+            Ok(Value::Object(canonical))
+        }
+        ResponseOutputItem::Other(raw)
+            if raw.get("type").and_then(Value::as_str) == Some("web_search_call") =>
+        {
+            let mut canonical = Map::new();
+            canonical.insert(
+                "type".to_string(),
+                Value::String("web_search_call".to_string()),
+            );
+            if let Some(id) =
+                optional_nonnull_string_field(&raw, "id").map_err(invalid_web_search_stream)?
+            {
+                canonical.insert("id".to_string(), Value::String(id.to_string()));
+            }
+            canonical.insert(
+                "query".to_string(),
+                Value::String(representable_web_search_query(&raw)?),
+            );
+            Ok(Value::Object(canonical))
+        }
+        _ => Err(invalid_web_search_stream(
+            "web-search output contained an unsupported item",
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn web_output_arrays_equivalent(
+    left: &[Value],
+    left_phase: OutputValidationPhase,
+    right: &[Value],
+    right_phase: OutputValidationPhase,
+) -> Result<bool, AppError> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left.iter().zip(right) {
+        if canonical_web_output_item(left, left_phase)?
+            != canonical_web_output_item(right, right_phase)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::result_large_err)]
+fn validated_snapshot_usage(
+    snapshot: &Map<String, Value>,
+) -> Result<Option<(ValidatedResponsesUsage, Value)>, AppError> {
+    let Some(usage) = snapshot.get("usage").filter(|usage| !usage.is_null()) else {
+        return Ok(None);
+    };
+    let response = json!({"usage":usage});
+    let validated = validate_raw_responses_usage(&response).map_err(invalid_web_search_stream)?;
+    Ok(Some((validated, usage.clone())))
+}
+
+#[allow(clippy::result_large_err)]
+fn reconcile_snapshot_value(
+    created: &Map<String, Value>,
+    terminal: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<Value>, AppError> {
+    let created_value = created.get(field).filter(|value| !value.is_null());
+    let terminal_value = terminal.get(field).filter(|value| !value.is_null());
+    match (created_value, terminal_value) {
+        (Some(created), Some(terminal)) if created != terminal => Err(invalid_web_search_stream(
+            format_args!("terminal {field} conflicted with response.created"),
+        )),
+        (Some(created), _) => Ok(Some(created.clone())),
+        (None, Some(terminal)) => Ok(Some(terminal.clone())),
+        (None, None) => Ok(None),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn reconcile_snapshot_usage(
+    created: &Map<String, Value>,
+    terminal: &Map<String, Value>,
+) -> Result<Option<Value>, AppError> {
+    let created_usage = validated_snapshot_usage(created)?;
+    let terminal_usage = validated_snapshot_usage(terminal)?;
+    match (created_usage, terminal_usage) {
+        (Some((created, _)), Some((terminal, _))) if created != terminal => Err(
+            invalid_web_search_stream("terminal usage conflicted with response.created"),
+        ),
+        (Some((_, raw)), _) => Ok(Some(raw)),
+        (None, Some((_, raw))) => Ok(Some(raw)),
+        (None, None) => Ok(None),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn reconcile_web_search_output(
+    created: Option<Vec<Value>>,
+    terminal: Option<Vec<Value>>,
+    lifecycle_initial: Option<Vec<Value>>,
+    lifecycle_final: Option<Vec<Value>>,
+) -> Result<Vec<Value>, AppError> {
+    let mut authoritative = match (terminal, lifecycle_final.clone()) {
+        (Some(terminal), Some(lifecycle)) => {
+            if !web_output_arrays_equivalent(
+                &terminal,
+                OutputValidationPhase::Done,
+                &lifecycle,
+                OutputValidationPhase::Done,
+            )? {
+                return Err(invalid_web_search_stream(
+                    "web-search output snapshots conflicted",
+                ));
+            }
+            Some(terminal)
+        }
+        (Some(terminal), None) => Some(terminal),
+        (None, Some(lifecycle)) => Some(lifecycle),
+        (None, None) => None,
+    };
+
+    if let Some(created) = created.filter(|created| !created.is_empty()) {
+        match authoritative.as_ref() {
+            None => authoritative = Some(created),
+            Some(final_output) => {
+                let matches_final = web_output_arrays_equivalent(
+                    &created,
+                    OutputValidationPhase::Added,
+                    final_output,
+                    OutputValidationPhase::Done,
+                )?;
+                let matches_lifecycle = match (lifecycle_initial.as_ref(), lifecycle_final.as_ref())
+                {
+                    (Some(initial), Some(final_lifecycle)) => {
+                        web_output_arrays_equivalent(
+                            &created,
+                            OutputValidationPhase::Added,
+                            initial,
+                            OutputValidationPhase::Added,
+                        )? && web_output_arrays_equivalent(
+                            final_output,
+                            OutputValidationPhase::Done,
+                            final_lifecycle,
+                            OutputValidationPhase::Done,
+                        )?
+                    }
+                    _ => false,
+                };
+                if !matches_final && !matches_lifecycle {
+                    return Err(invalid_web_search_stream(
+                        "response.created output conflicted with the terminal/lifecycle output",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(authoritative.unwrap_or_default())
 }
 
 /// Merge a full `response.created` object with a source-valid partial terminal.
@@ -964,8 +1324,6 @@ fn build_web_search_responses_stream_result(
         .ok_or_else(|| invalid_web_search_stream("the stream had no terminal event type"))?;
     validate_reconciled_response_identity(created, terminal)?;
     validate_terminal_status(&Value::Object(terminal.clone()), terminal_kind)
-        .map_err(invalid_web_search_stream)?;
-    validate_raw_responses_usage(&Value::Object(terminal.clone()))
         .map_err(invalid_web_search_stream)?;
 
     match terminal_kind {
@@ -994,33 +1352,51 @@ fn build_web_search_responses_stream_result(
         ResponsesTerminalKind::Completed => {}
     }
 
-    let collected_output = build_collected_web_search_output(state)?;
-    let terminal_output = validated_terminal_output(terminal)?;
-    let output = if collected_output.is_empty() {
-        match terminal_output {
-            Some(output) => output,
-            None => created
-                .get("output")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-        }
+    let created_output = validated_snapshot_output(created, OutputValidationPhase::Added)?;
+    let terminal_output = validated_snapshot_output(terminal, OutputValidationPhase::Done)?;
+    let lifecycle_initial = build_lifecycle_initial_output(state)?;
+    let lifecycle_final = if state.output_items_by_index.is_empty() {
+        None
     } else {
-        if terminal_output
-            .as_ref()
-            .is_some_and(|terminal| terminal != &collected_output)
-        {
-            return Err(invalid_web_search_stream(
-                "terminal output conflicted with completed output items",
-            ));
-        }
-        collected_output
+        Some(build_collected_web_search_output(state)?)
     };
+    let output = reconcile_web_search_output(
+        created_output,
+        terminal_output,
+        lifecycle_initial,
+        lifecycle_final,
+    )?;
+    let usage = reconcile_snapshot_usage(created, terminal)?;
+    let metadata = reconcile_snapshot_value(created, terminal, "metadata")?;
+    let output_text = reconcile_snapshot_value(created, terminal, "output_text")?;
+    let model = reconcile_snapshot_value(created, terminal, "model")?;
+    let object = reconcile_snapshot_value(created, terminal, "object")?;
 
     let mut response = created.clone();
     for (key, value) in terminal {
-        if !matches!(key.as_str(), "output" | "status") {
+        if !matches!(
+            key.as_str(),
+            "id" | "model" | "object" | "status" | "output" | "output_text" | "usage" | "metadata"
+        ) && !value.is_null()
+            && response.get(key).is_none_or(Value::is_null)
+        {
             response.insert(key.clone(), value.clone());
+        }
+    }
+    for (field, value) in [
+        ("model", model),
+        ("object", object),
+        ("output_text", output_text),
+        ("usage", usage),
+        ("metadata", metadata),
+    ] {
+        match value {
+            Some(value) => {
+                response.insert(field.to_string(), value);
+            }
+            None => {
+                response.remove(field);
+            }
         }
     }
     response.insert(
@@ -1031,7 +1407,7 @@ fn build_web_search_responses_stream_result(
 
     let result: ResponsesResult = serde_json::from_value(Value::Object(response))
         .map_err(|error| invalid_web_search_stream(format_args!("merged response: {error}")))?;
-    validate_complete_responses_result(&result)?;
+    validate_web_search_result(&result)?;
     Ok(result)
 }
 
@@ -1052,7 +1428,10 @@ pub async fn collect_web_search_responses_stream_result(
         if event.event.as_deref() == Some("ping") {
             continue;
         }
-        if event.data.is_empty() || event.data == "[DONE]" {
+        if event.data == "[DONE]" {
+            break;
+        }
+        if event.data.is_empty() {
             continue;
         }
 
@@ -1067,15 +1446,15 @@ pub async fn collect_web_search_responses_stream_result(
                 .unwrap_or_else(|| format!("{error_message_prefix} failed"));
             return Err(AppError::Other(anyhow::anyhow!(message)));
         }
-
-        if is_responses_terminal_event(&parsed) {
-            return build_web_search_responses_stream_result(&state);
-        }
     }
 
-    Err(AppError::Other(anyhow::anyhow!(
-        "{error_message_prefix} ended without a terminal event"
-    )))
+    if state.terminal_response.is_some() {
+        build_web_search_responses_stream_result(&state)
+    } else {
+        Err(AppError::Other(anyhow::anyhow!(
+            "{error_message_prefix} ended without a terminal event"
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1116,6 +1116,7 @@ pub(crate) struct ValidatedResponsesUsage {
     pub input_tokens: i64,
     pub cached_input_tokens: Option<i64>,
     pub output_tokens: i64,
+    pub reasoning_output_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1318,7 +1319,11 @@ pub(crate) fn validate_typed_output_item(
             }
             validate_internal_metadata(&compaction.extra)?;
         }
-        ResponseOutputItem::Other(_) => {}
+        ResponseOutputItem::Other(_) => {
+            // Raw variants remain valid for native forwarding and the dedicated
+            // web-search classifier. Anthropic translation applies the stricter
+            // `parse_and_validate_anthropic_output_item` policy below.
+        }
     }
     Ok(())
 }
@@ -1331,6 +1336,26 @@ pub(crate) fn parse_and_validate_output_item(
         .map_err(|_| "A known output item did not match its typed Responses contract.")?;
     validate_typed_output_item(&item, phase)?;
     Ok(item)
+}
+
+pub(crate) fn parse_and_validate_anthropic_output_item(
+    value: &Value,
+    phase: OutputValidationPhase,
+) -> Result<ResponseOutputItem, &'static str> {
+    let item = parse_and_validate_output_item(value, phase)?;
+    if matches!(item, ResponseOutputItem::Other(_)) {
+        return Err("The Responses output contained a variant unsupported by Anthropic Messages.");
+    }
+    Ok(item)
+}
+
+pub(crate) fn canonical_anthropic_output_item(
+    value: &Value,
+    phase: OutputValidationPhase,
+) -> Result<Value, &'static str> {
+    let item = parse_and_validate_anthropic_output_item(value, phase)?;
+    serde_json::to_value(item)
+        .map_err(|_| "A Responses output item could not be canonicalized for reconciliation.")
 }
 
 fn required_nonnegative_usage_field(
@@ -1387,6 +1412,7 @@ fn validate_usage_counters(
         input_tokens,
         cached_input_tokens,
         output_tokens,
+        reasoning_output_tokens,
     })
 }
 
@@ -1443,90 +1469,36 @@ pub(crate) fn validate_terminal_status(
     response: &Value,
     terminal_kind: ResponsesTerminalKind,
 ) -> Result<(), &'static str> {
-    if response
-        .get("status")
-        .is_some_and(|status| status.as_str() != Some(terminal_kind.expected_status()))
-    {
-        return Err("A terminal Responses event had an inconsistent response status.");
+    match response.get("status") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(status)) if status == terminal_kind.expected_status() => Ok(()),
+        Some(Value::String(_)) => {
+            Err("A terminal Responses event had an inconsistent response status.")
+        }
+        Some(_) => Err("A terminal Responses event had a non-string response status."),
     }
-    Ok(())
 }
 
-pub(crate) fn validate_raw_response_fields(response: &Value) -> Result<(), &'static str> {
-    let Some(response) = response.as_object() else {
-        return Err("A Responses event had an invalid response object.");
-    };
-    if response
-        .get("object")
-        .is_some_and(|object| object.as_str() != Some("response"))
-    {
-        return Err("A Responses response object field was invalid.");
-    }
-    if response
-        .get("created_at")
-        .is_some_and(|created_at| created_at.as_i64().is_none_or(|created_at| created_at < 0))
-    {
-        return Err("A Responses response created_at field was invalid.");
-    }
-    if response
-        .get("model")
-        .is_some_and(|model| model.as_str().is_none_or(|model| model.trim().is_empty()))
-    {
-        return Err("A Responses response model field was invalid.");
-    }
-    if response
-        .get("output")
-        .is_some_and(|output| !output.is_array())
-    {
-        return Err("A Responses response output field was not an array.");
-    }
-    if response
-        .get("output_text")
-        .is_some_and(|output_text| !output_text.is_null() && !output_text.is_string())
-    {
-        return Err("A Responses response output_text field was invalid.");
-    }
-    if response
-        .get("metadata")
-        .is_some_and(|metadata| !metadata.is_null() && !metadata.is_object())
-    {
-        return Err("A Responses response metadata field was invalid.");
-    }
-    if response
-        .get("instructions")
-        .is_some_and(|instructions| !instructions.is_null() && !instructions.is_string())
-    {
-        return Err("A Responses response instructions field was invalid.");
-    }
-    if response
-        .get("parallel_tool_calls")
-        .is_some_and(|parallel| !parallel.is_null() && !parallel.is_boolean())
-    {
-        return Err("A Responses response parallel_tool_calls field was invalid.");
-    }
-    if response
-        .get("tools")
-        .is_some_and(|tools| !tools.is_null() && !tools.is_array())
-    {
-        return Err("A Responses response tools field was invalid.");
-    }
-    for field in ["temperature", "top_p"] {
-        if response
-            .get(field)
-            .is_some_and(|value| !value.is_null() && !value.is_number())
-        {
-            return Err("A Responses response sampling field was invalid.");
+pub(crate) fn validate_created_status(response: &Value) -> Result<(), &'static str> {
+    match response.get("status") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(status)) if status == "in_progress" => Ok(()),
+        Some(Value::String(_)) => {
+            Err("A response.created event had an inconsistent response status.")
         }
+        Some(_) => Err("A response.created event had a non-string response status."),
     }
-    for field in ["error", "incomplete_details"] {
-        if response
-            .get(field)
-            .is_some_and(|value| !value.is_null() && !value.is_object())
-        {
-            return Err("A Responses response error/details field was invalid.");
-        }
+}
+
+pub(crate) fn optional_nonnull_string_field<'a>(
+    response: &'a Value,
+    field: &str,
+) -> Result<Option<&'a str>, &'static str> {
+    match response.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err("A supported Responses field was not a string or null."),
     }
-    Ok(())
 }
 
 pub(crate) fn reconcile_tool_search_call_id<'a>(
@@ -1711,28 +1683,9 @@ fn output_item_status(item: &ResponseOutputItem) -> Option<&str> {
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) fn validate_complete_responses_result(
+pub(crate) fn validate_typed_output_items_and_usage(
     response: &ResponsesResult,
 ) -> Result<(), AppError> {
-    if response.id.trim().is_empty()
-        || response.model.trim().is_empty()
-        || !matches!(response.status.as_str(), "completed" | "incomplete")
-    {
-        return Err(invalid_upstream_output(
-            "response id/model/status was missing or invalid",
-        ));
-    }
-    if !response.object.is_empty() && response.object != "response" {
-        return Err(invalid_upstream_output("response object was invalid"));
-    }
-    if response.created_at < 0 {
-        return Err(invalid_upstream_output("response created_at was negative"));
-    }
-    let raw_response = serde_json::to_value(response).map_err(|error| {
-        invalid_upstream_output(format_args!("response serialization: {error}"))
-    })?;
-    validate_raw_response_fields(&raw_response).map_err(invalid_upstream_output)?;
-
     let mut item_ids = HashSet::new();
     let mut tool_call_ids = HashSet::new();
     for item in &response.output {
@@ -1758,6 +1711,21 @@ pub(crate) fn validate_complete_responses_result(
     }
     validate_typed_responses_usage(response.usage.as_ref()).map_err(invalid_upstream_output)?;
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn validate_complete_responses_result(
+    response: &ResponsesResult,
+) -> Result<(), AppError> {
+    if response.id.trim().is_empty()
+        || response.model.trim().is_empty()
+        || !matches!(response.status.as_str(), "completed" | "incomplete")
+    {
+        return Err(invalid_upstream_output(
+            "response id/model/status was missing or invalid",
+        ));
+    }
+    validate_typed_output_items_and_usage(response)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1848,7 +1816,11 @@ fn map_output_to_anthropic_content(
             ResponseOutputItem::Compaction(compaction) => {
                 content_blocks.push(create_compaction_thinking_block(compaction));
             }
-            ResponseOutputItem::Other(_) => {}
+            ResponseOutputItem::Other(_) => {
+                return Err(invalid_upstream_output(
+                    "output variant is unsupported by Anthropic Messages",
+                ))
+            }
         }
     }
 

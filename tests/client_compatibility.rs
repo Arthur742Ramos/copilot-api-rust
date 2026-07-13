@@ -343,6 +343,302 @@ fn reasoning_summary_fixture_item(model: &str) -> Option<Value> {
     })
 }
 
+fn audited_raw_output_variants() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "gpt-raw-additional-tools",
+            json!({"type":"additional_tools","role":"developer","tools":[]}),
+        ),
+        (
+            "gpt-raw-agent-message",
+            json!({
+                "type":"agent_message",
+                "id":"agent-raw",
+                "author":"agent",
+                "recipient":"user",
+                "content":[{"type":"input_text","text":"agent output"}]
+            }),
+        ),
+        (
+            "gpt-raw-local-shell-call",
+            json!({
+                "type":"local_shell_call",
+                "id":"shell-raw",
+                "call_id":"shell-call",
+                "status":"completed",
+                "action":{
+                    "type":"exec",
+                    "command":["pwd"],
+                    "timeout_ms":null,
+                    "working_directory":null,
+                    "env":null,
+                    "user":null
+                }
+            }),
+        ),
+        (
+            "gpt-raw-function-call-output",
+            json!({
+                "type":"function_call_output",
+                "id":"function-output-raw",
+                "call_id":"function-call",
+                "output":"done"
+            }),
+        ),
+        (
+            "gpt-raw-custom-tool-call-output",
+            json!({
+                "type":"custom_tool_call_output",
+                "id":"custom-output-raw",
+                "call_id":"custom-call",
+                "name":"freeform",
+                "output":"done"
+            }),
+        ),
+        (
+            "gpt-raw-web-search-call",
+            json!({
+                "type":"web_search_call",
+                "id":"web-raw",
+                "status":"completed",
+                "action":{"type":"search","query":"rust"}
+            }),
+        ),
+        (
+            "gpt-raw-image-generation-call",
+            json!({
+                "type":"image_generation_call",
+                "id":"image-raw",
+                "status":"completed",
+                "revised_prompt":"a ferris crab",
+                "result":"image-data"
+            }),
+        ),
+        (
+            "gpt-raw-context-compaction",
+            json!({
+                "type":"context_compaction",
+                "id":"context-raw",
+                "encrypted_content":"opaque"
+            }),
+        ),
+        (
+            "gpt-raw-compaction-trigger",
+            json!({"type":"compaction_trigger"}),
+        ),
+        (
+            "gpt-raw-future-variant",
+            json!({
+                "type":"future_response_item",
+                "id":"future-raw",
+                "future":{"keep":true}
+            }),
+        ),
+    ]
+}
+
+fn raw_output_variant_for_model(model: &str) -> Option<Value> {
+    audited_raw_output_variants()
+        .into_iter()
+        .find_map(|(candidate, item)| (candidate == model).then_some(item))
+}
+
+fn raw_output_stream_fixture(model: &str) -> Option<Response> {
+    let item = raw_output_variant_for_model(model)?;
+    Some(sse_response(render_sse(&[
+        (
+            "response.created",
+            json!({
+                "type":"response.created",
+                "sequence_number":0,
+                "response":{"id":"resp_raw_fixture","model":model}
+            }),
+        ),
+        (
+            "response.output_item.added",
+            json!({
+                "type":"response.output_item.added",
+                "sequence_number":1,
+                "output_index":0,
+                "item":item.clone()
+            }),
+        ),
+        (
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done",
+                "sequence_number":2,
+                "output_index":0,
+                "item":item.clone()
+            }),
+        ),
+        (
+            "response.completed",
+            json!({
+                "type":"response.completed",
+                "sequence_number":3,
+                "response":{"id":"resp_raw_fixture","output":[item]}
+            }),
+        ),
+    ])))
+}
+
+fn created_output_contract_stream_fixture(model: &str) -> Option<Response> {
+    let created_item = json!({
+        "type":"message",
+        "id":null,
+        "role":"assistant",
+        "status":"in_progress",
+        "content":[]
+    });
+    let added_item = json!({
+        "type":"message",
+        "role":"assistant",
+        "status":"in_progress",
+        "content":[]
+    });
+    let done_item = json!({
+        "type":"message",
+        "role":"assistant",
+        "status":"completed",
+        "content":[{"type":"output_text","text":"created lifecycle"}]
+    });
+    let events = match model {
+        "gpt-contract-created-only-output" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_created_output",
+                        "output":[{
+                            "type":"message",
+                            "role":"assistant",
+                            "status":"completed",
+                            "content":[{"type":"output_text","text":"unrendered"}]
+                        }]
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_created_output"}
+                }),
+            ),
+        ],
+        "gpt-contract-created-only-raw-output" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_created_output",
+                        "output":[{
+                            "type":"web_search_call",
+                            "id":"created-raw",
+                            "status":"completed",
+                            "action":{"type":"search","query":"rust"}
+                        }]
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_created_output"}
+                }),
+            ),
+        ],
+        "gpt-contract-created-output-lifecycle-match" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{"id":"resp_created_output","output":[created_item]}
+                }),
+            ),
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":added_item
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":done_item.clone()
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":3,
+                    "response":{"id":"resp_created_output","output":[done_item]}
+                }),
+            ),
+        ],
+        "gpt-contract-created-output-conflict" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{"id":"resp_created_output","output":[created_item]}
+                }),
+            ),
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added",
+                    "sequence_number":1,
+                    "output_index":0,
+                    "item":{
+                        "type":"message",
+                        "id":"different",
+                        "role":"assistant",
+                        "status":"in_progress",
+                        "content":[]
+                    }
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done",
+                    "sequence_number":2,
+                    "output_index":0,
+                    "item":done_item
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":3,
+                    "response":{"id":"resp_created_output"}
+                }),
+            ),
+        ],
+        _ => return None,
+    };
+    Some(sse_response(render_sse(&events)))
+}
+
 fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
     let created = (
         "response.created",
@@ -449,6 +745,44 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
                 }),
             ),
         ],
+        "gpt-terminal-completed-null-status" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_terminal_fixture",
+                        "status":null,
+                        "model":null,
+                        "object":42,
+                        "created_at":"ignored",
+                        "metadata":["ignored"],
+                        "instructions":{"ignored":true},
+                        "parallel_tool_calls":"ignored",
+                        "tools":{"ignored":true},
+                        "temperature":"ignored",
+                        "top_p":false,
+                        "output":null,
+                        "output_text":42,
+                        "usage":null,
+                        "end_turn":null
+                    }
+                }),
+            ),
+        ],
+        "gpt-terminal-completed-wrong-status-type" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_terminal_fixture","status":42}
+                }),
+            ),
+        ],
         "gpt-terminal-completed-mismatched-status" => vec![
             created,
             (
@@ -476,6 +810,36 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
                     "response":{
                         "id":"resp_terminal_fixture",
                         "status":"incomplete",
+                        "incomplete_details":{"reason":"max_output_tokens"}
+                    }
+                }),
+            ),
+        ],
+        "gpt-terminal-incomplete-null-status" => vec![
+            created,
+            (
+                "response.incomplete",
+                json!({
+                    "type":"response.incomplete",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_terminal_fixture",
+                        "status":null,
+                        "incomplete_details":{"reason":"max_output_tokens"}
+                    }
+                }),
+            ),
+        ],
+        "gpt-terminal-incomplete-wrong-status-type" => vec![
+            created,
+            (
+                "response.incomplete",
+                json!({
+                    "type":"response.incomplete",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_terminal_fixture",
+                        "status":false,
                         "incomplete_details":{"reason":"max_output_tokens"}
                     }
                 }),
@@ -542,6 +906,21 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
             error,
         ],
         "gpt-terminal-failed-later" => vec![created, failed, completed_no_status_no_usage, error],
+        "gpt-terminal-failed-null-status" => vec![
+            created,
+            (
+                "response.failed",
+                json!({
+                    "type":"response.failed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_terminal_fixture",
+                        "status":null,
+                        "error":{"message":"nullable failed status"}
+                    }
+                }),
+            ),
+        ],
         "gpt-terminal-error-later" => vec![created, error, failed, completed_no_status_no_usage],
         "gpt-terminal-incomplete-unknown-reason" => vec![
             created,
@@ -605,6 +984,20 @@ fn created_usage_contract_stream_fixture(model: &str) -> Option<Response> {
         "gpt-contract-created-upstream-model" => {
             created_response["model"] = json!("upstream-reported-model");
         }
+        "gpt-contract-created-null-optionals" => {
+            created_response["model"] = Value::Null;
+            created_response["status"] = Value::Null;
+            created_response["object"] = json!(42);
+            created_response["created_at"] = json!("ignored");
+            created_response["metadata"] = json!(["ignored"]);
+            created_response["instructions"] = json!({"ignored":true});
+            created_response["parallel_tool_calls"] = json!("ignored");
+            created_response["tools"] = json!({"ignored":true});
+            created_response["temperature"] = json!("ignored");
+            created_response["top_p"] = json!(false);
+            created_response["output"] = Value::Null;
+            created_response["output_text"] = json!(42);
+        }
         "gpt-contract-created-empty-id" => created_response["id"] = json!(""),
         "gpt-contract-created-wrong-id" => created_response["id"] = json!(42),
         "gpt-contract-created-missing-id" => {
@@ -614,6 +1007,9 @@ fn created_usage_contract_stream_fixture(model: &str) -> Option<Response> {
         "gpt-contract-created-wrong-model" => created_response["model"] = json!(42),
         "gpt-contract-created-status-mismatch" => {
             created_response["status"] = json!("completed");
+        }
+        "gpt-contract-created-wrong-status-type" => {
+            created_response["status"] = json!(42);
         }
         "gpt-contract-created-partial-usage" => {
             created_response["usage"] = json!({"input_tokens":1});
@@ -2693,7 +3089,7 @@ fn scalar_nonstream_fixture(model: &str) -> Option<Response> {
         | "gpt-contract-terminal-wrong-end-turn"
         | "gpt-contract-usage-wrong-input"
         | "gpt-contract-usage-total-mismatch" => vec![],
-        _ => return None,
+        _ => vec![raw_output_variant_for_model(model)?],
     };
     let mut response = json!({
         "id":"resp_scalar_fixture",
@@ -2746,7 +3142,8 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                 "status":"in_progress",
                 "output":[],
                 "output_text":null,
-                "usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}
+                "usage":usage.clone(),
+                "metadata":{"snapshot":"matching"}
             }
         }),
     );
@@ -2767,7 +3164,9 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
             "annotations":[{
                 "type":"url_citation",
                 "url":"https://example.test/source",
-                "title":"Source"
+                "title":"Source",
+                "page_age":null,
+                "ignored_extension":{"side":"created"}
             }]
         }]
     });
@@ -2818,7 +3217,8 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                 "annotation":{
                     "type":"url_citation",
                     "url":"https://example.test/source",
-                    "title":"Source"
+                    "title":"Source",
+                    "ignored_extension":{"side":"terminal"}
                 }
             }),
         ),
@@ -2853,7 +3253,50 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                 json!({
                     "type":"response.completed",
                     "sequence_number":7,
-                    "response":{"id":"resp_web_partial","usage":usage}
+                    "response":{
+                        "id":"resp_web_partial",
+                        "status":null,
+                        "usage":usage,
+                        "metadata":{"snapshot":"matching"}
+                    }
+                }),
+            ));
+            events
+        }
+        "gpt-web-created-lifecycle-equivalent" => {
+            let message_added = json!({
+                "type":"message",
+                "id":"web-message",
+                "role":"assistant",
+                "status":"in_progress",
+                "content":[]
+            });
+            let mut events = vec![(
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "object":"response",
+                        "model":model,
+                        "status":"in_progress",
+                        "output":[web_search_item.clone(),message_added],
+                        "usage":usage.clone()
+                    }
+                }),
+            )];
+            events.extend(output_events);
+            events.push((
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":7,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "output":[web_search_item,message_item],
+                        "usage":usage
+                    }
                 }),
             ));
             events
@@ -2869,6 +3312,216 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                         "id":"resp_web_partial",
                         "usage":usage,
                         "output":[web_search_item,message_item]
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-created-only-completed" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "object":"response",
+                        "model":model,
+                        "status":"in_progress",
+                        "output":[web_search_item,message_item],
+                        "output_text":"Grounded answer.",
+                        "usage":usage,
+                        "metadata":{"snapshot":"created-only"}
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_web_partial","status":null}
+                }),
+            ),
+        ],
+        "gpt-web-terminal-only-completed" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "object":null,
+                        "model":null,
+                        "status":null,
+                        "output":null,
+                        "output_text":null,
+                        "usage":null,
+                        "metadata":null
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "object":"response",
+                        "model":model,
+                        "status":null,
+                        "output":[web_search_item,message_item],
+                        "output_text":"Grounded answer.",
+                        "usage":usage,
+                        "metadata":{"snapshot":"terminal-only"}
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-matching-duplicate-completed" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "object":"response",
+                        "model":model,
+                        "status":"in_progress",
+                        "output":[web_search_item.clone(),message_item.clone()],
+                        "output_text":"Grounded answer.",
+                        "usage":usage.clone(),
+                        "metadata":{"snapshot":"duplicate"}
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "object":"response",
+                        "model":model,
+                        "status":"completed",
+                        "output":[web_search_item,message_item],
+                        "output_text":"Grounded answer.",
+                        "usage":usage,
+                        "metadata":{"snapshot":"duplicate"}
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-usage-null-details-match" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "model":model,
+                        "status":null,
+                        "output":[],
+                        "usage":{
+                            "input_tokens":6,
+                            "input_tokens_details":null,
+                            "output_tokens":4,
+                            "output_tokens_details":null,
+                            "total_tokens":10
+                        }
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "status":null,
+                        "output":[web_search_item,message_item],
+                        "usage":{"input_tokens":6,"output_tokens":4,"total_tokens":10}
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-output-null-optional-equivalent" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "model":model,
+                        "status":null,
+                        "output":[
+                            {
+                                "type":"web_search_call",
+                                "id":null,
+                                "status":null,
+                                "ignored_extension":{"side":"created"},
+                                "action":{"type":"search","query":"rust async"}
+                            },
+                            {
+                                "type":"message",
+                                "id":null,
+                                "role":"assistant",
+                                "status":null,
+                                "ignored_extension":{"side":"created"},
+                                "content":[{
+                                    "type":"output_text",
+                                    "text":"Grounded answer.",
+                                    "annotations":[{
+                                        "type":"url_citation",
+                                        "url":"https://example.test/source",
+                                        "title":"Source",
+                                        "page_age":null,
+                                        "ignored_extension":{"side":"created"}
+                                    }]
+                                }]
+                            }
+                        ],
+                        "usage":usage.clone()
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "status":null,
+                        "output":[
+                            {
+                                "type":"web_search_call",
+                                "ignored_extension":{"side":"terminal"},
+                                "action":{"type":"search","query":"rust async"}
+                            },
+                            {
+                                "type":"message",
+                                "role":"assistant",
+                                "ignored_extension":{"side":"terminal"},
+                                "content":[{
+                                    "type":"output_text",
+                                    "text":"Grounded answer.",
+                                    "annotations":[{
+                                        "type":"url_citation",
+                                        "url":"https://example.test/source",
+                                        "title":"Source",
+                                        "ignored_extension":{"side":"terminal"}
+                                    }]
+                                }]
+                            }
+                        ],
+                        "usage":usage
                     }
                 }),
             ),
@@ -2899,6 +3552,21 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                 }),
             ),
         ],
+        "gpt-web-terminal-object-conflict" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "object":"different",
+                        "usage":usage
+                    }
+                }),
+            ),
+        ],
         "gpt-web-terminal-status-conflict" => vec![
             created,
             (
@@ -2923,11 +3591,131 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                     "sequence_number":1,
                     "response":{
                         "id":"resp_web_partial",
-                        "usage":{"input_tokens":6,"output_tokens":4,"total_tokens":9}
+                        "usage":{
+                            "input_tokens":7,
+                            "input_tokens_details":{"cached_tokens":1},
+                            "output_tokens":4,
+                            "output_tokens_details":{"reasoning_tokens":1},
+                            "total_tokens":11
+                        }
                     }
                 }),
             ),
         ],
+        "gpt-web-terminal-cached-usage-conflict" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":{
+                            "input_tokens":6,
+                            "input_tokens_details":{"cached_tokens":2},
+                            "output_tokens":4,
+                            "output_tokens_details":{"reasoning_tokens":1},
+                            "total_tokens":10
+                        }
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-reasoning-usage-conflict" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":{
+                            "input_tokens":6,
+                            "input_tokens_details":{"cached_tokens":1},
+                            "output_tokens":4,
+                            "output_tokens_details":{"reasoning_tokens":2},
+                            "total_tokens":10
+                        }
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-metadata-conflict" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":usage,
+                        "metadata":{"snapshot":"different"}
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-output-conflict" => vec![
+            (
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "object":"response",
+                        "model":model,
+                        "status":"in_progress",
+                        "output":[web_search_item.clone(),message_item.clone()],
+                        "usage":usage.clone()
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "output":[
+                            web_search_item,
+                            {
+                                "type":"message",
+                                "id":"web-message",
+                                "role":"assistant",
+                                "status":"completed",
+                                "content":[{
+                                    "type":"output_text",
+                                    "text":"Different answer.",
+                                    "annotations":[]
+                                }]
+                            }
+                        ],
+                        "usage":usage
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-terminal-lifecycle-output-conflict" => {
+            let mut events = vec![created];
+            events.extend(output_events);
+            events.push((
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":7,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":usage,
+                        "output":[web_search_item]
+                    }
+                }),
+            ));
+            events
+        }
         "gpt-web-terminal-output-malformed" => vec![
             created,
             (
@@ -2942,6 +3730,86 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                             "type":"message",
                             "role":"assistant",
                             "content":[{"type":"output_text","text":42}]
+                        }]
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-unsupported-raw-output" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":usage,
+                        "output":[{
+                            "type":"image_generation_call",
+                            "id":"image-web",
+                            "status":"completed",
+                            "result":"image-data"
+                        }]
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-unrepresentable-search-call" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":usage,
+                        "output":[{
+                            "type":"web_search_call",
+                            "id":"web-multiple",
+                            "status":"completed",
+                            "action":{"type":"search","queries":["one","two"]}
+                        }]
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-incomplete-search-call" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":usage,
+                        "output":[{
+                            "type":"web_search_call",
+                            "id":"web-incomplete",
+                            "status":"in_progress",
+                            "action":{"type":"search","query":"rust"}
+                        }]
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-empty-query-entry" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "usage":usage,
+                        "output":[{
+                            "type":"web_search_call",
+                            "id":"web-empty-query",
+                            "status":"completed",
+                            "action":{"type":"search","queries":["","rust"]}
                         }]
                     }
                 }),
@@ -3041,6 +3909,28 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                         "id":"resp_web_partial",
                         "incomplete_details":{"reason":"max_output_tokens"},
                         "usage":usage
+                    }
+                }),
+            ),
+        ],
+        "gpt-web-later-terminal" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{"id":"resp_web_partial","usage":usage}
+                }),
+            ),
+            (
+                "response.incomplete",
+                json!({
+                    "type":"response.incomplete",
+                    "sequence_number":2,
+                    "response":{
+                        "id":"resp_web_partial",
+                        "incomplete_details":{"reason":"max_output_tokens"}
                     }
                 }),
             ),
@@ -4116,6 +5006,51 @@ fn responses_fixture(body: &Value) -> Response {
         _ => {}
     }
 
+    if model == "gpt-native-raw-variants" {
+        let output: Vec<Value> = audited_raw_output_variants()
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
+        if body["stream"] == true {
+            let mut events = vec![(
+                "response.created",
+                json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{"id":"resp_native_raw","model":model}
+                }),
+            )];
+            for (index, item) in output.iter().enumerate() {
+                events.push((
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":index + 1,
+                        "output_index":index,
+                        "item":item
+                    }),
+                ));
+            }
+            events.push((
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":output.len() + 1,
+                    "response":{"id":"resp_native_raw","output":output}
+                }),
+            ));
+            return sse_response(render_sse(&events));
+        }
+        return Json(json!({
+            "id":"resp_native_raw",
+            "object":"response",
+            "model":model,
+            "status":"completed",
+            "output":output
+        }))
+        .into_response();
+    }
+
     if body["stream"] == true {
         if let Some(response) = web_search_partial_terminal_fixture(model) {
             return response;
@@ -4129,6 +5064,12 @@ fn responses_fixture(body: &Value) -> Response {
     }
 
     if body["stream"] == true {
+        if let Some(response) = created_output_contract_stream_fixture(model) {
+            return response;
+        }
+        if let Some(response) = raw_output_stream_fixture(model) {
+            return response;
+        }
         if let Some(response) = malformed_scalar_stream_fixture(model) {
             return response;
         }
@@ -4844,25 +5785,59 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-scalar-metadata-wrong",
         "gpt-scalar-metadata-turn-id-wrong",
         "gpt-web-partial-completed",
+        "gpt-web-created-lifecycle-equivalent",
         "gpt-web-terminal-output-completed",
+        "gpt-web-created-only-completed",
+        "gpt-web-terminal-only-completed",
+        "gpt-web-matching-duplicate-completed",
+        "gpt-web-usage-null-details-match",
+        "gpt-web-output-null-optional-equivalent",
         "gpt-web-terminal-id-conflict",
         "gpt-web-terminal-model-conflict",
+        "gpt-web-terminal-object-conflict",
         "gpt-web-terminal-status-conflict",
         "gpt-web-terminal-usage-conflict",
+        "gpt-web-terminal-cached-usage-conflict",
+        "gpt-web-terminal-reasoning-usage-conflict",
+        "gpt-web-terminal-metadata-conflict",
+        "gpt-web-terminal-output-conflict",
+        "gpt-web-terminal-lifecycle-output-conflict",
         "gpt-web-terminal-output-malformed",
+        "gpt-web-unsupported-raw-output",
+        "gpt-web-unrepresentable-search-call",
+        "gpt-web-incomplete-search-call",
+        "gpt-web-empty-query-entry",
         "gpt-web-late-text-conflict",
         "gpt-web-delta-after-item-done",
         "gpt-web-terminal-failed",
         "gpt-web-terminal-incomplete",
+        "gpt-web-later-terminal",
+        "gpt-native-raw-variants",
+        "gpt-raw-additional-tools",
+        "gpt-raw-agent-message",
+        "gpt-raw-local-shell-call",
+        "gpt-raw-function-call-output",
+        "gpt-raw-custom-tool-call-output",
+        "gpt-raw-web-search-call",
+        "gpt-raw-image-generation-call",
+        "gpt-raw-context-compaction",
+        "gpt-raw-compaction-trigger",
+        "gpt-raw-future-variant",
         "gpt-contract-created-model-less",
         "gpt-contract-created-with-model",
         "gpt-contract-created-upstream-model",
+        "gpt-contract-created-null-optionals",
+        "gpt-contract-created-only-output",
+        "gpt-contract-created-only-raw-output",
+        "gpt-contract-created-output-lifecycle-match",
+        "gpt-contract-created-output-conflict",
         "gpt-contract-created-empty-id",
         "gpt-contract-created-wrong-id",
         "gpt-contract-created-missing-id",
         "gpt-contract-created-empty-model",
         "gpt-contract-created-wrong-model",
         "gpt-contract-created-status-mismatch",
+        "gpt-contract-created-wrong-status-type",
         "gpt-contract-created-partial-usage",
         "gpt-contract-completed-empty-id",
         "gpt-contract-completed-wrong-id",
@@ -4905,16 +5880,21 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-terminal-completed-no-status-usage",
         "gpt-terminal-completed-no-status-no-usage",
         "gpt-terminal-completed-matching-status",
+        "gpt-terminal-completed-null-status",
+        "gpt-terminal-completed-wrong-status-type",
         "gpt-terminal-completed-mismatched-status",
         "gpt-terminal-incomplete-no-status-usage",
         "gpt-terminal-incomplete-no-status-no-usage",
         "gpt-terminal-incomplete-matching-status",
+        "gpt-terminal-incomplete-null-status",
+        "gpt-terminal-incomplete-wrong-status-type",
         "gpt-terminal-incomplete-mismatched-status",
         "gpt-terminal-completed-pending-item",
         "gpt-terminal-incomplete-pending-item",
         "gpt-terminal-completed-repeated-later",
         "gpt-terminal-incomplete-repeated-later",
         "gpt-terminal-failed-later",
+        "gpt-terminal-failed-null-status",
         "gpt-terminal-error-later",
         "gpt-terminal-incomplete-unknown-reason",
         "gpt-terminal-incomplete-missing-response",
@@ -6048,6 +7028,7 @@ async fn claude_completed_terminals_follow_codex_event_discriminator() {
         ),
         ("gpt-terminal-completed-no-status-no-usage", 0, 0, None),
         ("gpt-terminal-completed-matching-status", 0, 0, None),
+        ("gpt-terminal-completed-null-status", 0, 0, None),
         ("gpt-terminal-completed-repeated-later", 8, 7, Some(3)),
     ] {
         let (status, body) = send(post_json(
@@ -6179,6 +7160,13 @@ async fn claude_incomplete_terminals_preserve_truncation_semantics_without_statu
             None,
         ),
         (
+            "gpt-terminal-incomplete-null-status",
+            "max_tokens",
+            0,
+            0,
+            None,
+        ),
+        (
             "gpt-terminal-incomplete-repeated-later",
             "max_tokens",
             8,
@@ -6241,7 +7229,9 @@ async fn claude_terminal_contradictions_and_pending_state_fail_once() {
 
     for model in [
         "gpt-terminal-completed-mismatched-status",
+        "gpt-terminal-completed-wrong-status-type",
         "gpt-terminal-incomplete-mismatched-status",
+        "gpt-terminal-incomplete-wrong-status-type",
         "gpt-terminal-completed-pending-item",
         "gpt-terminal-incomplete-pending-item",
         "gpt-terminal-incomplete-unknown-reason",
@@ -6294,6 +7284,7 @@ async fn claude_failed_and_error_terminals_suppress_all_later_terminals() {
     for (model, expected_message) in [
         ("gpt-terminal-failed-later", "canonical fixture failure"),
         ("gpt-terminal-error-later", "canonical top-level error"),
+        ("gpt-terminal-failed-null-status", "nullable failed status"),
     ] {
         let (status, body) = send(post_json(
             "/v1/messages",
@@ -6349,6 +7340,10 @@ async fn claude_model_less_created_uses_resolved_model_context() {
             "gpt-contract-created-upstream-model",
             "upstream-reported-model",
         ),
+        (
+            "gpt-contract-created-null-optionals",
+            "gpt-contract-created-null-optionals",
+        ),
     ] {
         let (status, body) = send(post_json(
             "/v1/messages",
@@ -6393,6 +7388,67 @@ async fn claude_model_less_created_uses_resolved_model_context() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
+async fn claude_created_output_requires_matching_rendered_lifecycle() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let request = |model: &str| {
+        post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"created output"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        )
+    };
+
+    let (status, body) = send(request("gpt-contract-created-output-lifecycle-match")).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let text: String = events
+        .iter()
+        .filter(|event| event["delta"]["type"] == "text_delta")
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "created lifecycle");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
+    );
+
+    for model in [
+        "gpt-contract-created-only-output",
+        "gpt-contract-created-only-raw-output",
+        "gpt-contract-created-output-conflict",
+    ] {
+        let (status, body) = send(request(model)).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}: {events:#?}"
+        );
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("message_delta" | "message_stop")
+            )
+        }));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
 async fn claude_created_and_terminal_identity_fields_fail_closed() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
@@ -6405,6 +7461,7 @@ async fn claude_created_and_terminal_identity_fields_fail_closed() {
         "gpt-contract-created-empty-model",
         "gpt-contract-created-wrong-model",
         "gpt-contract-created-status-mismatch",
+        "gpt-contract-created-wrong-status-type",
         "gpt-contract-completed-empty-id",
         "gpt-contract-completed-wrong-id",
         "gpt-contract-completed-mismatched-id",
@@ -7110,6 +8167,62 @@ async fn claude_json_and_sse_reject_equivalent_malformed_outputs() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
+async fn claude_raw_output_variants_fail_explicitly_in_json_and_sse() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, _) in audited_raw_output_variants() {
+        let request = |stream| {
+            post_json(
+                "/v1/messages",
+                json!({
+                    "model":format!("responses-fixture/{model}"),
+                    "max_tokens":128,
+                    "messages":[{"role":"user","content":"raw output"}],
+                    "stream":stream
+                }),
+                Some(CLIENT_KEY),
+            )
+        };
+        let (json_status, json_bytes) = send(request(false)).await;
+        assert!(
+            json_status.is_server_error(),
+            "{model}: {json_status} {}",
+            String::from_utf8_lossy(&json_bytes)
+        );
+        let json_error = json_body(&json_bytes);
+        assert_eq!(json_error["type"], "error", "{model}");
+        assert_eq!(json_error["error"]["type"], "api_error", "{model}");
+        assert!(json_error.get("stop_reason").is_none(), "{model}");
+
+        let (sse_status, sse_bytes) = send(request(true)).await;
+        assert_eq!(sse_status, StatusCode::OK, "{model}");
+        let events = data_events(&sse_bytes);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1,
+            "{model}: {events:#?}"
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("error"),
+            "{model}"
+        );
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("content_block_start" | "message_delta" | "message_stop")
+            )
+        }));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
 async fn claude_tool_search_late_identity_corruption_fails_once_after_closing_block() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
@@ -7177,7 +8290,13 @@ async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
 
     for model in [
         "gpt-web-partial-completed",
+        "gpt-web-created-lifecycle-equivalent",
         "gpt-web-terminal-output-completed",
+        "gpt-web-created-only-completed",
+        "gpt-web-terminal-only-completed",
+        "gpt-web-matching-duplicate-completed",
+        "gpt-web-usage-null-details-match",
+        "gpt-web-output-null-optional-equivalent",
     ] {
         configure_with_web_search_model(&fixture, Some(&format!("responses-fixture/{model}")));
         let (json_status, json_bytes) = send(web_search_messages_request(false)).await;
@@ -7198,6 +8317,13 @@ async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
         );
         assert_eq!(json_response["content"].as_array().map(Vec::len), Some(3));
         assert_eq!(json_response["content"][0]["type"], "server_tool_use");
+        if model == "gpt-web-output-null-optional-equivalent" {
+            assert!(json_response["content"][0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("srvtoolu_")));
+        } else {
+            assert_eq!(json_response["content"][0]["id"], "web-search-item");
+        }
         assert_eq!(json_response["content"][0]["name"], "web_search");
         assert_eq!(json_response["content"][0]["input"]["query"], "rust async");
         assert_eq!(
@@ -7266,13 +8392,24 @@ async fn claude_web_search_terminal_conflicts_fail_before_json_or_sse_success() 
     for model in [
         "gpt-web-terminal-id-conflict",
         "gpt-web-terminal-model-conflict",
+        "gpt-web-terminal-object-conflict",
         "gpt-web-terminal-status-conflict",
         "gpt-web-terminal-usage-conflict",
+        "gpt-web-terminal-cached-usage-conflict",
+        "gpt-web-terminal-reasoning-usage-conflict",
+        "gpt-web-terminal-metadata-conflict",
+        "gpt-web-terminal-output-conflict",
+        "gpt-web-terminal-lifecycle-output-conflict",
         "gpt-web-terminal-output-malformed",
+        "gpt-web-unsupported-raw-output",
+        "gpt-web-unrepresentable-search-call",
+        "gpt-web-incomplete-search-call",
+        "gpt-web-empty-query-entry",
         "gpt-web-late-text-conflict",
         "gpt-web-delta-after-item-done",
         "gpt-web-terminal-failed",
         "gpt-web-terminal-incomplete",
+        "gpt-web-later-terminal",
     ] {
         configure_with_web_search_model(&fixture, Some(&format!("responses-fixture/{model}")));
         for stream in [false, true] {
@@ -7289,6 +8426,50 @@ async fn claude_web_search_terminal_conflicts_fail_before_json_or_sse_success() 
             assert!(error.get("stop_reason").is_none(), "{model}/{stream}");
         }
     }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn native_responses_preserves_all_raw_output_variants() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let expected: Vec<Value> = audited_raw_output_variants()
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect();
+
+    let request = |stream| {
+        post_json(
+            "/v1/responses",
+            json!({
+                "model":"responses-fixture/gpt-native-raw-variants",
+                "input":"preserve raw output",
+                "stream":stream
+            }),
+            Some(CLIENT_KEY),
+        )
+    };
+
+    let (json_status, json_bytes) = send(request(false)).await;
+    assert_eq!(json_status, StatusCode::OK);
+    let response = json_body(&json_bytes);
+    assert_eq!(response["output"], Value::Array(expected.clone()));
+
+    let (sse_status, sse_bytes) = send(request(true)).await;
+    assert_eq!(sse_status, StatusCode::OK);
+    let events = data_events(&sse_bytes);
+    let done_items: Vec<Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .map(|event| event["item"].clone())
+        .collect();
+    assert_eq!(done_items, expected);
+    let terminal = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("native raw terminal");
+    assert_eq!(terminal["response"]["output"], Value::Array(expected));
 }
 
 #[tokio::test]
