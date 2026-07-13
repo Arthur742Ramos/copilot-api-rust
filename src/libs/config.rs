@@ -734,6 +734,16 @@ pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
     })
 }
 
+/// Whether a provider routes requests through the OpenAI Responses wire
+/// contract. `codex` is Responses-backed even before credential setup has
+/// materialized its runtime provider configuration.
+pub fn provider_uses_responses_api(name: &str) -> bool {
+    let name = name.trim();
+    name == "codex"
+        || get_provider_config(name)
+            .is_some_and(|config| config.provider_type == "openai-responses")
+}
+
 pub fn list_enabled_providers() -> Vec<String> {
     let config = get_config();
     let names: Vec<String> = config

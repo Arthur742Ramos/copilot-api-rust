@@ -1019,6 +1019,24 @@ mod tests {
     }
 
     #[test]
+    fn chat_completions_preserves_stop_sequence_order_and_duplicates() {
+        let payload = AnthropicMessagesPayload {
+            model: "gpt-4o".to_string(),
+            messages: vec![user_message(json!("hello"))],
+            max_tokens: Some(100),
+            stop_sequences: Some(vec![
+                "z-stop".to_string(),
+                "a-stop".to_string(),
+                "z-stop".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let translated = translate_to_openai(&payload).expect("translate chat request");
+        let value = serde_json::to_value(translated).expect("serialize chat request");
+        assert_eq!(value["stop"], json!(["z-stop", "a-stop", "z-stop"]));
+    }
+
+    #[test]
     fn tool_result_message_comes_before_user_message() {
         // A user message carrying a tool_result block (string content) plus a
         // trailing text block must translate to [tool message, user message].

@@ -10,7 +10,10 @@ use axum::response::Response;
 use serde_json::Value;
 
 use crate::libs::compact::COMPACT_REQUEST;
-use crate::libs::config::{get_small_model, is_messages_api_enabled, resolve_mapped_model};
+use crate::libs::config::{
+    get_message_api_web_search_model, get_small_model, is_messages_api_enabled,
+    is_responses_api_web_search_enabled, provider_uses_responses_api, resolve_mapped_model,
+};
 use crate::libs::error::AppError;
 use crate::libs::models::{find_endpoint_model, is_context_1m_model};
 use crate::libs::provider_model::parse_provider_model_alias;
@@ -27,6 +30,10 @@ use crate::routes::messages::preprocess::{
     sanitize_ide_tools, strip_tool_reference_turn_boundary,
 };
 use crate::routes::messages::request_validation::validate_messages_request_shape;
+use crate::routes::messages::responses_translation::validate_responses_request_controls;
+use crate::routes::messages::web_search::fulfill::{
+    resolve_web_search_route, ResolveWebSearchRouteOptions, WebSearchRoute,
+};
 use crate::routes::responses::utils::get_responses_transport_for_model;
 use crate::services::copilot::create_messages::CONTEXT_1M_BETA;
 use crate::services::copilot::get_models::Model;
@@ -47,6 +54,80 @@ fn set_model(payload: &mut Value, model: &str) {
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".to_string(), Value::String(model.to_string()));
     }
+}
+
+/// Validate controls only after resolving the request's actual transport.
+/// Native Anthropic and Chat Completions retain their own control support.
+#[allow(clippy::result_large_err)]
+fn validate_selected_responses_controls(
+    payload: &Value,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    let has_nonempty_stop = payload
+        .get("stop_sequences")
+        .and_then(Value::as_array)
+        .is_some_and(|sequences| !sequences.is_empty());
+    let has_non_null = |field: &str| payload.get(field).is_some_and(|value| !value.is_null());
+    if !has_nonempty_stop
+        && ![
+            "top_k",
+            "cache_control",
+            "service_tier",
+            "temperature",
+            "top_p",
+        ]
+        .into_iter()
+        .any(has_non_null)
+    {
+        return Ok(());
+    }
+    let typed = deserialize_payload(payload)?;
+
+    if has_web_search_server_tool_value(payload) {
+        match resolve_web_search_route(
+            &typed,
+            ResolveWebSearchRouteOptions {
+                web_search_model: get_message_api_web_search_model(),
+                responses_web_search_enabled: is_responses_api_web_search_enabled(),
+            },
+        ) {
+            WebSearchRoute::Responses { .. } => {
+                return validate_responses_request_controls(&typed, false);
+            }
+            WebSearchRoute::Provider { alias } if provider_uses_responses_api(&alias.provider) => {
+                return validate_responses_request_controls(&typed, alias.provider == "codex");
+            }
+            WebSearchRoute::Provider { .. } => return Ok(()),
+            WebSearchRoute::Strip => {}
+        }
+    }
+
+    if let Some(alias) = parse_provider_model_alias(&model_of(payload)) {
+        if provider_uses_responses_api(&alias.provider) {
+            return validate_responses_request_controls(&typed, alias.provider == "codex");
+        }
+        return Ok(());
+    }
+
+    let compact_type = get_compact_type(payload);
+    let no_tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| tools.is_empty())
+        .unwrap_or(true);
+    let warmup = headers.contains_key("anthropic-beta") && no_tools && compact_type == 0;
+    let effective_model = if warmup {
+        get_small_model()
+    } else {
+        model_of(payload)
+    };
+    let selected_model = find_endpoint_model(&effective_model);
+    if !should_use_messages_api(selected_model.as_ref())
+        && should_use_responses_api(selected_model.as_ref(), compact_type)
+    {
+        return validate_responses_request_controls(&typed, false);
+    }
+    Ok(())
 }
 
 /// Mirrors `handleCompletion`. `body` is the raw Anthropic request JSON; it is
@@ -75,6 +156,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     if mapped_model != requested_model {
         tracing::debug!("Resolved model mapping: {requested_model} -> {mapped_model}");
     }
+    validate_selected_responses_controls(&payload, &headers)?;
 
     // Shared admission must precede every early dispatch below. In particular,
     // fulfilled web-search requests and provider aliases return directly and

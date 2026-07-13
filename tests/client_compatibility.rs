@@ -71,6 +71,7 @@ impl Fixture {
         let state = FixtureState::default();
         let app = Router::new()
             .route("/v1/messages", post(fixture_handler))
+            .route("/v1/chat/completions", post(fixture_handler))
             .route("/v1/responses", post(fixture_handler))
             .route("/v1/responses/compact", post(fixture_handler))
             .with_state(state.clone());
@@ -125,10 +126,31 @@ async fn fixture_handler(
 
     match uri.path() {
         "/v1/messages" => anthropic_fixture(&body),
+        "/v1/chat/completions" => chat_completions_fixture(&body),
         "/v1/responses" => responses_fixture(&body),
         "/v1/responses/compact" => compact_fixture(&body),
         other => panic!("unexpected fixture path {other}"),
     }
+}
+
+fn chat_completions_fixture(body: &Value) -> Response {
+    Json(json!({
+        "id":"chatcmpl-fixture",
+        "object":"chat.completion",
+        "created":1,
+        "model":body["model"],
+        "choices":[{
+            "index":0,
+            "message":{"role":"assistant","content":"chat fixture"},
+            "finish_reason":"stop"
+        }],
+        "usage":{
+            "prompt_tokens":3,
+            "completion_tokens":2,
+            "total_tokens":5
+        }
+    }))
+    .into_response()
 }
 
 fn compact_fixture(body: &Value) -> Response {
@@ -7042,6 +7064,9 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
     .into_iter()
     .map(|model| (model.to_string(), ModelConfig::default()))
     .collect();
+    let chat_models = [("gpt-chat-fixture".to_string(), ModelConfig::default())]
+        .into_iter()
+        .collect();
     let providers = BTreeMap::from([
         (
             "anthropic-fixture".to_string(),
@@ -7065,6 +7090,19 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
                 api_key: Some(UPSTREAM_KEY.to_string()),
                 auth_type: Some("authorization".to_string()),
                 models: Some(response_models),
+                adjust_input_tokens: None,
+                extra: Map::new(),
+            },
+        ),
+        (
+            "chat-fixture".to_string(),
+            ProviderConfig {
+                provider_type: Some("openai-compatible".to_string()),
+                enabled: Some(true),
+                base_url: Some(fixture.base_url.clone()),
+                api_key: Some(UPSTREAM_KEY.to_string()),
+                auth_type: Some("authorization".to_string()),
+                models: Some(chat_models),
                 adjust_input_tokens: None,
                 extra: Map::new(),
             },
@@ -10195,6 +10233,493 @@ async fn claude_open_object_extension_collisions_fail_before_provider_dispatch()
     }
 }
 
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_payload_and_message_extensions_survive_split_responses_translation() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "future_request_extension":{
+            "first":1,
+            "nested":{"keep":true,"null":null},
+            "array":[null,{"x":1}],
+            "last":2
+        },
+        "tools":[{
+            "name":"actual",
+            "input_schema":{"type":"object"}
+        }],
+        "messages":[
+            {
+                "role":"assistant",
+                "future_assistant_extension":{"keep":"assistant","null":null},
+                "content":[
+                    {"type":"text","text":"before tool"},
+                    {"type":"tool_use","id":"call","name":"actual","input":{}},
+                    {"type":"text","text":"after tool"}
+                ]
+            },
+            {
+                "role":"user",
+                "future_user_extension":{"keep":"user","null":null},
+                "content":[
+                    {"type":"text","text":"before result"},
+                    {"type":"tool_result","tool_use_id":"call","content":"done"},
+                    {"type":"text","text":"after result"}
+                ]
+            }
+        ]
+    });
+    let (status, _) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("split extension capture");
+    assert_eq!(
+        capture.body["future_request_extension"],
+        json!({
+            "first":1,
+            "nested":{"keep":true,"null":null},
+            "array":[null,{"x":1}],
+            "last":2
+        })
+    );
+    let request_keys: Vec<&str> = capture
+        .body
+        .as_object()
+        .expect("captured Responses request object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        request_keys.last().copied(),
+        Some("future_request_extension"),
+        "open request extensions append after canonical Responses fields"
+    );
+    let extension_keys: Vec<&str> = capture.body["future_request_extension"]
+        .as_object()
+        .expect("nested request extension object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(extension_keys, ["first", "nested", "array", "last"]);
+    let nested_extension_keys: Vec<&str> = capture.body["future_request_extension"]["nested"]
+        .as_object()
+        .expect("nested extension value")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(nested_extension_keys, ["keep", "null"]);
+    let input = capture.body["input"].as_array().expect("translated input");
+    let assistant_messages: Vec<&Value> = input
+        .iter()
+        .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+        .collect();
+    let user_messages: Vec<&Value> = input
+        .iter()
+        .filter(|item| item["type"] == "message" && item["role"] == "user")
+        .collect();
+    assert_eq!(assistant_messages.len(), 2);
+    assert_eq!(user_messages.len(), 2);
+    assert!(assistant_messages.iter().all(|message| {
+        message["future_assistant_extension"] == json!({"keep":"assistant","null":null})
+    }));
+    assert!(user_messages
+        .iter()
+        .all(|message| { message["future_user_extension"] == json!({"keep":"user","null":null}) }));
+    assert!(assistant_messages.iter().all(|message| {
+        message
+            .as_object()
+            .and_then(|message| message.keys().next_back())
+            .is_some_and(|key| key == "future_assistant_extension")
+    }));
+    assert!(user_messages.iter().all(|message| {
+        message
+            .as_object()
+            .and_then(|message| message.keys().next_back())
+            .is_some_and(|key| key == "future_user_extension")
+    }));
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_payload_and_message_extension_collisions_fail_without_dispatch() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    for (label, body) in [
+        (
+            "request input collision",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "input":{"override":true},
+                "messages":[{"role":"user","content":"collision"}]
+            }),
+        ),
+        (
+            "request stop bypass",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "stop":["bypass"],
+                "messages":[{"role":"user","content":"collision"}]
+            }),
+        ),
+        (
+            "user message phase collision",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "messages":[{
+                    "role":"user",
+                    "content":"collision",
+                    "phase":"override"
+                }]
+            }),
+        ),
+        (
+            "assistant message status collision",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "messages":[{
+                    "role":"assistant",
+                    "content":"collision",
+                    "status":"override"
+                }]
+            }),
+        ),
+        (
+            "tool-only assistant extension",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[{
+                    "name":"actual",
+                    "input_schema":{"type":"object"}
+                }],
+                "messages":[{
+                    "role":"assistant",
+                    "future_assistant_extension":{"cannot_move":true},
+                    "content":[{
+                        "type":"tool_use",
+                        "id":"call",
+                        "name":"actual",
+                        "input":{}
+                    }]
+                }]
+            }),
+        ),
+        (
+            "tool-result-only user extension",
+            json!({
+                "model":"responses-fixture/gpt-fixture",
+                "max_tokens":128,
+                "tools":[{
+                    "name":"actual",
+                    "input_schema":{"type":"object"}
+                }],
+                "messages":[
+                    {
+                        "role":"assistant",
+                        "content":[{
+                            "type":"tool_use",
+                            "id":"call",
+                            "name":"actual",
+                            "input":{}
+                        }]
+                    },
+                    {
+                        "role":"user",
+                        "future_user_extension":{"cannot_move":true},
+                        "content":[{
+                            "type":"tool_result",
+                            "tool_use_id":"call",
+                            "content":"done"
+                        }]
+                    }
+                ]
+            }),
+        ),
+    ] {
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+        assert_anthropic_invalid_request(&response, label);
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_stop_sequences_reject_responses_but_preserve_native_anthropic_support() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let responses_body = |stop_sequences: Value| {
+        json!({
+            "model":"responses-fixture/gpt-fixture",
+            "max_tokens":128,
+            "stop_sequences":stop_sequences,
+            "messages":[{"role":"user","content":"stop policy"}]
+        })
+    };
+    let before = fixture.requests().len();
+    let (status, response) = send(post_json(
+        "/v1/messages",
+        responses_body(json!(["END"])),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_anthropic_invalid_request(&response, "Responses stop_sequences");
+    assert!(json_body(&response)["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("stop_sequences")));
+    assert_eq!(fixture.requests().len(), before);
+
+    let before = fixture.requests().len();
+    let (status, response) = send(post_json(
+        "/responses-fixture/v1/messages",
+        responses_body(json!(["DIRECT-END"])),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_anthropic_invalid_request(&response, "direct provider stop_sequences");
+    assert_eq!(fixture.requests().len(), before);
+
+    let mut codex_alias_body = responses_body(json!(["CODEX-END"]));
+    codex_alias_body["model"] = json!("codex/gpt-fixture");
+    let before = fixture.requests().len();
+    let (status, response) = send(post_json(
+        "/v1/messages",
+        codex_alias_body,
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_anthropic_invalid_request(&response, "Codex alias stop_sequences");
+    assert_eq!(fixture.requests().len(), before);
+
+    let chat_body = json!({
+        "model":"chat-fixture/gpt-chat-fixture",
+        "max_tokens":128,
+        "stop_sequences":["z-stop","a-stop","z-stop"],
+        "messages":[{"role":"user","content":"chat stop policy"}],
+        "stream":false
+    });
+    let (status, _) = send(post_json("/v1/messages", chat_body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/chat/completions")
+        .expect("Chat Completions stop capture");
+    assert_eq!(capture.body["stop"], json!(["z-stop", "a-stop", "z-stop"]));
+
+    for empty in [Value::Null, json!([])] {
+        let before = fixture.requests().len();
+        let (status, _) = send(post_json(
+            "/v1/messages",
+            responses_body(empty),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let captures = fixture.requests();
+        assert_eq!(captures.len(), before + 1);
+        assert!(captures
+            .last()
+            .expect("Responses empty-stop capture")
+            .body
+            .get("stop_sequences")
+            .is_none());
+    }
+
+    let native_body = json!({
+        "model":"anthropic-fixture/claude-sonnet-4-6",
+        "max_tokens":128,
+        "stop_sequences":["z-stop","a-stop","z-stop"],
+        "top_k":17,
+        "cache_control":{"type":"ephemeral"},
+        "service_tier":"standard_only",
+        "temperature":0.25,
+        "top_p":0.75,
+        "messages":[{"role":"user","content":"native stop policy"}],
+        "stream":false
+    });
+    let (status, _) = send(post_json("/v1/messages", native_body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/messages")
+        .expect("native Anthropic stop capture");
+    assert_eq!(
+        capture.body["stop_sequences"],
+        json!(["z-stop", "a-stop", "z-stop"])
+    );
+    assert_eq!(capture.body["top_k"], 17);
+    assert_eq!(capture.body["cache_control"], json!({"type":"ephemeral"}));
+    assert_eq!(capture.body["service_tier"], "standard_only");
+    assert_eq!(capture.body["temperature"], 0.25);
+    assert_eq!(capture.body["top_p"], 0.75);
+
+    configure_with_web_search_model(&fixture, Some("anthropic-fixture/claude-sonnet-4-6"));
+    let native_web_search_body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "stop_sequences":["NATIVE-WEB-END"],
+        "tools":[{
+            "type":"web_search_20250305",
+            "name":"web_search"
+        }],
+        "messages":[{"role":"user","content":"native search"}]
+    });
+    let (status, _) = send(post_json(
+        "/v1/messages",
+        native_web_search_body,
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/messages")
+        .expect("native web-search stop capture");
+    assert_eq!(capture.body["stop_sequences"], json!(["NATIVE-WEB-END"]));
+
+    configure_with_web_search_model(&fixture, Some("responses-fixture/gpt-fixture"));
+    let web_search_body = json!({
+        "model":"anthropic-fixture/claude-sonnet-4-6",
+        "max_tokens":128,
+        "stop_sequences":["WEB-END"],
+        "tools":[{
+            "type":"web_search_20250305",
+            "name":"web_search"
+        }],
+        "messages":[{"role":"user","content":"search"}]
+    });
+    let before = fixture.requests().len();
+    let (status, response) =
+        send(post_json("/v1/messages", web_search_body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_anthropic_invalid_request(&response, "web-search stop_sequences");
+    assert_eq!(fixture.requests().len(), before);
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_responses_controls_preserve_supported_and_reject_unrepresentable_values() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+    let base = || {
+        json!({
+            "model":"responses-fixture/gpt-fixture",
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"control policy"}]
+        })
+    };
+
+    for (label, field, value) in [
+        ("top_k", "top_k", json!(17)),
+        (
+            "top-level cache_control",
+            "cache_control",
+            json!({"type":"ephemeral"}),
+        ),
+        ("service_tier", "service_tier", json!("standard_only")),
+    ] {
+        let mut body = base();
+        body[field] = value;
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+        assert_anthropic_invalid_request(&response, label);
+        assert!(json_body(&response)["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(field)));
+        assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
+    }
+
+    let mut supported = base();
+    supported["temperature"] = json!(0.25);
+    supported["top_p"] = json!(0.75);
+    let (status, _) = send(post_json("/v1/messages", supported, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("supported Responses control capture");
+    assert_eq!(capture.body["temperature"], 0.25);
+    assert_eq!(capture.body["top_p"], 0.75);
+
+    for field in ["temperature", "top_p"] {
+        let mut body = base();
+        body["model"] = json!("codex/gpt-fixture");
+        body[field] = json!(0.25);
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "Codex {field}");
+        assert_anthropic_invalid_request(&response, &format!("Codex {field}"));
+        assert!(json_body(&response)["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(field)));
+        assert_eq!(
+            fixture.requests().len(),
+            before,
+            "Codex {field} reached upstream"
+        );
+    }
+
+    let mut direct_codex_body = base();
+    direct_codex_body["temperature"] = json!(0.25);
+    let before = fixture.requests().len();
+    let (status, response) = send(post_json(
+        "/codex/v1/messages",
+        direct_codex_body,
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_anthropic_invalid_request(&response, "direct Codex temperature");
+    assert_eq!(fixture.requests().len(), before);
+
+    let mut null_controls = base();
+    null_controls["top_k"] = Value::Null;
+    null_controls["cache_control"] = Value::Null;
+    null_controls["service_tier"] = Value::Null;
+    null_controls["temperature"] = Value::Null;
+    let (status, _) = send(post_json("/v1/messages", null_controls, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("null Responses controls capture");
+    assert_eq!(capture.body["temperature"], 1.0);
+    assert!(capture.body.get("top_k").is_none());
+    assert!(capture.body.get("cache_control").is_none());
+    assert!(capture.body.get("service_tier").is_none());
+}
+
 fn binary_schema(depth: usize) -> Value {
     if depth == 0 {
         return Value::Bool(true);
@@ -10324,6 +10849,12 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
             "flags":{"type":"array","items":[true,{"not":false}]},
             "all_types":{
                 "type":["null","boolean","object","array","number","string","integer"]
+            },
+            "empty_constraints":{
+                "type":"object",
+                "required":[],
+                "dependentRequired":{"x":[]},
+                "dependencies":{"legacy":[]}
             }
         },
         "patternProperties":{"^x-":false},

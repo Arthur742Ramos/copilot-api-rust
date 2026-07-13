@@ -45,6 +45,31 @@ use crate::services::copilot::create_responses::{
 };
 
 const MESSAGE_TYPE: &str = "message";
+const RESPONSES_MESSAGE_CANONICAL_FIELDS: &[&str] = &["type", "role", "content", "status", "phase"];
+const RESPONSES_REQUEST_CANONICAL_FIELDS: &[&str] = &[
+    "model",
+    "instructions",
+    "input",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "metadata",
+    "stream",
+    "safety_identifier",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "parallel_tool_calls",
+    "store",
+    "reasoning",
+    "context_management",
+    "include",
+    "service_tier",
+    // Not a Responses field, but accepting this extension would silently
+    // bypass the explicit `stop_sequences` unsupported-control policy.
+    "stop",
+];
 const COMPACTION_SIGNATURE_PREFIX: &str = "cm1#";
 const COMPACTION_SIGNATURE_SEPARATOR: &str = "@";
 const OPTIONAL_REASONING_SIGNATURE_PREFIX: &str = "rs1#";
@@ -225,6 +250,7 @@ pub fn translate_anthropic_messages_to_responses_payload(
     payload: &AnthropicMessagesPayload,
     subagent_agent_id: Option<&str>,
 ) -> Result<ResponsesPayload, AppError> {
+    validate_responses_request_controls(payload, false)?;
     let mut input: Vec<ResponseInputItem> = Vec::new();
     let apply_phase = should_apply_phase(&payload.model);
 
@@ -244,8 +270,9 @@ pub fn translate_anthropic_messages_to_responses_payload(
         tool_use_name_by_id: std::collections::HashMap::new(),
     };
 
-    for message in &payload.messages {
-        let items = translate_message(message, &payload.model, apply_phase, &mut state)?;
+    for (message_index, message) in payload.messages.iter().enumerate() {
+        let path = format!("messages[{message_index}]");
+        let items = translate_message(message, &payload.model, apply_phase, &mut state, &path)?;
         input.extend(items);
     }
 
@@ -301,13 +328,21 @@ pub fn translate_anthropic_messages_to_responses_payload(
         merge_open_object_extensions(&output_config.extra, &[], &mut reasoning, "output_config")?;
     }
 
+    let extra = collect_open_object_extensions(
+        &payload.extra,
+        &[],
+        RESPONSES_REQUEST_CANONICAL_FIELDS,
+        "request",
+    )?;
     let mut responses_payload = ResponsesPayload {
         model: payload.model.clone(),
         instructions: translate_system_prompt(payload.system.as_ref(), &payload.model)?,
         input: Some(InputField::Items(input)),
         tools: translated_tools,
         tool_choice: Some(tool_choice),
-        temperature: Some(1.0), // reasoning high temperature fixed to 1
+        // Preserve an explicit supported control. Responses reasoning defaults
+        // to the established temperature of 1 only when Claude omitted it.
+        temperature: payload.temperature.or(Some(1.0)),
         top_p: payload.top_p,
         max_output_tokens: Some(max_output_tokens),
         metadata: metadata_value,
@@ -321,7 +356,7 @@ pub fn translate_anthropic_messages_to_responses_payload(
         context_management: None,
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
         service_tier: None,
-        extra: Map::new(),
+        extra,
     };
 
     if has_original_tools {
@@ -329,6 +364,50 @@ pub fn translate_anthropic_messages_to_responses_payload(
     }
 
     Ok(responses_payload)
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn validate_responses_request_controls(
+    payload: &AnthropicMessagesPayload,
+    codex_transport: bool,
+) -> Result<(), AppError> {
+    if payload
+        .stop_sequences
+        .as_ref()
+        .is_some_and(|sequences| !sequences.is_empty())
+    {
+        return Err(AppError::BadRequest(
+            "stop_sequences is not supported by the OpenAI Responses wire contract".to_string(),
+        ));
+    }
+    if payload.top_k.is_some() {
+        return Err(AppError::BadRequest(
+            "top_k is not supported by the OpenAI Responses wire contract".to_string(),
+        ));
+    }
+    if payload.cache_control.is_some() {
+        return Err(AppError::BadRequest(
+            "top-level cache_control is not supported by the OpenAI Responses wire contract"
+                .to_string(),
+        ));
+    }
+    if payload.service_tier.is_some() {
+        return Err(AppError::BadRequest(
+            "Anthropic service_tier cannot be represented safely by every configured OpenAI Responses transport"
+                .to_string(),
+        ));
+    }
+    if codex_transport && payload.temperature.is_some() {
+        return Err(AppError::BadRequest(
+            "temperature is not supported by the audited Codex Responses wire contract".to_string(),
+        ));
+    }
+    if codex_transport && payload.top_p.is_some() {
+        return Err(AppError::BadRequest(
+            "top_p is not supported by the audited Codex Responses wire contract".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn should_apply_phase(_model: &str) -> bool {
@@ -341,11 +420,12 @@ fn translate_message(
     model: &str,
     apply_phase: bool,
     state: &mut TranslationState,
+    path: &str,
 ) -> Result<Vec<ResponseInputItem>, AppError> {
     if message.role == "user" {
-        translate_user_message(message, state)
+        translate_user_message(message, state, path)
     } else {
-        translate_assistant_message(message, model, apply_phase, state)
+        translate_assistant_message(message, model, apply_phase, state, path)
     }
 }
 
@@ -353,12 +433,20 @@ fn translate_message(
 fn translate_user_message(
     message: &AnthropicInputMessage,
     state: &mut TranslationState,
+    path: &str,
 ) -> Result<Vec<ResponseInputItem>, AppError> {
+    let message_extra = collect_open_object_extensions(
+        &message.extra,
+        &[],
+        RESPONSES_MESSAGE_CANONICAL_FIELDS,
+        path,
+    )?;
     if let Some(text) = message.content.as_str() {
         return Ok(vec![create_message(
             "user",
             MessageContent::Text(text.to_string()),
             None,
+            message_extra,
         )]);
     }
 
@@ -373,7 +461,7 @@ fn translate_user_message(
 
     for block in blocks {
         if block_type(block) == Some("tool_result") {
-            flush_pending_content(&mut pending, &mut items, "user", None);
+            flush_pending_content(&mut pending, &mut items, "user", None, &message_extra);
             items.push(create_tool_call_output(block, state)?);
             continue;
         }
@@ -382,7 +470,8 @@ fn translate_user_message(
         pending.extend(converted);
     }
 
-    flush_pending_content(&mut pending, &mut items, "user", None);
+    flush_pending_content(&mut pending, &mut items, "user", None, &message_extra);
+    ensure_message_extensions_represented(&items, &message_extra, path)?;
     Ok(items)
 }
 
@@ -392,14 +481,22 @@ fn translate_assistant_message(
     model: &str,
     apply_phase: bool,
     state: &mut TranslationState,
+    path: &str,
 ) -> Result<Vec<ResponseInputItem>, AppError> {
     let assistant_phase = resolve_assistant_phase(model, &message.content, apply_phase);
+    let message_extra = collect_open_object_extensions(
+        &message.extra,
+        &[],
+        RESPONSES_MESSAGE_CANONICAL_FIELDS,
+        path,
+    )?;
 
     if let Some(text) = message.content.as_str() {
         return Ok(vec![create_message(
             "assistant",
             MessageContent::Text(text.to_string()),
             assistant_phase,
+            message_extra,
         )]);
     }
 
@@ -427,6 +524,7 @@ fn translate_assistant_message(
                 &mut items,
                 "assistant",
                 assistant_phase.clone(),
+                &message_extra,
             );
             items.push(create_tool_call(block, state)?);
             continue;
@@ -444,6 +542,7 @@ fn translate_assistant_message(
                         &mut items,
                         "assistant",
                         assistant_phase.clone(),
+                        &message_extra,
                     );
                     items.push(ResponseInputItem::Compaction(compaction));
                     continue;
@@ -455,6 +554,7 @@ fn translate_assistant_message(
                         &mut items,
                         "assistant",
                         assistant_phase.clone(),
+                        &message_extra,
                     );
                     items.push(ResponseInputItem::Reasoning(create_reasoning_content(
                         block,
@@ -469,8 +569,34 @@ fn translate_assistant_message(
         }
     }
 
-    flush_pending_content(&mut pending, &mut items, "assistant", assistant_phase);
+    flush_pending_content(
+        &mut pending,
+        &mut items,
+        "assistant",
+        assistant_phase,
+        &message_extra,
+    );
+    ensure_message_extensions_represented(&items, &message_extra, path)?;
     Ok(items)
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_message_extensions_represented(
+    items: &[ResponseInputItem],
+    message_extra: &Map<String, Value>,
+    path: &str,
+) -> Result<(), AppError> {
+    if message_extra.is_empty()
+        || items
+            .iter()
+            .any(|item| matches!(item, ResponseInputItem::Message(_)))
+    {
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(format!(
+        "{path}: message extensions cannot be represented when the message contains only non-message Responses items"
+    )))
 }
 
 #[allow(clippy::result_large_err)]
@@ -529,16 +655,27 @@ fn flush_pending_content(
     target: &mut Vec<ResponseInputItem>,
     role: &str,
     phase: Option<String>,
+    message_extra: &Map<String, Value>,
 ) {
     if pending.is_empty() {
         return;
     }
 
     let content = std::mem::take(pending);
-    target.push(create_message(role, MessageContent::Blocks(content), phase));
+    target.push(create_message(
+        role,
+        MessageContent::Blocks(content),
+        phase,
+        message_extra.clone(),
+    ));
 }
 
-fn create_message(role: &str, content: MessageContent, phase: Option<String>) -> ResponseInputItem {
+fn create_message(
+    role: &str,
+    content: MessageContent,
+    phase: Option<String>,
+    extra: Map<String, Value>,
+) -> ResponseInputItem {
     let phase = if role == "assistant" { phase } else { None };
     ResponseInputItem::Message(ResponseInputMessage {
         item_type: Some(MESSAGE_TYPE.to_string()),
@@ -546,7 +683,7 @@ fn create_message(role: &str, content: MessageContent, phase: Option<String>) ->
         content: Some(content),
         status: None,
         phase,
-        extra: Default::default(),
+        extra,
     })
 }
 

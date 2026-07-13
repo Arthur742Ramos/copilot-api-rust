@@ -264,6 +264,10 @@ fn validate_schema_name_array(value: &Value, path: &str) -> Result<(), AppError>
     let array = value
         .as_array()
         .ok_or_else(|| invalid(path, "must be an array of property-name strings"))?;
+    // JSON Schema's shared `stringArray` meta-schema has `default: []` and
+    // `uniqueItems: true`, but no `minItems`. Empty `required`,
+    // `dependentRequired`, and legacy dependency arrays are therefore valid
+    // no-op constraints; only entries that are present need name validation.
     validate_schema_collection_bound(array.len(), path)?;
     let mut seen = HashSet::new();
     for (index, value) in array.iter().enumerate() {

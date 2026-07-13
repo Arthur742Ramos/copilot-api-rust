@@ -201,7 +201,10 @@ retains the established empty-properties normalization.
 The known `type` keyword accepts only `null`, `boolean`, `object`, `array`,
 `number`, `string`, or `integer`; arrays must be non-empty, unique subsets of
 those values. `required`, `dependentRequired`, and legacy name-array
-dependencies contain unique non-blank property names. `enum`, `const`, and
+dependencies contain unique non-blank property names. Empty name arrays are
+valid no-op constraints: the JSON Schema
+[`stringArray` meta-schema](https://github.com/json-schema-org/json-schema-spec/blob/fb2a20df8ea471e8754e32205ea372939b5527ca/specs/meta/meta.schema.json)
+has `default: []`, `uniqueItems: true`, and no `minItems`. `enum`, `const`, and
 unknown keywords are not semantically interpreted and remain unchanged.
 
 An explicit `tool_choice` of type `tool` must name exactly one declared
@@ -228,6 +231,37 @@ Open-object extensions use a per-target policy rather than blanket dropping:
   are retained on their open target objects; unrepresentable structured-system
   extras fail explicitly. Large base64 data is not duplicated.
 
+Top-level `AnthropicMessagesPayload.extra` fields are appended to the open
+Responses request after canonical fields, and `AnthropicInputMessage.extra`
+fields are copied onto every produced Responses message item—even when a
+tool-use/result splits one Anthropic message into multiple message items.
+An extension on a tool-call/result-only message is rejected because moving it
+onto the non-message item would change its scope.
+Canonical request/message collisions (`input`, `phase`, `status`, and similar)
+and the unsafe `stop` bypass fail explicitly before provider dispatch.
+
+`stop_sequences` has no field in either the audited Codex 0.144.1
+[`ResponsesApiRequest`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/codex-api/src/common.rs)
+or the current generated OpenAI
+[`ResponseCreateParamsBase`](https://github.com/openai/openai-python/blob/f16fbbd2bd25dc1ff150b5f78dbd15ff6bab6d91/src/openai/types/responses/response_create_params.py).
+Non-empty sequences therefore return Anthropic HTTP 400 before a selected
+Responses provider or web-search bridge consumes admission. Omitted, `null`,
+and empty arrays are no-op. Native Anthropic forwarding preserves the original
+array, and the Chat Completions translator maps it exactly to `stop`, retaining
+order and duplicates.
+
+The same route-specific policy covers other top-level controls. Generic and
+direct-Copilot Responses preserve explicit `temperature`/`top_p`
+(`temperature` defaults to the established `1` only when omitted/null), while
+the audited Codex request has neither field and rejects explicit values before
+admission. Non-null `top_k`, top-level `cache_control`, and Anthropic
+`service_tier` fail before any Responses provider dispatch because they cannot
+be carried unchanged by every supported Responses transport. Native Anthropic
+forwarding retains those controls. Null/omitted values remain no-op. Anthropic
+`max_tokens` remains required at the public Messages boundary, but Codex has no
+output-token-limit member; its value is therefore validation/translation input,
+not a Codex wire constraint.
+
 System blocks, metadata, thinking/output configuration, stop sequences, cache
 controls, text/image/document sources, tool-use inputs, and tool-result content
 all validate their known container and scalar types before translation. Image
@@ -253,6 +287,10 @@ allowed. Exact public evidence is in
 `claude_recursive_schema_shape_and_bounds_fail_before_dispatch`,
 `claude_complex_boolean_schemas_choices_and_sources_preserve_supported_shape`,
 `claude_open_object_extension_collisions_fail_before_provider_dispatch`,
+`claude_payload_and_message_extensions_survive_split_responses_translation`,
+`claude_payload_and_message_extension_collisions_fail_without_dispatch`,
+`claude_stop_sequences_reject_responses_but_preserve_native_anthropic_support`,
+`claude_responses_controls_preserve_supported_and_reject_unrepresentable_values`,
 and `claude_unsupported_source_types_fail_before_admission_or_dispatch`.
 
 ### Reasoning framing and stream lifecycle policy
@@ -609,7 +647,7 @@ Status means deterministic, credential-free evidence exists.
 | Text and structured input | Messages content blocks | string/array input; images with optional `detail` | typed audit and provider-boundary captures |
 | Tool definitions/results | tool use/result, multi-turn; explicit choices bind to one compatible catalog entry; recursive object/boolean schemas are shape/bound validated; deferred references preserve explicit order/duplicates; malformed definitions, identities, arguments, and result collections fail before dispatch | function/custom/tool-search calls and outputs, including optional IDs | catalog choice, recursive schema, request collection, deferred reference, optional-item, and paired JSON/SSE boundary audits |
 | Parallel/interleaved calls | serialized only where Anthropic requires it | native interleaved Responses events | stream ordering/ID assertions |
-| Prompt caching | `cache_control` and beta headers | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
+| Prompt caching | `cache_control` and beta headers on native transports; top-level cache control is rejected for Responses | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
 | Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
 | Usage | strict nonnegative input/output/cache mapping; malformed Responses usage errors once | OpenAI cached/reasoning token details | public valid/absent/partial/type/range/overflow usage fixtures |
 | Model routing | aliases, `[1m]`, provider models; model-less created events use validated request context | aliases and `provider/model` | model helpers and public model-less-created boundary tests |

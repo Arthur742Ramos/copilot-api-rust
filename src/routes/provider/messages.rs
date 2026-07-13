@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::libs::config::{ModelConfig, ResolvedProviderConfig};
+use crate::libs::config::{provider_uses_responses_api, ModelConfig, ResolvedProviderConfig};
 use crate::libs::error::{anthropic_error_response, http_error_from_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{
@@ -40,6 +40,7 @@ use crate::routes::messages::responses_stream_translation::{
 };
 use crate::routes::messages::responses_translation::{
     translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
+    validate_responses_request_controls,
 };
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, malformed_stream_error_events,
@@ -83,6 +84,11 @@ pub async fn post_provider_messages(
             return AppError::BadRequest(format!("Invalid request payload: {e}")).into_response()
         }
     };
+    if provider_uses_responses_api(&provider) {
+        if let Err(error) = validate_responses_request_controls(&payload, provider == "codex") {
+            return error.into_response();
+        }
+    }
     if payload.model.trim().is_empty() {
         return AppError::BadRequest(
             "model: field required and must be a non-empty string".to_string(),
@@ -125,6 +131,9 @@ pub async fn handle_provider_messages_for_provider(
             format!("Provider '{provider}' not found or disabled"),
         ));
     };
+    if provider_config.provider_type == "openai-responses" {
+        validate_responses_request_controls(&payload, provider == "codex")?;
+    }
 
     let model_config = provider_config
         .models
