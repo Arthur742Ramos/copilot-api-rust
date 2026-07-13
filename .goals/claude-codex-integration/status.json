@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 17,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -86,6 +86,11 @@
       "iteration": 16,
       "verdict": "FAIL",
       "summary": "Catalog choices, recursive bounds, boolean schemas, source types, and deferred references pass, but schema primitive semantics and unknown tool-choice/tool fields are still lost or accepted."
+    },
+    {
+      "iteration": 17,
+      "verdict": "FAIL",
+      "summary": "Schema semantics, catalog choices, collision checks, and extension preservation mostly pass, but top-level/message extras and stop_sequences are still dropped and empty schema name arrays remain accepted."
     }
   ]
 }
