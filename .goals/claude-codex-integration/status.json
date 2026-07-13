@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 26,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -131,6 +131,11 @@
       "iteration": 25,
       "verdict": "FAIL",
       "summary": "Shared Chat budgets, exact/overflow UTF-8 fixtures, scheduler cleanup, and reasoning/signature accounting pass, but Responses function-argument state is over-reserved, web-search records usage before budget validation, and no public Responses budget fixtures exist."
+    },
+    {
+      "iteration": 26,
+      "verdict": "FAIL",
+      "summary": "Public Responses and web-search fixtures cross the Axum boundary and gates pass, but independent output/retained reservations are not atomic; failed retained transitions leave stale output charges, and regular Responses overflow usage is recorded without a validated translated success."
     }
   ]
 }
