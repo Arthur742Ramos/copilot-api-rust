@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 20,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -101,6 +101,11 @@
       "iteration": 19,
       "verdict": "FAIL",
       "summary": "Chat request extras, collisions, split carriers, structured content, and no-dispatch policy pass, but reverse Chat responses still drop open fields and turn malformed choices, tool calls, arguments, and usage into successful Anthropic output."
+    },
+    {
+      "iteration": 20,
+      "verdict": "FAIL",
+      "summary": "Non-stream Chat validation, extras, sanitized 502s, and provider/direct fixtures pass, but Chat SSE still defaults identity/index/usage, accepts finish/tool conflicts, and diverges on OpenAI-optional usage semantics."
     }
   ]
 }
