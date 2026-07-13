@@ -67,7 +67,8 @@ use crate::services::copilot::create_messages::{
     create_messages, CreateMessagesOptions, CreateMessagesResult,
 };
 use crate::services::copilot::create_responses::{
-    create_responses, CreateResponsesReturn, ResponsesRequestOptions, ResponsesTransport,
+    create_responses, CreateResponsesReturn, ResponsesBufferedContract, ResponsesRequestOptions,
+    ResponsesTransport,
 };
 use crate::services::copilot::get_models::Model;
 
@@ -441,6 +442,7 @@ pub async fn handle_with_responses_api(
             session_id: opts.session_id.as_deref(),
             compact_type: opts.compact_type,
             transport,
+            buffered_contract: ResponsesBufferedContract::Regular,
         },
     )
     .await?;
@@ -577,6 +579,10 @@ pub async fn handle_with_responses_api(
             recorder.record(normalize_responses_usage(usage_value.as_ref()));
             Ok(Json(anthropic_response).into_response())
         }
+        CreateResponsesReturn::CompactResult(_) => Err(crate::libs::error::HttpError::internal(
+            "Messages Responses flow unexpectedly returned a compact result",
+        )
+        .into()),
     }
 }
 

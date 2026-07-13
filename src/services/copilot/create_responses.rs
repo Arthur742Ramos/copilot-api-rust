@@ -13,7 +13,7 @@
 //!   shape is a union; typed structs are used where a known shape helps.
 //! - All optionals use `#[serde(skip_serializing_if = "Option::is_none")]`.
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -829,11 +829,92 @@ pub type ResponsesEventStream = std::pin::Pin<
 pub struct ResponsesBufferedResult {
     pub parsed: ResponsesResult,
     pub raw: Bytes,
+    pub headers: HeaderMap,
 }
 
-fn parse_buffered_responses(raw: Bytes) -> Result<ResponsesBufferedResult, serde_json::Error> {
-    let parsed = serde_json::from_slice::<ResponsesResult>(&raw)?;
-    Ok(ResponsesBufferedResult { parsed, raw })
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesCompactResult {
+    pub output: Vec<ResponseOutputItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ResponseUsage>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+pub struct ResponsesCompactBufferedResult {
+    pub parsed: ResponsesCompactResult,
+    pub raw: Bytes,
+    pub headers: HeaderMap,
+}
+
+/// Buffered JSON contract selected by the public route.
+///
+/// Regular Responses require the complete response identity/status shape. The
+/// compact endpoint deliberately uses the smaller Codex output-only contract,
+/// whose valid result has no response id, model, or status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesBufferedContract {
+    Regular,
+    Compact,
+}
+
+fn safe_buffered_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut safe = HeaderMap::new();
+    for name in ["x-request-id", "openai-request-id", "x-codex-turn-state"] {
+        if let Some(value) = headers.get(name) {
+            if let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) {
+                safe.insert(name, value.clone());
+            }
+        }
+    }
+    safe
+}
+
+fn validate_buffered_usage(usage: Option<&ResponseUsage>) -> Result<(), String> {
+    let Some(usage) = usage else {
+        return Ok(());
+    };
+    if usage.input_tokens < 0
+        || usage.output_tokens < 0
+        || usage.input_tokens.checked_add(usage.output_tokens) != Some(usage.total_tokens)
+        || usage.input_tokens_details.as_ref().is_some_and(|details| {
+            details.cached_tokens < 0 || details.cached_tokens > usage.input_tokens
+        })
+        || usage.output_tokens_details.as_ref().is_some_and(|details| {
+            details.reasoning_tokens < 0 || details.reasoning_tokens > usage.output_tokens
+        })
+    {
+        return Err("Responses usage counters were inconsistent".to_string());
+    }
+    Ok(())
+}
+
+fn parse_buffered_responses(
+    raw: Bytes,
+    headers: HeaderMap,
+) -> Result<ResponsesBufferedResult, String> {
+    let parsed =
+        serde_json::from_slice::<ResponsesResult>(&raw).map_err(|error| error.to_string())?;
+    validate_buffered_usage(parsed.usage.as_ref())?;
+    Ok(ResponsesBufferedResult {
+        parsed,
+        raw,
+        headers,
+    })
+}
+
+fn parse_buffered_compact(
+    raw: Bytes,
+    headers: HeaderMap,
+) -> Result<ResponsesCompactBufferedResult, String> {
+    let parsed = serde_json::from_slice::<ResponsesCompactResult>(&raw)
+        .map_err(|error| error.to_string())?;
+    validate_buffered_usage(parsed.usage.as_ref())?;
+    Ok(ResponsesCompactBufferedResult {
+        parsed,
+        raw,
+        headers,
+    })
 }
 
 /// Return type of [`create_responses`] / [`create_http_responses`], mirroring
@@ -845,6 +926,8 @@ fn parse_buffered_responses(raw: Bytes) -> Result<ResponsesBufferedResult, serde
 pub enum CreateResponsesReturn {
     /// Non-streaming: the fully-buffered, parsed result.
     Result(Box<ResponsesBufferedResult>),
+    /// Non-streaming output-only response from `/v1/responses/compact`.
+    CompactResult(Box<ResponsesCompactBufferedResult>),
     /// Streaming: decoded SSE events from the chosen transport.
     Stream(ResponsesEventStream),
 }
@@ -863,6 +946,7 @@ pub struct ResponsesRequestOptions<'a> {
     pub session_id: Option<&'a str>,
     pub compact_type: Option<i32>,
     pub transport: ResponsesTransport,
+    pub buffered_contract: ResponsesBufferedContract,
 }
 
 /// Mirrors `createResponses` in services/copilot/create-responses.ts.
@@ -1119,12 +1203,45 @@ async fn create_http_responses(
             crate::libs::sse::events(response),
         )))
     } else {
+        let headers = safe_buffered_response_headers(response.headers());
         let raw = crate::libs::http::read_bytes_capped(response)
             .await
-            .map_err(|e| HttpError::internal(format!("Failed to parse responses: {e}")))?;
-        let result = parse_buffered_responses(raw)
-            .map_err(|e| HttpError::internal(format!("Failed to parse responses: {e}")))?;
-        Ok(CreateResponsesReturn::Result(Box::new(result)))
+            .map_err(|error| {
+                HttpError::new(
+                    if error.contains("too large") || error.contains("exceeded") {
+                        "Upstream Responses body exceeded the maximum allowed size."
+                    } else {
+                        "The upstream Responses body could not be read."
+                    },
+                    StatusCode::BAD_GATEWAY,
+                    headers.clone(),
+                    String::new(),
+                )
+            })?;
+        match options.buffered_contract {
+            ResponsesBufferedContract::Compact => {
+                let result = parse_buffered_compact(raw, headers.clone()).map_err(|_| {
+                    HttpError::new(
+                        "The upstream compact Responses body was malformed.",
+                        StatusCode::BAD_GATEWAY,
+                        headers,
+                        String::new(),
+                    )
+                })?;
+                Ok(CreateResponsesReturn::CompactResult(Box::new(result)))
+            }
+            ResponsesBufferedContract::Regular => {
+                let result = parse_buffered_responses(raw, headers.clone()).map_err(|_| {
+                    HttpError::new(
+                        "The upstream Responses body was malformed.",
+                        StatusCode::BAD_GATEWAY,
+                        headers,
+                        String::new(),
+                    )
+                })?;
+                Ok(CreateResponsesReturn::Result(Box::new(result)))
+            }
+        }
     }
 }
 
@@ -1264,10 +1381,47 @@ mod tests {
         let raw = Bytes::from_static(
             br#"{"unknown_before":1,"id":"r","object":null,"created_at":null,"model":"gpt","output":[],"output_text":null,"status":"completed","usage":null,"metadata":null,"unknown_after":null}"#,
         );
-        let result = parse_buffered_responses(raw.clone()).expect("parse buffered response");
+        let result = parse_buffered_responses(raw.clone(), HeaderMap::new())
+            .expect("parse buffered response");
         assert_eq!(result.parsed.id, "r");
         assert!(result.parsed.object.is_null());
         assert_eq!(result.raw, raw);
+    }
+
+    #[test]
+    fn buffered_compact_accepts_output_only_idless_shape() {
+        let raw = Bytes::from_static(
+            br#"{"unknown_before":null,"output":[{"type":"compaction","id":null,"encrypted_content":"enc"}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3},"unknown_after":{"keep":true}}"#,
+        );
+        let result =
+            parse_buffered_compact(raw.clone(), HeaderMap::new()).expect("parse compact response");
+        assert_eq!(result.parsed.output.len(), 1);
+        assert!(matches!(
+            &result.parsed.output[0],
+            ResponseOutputItem::Compaction(item)
+                if item.id.is_none() && item.encrypted_content == "enc"
+        ));
+        assert_eq!(result.raw, raw);
+    }
+
+    #[test]
+    fn buffered_compact_rejects_wrong_known_shapes() {
+        for raw in [
+            br#"{"output":"wrong"}"#.as_slice(),
+            br#"{"output":[{"type":"compaction"}]}"#.as_slice(),
+            br#"{"output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":9}}"#
+                .as_slice(),
+        ] {
+            assert!(parse_buffered_compact(Bytes::copy_from_slice(raw), HeaderMap::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn buffered_regular_rejects_inconsistent_usage() {
+        let raw = Bytes::from_static(
+            br#"{"id":"r","model":"gpt","output":[],"status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":9}}"#,
+        );
+        assert!(parse_buffered_responses(raw, HeaderMap::new()).is_err());
     }
 
     #[test]

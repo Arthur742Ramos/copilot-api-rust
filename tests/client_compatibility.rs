@@ -8,7 +8,7 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -23,6 +23,7 @@ use copilot_api::libs::config::{
 use copilot_api::routes::messages::responses_translation::{
     encode_reasoning_signature, REASONING_SUMMARY_SEPARATOR, THINKING_TEXT,
 };
+use copilot_api::services::copilot::get_models::{Model, ModelsResponse};
 use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
@@ -30,6 +31,20 @@ const CLIENT_KEY: &str = "fixture-client-key";
 const UPSTREAM_KEY: &str = "fixture-upstream-key";
 const NATIVE_NULL_SHAPE: &str = r#"{"unknown_before":{"keep":true},"id":"resp_native_null","object":null,"created_at":null,"model":"gpt-native-null-shape","output":[],"output_text":null,"status":"completed","usage":null,"metadata":null,"parallel_tool_calls":null,"tools":null,"unknown_after":null}"#;
 const COMPACT_NULL_SHAPE: &str = r#"{"unknown_before":{"keep":true},"output":[{"type":"compaction","id":null,"encrypted_content":"enc_raw"}],"metadata":null,"unknown_after":null}"#;
+const DIRECT_COMPACT_SHAPE: &str = r#"{"extension_before":null,"output":[{"type":"compaction","id":null,"encrypted_content":"enc_direct","internal_chat_message_metadata_passthrough":{"turn_id":"direct-turn"}}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3},"extension_after":{"keep":true}}"#;
+const DIRECT_RESPONSES_SHAPE: &str = r#"{"extension_before":null,"id":"resp_direct","object":null,"created_at":null,"model":"gpt-direct-response-raw","output":[],"output_text":null,"status":"completed","usage":null,"metadata":null,"extension_after":{"keep":true}}"#;
+static INIT_HOME: Once = Once::new();
+
+fn init_home() {
+    INIT_HOME.call_once(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "copilot-api-client-compatibility-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create compatibility home");
+        std::env::set_var("COPILOT_API_HOME", dir);
+    });
+}
 
 #[derive(Clone, Debug)]
 struct CapturedRequest {
@@ -51,6 +66,7 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        init_home();
         let state = FixtureState::default();
         let app = Router::new()
             .route("/v1/messages", post(fixture_handler))
@@ -109,12 +125,83 @@ async fn fixture_handler(
     match uri.path() {
         "/v1/messages" => anthropic_fixture(&body),
         "/v1/responses" => responses_fixture(&body),
-        "/v1/responses/compact" if body["model"] == "gpt-native-null-shape" => Response::builder()
+        "/v1/responses/compact" => compact_fixture(&body),
+        other => panic!("unexpected fixture path {other}"),
+    }
+}
+
+fn compact_fixture(body: &Value) -> Response {
+    match body["model"].as_str().unwrap_or_default() {
+        "gpt-native-null-shape" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
             .body(Body::from(COMPACT_NULL_SHAPE))
             .expect("compact null fixture"),
-        "/v1/responses/compact" => Json(json!({
+        "gpt-direct-compact-success" | "gpt-direct-compact-headers" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "direct-compact-request")
+            .header("x-codex-turn-state", "direct-state")
+            .header("x-unsafe-secret", "must-not-propagate")
+            .body(Body::from(DIRECT_COMPACT_SHAPE))
+            .expect("direct compact fixture"),
+        "gpt-direct-compact-malformed-json" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "direct-compact-malformed")
+            .header("x-unsafe-secret", "must-not-propagate")
+            .body(Body::from("{not-json"))
+            .expect("malformed compact fixture"),
+        "gpt-direct-compact-wrong-output" => {
+            Json(json!({"output":"wrong","extension":{"keep":true}})).into_response()
+        }
+        "gpt-direct-compact-wrong-item" => {
+            Json(json!({"output":[{"type":"compaction","id":null}]})).into_response()
+        }
+        "gpt-direct-compact-wrong-usage" => Json(json!({
+            "output":[],
+            "usage":{"input_tokens":2,"output_tokens":1,"total_tokens":9}
+        }))
+        .into_response(),
+        "gpt-direct-compact-oversized" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", "direct-compact-oversized")
+            .header(
+                "content-length",
+                (copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES + 1).to_string(),
+            )
+            .body(Body::from(vec![
+                b'x';
+                copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+                    + 1
+            ]))
+            .expect("oversized compact fixture"),
+        "gpt-direct-compact-400" => (
+            StatusCode::BAD_REQUEST,
+            [("x-request-id", "direct-compact-400")],
+            Json(json!({
+                "error":{
+                    "message":"direct compact invalid",
+                    "type":"invalid_request_error",
+                    "code":"compact_invalid"
+                }
+            })),
+        )
+            .into_response(),
+        "gpt-direct-compact-503" => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("x-request-id", "direct-compact-503"), ("retry-after", "3")],
+            Json(json!({
+                "error":{
+                    "message":"direct compact unavailable",
+                    "type":"server_error",
+                    "code":"compact_unavailable"
+                }
+            })),
+        )
+            .into_response(),
+        _ => Json(json!({
             "output": [
                 {
                     "type": "compaction",
@@ -127,7 +214,6 @@ async fn fixture_handler(
             "fixture_extension": {"preserved": true}
         }))
         .into_response(),
-        other => panic!("unexpected fixture path {other}"),
     }
 }
 
@@ -3220,6 +3306,31 @@ fn web_search_authority_fixture(model: &str) -> Option<Response> {
             created["incomplete_details"] = json!({"reason":"created","nested":{"x":1}});
             terminal["incomplete_details"] = json!({"reason":"terminal","nested":{"x":2}});
         }
+        "gpt-web-metadata-created-only" => {
+            created["metadata"] = json!({"source":"created","nested":{"x":1}});
+        }
+        "gpt-web-metadata-terminal-only" => {
+            terminal["metadata"] = json!({"source":"terminal","nested":{"x":1}});
+        }
+        "gpt-web-metadata-matching" => {
+            created["metadata"] = json!({"source":"matching","nested":{"x":1}});
+            terminal["metadata"] = json!({"source":"matching","nested":{"x":1}});
+        }
+        "gpt-web-metadata-null-absent" => {
+            terminal["metadata"] = Value::Null;
+        }
+        "gpt-web-created-metadata-malformed" => {
+            created["metadata"] = json!("malformed");
+        }
+        "gpt-web-terminal-metadata-malformed" => {
+            terminal["metadata"] = json!(["malformed"]);
+        }
+        "gpt-web-created-incomplete-details-malformed" => {
+            created["incomplete_details"] = json!("malformed");
+        }
+        "gpt-web-terminal-incomplete-details-malformed" => {
+            terminal["incomplete_details"] = json!(["malformed"]);
+        }
         "gpt-web-end-turn-created-only" => {
             created["end_turn"] = json!(false);
         }
@@ -5342,6 +5453,9 @@ fn reasoning_lifecycle_stream_fixture(model: &str) -> Option<Response> {
 
 fn responses_fixture(body: &Value) -> Response {
     let model = body["model"].as_str().unwrap_or("gpt-fixture");
+    if model.starts_with("gpt-direct-compact-") {
+        return compact_fixture(body);
+    }
     match model {
         "gpt-rate-limit" => {
             return (
@@ -5426,6 +5540,107 @@ fn responses_fixture(body: &Value) -> Response {
                 )
                 .body(Body::empty())
                 .unwrap()
+        }
+        _ => {}
+    }
+
+    match model {
+        "gpt-direct-response-raw" => {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("openai-request-id", "direct-response-request")
+                .header("x-unsafe-secret", "must-not-propagate")
+                .body(Body::from(DIRECT_RESPONSES_SHAPE))
+                .expect("direct response fixture")
+        }
+        "gpt-direct-response-malformed" => {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-request-id", "direct-response-malformed")
+                .header("x-unsafe-secret", "must-not-propagate")
+                .body(Body::from("{not-json"))
+                .expect("malformed direct response")
+        }
+        "gpt-direct-response-wrong-shape" => {
+            return Json(json!({
+                "model":"gpt-direct-response-wrong-shape",
+                "status":"completed",
+                "output":"wrong"
+            }))
+            .into_response()
+        }
+        "gpt-direct-response-wrong-item" => {
+            return Json(json!({
+                "id":"resp_direct_wrong_item",
+                "model":"gpt-direct-response-wrong-item",
+                "status":"completed",
+                "output":[{
+                    "type":"function_call",
+                    "name":"missing_call_id",
+                    "arguments":"{}"
+                }]
+            }))
+            .into_response()
+        }
+        "gpt-direct-response-wrong-usage" => {
+            return Json(json!({
+                "id":"resp_direct_wrong_usage",
+                "model":"gpt-direct-response-wrong-usage",
+                "status":"completed",
+                "output":[],
+                "usage":{"input_tokens":3,"output_tokens":2,"total_tokens":99}
+            }))
+            .into_response()
+        }
+        "gpt-direct-response-oversized" => {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-request-id", "direct-response-oversized")
+                .header(
+                    "content-length",
+                    (copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES + 1).to_string(),
+                )
+                .body(Body::from(vec![
+                    b'x';
+                    copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+                        + 1
+                ]))
+                .expect("oversized direct response")
+        }
+        "gpt-direct-response-400" => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [("x-request-id", "direct-response-400")],
+                Json(json!({
+                    "error":{
+                        "message":"direct response invalid",
+                        "type":"invalid_request_error",
+                        "code":"direct_invalid",
+                        "fixture_extension":{"keep":true}
+                    }
+                })),
+            )
+                .into_response()
+        }
+        "gpt-direct-response-500" => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [
+                    ("x-request-id", "direct-response-500"),
+                    ("retry-after", "2"),
+                ],
+                Json(json!({
+                    "error":{
+                        "message":"direct response unavailable",
+                        "type":"server_error",
+                        "code":"direct_unavailable"
+                    }
+                })),
+            )
+                .into_response()
         }
         _ => {}
     }
@@ -6108,6 +6323,49 @@ fn configure(fixture: &Fixture) {
     configure_with_web_search_model(fixture, None);
 }
 
+fn configure_direct_copilot(fixture: &Fixture) {
+    configure(fixture);
+    let model_ids = [
+        "gpt-direct-compact-success",
+        "gpt-direct-compact-malformed-json",
+        "gpt-direct-compact-wrong-output",
+        "gpt-direct-compact-wrong-item",
+        "gpt-direct-compact-wrong-usage",
+        "gpt-direct-compact-oversized",
+        "gpt-direct-compact-400",
+        "gpt-direct-compact-503",
+        "gpt-direct-compact-headers",
+        "gpt-direct-response-raw",
+        "gpt-direct-response-malformed",
+        "gpt-direct-response-wrong-shape",
+        "gpt-direct-response-wrong-item",
+        "gpt-direct-response-wrong-usage",
+        "gpt-direct-response-oversized",
+        "gpt-direct-response-400",
+        "gpt-direct-response-500",
+    ];
+    let models = ModelsResponse {
+        object: "list".to_string(),
+        data: model_ids
+            .into_iter()
+            .map(|id| Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                supported_endpoints: Some(vec!["/responses".to_string()]),
+                ..Default::default()
+            })
+            .collect(),
+    };
+    copilot_api::libs::state::with_state_mut(|state| {
+        state.provider_only = None;
+        state.copilot_token = Some("direct-copilot-token".to_string());
+        state.copilot_api_url = Some(format!("{}/v1", fixture.base_url));
+        state.account_type = "individual".to_string();
+        state.models = Some(Arc::new(models));
+        state.premium_interactions = None;
+    });
+}
+
 fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&str>) {
     copilot_api::libs::state::with_state_mut(|state| {
         state.provider_only = Some("responses-fixture".to_string());
@@ -6227,6 +6485,14 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-web-incomplete-details-matching",
         "gpt-web-incomplete-details-null-absent",
         "gpt-web-incomplete-details-conflict",
+        "gpt-web-metadata-created-only",
+        "gpt-web-metadata-terminal-only",
+        "gpt-web-metadata-matching",
+        "gpt-web-metadata-null-absent",
+        "gpt-web-created-metadata-malformed",
+        "gpt-web-terminal-metadata-malformed",
+        "gpt-web-created-incomplete-details-malformed",
+        "gpt-web-terminal-incomplete-details-malformed",
         "gpt-web-end-turn-conflict",
         "gpt-web-output-text-conflict",
         "gpt-web-ignored-extra-conflict",
@@ -8782,6 +9048,10 @@ async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
         "gpt-web-incomplete-details-terminal-only",
         "gpt-web-incomplete-details-matching",
         "gpt-web-incomplete-details-null-absent",
+        "gpt-web-metadata-created-only",
+        "gpt-web-metadata-terminal-only",
+        "gpt-web-metadata-matching",
+        "gpt-web-metadata-null-absent",
         "gpt-web-ignored-extra-conflict",
         "gpt-web-item-id-created-only",
         "gpt-web-item-id-terminal-only",
@@ -8818,6 +9088,10 @@ async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
                 | "gpt-web-incomplete-details-terminal-only"
                 | "gpt-web-incomplete-details-matching"
                 | "gpt-web-incomplete-details-null-absent"
+                | "gpt-web-metadata-created-only"
+                | "gpt-web-metadata-terminal-only"
+                | "gpt-web-metadata-matching"
+                | "gpt-web-metadata-null-absent"
                 | "gpt-web-ignored-extra-conflict"
         ) {
             assert_eq!(json_response["content"][0]["id"], "authority-web");
@@ -8969,7 +9243,16 @@ async fn claude_web_search_terminal_conflicts_fail_before_json_or_sse_success() 
         "gpt-web-terminal-usage-conflict",
         "gpt-web-terminal-cached-usage-conflict",
         "gpt-web-terminal-reasoning-usage-conflict",
+        "gpt-web-created-usage-details-malformed",
+        "gpt-web-terminal-usage-details-malformed",
         "gpt-web-terminal-metadata-conflict",
+        "gpt-web-incomplete-details-conflict",
+        "gpt-web-created-metadata-malformed",
+        "gpt-web-terminal-metadata-malformed",
+        "gpt-web-created-incomplete-details-malformed",
+        "gpt-web-terminal-incomplete-details-malformed",
+        "gpt-web-end-turn-conflict",
+        "gpt-web-output-text-conflict",
         "gpt-web-terminal-output-conflict",
         "gpt-web-terminal-lifecycle-output-conflict",
         "gpt-web-terminal-output-malformed",
@@ -8977,6 +9260,11 @@ async fn claude_web_search_terminal_conflicts_fail_before_json_or_sse_success() 
         "gpt-web-unrepresentable-search-call",
         "gpt-web-incomplete-search-call",
         "gpt-web-empty-query-entry",
+        "gpt-web-item-id-conflict",
+        "gpt-web-message-id-conflict",
+        "gpt-web-item-status-conflict",
+        "gpt-web-lifecycle-item-id-conflict",
+        "gpt-web-lifecycle-item-action-conflict",
         "gpt-web-late-text-conflict",
         "gpt-web-delta-after-item-done",
         "gpt-web-terminal-failed",
@@ -9089,6 +9377,293 @@ async fn native_nonstream_responses_preserves_exact_null_and_unknown_shape() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let error = json_body(&body);
     assert_eq!(error["error"]["type"], "server_error");
+}
+
+fn assert_responses_upstream_metric(status: &str) {
+    let rendered = copilot_api::libs::metrics::render();
+    assert!(
+        rendered.lines().any(|line| {
+            line.starts_with("copilot_upstream_request_seconds_count{")
+                && line.contains("endpoint=\"responses\"")
+                && line.contains(&format!("status=\"{status}\""))
+                && line
+                    .split_whitespace()
+                    .last()
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .is_some_and(|value| value >= 1.0)
+        }),
+        "missing bounded Responses upstream metric for {status}:\n{rendered}"
+    );
+}
+
+async fn await_usage_event(model: &str) -> copilot_api::libs::token_usage::TokenUsageEventRecord {
+    for _ in 0..100 {
+        if let Some(event) =
+            copilot_api::libs::token_usage::get_token_usage_events_page(1, 100, "day")
+                .items
+                .into_iter()
+                .find(|event| event.model == model)
+        {
+            return event;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for token usage event for {model}");
+}
+
+fn direct_compact_request(model: &str) -> Request<Body> {
+    post_json(
+        "/v1/responses/compact",
+        json!({
+            "model":model,
+            "instructions":"Keep decisions.",
+            "input":[{
+                "type":"message",
+                "role":"user",
+                "content":[{"type":"input_text","text":"compact direct history"}]
+            }],
+            "fixture_extension":{"keep":true}
+        }),
+        Some(CLIENT_KEY),
+    )
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn direct_copilot_compact_preserves_output_only_contract_and_continuation() {
+    let _ = copilot_api::libs::metrics::metrics_handle();
+    let fixture = Fixture::start().await;
+    configure_direct_copilot(&fixture);
+
+    for model in ["gpt-direct-compact-success", "gpt-direct-compact-headers"] {
+        let (status, headers, body) = send_full(direct_compact_request(model)).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        assert_eq!(body.as_slice(), DIRECT_COMPACT_SHAPE.as_bytes(), "{model}");
+        assert_eq!(
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("direct-compact-request")
+        );
+        assert_eq!(
+            headers
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok()),
+            Some("direct-state")
+        );
+        assert!(headers.get("x-unsafe-secret").is_none());
+    }
+
+    let compacted = serde_json::from_str::<Value>(DIRECT_COMPACT_SHAPE)
+        .expect("compact fixture JSON")["output"][0]
+        .clone();
+    let (status, body) = send(post_json(
+        "/v1/responses",
+        json!({
+            "model":"gpt-direct-response-raw",
+            "input":[
+                compacted,
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+            ],
+            "stream":false
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_slice(), DIRECT_RESPONSES_SHAPE.as_bytes());
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("direct continuation capture");
+    assert_eq!(capture.body["input"][0]["type"], "compaction");
+    assert!(capture.body["input"][0].get("id").is_none());
+    assert_eq!(capture.body["input"][0]["encrypted_content"], "enc_direct");
+    assert_eq!(
+        capture.body["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
+        "direct-turn"
+    );
+    let usage = await_usage_event("gpt-direct-compact-success").await;
+    assert_eq!(usage.endpoint, "responses_compact");
+    assert_eq!(usage.source, "copilot");
+    assert_eq!(usage.input_tokens, 2);
+    assert_eq!(usage.output_tokens, 1);
+    assert_eq!(usage.total_tokens, 3);
+    assert_responses_upstream_metric("ok");
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn direct_copilot_compact_failures_use_native_bad_gateway_semantics() {
+    let _ = copilot_api::libs::metrics::metrics_handle();
+    let fixture = Fixture::start().await;
+    configure_direct_copilot(&fixture);
+
+    for (model, expected_request_id) in [
+        (
+            "gpt-direct-compact-malformed-json",
+            Some("direct-compact-malformed"),
+        ),
+        ("gpt-direct-compact-wrong-output", None),
+        ("gpt-direct-compact-wrong-item", None),
+        ("gpt-direct-compact-wrong-usage", None),
+        (
+            "gpt-direct-compact-oversized",
+            Some("direct-compact-oversized"),
+        ),
+    ] {
+        let (status, headers, body) = send_full(direct_compact_request(model)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}");
+        let error = json_body(&body);
+        assert_eq!(error["error"]["type"], "server_error", "{model}");
+        assert_eq!(error["error"]["code"], "server_error", "{model}");
+        assert_eq!(error["error"]["param"], Value::Null, "{model}");
+        assert!(!body.windows(8).any(|window| window == b"not-json"));
+        assert_eq!(
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            expected_request_id,
+            "{model}"
+        );
+        assert!(headers.get("x-unsafe-secret").is_none(), "{model}");
+    }
+
+    for (model, expected_status, request_id, retry_after) in [
+        (
+            "gpt-direct-compact-400",
+            StatusCode::BAD_REQUEST,
+            "direct-compact-400",
+            None,
+        ),
+        (
+            "gpt-direct-compact-503",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "direct-compact-503",
+            Some("3"),
+        ),
+    ] {
+        let (status, headers, body) = send_full(direct_compact_request(model)).await;
+        assert_eq!(status, expected_status, "{model}");
+        assert_eq!(
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id)
+        );
+        assert_eq!(
+            headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            retry_after
+        );
+        let error = json_body(&body);
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("direct compact")));
+        assert_eq!(
+            error["error"]["code"],
+            if expected_status == StatusCode::BAD_REQUEST {
+                "compact_invalid"
+            } else {
+                "compact_unavailable"
+            },
+            "{model}"
+        );
+    }
+    assert_responses_upstream_metric("ok");
+    assert_responses_upstream_metric("client_error");
+    assert_responses_upstream_metric("server_error");
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn direct_copilot_regular_responses_preserve_bytes_headers_and_errors() {
+    let _ = copilot_api::libs::metrics::metrics_handle();
+    let fixture = Fixture::start().await;
+    configure_direct_copilot(&fixture);
+    let request = |model: &str| {
+        post_json(
+            "/v1/responses",
+            json!({"model":model,"input":"direct response","stream":false}),
+            Some(CLIENT_KEY),
+        )
+    };
+
+    let (status, headers, body) = send_full(request("gpt-direct-response-raw")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_slice(), DIRECT_RESPONSES_SHAPE.as_bytes());
+    assert_eq!(
+        headers
+            .get("openai-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("direct-response-request")
+    );
+    assert!(headers.get("x-unsafe-secret").is_none());
+
+    for (model, expected_request_id) in [
+        (
+            "gpt-direct-response-malformed",
+            Some("direct-response-malformed"),
+        ),
+        ("gpt-direct-response-wrong-shape", None),
+        ("gpt-direct-response-wrong-item", None),
+        ("gpt-direct-response-wrong-usage", None),
+        (
+            "gpt-direct-response-oversized",
+            Some("direct-response-oversized"),
+        ),
+    ] {
+        let (status, headers, body) = send_full(request(model)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}");
+        let error = json_body(&body);
+        assert_eq!(error["error"]["type"], "server_error");
+        assert_eq!(error["error"]["code"], "server_error");
+        assert_eq!(error["error"]["param"], Value::Null);
+        assert_eq!(
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            expected_request_id,
+            "{model}"
+        );
+        assert!(headers.get("x-unsafe-secret").is_none(), "{model}");
+    }
+
+    let (status, headers, body) = send_full(request("gpt-direct-response-400")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("direct-response-400")
+    );
+    let error = json_body(&body);
+    assert_eq!(error["error"]["message"], "direct response invalid");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "direct_invalid");
+    assert_eq!(error["error"]["fixture_extension"]["keep"], true);
+
+    let (status, headers, body) = send_full(request("gpt-direct-response-500")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("direct-response-500")
+    );
+    assert_eq!(
+        headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(json_body(&body)["error"]["code"], "direct_unavailable");
+    assert_responses_upstream_metric("ok");
+    assert_responses_upstream_metric("client_error");
+    assert_responses_upstream_metric("server_error");
 }
 
 #[tokio::test]

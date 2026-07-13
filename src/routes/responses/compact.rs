@@ -11,6 +11,7 @@ use crate::libs::error::{http_error_from_response, openai_error_response, AppErr
 use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::state;
+use crate::libs::token_usage::{create_copilot_token_usage_recorder, normalize_responses_usage};
 use crate::routes::parse_json_body;
 use crate::routes::responses::handler::{
     get_codex_responses_subagent_marker, get_incoming_responses_session_id,
@@ -21,7 +22,8 @@ use crate::routes::responses::utils::{
 };
 use crate::services::codex::create_responses::forward_codex_compact;
 use crate::services::copilot::create_responses::{
-    create_responses, CreateResponsesReturn, ResponsesPayload, ResponsesRequestOptions,
+    create_responses, CreateResponsesReturn, ResponsesBufferedContract, ResponsesPayload,
+    ResponsesRequestOptions,
 };
 use crate::services::providers::provider_proxy::forward_provider_responses_compact;
 
@@ -90,6 +92,12 @@ async fn handle_responses_compact(body: Value, headers: HeaderMap) -> Result<Res
     let fallback_session_id =
         session_id.unwrap_or_else(|| crate::libs::utils::get_uuid(&request_id));
     let (vision, inferred_initiator) = get_responses_request_options(&payload);
+    let response_model = payload.model.clone();
+    let recorder = create_copilot_token_usage_recorder(
+        "responses_compact",
+        response_model.clone(),
+        Some(fallback_session_id.clone()),
+    );
 
     let result = create_responses(
         payload,
@@ -105,16 +113,40 @@ async fn handle_responses_compact(body: Value, headers: HeaderMap) -> Result<Res
             session_id: Some(&fallback_session_id),
             compact_type: Some(COMPACT_REQUEST),
             transport,
+            buffered_contract: ResponsesBufferedContract::Compact,
         },
     )
     .await?;
 
     match result {
-        CreateResponsesReturn::Result(result) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(result.raw))
-            .expect("static compact Responses response")),
+        CreateResponsesReturn::CompactResult(result) => {
+            if let Some(ctx) = crate::libs::request_context::request_context_store() {
+                ctx.set_flow_transport_model_non_streaming(
+                    &response_model,
+                    "responses_compact",
+                    crate::libs::stream_metrics::transport::NATIVE,
+                );
+            }
+            let usage = result
+                .parsed
+                .usage
+                .as_ref()
+                .and_then(|usage| serde_json::to_value(usage).ok());
+            recorder.record(normalize_responses_usage(usage.as_ref()));
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(result.raw))
+                .expect("static compact Responses response");
+            for (name, value) in &result.headers {
+                response.headers_mut().insert(name, value.clone());
+            }
+            Ok(response)
+        }
+        CreateResponsesReturn::Result(_) => Err(HttpError::internal(
+            "Responses compact unexpectedly returned a full response",
+        )
+        .into()),
         CreateResponsesReturn::Stream(_) => {
             Err(HttpError::internal("Responses compact unexpectedly returned a stream").into())
         }

@@ -378,10 +378,15 @@ snapshots never overwrite an asserted earlier value silently:
 | `output` | Structured merge across created, lifecycle-added, lifecycle-done, and terminal snapshots using the nested item rules below. Created `[]` is provisional; terminal `[]` is authoritative. |
 | `output_text` | Optional assertion; one present value is retained, matching values merge, conflicts fail. |
 | `usage` | A present object requires valid input/output/total counters. Required counters must match across snapshots. Optional cached/reasoning details merge independently when present; omission/null is no assertion, and contradictory present values fail. |
-| `metadata`, `incomplete_details` | Optional opaque semantic assertions. Missing/null values are filled from another snapshot; deep conflicting present values fail. |
+| `metadata`, `incomplete_details` | Optional structured assertions. Present values must be objects; missing/null values are filled from another snapshot, matching objects merge, and deep conflicting present objects fail. Scalars/arrays fail before success. |
 | `end_turn` | Optional boolean assertion. Missing/null is no assertion; conflicts fail; `false` maps to `pause_turn`. |
 | `error` | Used only to report failed terminals; never merged into successful reconstruction. |
 | `created_at`, `instructions`, `parallel_tool_calls`, `temperature`, `tool_choice`, `tools`, `top_p`, unknown fields | Client/bridge-ignored raw extras. They are retained from created or filled when missing, but are not conflict/type gates. |
+
+Public fixtures cover created-only, terminal-only, matching, null/absent,
+conflicting, scalar, and array cases for both structured
+`metadata` and `incomplete_details`. Ignored raw fields are deliberately tested
+with conflicting values to prove they are not accidental semantic gates.
 
 Nested output authority is likewise field-specific:
 
@@ -402,6 +407,25 @@ size-bounded and parsed for malformed-body/usage/output handling, but the
 original bytes are returned across Copilot, Codex-provider, and generic-provider
 branches, preserving explicit nulls, unknown fields, whitespace, and key order.
 Native SSE remains raw event forwarding under the existing lifecycle guard.
+
+Direct Copilot buffering uses separate contracts:
+
+| Endpoint | Buffered validation |
+|---|---|
+| `/v1/responses` | Full Responses result: required identity/model/status/output, strict known output item fields, and internally consistent nonnegative usage. |
+| `/v1/responses/compact` | Compact output-only result: required output array, source-valid ResponseItem shapes (including id-less `compaction`), optional strict usage, and arbitrary extensions; no fabricated response ID/model/status requirement. |
+
+Malformed JSON, wrong known output/item shapes, inconsistent usage, and
+size-limit failures from an otherwise successful direct upstream response become
+sanitized OpenAI `502 Bad Gateway` errors. Real upstream 4xx/5xx statuses,
+OpenAI error bodies, `Retry-After`, and allowlisted request IDs are retained.
+Successful direct regular/compact bodies preserve original bytes and only
+allowlisted `x-request-id`, `openai-request-id`, and `x-codex-turn-state`
+headers; arbitrary upstream headers are not exposed.
+The public fixtures exercise the actual 16 MiB response bound and assert the
+bounded `copilot_upstream_request_seconds` status classes. Successful direct
+compact usage is recorded under the `responses_compact` token-usage endpoint;
+malformed/oversized bodies are rejected before usage is recorded.
 
 `response.completed` and `response.incomplete` cannot produce Anthropic success
 while an added output item, function call, or reasoning buffer is unfinished.
@@ -432,6 +456,9 @@ evidence is in
 `claude_raw_output_variants_fail_explicitly_in_json_and_sse`,
 `native_responses_preserves_all_raw_output_variants`,
 `native_nonstream_responses_preserves_exact_null_and_unknown_shape`,
+`direct_copilot_compact_preserves_output_only_contract_and_continuation`,
+`direct_copilot_compact_failures_use_native_bad_gateway_semantics`,
+`direct_copilot_regular_responses_preserve_bytes_headers_and_errors`,
 and
 `claude_incomplete_or_out_of_order_response_items_fail_once_without_success`,
 in addition to the JSON/SSE framing regressions.
@@ -497,6 +524,7 @@ authentication, body limits, admission, and JSON parsing:
 | request too large | Anthropic `request_too_large` | OpenAI `request_too_large` code |
 | rate limit/overload | Anthropic retryable error + `Retry-After` | OpenAI rate/server error + retry metadata |
 | upstream 4xx/5xx | status preserved, sanitized native envelope | status preserved, sanitized native envelope |
+| malformed/oversized successful upstream JSON | Anthropic `api_error` | sanitized OpenAI `502 server_error`; no upstream body leakage |
 | malformed stream frame | one terminal Anthropic `error`; no `message_stop` | one terminal OpenAI `error` or `response.failed`; no completion |
 | premature EOF/transport reset | one retryable terminal error | one terminal OpenAI error; no completion |
 | incomplete/conflicting output-item lifecycle | one terminal Anthropic `error`; open blocks close; later events ignored | native Responses stream is forwarded unchanged |

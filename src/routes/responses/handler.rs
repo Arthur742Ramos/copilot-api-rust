@@ -15,7 +15,7 @@ use crate::libs::token_usage::{create_copilot_token_usage_recorder, normalize_re
 use crate::libs::utils::{generate_request_id_from_payload, get_uuid};
 use crate::services::copilot::create_responses::{
     create_responses, CreateResponsesReturn, InputField, MessageContent, ResponseInputItem,
-    ResponsesPayload, ResponsesRequestOptions,
+    ResponsesBufferedContract, ResponsesPayload, ResponsesRequestOptions,
 };
 
 use crate::routes::responses::stream_guard::{ResponsesStreamGuard, ResponsesTerminal};
@@ -150,6 +150,7 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
             session_id: Some(&fallback_session_id),
             compact_type: None,
             transport: responses_transport,
+            buffered_contract: ResponsesBufferedContract::Regular,
         },
     )
     .await?;
@@ -178,12 +179,20 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
                 .as_ref()
                 .and_then(|u| serde_json::to_value(u).ok());
             recorder.record(normalize_responses_usage(usage_value.as_ref()));
-            Ok(Response::builder()
+            let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(result.raw))
-                .expect("static native Responses response"))
+                .expect("static native Responses response");
+            for (name, value) in &result.headers {
+                response.headers_mut().insert(name, value.clone());
+            }
+            Ok(response)
         }
+        CreateResponsesReturn::CompactResult(_) => Err(crate::libs::error::HttpError::internal(
+            "Responses endpoint unexpectedly returned a compact result",
+        )
+        .into()),
     }
 }
 

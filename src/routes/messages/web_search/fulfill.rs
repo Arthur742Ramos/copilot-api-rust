@@ -60,7 +60,8 @@ use crate::routes::responses::utils::{
 };
 use crate::services::copilot::create_responses::{
     create_responses, CreateResponsesReturn, ResponseOutputContentBlock, ResponseOutputItem,
-    ResponsesPayload, ResponsesRequestOptions, ResponsesResult, ResponsesTransport,
+    ResponsesBufferedContract, ResponsesPayload, ResponsesRequestOptions, ResponsesResult,
+    ResponsesTransport,
 };
 
 const LOG_TAG: &str = "messages-web-search";
@@ -387,10 +388,33 @@ fn representable_web_search_query(raw: &Value) -> Result<String, AppError> {
 }
 
 #[allow(clippy::result_large_err)]
+fn validate_optional_object_field(value: &Value, field: &str) -> Result<(), AppError> {
+    if value
+        .get(field)
+        .is_some_and(|value| !value.is_null() && !value.is_object())
+    {
+        return Err(invalid_web_search_stream(format_args!(
+            "{field} was not an object or null"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(), AppError> {
     if result.id.trim().is_empty() || result.status != "completed" {
         return Err(invalid_web_search_stream(
             "the web-search response had invalid identity or completion status",
+        ));
+    }
+    if !result.metadata.is_null() && !result.metadata.is_object() {
+        return Err(invalid_web_search_stream(
+            "metadata was not an object or null",
+        ));
+    }
+    if !result.incomplete_details.is_null() && !result.incomplete_details.is_object() {
+        return Err(invalid_web_search_stream(
+            "incomplete_details was not an object or null",
         ));
     }
     validate_typed_output_items_and_usage(result)?;
@@ -663,6 +687,8 @@ fn validate_web_search_snapshot_fields(
             "a web-search response snapshot had invalid output_text",
         ));
     }
+    validate_optional_object_field(response, "metadata")?;
+    validate_optional_object_field(response, "incomplete_details")?;
     validate_raw_responses_usage(response).map_err(invalid_web_search_stream)?;
     Ok(())
 }
@@ -2042,6 +2068,7 @@ pub async fn handle_web_search_via_responses(
             session_id: options.session_id.as_deref(),
             compact_type,
             transport,
+            buffered_contract: ResponsesBufferedContract::Regular,
         },
     )
     .await?;
@@ -2056,6 +2083,12 @@ pub async fn handle_web_search_via_responses(
             .await?
         }
         CreateResponsesReturn::Result(result) => result.parsed,
+        CreateResponsesReturn::CompactResult(_) => {
+            return Err(crate::libs::error::HttpError::internal(
+                "Web-search Responses flow unexpectedly returned a compact result",
+            )
+            .into())
+        }
     };
     validate_web_search_result(&result)?;
 
