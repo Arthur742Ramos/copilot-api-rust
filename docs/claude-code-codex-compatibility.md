@@ -304,18 +304,31 @@ present, extras merge without conflict until the tool block starts, and argument
 fragments retain wire order. At `tool_calls` finish every index must have a
 non-empty id/name and complete object-valued JSON. Gaps, conflicts, late
 unemittable extras, missing terminal identity, scalar JSON, and size/count bound
-violations fail once.
+violations fail once. A `content_filter` terminal may follow already-observed
+tool calls only when every call has the same complete identity/object contract;
+an incomplete tool fails before translated success. `stop`/`length` still
+conflict with tool calls.
 
 Every non-null streamed Chat `refusal` string is an incremental fragment,
 including an empty no-op fragment. Refusal fragments accumulate in source
 order. Accumulated ordinary content and refusal must remain prefix-compatible:
 refusal-only output is emitted once at finish, identical or interleaved mirrors
-emit no duplicate text, and both non-empty representations must be identical at
-finish. Divergent representations fail on the conflicting chunk; a strict
-prefix that remains at finish is incomplete and fails before success. A
-non-empty refusal requires `content_filter`; `content_filter` without
-representable text or refusal, late refusal after either a usage-bearing finish
-or usage-only terminal, malformed values, and repeated terminals fail once.
+emit no duplicate text, and the longer prefix-compatible representation supplies
+the complete visible text. If refusal extends ordinary content, only its suffix
+is emitted; a partial refusal adds nothing to already-complete content.
+Divergent representations fail on the conflicting chunk. A non-empty refusal
+requires `content_filter`; `content_filter` without representable text/refusal,
+late refusal after either a usage-bearing finish or usage-only terminal,
+malformed values, and repeated terminals fail once.
+
+The scheduler separately bounds and tracks source-observed ordinary content,
+ordinary content whose Anthropic delta was actually emitted, all emitted text,
+and source-ordered deferred output. An open tool block is closed first; deferred
+text and later complete tool blocks then drain in first-observed order; only
+after every ordinary prefix was emitted may a refusal-only suffix be emitted,
+followed by the terminal. Text is never emitted inside a tool block. Reasoning
+fallback text uses the same ordered queue without becoming refusal authority,
+so it cannot overwrite or falsely satisfy ordinary-content assertions.
 The Anthropic `message_delta`/`message_stop` pair remains pending until
 upstream `[DONE]` or clean EOF, so trailing records cannot hide behind an
 already-emitted success.
@@ -761,7 +774,7 @@ Status means deterministic, credential-free evidence exists.
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
 | Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss | native Responses web-search output | request-policy, paired partial/terminal-only output, and conflict fixtures |
-| Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity, refusal-fragment reconciliation, and strict one-choice/tool/optional-usage state | not Codex 0.144.1's wire API | public provider/direct captures, split/interleaved refusal, split-carrier, malformed-body/chunk, status/header, usage, tool-state, and collision fixtures |
+| Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity, source-ordered tool/text/refusal scheduling, and strict one-choice/optional-usage state | not Codex 0.144.1's wire API | public provider/direct captures, split/partial/deferred/multi-tool refusal ordering, split-carrier, malformed-body/chunk, status/header, usage, and collision fixtures |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
 The detailed Claude-specific matrix remains in

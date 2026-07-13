@@ -451,6 +451,21 @@ pub struct AnthropicStreamToolCall {
     pub started: bool,
 }
 
+/// Source-ordered output that cannot be emitted while an Anthropic tool block
+/// is open. Chat deltas can interleave text/reasoning and parallel tool calls,
+/// while Anthropic content blocks must remain strictly sequential.
+#[derive(Debug, Clone)]
+pub enum AnthropicStreamDeferredOutput {
+    Text {
+        text: String,
+        /// True only for ordinary `ChoiceDelta.content`. Reasoning fallbacks
+        /// share the text scheduler but are not refusal-mirror authority.
+        source_content: bool,
+    },
+    ToolCall(i64),
+    ReasoningOpaque(String),
+}
+
 /// `AnthropicStreamState` — plain mutable scratch state for the streaming
 /// translator. NOT a wire type (no serde).
 #[derive(Debug, Clone, Default)]
@@ -466,7 +481,15 @@ pub struct AnthropicStreamState {
     pub chat_usage_source: Option<Value>,
     pub chat_output_seen: bool,
     pub chat_refusal_text: Option<String>,
-    pub chat_text_output: String,
+    /// Ordinary Chat `content` observed from the source, including fragments
+    /// currently deferred behind tool blocks. Refusal reconciliation uses this.
+    pub chat_content_seen: String,
+    /// Ordinary Chat `content` for which an Anthropic text delta was actually
+    /// emitted. This advances only after the event is appended.
+    pub chat_content_emitted: String,
+    /// Every client-visible Anthropic text delta actually emitted, including
+    /// reasoning fallbacks and refusal-only suffixes.
+    pub chat_text_emitted: String,
     pub chat_finish_reason: Option<String>,
     /// True after a finish chunk carried usage or one post-finish usage-only
     /// chunk was accepted. Success stays pending until [DONE]/EOF so a later
@@ -477,7 +500,8 @@ pub struct AnthropicStreamState {
     pub content_block_open: bool,
     pub thinking_block_open: bool,
     pub pending_message_delta: Option<AnthropicStreamEventData>,
-    pub deferred_content: Option<String>,
+    pub deferred_output: std::collections::VecDeque<AnthropicStreamDeferredOutput>,
+    pub deferred_output_bytes: usize,
     /// openAIToolIndex -> { id, name, anthropic_block_index }
     pub tool_calls: std::collections::HashMap<i64, AnthropicStreamToolCall>,
     /// First-seen order for deterministic serialization of parallel calls.

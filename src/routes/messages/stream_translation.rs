@@ -5,12 +5,12 @@
 //! `AnthropicStreamEventData` events. The translation is stateful: per-stream
 //! progress lives in [`AnthropicStreamState`] (message_start emitted once, the
 //! single currently-open content block, the thinking block, accumulated tool
-//! calls, deferred text, and a pending `message_delta`).
+//! calls, a source-ordered deferred-output scheduler, and a pending
+//! `message_delta`).
 //!
 //! Chunks are dynamic (`content` is `string | null`, `tool_calls` is a sparse
 //! array, etc.) so we accept the chunk as `&serde_json::Value` and project the
-//! one delta we care about into a small mutable [`DeltaView`], reproducing the
-//! TS `delta.content = …` mutation in `handleThinkingText`.
+//! one delta we care about into a small [`DeltaView`].
 
 use std::collections::HashSet;
 
@@ -18,8 +18,8 @@ use serde_json::{json, Map, Value};
 
 use super::anthropic_types::{
     AnthropicContentBlockDelta, AnthropicMessageDeltaBody, AnthropicMessageDeltaUsage,
-    AnthropicMessageStart, AnthropicStreamEventData, AnthropicStreamState, AnthropicStreamToolCall,
-    AnthropicUsage,
+    AnthropicMessageStart, AnthropicStreamDeferredOutput, AnthropicStreamEventData,
+    AnthropicStreamState, AnthropicStreamToolCall, AnthropicUsage,
 };
 use super::non_stream_translation::{
     empty_chat_completion_usage, map_openai_chat_completion_usage, parse_chat_service_tier,
@@ -38,8 +38,8 @@ use super::utils::THINKING_TEXT;
 // ---------------------------------------------------------------------------
 
 /// The fields of a single OpenAI streaming `delta` that the state machine
-/// consumes. Mutable so `handle_thinking_text` can rewrite `content` and clear
-/// the reasoning text fields, exactly like the TS in-place mutation.
+/// consumes. Ordinary content remains distinct from reasoning fallback text so
+/// refusal authority and actual emission state cannot be conflated.
 struct DeltaView {
     content: Option<String>,
     reasoning_text: Option<String>,
@@ -522,8 +522,10 @@ fn validate_terminal_tools(
             arguments.entry(delta.index).or_default().push_str(fragment);
         }
     }
-    if finish_reason == "tool_calls" {
-        if arguments.is_empty() {
+    let tools_must_be_complete = finish_reason == "tool_calls"
+        || (finish_reason == "content_filter" && !arguments.is_empty());
+    if tools_must_be_complete {
+        if finish_reason == "tool_calls" && arguments.is_empty() {
             return Err(());
         }
         for index in 0..arguments.len() as i64 {
@@ -583,12 +585,6 @@ fn validate_finish_reason(
     if refusal_seen && finish != "content_filter" {
         return Err(());
     }
-    if refusal_seen
-        && reconciliation.content_len > 0
-        && reconciliation.content_len != reconciliation.refusal_len
-    {
-        return Err(());
-    }
     if !has_output {
         return Err(());
     }
@@ -617,11 +613,10 @@ fn parse_chunk_usage(
 
 /// OpenAI declares `refusal` on `ChoiceDelta`, so every present string is a
 /// fragment rather than a complete snapshot. Ordinary content and refusal may
-/// mirror one another. Aggregates must remain prefix-compatible while either
-/// carrier is incomplete and, when both exist, become identical at finish.
+/// mirror one another. Aggregates must remain prefix-compatible; whichever
+/// representation is longer supplies the complete visible text at finish.
 #[derive(Debug, Clone, Copy)]
 struct RefusalReconciliation {
-    content_len: usize,
     refusal_len: usize,
 }
 
@@ -633,7 +628,7 @@ fn reconcile_refusal_content(
     let refusal_base = state.chat_refusal_text.as_deref().unwrap_or_default();
     let refusal_fragment = delta.refusal.as_deref().unwrap_or_default();
     let content_len = state
-        .chat_text_output
+        .chat_content_seen
         .len()
         .checked_add(content_fragment.len())
         .filter(|length| *length <= crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
@@ -647,9 +642,9 @@ fn reconcile_refusal_content(
     // Previous aggregates were already prefix-checked. Compare only the newly
     // overlapping bytes so long mirrored streams remain linear rather than
     // rescanning or cloning their entire output for every fragment.
-    let compared = state.chat_text_output.len().min(refusal_base.len());
+    let compared = state.chat_content_seen.len().min(refusal_base.len());
     let newly_comparable = content_len.min(refusal_len);
-    let content_base = state.chat_text_output.as_bytes();
+    let content_base = state.chat_content_seen.as_bytes();
     let content_fragment = content_fragment.as_bytes();
     let refusal_base = refusal_base.as_bytes();
     let refusal_fragment = refusal_fragment.as_bytes();
@@ -668,10 +663,7 @@ fn reconcile_refusal_content(
             return Err(());
         }
     }
-    Ok(RefusalReconciliation {
-        content_len,
-        refusal_len,
-    })
+    Ok(RefusalReconciliation { refusal_len })
 }
 
 fn validate_chat_chunk(
@@ -823,7 +815,7 @@ pub fn translate_chunk_to_anthropic_events(
     };
 
     let mut events: Vec<AnthropicStreamEventData> = Vec::new();
-    let (mut delta, finish_reason, usage, usage_present) = match validated {
+    let (delta, finish_reason, usage, usage_present) = match validated {
         ValidatedChatChunk::UsageOnly(mut usage) => {
             // An include_usage chunk is only valid after a finish_reason queued
             // the terminal message delta, and only once. Keep success pending
@@ -865,6 +857,11 @@ pub fn translate_chunk_to_anthropic_events(
 
     handle_message_start(state, &mut events);
 
+    let source_content = delta
+        .content
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let output_in_chunk = delta.has_content()
         || delta
             .reasoning_text
@@ -879,21 +876,11 @@ pub fn translate_chunk_to_anthropic_events(
             .as_deref()
             .is_some_and(|value| !value.is_empty())
         || !delta.tool_calls.is_empty();
-    let emitted_text = delta
-        .content
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
     let refusal_fragment = delta.refusal.clone();
 
-    handle_thinking_text(&mut delta, state, &mut events);
-
-    handle_content(&delta, state, &mut events);
-
-    handle_tool_calls(&delta, state, &mut events);
     state.chat_output_seen |= output_in_chunk;
-    if let Some(text) = emitted_text {
-        state.chat_text_output.push_str(&text);
+    if let Some(content) = source_content.as_deref() {
+        state.chat_content_seen.push_str(content);
     }
     if let Some(fragment) = refusal_fragment {
         state
@@ -902,16 +889,34 @@ pub fn translate_chunk_to_anthropic_events(
             .push_str(&fragment);
     }
 
+    let reasoning_fallback = handle_thinking_text(&delta, state, &mut events);
+    if reasoning_fallback
+        .map(|text| schedule_text_fragment(text, false, state, &mut events))
+        .transpose()
+        .is_err()
+        || schedule_reasoning_opaque(delta.reasoning_opaque.clone(), state, &mut events).is_err()
+        || handle_tool_calls(&delta, state, &mut events).is_err()
+        || source_content
+            .map(|text| schedule_text_fragment(text, true, state, &mut events))
+            .transpose()
+            .is_err()
+    {
+        events.extend(malformed_stream_error_events(state));
+        return events;
+    }
+
     if let Some(finish_reason) = finish_reason {
-        flush_reconciled_refusal(state, &mut events);
-        handle_finish(
+        if handle_finish(
             &finish_reason,
-            &delta,
             state,
             &mut events,
             usage.as_ref(),
             usage_present,
-        );
+        )
+        .is_err()
+        {
+            events.extend(malformed_stream_error_events(state));
+        }
     }
 
     events
@@ -1047,7 +1052,7 @@ pub fn is_transient_transport_error(err: &std::io::Error) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// State-machine steps (mirroring the TS private functions, push-order exact)
+// State-machine steps (explicit source-order scheduler)
 // ---------------------------------------------------------------------------
 
 /// `isToolBlockOpen` — is the currently-open block a tool_use block?
@@ -1059,6 +1064,121 @@ fn is_tool_block_open(state: &AnthropicStreamState) -> bool {
         .tool_calls
         .values()
         .any(|tc| tc.anthropic_block_index == state.content_block_index)
+}
+
+fn close_open_content_block(
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) {
+    if !state.content_block_open {
+        return;
+    }
+    let tool_block_open = is_tool_block_open(state);
+    events.push(AnthropicStreamEventData::ContentBlockStop {
+        index: state.content_block_index,
+    });
+    state.content_block_open = false;
+    state.content_block_index += 1;
+    if tool_block_open {
+        state.active_tool_call_index = None;
+    }
+}
+
+fn emit_text_fragment(
+    text: &str,
+    source_content: bool,
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) -> Result<(), ()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if is_tool_block_open(state) {
+        return Err(());
+    }
+    if state
+        .chat_text_emitted
+        .len()
+        .checked_add(text.len())
+        .is_none_or(|length| length > crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
+    {
+        return Err(());
+    }
+    if source_content {
+        let start = state.chat_content_emitted.len();
+        let end = start.checked_add(text.len()).ok_or(())?;
+        if state
+            .chat_content_seen
+            .as_bytes()
+            .get(start..end)
+            .is_none_or(|expected| expected != text.as_bytes())
+        {
+            return Err(());
+        }
+    }
+    close_thinking_block_if_open(state, events);
+    if !state.content_block_open {
+        events.push(AnthropicStreamEventData::ContentBlockStart {
+            index: state.content_block_index,
+            content_block: json!({"type":"text","text":""}),
+        });
+        state.content_block_open = true;
+    }
+    events.push(AnthropicStreamEventData::ContentBlockDelta {
+        index: state.content_block_index,
+        delta: AnthropicContentBlockDelta::TextDelta {
+            text: text.to_string(),
+        },
+    });
+    state.chat_text_emitted.push_str(text);
+    if source_content {
+        state.chat_content_emitted.push_str(text);
+    }
+    Ok(())
+}
+
+fn defer_text_fragment(
+    text: String,
+    source_content: bool,
+    state: &mut AnthropicStreamState,
+) -> Result<(), ()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    state.deferred_output_bytes = state
+        .deferred_output_bytes
+        .checked_add(text.len())
+        .filter(|length| *length <= crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
+        .ok_or(())?;
+    if let Some(AnthropicStreamDeferredOutput::Text {
+        text: existing,
+        source_content: existing_source,
+    }) = state.deferred_output.back_mut()
+    {
+        if *existing_source == source_content {
+            existing.push_str(&text);
+            return Ok(());
+        }
+    }
+    state
+        .deferred_output
+        .push_back(AnthropicStreamDeferredOutput::Text {
+            text,
+            source_content,
+        });
+    Ok(())
+}
+
+fn defer_reasoning_opaque(signature: String, state: &mut AnthropicStreamState) -> Result<(), ()> {
+    state.deferred_output_bytes = state
+        .deferred_output_bytes
+        .checked_add(signature.len())
+        .filter(|length| *length <= crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
+        .ok_or(())?;
+    state
+        .deferred_output
+        .push_back(AnthropicStreamDeferredOutput::ReasoningOpaque(signature));
+    Ok(())
 }
 
 /// `completePendingMessage` — flush the queued `message_delta` then `message_stop`.
@@ -1128,41 +1248,48 @@ fn close_stream_for_error(
     state.active_tool_call_index = None;
     state.tool_calls.clear();
     state.tool_call_order.clear();
-    state.deferred_content = None;
+    state.deferred_output.clear();
+    state.deferred_output_bytes = 0;
     state.pending_message_delta = None;
 }
 
 fn flush_reconciled_refusal(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
-    let refusal = state.chat_refusal_text.as_deref().unwrap_or_default();
-    if refusal.is_empty() || state.chat_text_output.starts_with(refusal) {
-        return;
+) -> Result<(), ()> {
+    if state.chat_content_emitted != state.chat_content_seen {
+        return Err(());
     }
-    let Some(suffix) = refusal.strip_prefix(&state.chat_text_output) else {
+    let refusal = state.chat_refusal_text.as_deref().unwrap_or_default();
+    if refusal.is_empty() || state.chat_content_seen.starts_with(refusal) {
+        return Ok(());
+    }
+    let Some(suffix) = refusal.strip_prefix(&state.chat_content_seen) else {
         // Validation guarantees a prefix relation before a terminal chunk.
-        return;
+        return Err(());
     };
     if suffix.is_empty() {
-        return;
+        return Ok(());
     }
     let suffix = suffix.to_string();
+    emit_text_fragment(&suffix, false, state, events)
+}
+
+fn schedule_terminal_output(
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) -> Result<(), ()> {
     close_thinking_block_if_open(state, events);
-    if !state.content_block_open {
-        events.push(AnthropicStreamEventData::ContentBlockStart {
-            index: state.content_block_index,
-            content_block: json!({"type":"text","text":""}),
-        });
-        state.content_block_open = true;
+    if is_tool_block_open(state) {
+        close_open_content_block(state, events);
     }
-    events.push(AnthropicStreamEventData::ContentBlockDelta {
-        index: state.content_block_index,
-        delta: AnthropicContentBlockDelta::TextDelta {
-            text: suffix.clone(),
-        },
-    });
-    state.chat_text_output.push_str(&suffix);
+    flush_deferred_output(state, events)?;
+    if !tool_scheduler_is_complete(state) {
+        return Err(());
+    }
+    flush_reconciled_refusal(state, events)?;
+    close_open_content_block(state, events);
+    Ok(())
 }
 
 /// `handleFinish` — on a finishing chunk, close the open block, flush deferred
@@ -1170,40 +1297,18 @@ fn flush_reconciled_refusal(
 /// after every trailing upstream record has been validated.
 fn handle_finish(
     finish_reason: &str,
-    delta: &DeltaView,
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
     usage: Option<&AnthropicUsage>,
     usage_present: bool,
-) {
+) -> Result<(), ()> {
     // Already terminated: a well-behaved upstream sends one finishing chunk, but
     // an aggregator could send a second usage-bearing one. Ignore it so we never
     // emit a second message_delta/message_stop after the terminal stop.
     if state.message_stop_emitted {
-        return;
+        return Ok(());
     }
-
-    // A reasoning-only turn leaves a `content_block_start{thinking}` open with no
-    // matching content block; close it here so the stream stays well-formed.
-    close_thinking_block_if_open(state, events);
-
-    if state.content_block_open {
-        let tool_block_open = is_tool_block_open(state);
-        events.push(AnthropicStreamEventData::ContentBlockStop {
-            index: state.content_block_index,
-        });
-        state.content_block_open = false;
-        state.content_block_index += 1;
-        if tool_block_open {
-            state.active_tool_call_index = None;
-        }
-        if !tool_block_open {
-            handle_reasoning_opaque(delta, events, state);
-        }
-    }
-
-    flush_buffered_tool_calls(state, events);
-    flush_deferred_content(state, events);
+    schedule_terminal_output(state, events)?;
 
     let mut effective_usage = usage
         .cloned()
@@ -1244,6 +1349,7 @@ fn handle_finish(
     if usage_present {
         state.chat_terminal_usage_seen = true;
     }
+    Ok(())
 }
 
 /// `handleToolCalls`.
@@ -1251,14 +1357,12 @@ fn handle_tool_calls(
     delta: &DeltaView,
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
+) -> Result<(), ()> {
     if !delta.has_tool_call_delta() {
-        return;
+        return Ok(());
     }
 
     close_thinking_block_if_open(state, events);
-
-    handle_reasoning_opaque_in_tool_calls(state, events, delta);
 
     for tool_call in &delta.tool_calls {
         let index = tool_call.index;
@@ -1287,6 +1391,22 @@ fn handle_tool_calls(
             let _ = merge_tool_extensions(&mut info.extra, &tool_call.extra);
         }
 
+        if tool_call.first {
+            let ready = state
+                .tool_calls
+                .get(&index)
+                .is_some_and(|call| call.id.is_some() && call.name.is_some());
+            if state.active_tool_call_index.is_none() && state.deferred_output.is_empty() && ready {
+                start_tool_call(index, state, events)?;
+            } else {
+                state
+                    .deferred_output
+                    .push_back(AnthropicStreamDeferredOutput::ToolCall(index));
+            }
+        } else {
+            try_start_front_tool_call(state, events)?;
+        }
+
         if let Some(arguments) = &tool_call.arguments {
             if let Some(info) = state.tool_calls.get_mut(&index) {
                 info.arguments.push_str(arguments);
@@ -1302,43 +1422,53 @@ fn handle_tool_calls(
                 }
             }
         }
-        try_start_next_tool_call(state, events);
+        try_start_front_tool_call(state, events)?;
     }
+    Ok(())
 }
 
-fn try_start_next_tool_call(
+fn try_start_front_tool_call(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
+) -> Result<(), ()> {
     if state.active_tool_call_index.is_some() {
-        return;
+        return Ok(());
     }
-    let Some(index) = state.tool_call_order.iter().copied().find(|index| {
-        state
-            .tool_calls
-            .get(index)
-            .is_some_and(|call| !call.started)
-    }) else {
-        return;
+    let Some(AnthropicStreamDeferredOutput::ToolCall(index)) =
+        state.deferred_output.front().cloned()
+    else {
+        return Ok(());
     };
     let ready = state
         .tool_calls
         .get(&index)
         .is_some_and(|call| call.id.is_some() && call.name.is_some());
     if !ready {
-        return;
+        return Ok(());
     }
-    if state.content_block_open {
-        events.push(AnthropicStreamEventData::ContentBlockStop {
-            index: state.content_block_index,
-        });
-        state.content_block_index += 1;
-        state.content_block_open = false;
+    let _ = state.deferred_output.pop_front();
+    start_tool_call(index, state, events)
+}
+
+fn start_tool_call(
+    index: i64,
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+) -> Result<(), ()> {
+    if state.active_tool_call_index.is_some() {
+        return Err(());
     }
-    let info = state
-        .tool_calls
-        .get_mut(&index)
-        .expect("ordered tool call exists");
+    let ready = state.tool_calls.get(&index).is_some_and(|call| {
+        !call.started
+            && call.id.as_deref().is_some_and(|id| !id.is_empty())
+            && call.name.as_deref().is_some_and(|name| !name.is_empty())
+    });
+    if !ready {
+        return Err(());
+    }
+    close_thinking_block_if_open(state, events);
+    close_open_content_block(state, events);
+    let info = state.tool_calls.get_mut(&index).ok_or(())?;
     info.anthropic_block_index = state.content_block_index;
     info.started = true;
     let mut block = Map::from_iter([
@@ -1366,159 +1496,90 @@ fn try_start_next_tool_call(
     }
     state.active_tool_call_index = Some(index);
     state.content_block_open = true;
+    Ok(())
 }
 
-/// Serialize tool calls that OpenAI streamed in parallel after the active call.
-/// Their argument fragment boundaries are preserved, but their Anthropic blocks
-/// are emitted one-at-a-time in first-seen tool-index order.
-fn flush_buffered_tool_calls(
+fn flush_deferred_output(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
-    let order = state.tool_call_order.clone();
-    for index in order {
-        let Some(snapshot) = state.tool_calls.get(&index).cloned() else {
-            continue;
-        };
-        if snapshot.started {
-            continue;
-        }
-
-        let block_index = state.content_block_index;
-        state.content_block_index += 1;
-        let mut block = Map::from_iter([
-            ("type".to_string(), json!("tool_use")),
-            (
-                "id".to_string(),
-                json!(snapshot.id.as_deref().unwrap_or_default()),
-            ),
-            (
-                "name".to_string(),
-                json!(snapshot.name.as_deref().unwrap_or_default()),
-            ),
-            ("input".to_string(), json!({})),
-        ]);
-        block.extend(snapshot.extra.clone());
-        events.push(AnthropicStreamEventData::ContentBlockStart {
-            index: block_index,
-            content_block: Value::Object(block),
-        });
-        for partial_json in snapshot.buffered_arguments {
-            events.push(AnthropicStreamEventData::ContentBlockDelta {
-                index: block_index,
-                delta: AnthropicContentBlockDelta::InputJsonDelta { partial_json },
-            });
-        }
-        events.push(AnthropicStreamEventData::ContentBlockStop { index: block_index });
-        if let Some(info) = state.tool_calls.get_mut(&index) {
-            info.anthropic_block_index = block_index;
-            info.started = true;
+) -> Result<(), ()> {
+    while let Some(output) = state.deferred_output.pop_front() {
+        match output {
+            AnthropicStreamDeferredOutput::Text {
+                text,
+                source_content,
+            } => {
+                state.deferred_output_bytes = state
+                    .deferred_output_bytes
+                    .checked_sub(text.len())
+                    .ok_or(())?;
+                emit_text_fragment(&text, source_content, state, events)?;
+            }
+            AnthropicStreamDeferredOutput::ToolCall(index) => {
+                close_open_content_block(state, events);
+                start_tool_call(index, state, events)?;
+                close_open_content_block(state, events);
+            }
+            AnthropicStreamDeferredOutput::ReasoningOpaque(signature) => {
+                state.deferred_output_bytes = state
+                    .deferred_output_bytes
+                    .checked_sub(signature.len())
+                    .ok_or(())?;
+                close_open_content_block(state, events);
+                emit_complete_reasoning_opaque(&signature, events, state);
+            }
         }
     }
+    if state.deferred_output_bytes != 0 {
+        return Err(());
+    }
+    Ok(())
 }
 
-/// `handleReasoningOpaqueInToolCalls`.
-fn handle_reasoning_opaque_in_tool_calls(
-    state: &mut AnthropicStreamState,
-    events: &mut Vec<AnthropicStreamEventData>,
-    delta: &DeltaView,
-) {
-    if state.content_block_open && !is_tool_block_open(state) {
-        events.push(AnthropicStreamEventData::ContentBlockStop {
-            index: state.content_block_index,
-        });
-        state.content_block_index += 1;
-        state.content_block_open = false;
-    }
-    handle_reasoning_opaque(delta, events, state);
+/// Every first-seen tool index must have exactly one scheduler entry unless it
+/// is the currently active block.
+fn tool_scheduler_is_complete(state: &AnthropicStreamState) -> bool {
+    state.tool_call_order.iter().all(|index| {
+        state
+            .tool_calls
+            .get(index)
+            .is_some_and(|call| call.started && call.buffered_arguments.is_empty())
+    })
 }
 
-/// `handleContent`.
-fn handle_content(
-    delta: &DeltaView,
+fn schedule_text_fragment(
+    text: String,
+    source_content: bool,
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
-    if delta.has_content() {
-        close_thinking_block_if_open(state, events);
-
-        let content = delta.content.clone().unwrap_or_default();
-
-        if is_tool_block_open(state) || delta.has_tool_call_delta() {
-            let mut deferred = state.deferred_content.take().unwrap_or_default();
-            deferred.push_str(&content);
-            state.deferred_content = Some(deferred);
-            return;
-        }
-
-        if !state.content_block_open {
-            events.push(AnthropicStreamEventData::ContentBlockStart {
-                index: state.content_block_index,
-                content_block: serde_json::json!({ "type": "text", "text": "" }),
-            });
-            state.content_block_open = true;
-        }
-
-        events.push(AnthropicStreamEventData::ContentBlockDelta {
-            index: state.content_block_index,
-            delta: AnthropicContentBlockDelta::TextDelta { text: content },
-        });
+) -> Result<(), ()> {
+    if text.is_empty() {
+        return Ok(());
     }
-
-    // handle for claude model
-    if delta.content.as_deref() == Some("")
-        && delta
-            .reasoning_opaque
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-        && state.thinking_block_open
-    {
-        let signature = delta.reasoning_opaque.clone().unwrap_or_default();
-        events.push(AnthropicStreamEventData::ContentBlockDelta {
-            index: state.content_block_index,
-            delta: AnthropicContentBlockDelta::SignatureDelta { signature },
-        });
-        events.push(AnthropicStreamEventData::ContentBlockStop {
-            index: state.content_block_index,
-        });
-        state.content_block_index += 1;
-        state.thinking_block_open = false;
+    if state.active_tool_call_index.is_some() || !state.deferred_output.is_empty() {
+        return defer_text_fragment(text, source_content, state);
     }
+    emit_text_fragment(&text, source_content, state, events)
 }
 
-/// `flushDeferredContent`.
-fn flush_deferred_content(
+fn schedule_reasoning_opaque(
+    signature: Option<String>,
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
-    // `if (!state.deferredContent)` — empty string is falsy and skips.
-    let deferred = match state.deferred_content.take() {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            // Restore a non-flushed-but-present empty string? TS leaves it as-is;
-            // an empty/absent value is indistinguishable downstream, so drop it.
-            return;
-        }
+) -> Result<(), ()> {
+    let Some(signature) = signature.filter(|signature| !signature.is_empty()) else {
+        return Ok(());
     };
-
-    if !state.content_block_open {
-        events.push(AnthropicStreamEventData::ContentBlockStart {
-            index: state.content_block_index,
-            content_block: serde_json::json!({ "type": "text", "text": "" }),
-        });
-        state.content_block_open = true;
+    if state.thinking_block_open {
+        close_thinking_block(state, events, signature);
+        return Ok(());
     }
-
-    events.push(AnthropicStreamEventData::ContentBlockDelta {
-        index: state.content_block_index,
-        delta: AnthropicContentBlockDelta::TextDelta { text: deferred },
-    });
-    events.push(AnthropicStreamEventData::ContentBlockStop {
-        index: state.content_block_index,
-    });
-    state.deferred_content = None;
-    state.content_block_open = false;
-    state.content_block_index += 1;
+    if state.active_tool_call_index.is_some() || !state.deferred_output.is_empty() {
+        return defer_reasoning_opaque(signature, state);
+    }
+    close_open_content_block(state, events);
+    emit_complete_reasoning_opaque(&signature, events, state);
+    Ok(())
 }
 
 /// `handleMessageStart`.
@@ -1556,15 +1617,11 @@ fn handle_message_start(
 
 /// `handleReasoningOpaque` — emit a complete thinking block (start, default
 /// thinking_delta, signature_delta, stop) for an opaque reasoning blob.
-fn handle_reasoning_opaque(
-    delta: &DeltaView,
+fn emit_complete_reasoning_opaque(
+    signature: &str,
     events: &mut Vec<AnthropicStreamEventData>,
     state: &mut AnthropicStreamState,
 ) {
-    let Some(signature) = delta.reasoning_opaque.as_deref().filter(|s| !s.is_empty()) else {
-        return;
-    };
-
     events.push(AnthropicStreamEventData::ContentBlockStart {
         index: state.content_block_index,
         content_block: serde_json::json!({ "type": "thinking", "thinking": "" }),
@@ -1589,27 +1646,25 @@ fn handle_reasoning_opaque(
 
 /// `handleThinkingText`.
 fn handle_thinking_text(
-    delta: &mut DeltaView,
+    delta: &DeltaView,
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
+) -> Option<String> {
     // `delta.reasoning_text ?? delta.reasoning_content`
     let reasoning_text = delta
         .reasoning_text
         .clone()
         .or_else(|| delta.reasoning_content.clone());
 
-    let Some(reasoning_text) = reasoning_text.filter(|s| !s.is_empty()) else {
-        return;
-    };
+    let reasoning_text = reasoning_text.filter(|s| !s.is_empty())?;
 
     // compatible with copilot API returning content->reasoning_text->reasoning_opaque
     // in different deltas; abnormal claude-model server behaviour.
-    if state.content_block_open {
-        delta.content = Some(reasoning_text);
-        delta.reasoning_text = None;
-        delta.reasoning_content = None;
-        return;
+    if state.content_block_open
+        || state.active_tool_call_index.is_some()
+        || !state.deferred_output.is_empty()
+    {
+        return Some(reasoning_text);
     }
 
     if !state.thinking_block_open {
@@ -1626,6 +1681,26 @@ fn handle_thinking_text(
             thinking: reasoning_text,
         },
     });
+    None
+}
+
+fn close_thinking_block(
+    state: &mut AnthropicStreamState,
+    events: &mut Vec<AnthropicStreamEventData>,
+    signature: String,
+) {
+    if !state.thinking_block_open {
+        return;
+    }
+    events.push(AnthropicStreamEventData::ContentBlockDelta {
+        index: state.content_block_index,
+        delta: AnthropicContentBlockDelta::SignatureDelta { signature },
+    });
+    events.push(AnthropicStreamEventData::ContentBlockStop {
+        index: state.content_block_index,
+    });
+    state.content_block_index += 1;
+    state.thinking_block_open = false;
 }
 
 /// `closeThinkingBlockIfOpen`.
@@ -1636,17 +1711,7 @@ fn close_thinking_block_if_open(
     if !state.thinking_block_open {
         return;
     }
-    events.push(AnthropicStreamEventData::ContentBlockDelta {
-        index: state.content_block_index,
-        delta: AnthropicContentBlockDelta::SignatureDelta {
-            signature: String::new(),
-        },
-    });
-    events.push(AnthropicStreamEventData::ContentBlockStop {
-        index: state.content_block_index,
-    });
-    state.content_block_index += 1;
-    state.thinking_block_open = false;
+    close_thinking_block(state, events, String::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -1716,6 +1781,17 @@ mod tests {
         events
             .iter()
             .map(|e| serde_json::to_value(e).unwrap())
+            .collect()
+    }
+
+    fn deferred_text(state: &AnthropicStreamState) -> String {
+        state
+            .deferred_output
+            .iter()
+            .filter_map(|output| match output {
+                AnthropicStreamDeferredOutput::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
             .collect()
     }
 
@@ -1843,7 +1919,7 @@ mod tests {
         assert!(deferred.is_empty());
         assert!(state.content_block_open);
         assert_eq!(state.active_tool_call_index, Some(0));
-        assert_eq!(state.deferred_content.as_deref(), Some("deferred"));
+        assert_eq!(deferred_text(&state), "deferred");
         assert!(!state.tool_calls.is_empty());
         state
     }
@@ -1907,7 +1983,7 @@ mod tests {
         assert!(state.active_tool_call_index.is_none());
         assert!(state.tool_calls.is_empty());
         assert!(state.tool_call_order.is_empty());
-        assert!(state.deferred_content.is_none());
+        assert!(state.deferred_output.is_empty());
         assert!(state.pending_message_delta.is_none());
         assert!(state.terminal_event_emitted);
         assert!(!state.message_stop_emitted);
@@ -2232,7 +2308,7 @@ mod tests {
             ev.is_empty(),
             "content must be deferred while a tool block is open"
         );
-        assert_eq!(state.deferred_content.as_deref(), Some("trailing"));
+        assert_eq!(deferred_text(&state), "trailing");
 
         // Finish: tool block closes, deferred text flushed as its own block.
         let c3 = json!({
@@ -2751,7 +2827,7 @@ mod tests {
         );
         assert!(deferred.is_empty());
         assert!(tool_state.content_block_open);
-        assert_eq!(tool_state.deferred_content.as_deref(), Some("deferred"));
+        assert_eq!(deferred_text(&tool_state), "deferred");
         assert!(!tool_state.tool_calls.is_empty());
 
         let tool_terminal = to_values(&translate_chunk_to_anthropic_events(
@@ -2775,7 +2851,7 @@ mod tests {
         assert!(tool_state.active_tool_call_index.is_none());
         assert!(tool_state.tool_calls.is_empty());
         assert!(tool_state.tool_call_order.is_empty());
-        assert!(tool_state.deferred_content.is_none());
+        assert!(tool_state.deferred_output.is_empty());
         assert!(tool_state.pending_message_delta.is_none());
         assert!(tool_state.terminal_event_emitted);
     }
@@ -3346,5 +3422,358 @@ mod tests {
         assert_eq!(events, vec![malformed_error_event()]);
         assert!(state.terminal_event_emitted);
         assert!(!state.message_stop_emitted);
+    }
+
+    #[test]
+    fn tool_deferred_refusal_scheduler_emits_prefix_before_suffix() {
+        let mut state = AnthropicStreamState::default();
+        let mut all = Vec::new();
+        for chunk in [
+            json!({
+                "id":"scheduled",
+                "model":"m",
+                "choices":[{
+                    "index":0,
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call",
+                        "function":{"name":"actual","arguments":"{}"}
+                    }]},
+                    "finish_reason":null
+                }]
+            }),
+            json!({
+                "choices":[{
+                    "index":0,
+                    "delta":{"content":"foo","refusal":"foobar"},
+                    "finish_reason":null
+                }]
+            }),
+            json!({
+                "choices":[{
+                    "index":0,
+                    "delta":{},
+                    "finish_reason":"content_filter"
+                }]
+            }),
+        ] {
+            all.extend(to_values(&translate_chunk_to_anthropic_events(
+                &chunk, &mut state,
+            )));
+        }
+        all.extend(to_values(&flush_pending_anthropic_stream_events(
+            &mut state,
+        )));
+
+        let ordered: Vec<_> = all
+            .iter()
+            .filter_map(|event| match event["type"].as_str()? {
+                "content_block_start" => Some(format!(
+                    "start:{}:{}",
+                    event["index"],
+                    event["content_block"]["type"].as_str().unwrap_or_default()
+                )),
+                "content_block_delta" => Some(format!(
+                    "delta:{}:{}",
+                    event["index"],
+                    event
+                        .pointer("/delta/text")
+                        .or_else(|| event.pointer("/delta/partial_json"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                )),
+                "content_block_stop" => Some(format!("stop:{}", event["index"])),
+                "message_delta" => Some(format!(
+                    "terminal:{}",
+                    event["delta"]["stop_reason"].as_str().unwrap_or_default()
+                )),
+                "message_stop" => Some("message_stop".to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                "start:0:tool_use",
+                "delta:0:{}",
+                "stop:0",
+                "start:1:text",
+                "delta:1:foo",
+                "delta:1:bar",
+                "stop:1",
+                "terminal:refusal",
+                "message_stop",
+            ]
+        );
+        assert_eq!(state.chat_content_seen, "foo");
+        assert_eq!(state.chat_content_emitted, "foo");
+        assert_eq!(state.chat_text_emitted, "foobar");
+    }
+
+    #[test]
+    fn incomplete_tool_content_filter_discards_deferred_text_and_errors_once() {
+        let mut state = AnthropicStreamState::default();
+        let _ = translate_chunk_to_anthropic_events(
+            &json!({
+                "id":"incomplete",
+                "model":"m",
+                "choices":[{
+                    "index":0,
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call",
+                        "function":{"name":"actual","arguments":"{\"value\":"}
+                    }]},
+                    "finish_reason":null
+                }]
+            }),
+            &mut state,
+        );
+        assert!(translate_chunk_to_anthropic_events(
+            &json!({
+                "choices":[{
+                    "index":0,
+                    "delta":{"content":"foo","refusal":"foobar"},
+                    "finish_reason":null
+                }]
+            }),
+            &mut state,
+        )
+        .is_empty());
+
+        let events = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "choices":[{
+                    "index":0,
+                    "delta":{},
+                    "finish_reason":"content_filter"
+                }]
+            }),
+            &mut state,
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+        assert!(state.deferred_output.is_empty());
+        assert_eq!(state.deferred_output_bytes, 0);
+    }
+
+    #[test]
+    fn deferred_reasoning_fallback_does_not_overwrite_source_content() {
+        let mut state = AnthropicStreamState::default();
+        let mut all = Vec::new();
+        for chunk in [
+            json!({
+                "id":"reasoning-order",
+                "model":"m",
+                "choices":[{
+                    "index":0,
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call",
+                        "function":{"name":"actual","arguments":"{}"}
+                    }]},
+                    "finish_reason":null
+                }]
+            }),
+            json!({
+                "choices":[{
+                    "index":0,
+                    "delta":{"reasoning_text":"thought","content":"foo"},
+                    "finish_reason":null
+                }]
+            }),
+            json!({
+                "choices":[{
+                    "index":0,
+                    "delta":{},
+                    "finish_reason":"tool_calls"
+                }]
+            }),
+        ] {
+            all.extend(to_values(&translate_chunk_to_anthropic_events(
+                &chunk, &mut state,
+            )));
+        }
+        all.extend(to_values(&flush_pending_anthropic_stream_events(
+            &mut state,
+        )));
+        let text: String = all
+            .iter()
+            .filter_map(|event| event.pointer("/delta/text").and_then(Value::as_str))
+            .collect();
+        assert_eq!(text, "thoughtfoo");
+        assert_eq!(state.chat_content_seen, "foo");
+        assert_eq!(state.chat_content_emitted, "foo");
+        assert_eq!(state.chat_text_emitted, "thoughtfoo");
+        assert_single_open_block_invariant(&all);
+    }
+
+    #[test]
+    fn deferred_opaque_reasoning_keeps_block_order_behind_tool() {
+        let mut state = AnthropicStreamState::default();
+        let mut all = Vec::new();
+        for chunk in [
+            json!({
+                "id":"opaque-order",
+                "model":"m",
+                "choices":[{
+                    "index":0,
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call",
+                        "function":{"name":"actual","arguments":"{}"}
+                    }]},
+                    "finish_reason":null
+                }]
+            }),
+            json!({
+                "choices":[{
+                    "index":0,
+                    "delta":{
+                        "reasoning_text":"thought",
+                        "reasoning_opaque":"signature",
+                        "content":"foo"
+                    },
+                    "finish_reason":null
+                }]
+            }),
+            json!({
+                "choices":[{
+                    "index":0,
+                    "delta":{},
+                    "finish_reason":"tool_calls"
+                }]
+            }),
+        ] {
+            all.extend(to_values(&translate_chunk_to_anthropic_events(
+                &chunk, &mut state,
+            )));
+        }
+        all.extend(to_values(&flush_pending_anthropic_stream_events(
+            &mut state,
+        )));
+        assert_eq!(
+            all.iter()
+                .filter_map(|event| match event["type"].as_str()? {
+                    "content_block_start" => Some(format!(
+                        "start:{}:{}",
+                        event["index"],
+                        event["content_block"]["type"].as_str().unwrap_or_default()
+                    )),
+                    "content_block_delta" => Some(format!(
+                        "delta:{}:{}",
+                        event["index"],
+                        event["delta"]["type"].as_str().unwrap_or_default()
+                    )),
+                    "content_block_stop" => Some(format!("stop:{}", event["index"])),
+                    "message_delta" => Some("terminal".to_string()),
+                    "message_stop" => Some("message_stop".to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "start:0:tool_use",
+                "delta:0:input_json_delta",
+                "stop:0",
+                "start:1:text",
+                "delta:1:text_delta",
+                "stop:1",
+                "start:2:thinking",
+                "delta:2:thinking_delta",
+                "delta:2:signature_delta",
+                "stop:2",
+                "start:3:text",
+                "delta:3:text_delta",
+                "stop:3",
+                "terminal",
+                "message_stop",
+            ]
+        );
+        assert_eq!(
+            all.iter()
+                .find(|event| event["delta"]["type"] == "signature_delta")
+                .and_then(|event| event["delta"]["signature"].as_str()),
+            Some("signature")
+        );
+        assert_eq!(state.chat_content_seen, "foo");
+        assert_eq!(state.chat_content_emitted, "foo");
+        assert_eq!(state.chat_text_emitted, "thoughtfoo");
+        assert_single_open_block_invariant(&all);
+    }
+
+    #[test]
+    fn deferred_and_emitted_text_bounds_accept_limit_then_fail_once() {
+        let exact = "x".repeat(crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES);
+
+        let mut emitted_state = AnthropicStreamState::default();
+        let mut emitted_events = Vec::new();
+        emit_text_fragment(&exact, false, &mut emitted_state, &mut emitted_events)
+            .expect("exact emitted-text bound is accepted");
+        let event_count = emitted_events.len();
+        assert_eq!(
+            emitted_state.chat_text_emitted.len(),
+            crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+        );
+        assert!(emit_text_fragment("x", false, &mut emitted_state, &mut emitted_events).is_err());
+        assert_eq!(emitted_events.len(), event_count);
+
+        let mut deferred_state = AnthropicStreamState {
+            chat_id: Some("deferred-bound".to_string()),
+            chat_model: Some("m".to_string()),
+            chat_created: Some(1),
+            message_start_sent: true,
+            content_block_open: true,
+            active_tool_call_index: Some(0),
+            ..Default::default()
+        };
+        deferred_state.tool_call_order.push(0);
+        deferred_state.tool_calls.insert(
+            0,
+            AnthropicStreamToolCall {
+                id: Some("call".to_string()),
+                name: Some("actual".to_string()),
+                anthropic_block_index: 0,
+                arguments: "{}".to_string(),
+                started: true,
+                ..Default::default()
+            },
+        );
+        defer_text_fragment(exact, false, &mut deferred_state)
+            .expect("exact deferred-text bound is accepted");
+        assert_eq!(
+            deferred_state.deferred_output_bytes,
+            crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+        );
+
+        let events = to_values(&super::translate_chunk_to_anthropic_events(
+            &json!({
+                "id":"deferred-bound",
+                "object":"chat.completion.chunk",
+                "created":1,
+                "model":"m",
+                "choices":[{
+                    "index":0,
+                    "delta":{"content":"x"},
+                    "finish_reason":null
+                }]
+            }),
+            &mut deferred_state,
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+        assert!(deferred_state.deferred_output.is_empty());
+        assert_eq!(deferred_state.deferred_output_bytes, 0);
     }
 }

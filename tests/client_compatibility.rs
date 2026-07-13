@@ -781,6 +781,143 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
                 terminal,
             ]
         }
+        "gpt-chat-stream-refusal-content-prefix"
+        | "gpt-direct-chat-stream-refusal-content-prefix" => {
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("content_filter");
+            vec![
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"content":"blo"},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"refusal":"blocked"},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                terminal,
+            ]
+        }
+        "gpt-chat-stream-refusal-partial" | "gpt-direct-chat-stream-refusal-partial" => {
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("content_filter");
+            vec![
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"content":"blocked"},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"refusal":"blo"},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                terminal,
+            ]
+        }
+        "gpt-chat-stream-refusal-tool-deferred"
+        | "gpt-direct-chat-stream-refusal-tool-deferred" => {
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("content_filter");
+            vec![
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"tool_calls":[{
+                            "index":0,
+                            "id":"call-0",
+                            "type":"function",
+                            "function":{"name":"actual","arguments":"{}"}
+                        }]},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"content":"foo","refusal":"foobar"},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                terminal,
+            ]
+        }
+        "gpt-chat-stream-refusal-multiple-tools"
+        | "gpt-direct-chat-stream-refusal-multiple-tools" => {
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("content_filter");
+            vec![
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"content":"pre"},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"tool_calls":[{
+                            "index":0,
+                            "id":"call-0",
+                            "type":"function",
+                            "function":{"name":"first","arguments":"{}"}
+                        }]},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"content":"mid"},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"tool_calls":[{
+                            "index":1,
+                            "id":"call-1",
+                            "type":"function",
+                            "function":{"name":"second","arguments":"{}"}
+                        }]},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{
+                            "content":"post",
+                            "refusal":"premidpost-refused"
+                        },
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                terminal,
+            ]
+        }
         "gpt-chat-stream-tier-valid" => {
             let mut first = text();
             first["service_tier"] = json!("scale");
@@ -1129,15 +1266,19 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
             terminal["choices"][0]["finish_reason"] = json!("content_filter");
             vec![refusal, terminal, usage(), usage()]
         }
-        "gpt-chat-stream-bad-refusal-content-prefix"
-        | "gpt-direct-chat-stream-bad-refusal-content-prefix" => {
+        "gpt-chat-stream-bad-refusal-tool-incomplete"
+        | "gpt-direct-chat-stream-bad-refusal-tool-incomplete" => {
             let mut terminal = finish();
             terminal["choices"][0]["finish_reason"] = json!("content_filter");
             vec![
                 chunk(
                     json!([{
                         "index":0,
-                        "delta":{"content":"blo"},
+                        "delta":{"tool_calls":[{
+                            "index":0,
+                            "id":"call-incomplete",
+                            "function":{"name":"actual","arguments":"{\"value\":"}
+                        }]},
                         "finish_reason":null
                     }]),
                     Value::Null,
@@ -1145,7 +1286,7 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
                 chunk(
                     json!([{
                         "index":0,
-                        "delta":{"refusal":"blocked"},
+                        "delta":{"content":"foo","refusal":"foobar"},
                         "finish_reason":null
                     }]),
                     Value::Null,
@@ -1153,15 +1294,27 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
                 terminal,
             ]
         }
-        "gpt-chat-stream-bad-refusal-refusal-prefix"
-        | "gpt-direct-chat-stream-bad-refusal-refusal-prefix" => {
+        "gpt-chat-stream-bad-refusal-tool-late"
+        | "gpt-direct-chat-stream-bad-refusal-tool-late" => {
             let mut terminal = finish();
             terminal["choices"][0]["finish_reason"] = json!("content_filter");
+            let late = chunk(
+                json!([{
+                    "index":0,
+                    "delta":{"content":"conflict","refusal":"different"},
+                    "finish_reason":null
+                }]),
+                Value::Null,
+            );
             vec![
                 chunk(
                     json!([{
                         "index":0,
-                        "delta":{"content":"blocked"},
+                        "delta":{"tool_calls":[{
+                            "index":0,
+                            "id":"call-late",
+                            "function":{"name":"actual","arguments":"{}"}
+                        }]},
                         "finish_reason":null
                     }]),
                     Value::Null,
@@ -1169,12 +1322,37 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
                 chunk(
                     json!([{
                         "index":0,
-                        "delta":{"refusal":"blo"},
+                        "delta":{"content":"foo","refusal":"foobar"},
                         "finish_reason":null
                     }]),
                     Value::Null,
                 ),
                 terminal,
+                late,
+            ]
+        }
+        "gpt-chat-stream-bad-refusal-tool-eof" | "gpt-direct-chat-stream-bad-refusal-tool-eof" => {
+            vec![
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"tool_calls":[{
+                            "index":0,
+                            "id":"call-eof",
+                            "function":{"name":"actual","arguments":"{}"}
+                        }]},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"content":"foo","refusal":"foobar"},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
             ]
         }
         "gpt-chat-stream-bad-tool-late-extra" => {
@@ -1222,7 +1400,10 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
         _ => vec![text(), finish(), usage()],
     };
 
-    if model.starts_with("gpt-chat-stream-bad-") || model == "gpt-direct-chat-stream-bad-identity" {
+    if (model.starts_with("gpt-chat-stream-bad-")
+        && model != "gpt-chat-stream-bad-refusal-tool-eof")
+        || model == "gpt-direct-chat-stream-bad-identity"
+    {
         let mut late = finish();
         late["choices"][0]["delta"]["content"] = json!("late success");
         late["usage"] = json!({
@@ -1236,7 +1417,9 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
         .into_iter()
         .map(|chunk| format!("data: {chunk}\n\n"))
         .collect();
-    body.push_str("data: [DONE]\n\n");
+    if !model.ends_with("bad-refusal-tool-eof") {
+        body.push_str("data: [DONE]\n\n");
+    }
     sse_response(body)
 }
 
@@ -7810,6 +7993,10 @@ fn configure_direct_copilot(fixture: &Fixture) {
         "gpt-direct-chat-stream-refusal-mirror",
         "gpt-direct-chat-stream-refusal-empty",
         "gpt-direct-chat-stream-refusal-repeated",
+        "gpt-direct-chat-stream-refusal-content-prefix",
+        "gpt-direct-chat-stream-refusal-partial",
+        "gpt-direct-chat-stream-refusal-tool-deferred",
+        "gpt-direct-chat-stream-refusal-multiple-tools",
         "gpt-direct-chat-stream-tier-late",
         "gpt-direct-chat-stream-bad-tier",
         "gpt-direct-chat-stream-bad-refusal",
@@ -7819,8 +8006,9 @@ fn configure_direct_copilot(fixture: &Fixture) {
         "gpt-direct-chat-stream-bad-refusal-late-finish-usage",
         "gpt-direct-chat-stream-bad-refusal-late-after-usage",
         "gpt-direct-chat-stream-bad-refusal-repeated-usage",
-        "gpt-direct-chat-stream-bad-refusal-content-prefix",
-        "gpt-direct-chat-stream-bad-refusal-refusal-prefix",
+        "gpt-direct-chat-stream-bad-refusal-tool-incomplete",
+        "gpt-direct-chat-stream-bad-refusal-tool-late",
+        "gpt-direct-chat-stream-bad-refusal-tool-eof",
     ];
     let models = ModelsResponse {
         object: "list".to_string(),
@@ -8244,6 +8432,10 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-chat-stream-refusal-mirror",
         "gpt-chat-stream-refusal-empty",
         "gpt-chat-stream-refusal-repeated",
+        "gpt-chat-stream-refusal-content-prefix",
+        "gpt-chat-stream-refusal-partial",
+        "gpt-chat-stream-refusal-tool-deferred",
+        "gpt-chat-stream-refusal-multiple-tools",
         "gpt-chat-stream-tier-valid",
         "gpt-chat-stream-tier-late",
         "gpt-chat-stream-bad-missing-id",
@@ -8283,8 +8475,9 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-chat-stream-bad-refusal-late-finish-usage",
         "gpt-chat-stream-bad-refusal-late-after-usage",
         "gpt-chat-stream-bad-refusal-repeated-usage",
-        "gpt-chat-stream-bad-refusal-content-prefix",
-        "gpt-chat-stream-bad-refusal-refusal-prefix",
+        "gpt-chat-stream-bad-refusal-tool-incomplete",
+        "gpt-chat-stream-bad-refusal-tool-late",
+        "gpt-chat-stream-bad-refusal-tool-eof",
         "gpt-chat-stream-bad-tool-late-extra",
         "gpt-chat-stream-bad-tool-missing-terminal",
     ]
@@ -8376,6 +8569,38 @@ fn data_events(body: &[u8]) -> Vec<Value> {
         .filter_map(|line| line.strip_prefix("data: "))
         .filter(|data| !data.is_empty() && *data != "[DONE]")
         .map(|data| serde_json::from_str(data).expect("SSE data is JSON"))
+        .collect()
+}
+
+fn chat_event_schedule(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event["type"].as_str()? {
+            "message_start" => Some("message_start".to_string()),
+            "content_block_start" => Some(format!(
+                "start:{}:{}:{}",
+                event["index"],
+                event["content_block"]["type"].as_str().unwrap_or_default(),
+                event["content_block"]["name"].as_str().unwrap_or_default()
+            )),
+            "content_block_delta" => Some(format!(
+                "delta:{}:{}",
+                event["index"],
+                event
+                    .pointer("/delta/text")
+                    .or_else(|| event.pointer("/delta/partial_json"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            )),
+            "content_block_stop" => Some(format!("stop:{}", event["index"])),
+            "message_delta" => Some(format!(
+                "terminal:{}",
+                event["delta"]["stop_reason"].as_str().unwrap_or_default()
+            )),
+            "message_stop" => Some("message_stop".to_string()),
+            "error" => Some("error".to_string()),
+            _ => None,
+        })
         .collect()
 }
 
@@ -12952,10 +13177,11 @@ async fn claude_chat_sse_strict_identity_usage_extras_and_tools_cross_public_bou
             "model":format!("chat-fixture/{model}"),
             "max_tokens":128,
             "stream":true,
-            "tools":[{
-                "name":"actual",
-                "input_schema":{"type":"object"}
-            }],
+            "tools":[
+                {"name":"actual","input_schema":{"type":"object"}},
+                {"name":"first","input_schema":{"type":"object"}},
+                {"name":"second","input_schema":{"type":"object"}}
+            ],
             "messages":[{"role":"user","content":"stream"}]
         })
     };
@@ -13113,6 +13339,8 @@ async fn claude_chat_sse_strict_identity_usage_extras_and_tools_cross_public_bou
         ("gpt-chat-stream-refusal-interleaved", "blocked"),
         ("gpt-chat-stream-refusal-mirror", "blocked"),
         ("gpt-chat-stream-refusal-repeated", "blockedblocked"),
+        ("gpt-chat-stream-refusal-content-prefix", "blocked"),
+        ("gpt-chat-stream-refusal-partial", "blocked"),
     ] {
         let (status, body) =
             send(post_json("/v1/messages", request(model), Some(CLIENT_KEY))).await;
@@ -13152,6 +13380,63 @@ async fn claude_chat_sse_strict_identity_usage_extras_and_tools_cross_public_bou
             .find(|event| event["type"] == "message_delta")
             .expect("empty refusal terminal")["delta"]["stop_reason"],
         "end_turn"
+    );
+
+    let (status, body) = send(post_json(
+        "/v1/messages",
+        request("gpt-chat-stream-refusal-tool-deferred"),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    assert_eq!(
+        chat_event_schedule(&events),
+        vec![
+            "message_start",
+            "start:0:tool_use:actual",
+            "delta:0:{}",
+            "stop:0",
+            "start:1:text:",
+            "delta:1:foo",
+            "delta:1:bar",
+            "stop:1",
+            "terminal:refusal",
+            "message_stop",
+        ]
+    );
+
+    let (status, body) = send(post_json(
+        "/v1/messages",
+        request("gpt-chat-stream-refusal-multiple-tools"),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    assert_eq!(
+        chat_event_schedule(&events),
+        vec![
+            "message_start",
+            "start:0:text:",
+            "delta:0:pre",
+            "stop:0",
+            "start:1:tool_use:first",
+            "delta:1:{}",
+            "stop:1",
+            "start:2:text:",
+            "delta:2:mid",
+            "stop:2",
+            "start:3:tool_use:second",
+            "delta:3:{}",
+            "stop:3",
+            "start:4:text:",
+            "delta:4:post",
+            "delta:4:-refused",
+            "stop:4",
+            "terminal:refusal",
+            "message_stop",
+        ]
     );
 
     for (model, tier, fingerprint) in [
@@ -13224,8 +13509,9 @@ async fn claude_chat_sse_malformed_matrix_errors_once_without_later_success() {
         "gpt-chat-stream-bad-refusal-late-finish-usage",
         "gpt-chat-stream-bad-refusal-late-after-usage",
         "gpt-chat-stream-bad-refusal-repeated-usage",
-        "gpt-chat-stream-bad-refusal-content-prefix",
-        "gpt-chat-stream-bad-refusal-refusal-prefix",
+        "gpt-chat-stream-bad-refusal-tool-incomplete",
+        "gpt-chat-stream-bad-refusal-tool-late",
+        "gpt-chat-stream-bad-refusal-tool-eof",
         "gpt-chat-stream-bad-tool-late-extra",
         "gpt-chat-stream-bad-tool-missing-terminal",
     ];
@@ -13267,6 +13553,37 @@ async fn claude_chat_sse_malformed_matrix_errors_once_without_later_success() {
             "{model}"
         );
         assert_eq!(events.last().unwrap()["type"], "error", "{model}");
+        let expected_schedule = match model {
+            "gpt-chat-stream-bad-refusal-tool-incomplete" => Some(vec![
+                "message_start",
+                "start:0:tool_use:actual",
+                "delta:0:{\"value\":",
+                "stop:0",
+                "error",
+            ]),
+            "gpt-chat-stream-bad-refusal-tool-late" => Some(vec![
+                "message_start",
+                "start:0:tool_use:actual",
+                "delta:0:{}",
+                "stop:0",
+                "start:1:text:",
+                "delta:1:foo",
+                "delta:1:bar",
+                "stop:1",
+                "error",
+            ]),
+            "gpt-chat-stream-bad-refusal-tool-eof" => Some(vec![
+                "message_start",
+                "start:0:tool_use:actual",
+                "delta:0:{}",
+                "stop:0",
+                "error",
+            ]),
+            _ => None,
+        };
+        if let Some(expected_schedule) = expected_schedule {
+            assert_eq!(chat_event_schedule(&events), expected_schedule, "{model}");
+        }
     }
 }
 
@@ -13286,12 +13603,21 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
         "gpt-direct-chat-stream-refusal-mirror",
         "gpt-direct-chat-stream-refusal-empty",
         "gpt-direct-chat-stream-refusal-repeated",
+        "gpt-direct-chat-stream-refusal-content-prefix",
+        "gpt-direct-chat-stream-refusal-partial",
+        "gpt-direct-chat-stream-refusal-tool-deferred",
+        "gpt-direct-chat-stream-refusal-multiple-tools",
         "gpt-direct-chat-stream-tier-late",
     ] {
         let body = json!({
             "model":model,
             "max_tokens":128,
             "stream":true,
+            "tools":[
+                {"name":"actual","input_schema":{"type":"object"}},
+                {"name":"first","input_schema":{"type":"object"}},
+                {"name":"second","input_schema":{"type":"object"}}
+            ],
             "messages":[{"role":"user","content":"direct stream"}]
         });
         let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
@@ -13313,9 +13639,15 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
             "gpt-direct-chat-stream-refusal"
             | "gpt-direct-chat-stream-refusal-split"
             | "gpt-direct-chat-stream-refusal-interleaved"
-            | "gpt-direct-chat-stream-refusal-mirror" => Some(("blocked", "refusal")),
+            | "gpt-direct-chat-stream-refusal-mirror"
+            | "gpt-direct-chat-stream-refusal-content-prefix"
+            | "gpt-direct-chat-stream-refusal-partial" => Some(("blocked", "refusal")),
             "gpt-direct-chat-stream-refusal-empty" => Some(("Hello", "end_turn")),
             "gpt-direct-chat-stream-refusal-repeated" => Some(("blockedblocked", "refusal")),
+            "gpt-direct-chat-stream-refusal-tool-deferred" => Some(("foobar", "refusal")),
+            "gpt-direct-chat-stream-refusal-multiple-tools" => {
+                Some(("premidpost-refused", "refusal"))
+            }
             _ => None,
         };
         if let Some((expected_text, expected_stop)) = expected_text {
@@ -13333,6 +13665,45 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
                 "{model}"
             );
         }
+        let expected_schedule = match model {
+            "gpt-direct-chat-stream-refusal-tool-deferred" => Some(vec![
+                "message_start",
+                "start:0:tool_use:actual",
+                "delta:0:{}",
+                "stop:0",
+                "start:1:text:",
+                "delta:1:foo",
+                "delta:1:bar",
+                "stop:1",
+                "terminal:refusal",
+                "message_stop",
+            ]),
+            "gpt-direct-chat-stream-refusal-multiple-tools" => Some(vec![
+                "message_start",
+                "start:0:text:",
+                "delta:0:pre",
+                "stop:0",
+                "start:1:tool_use:first",
+                "delta:1:{}",
+                "stop:1",
+                "start:2:text:",
+                "delta:2:mid",
+                "stop:2",
+                "start:3:tool_use:second",
+                "delta:3:{}",
+                "stop:3",
+                "start:4:text:",
+                "delta:4:post",
+                "delta:4:-refused",
+                "stop:4",
+                "terminal:refusal",
+                "message_stop",
+            ]),
+            _ => None,
+        };
+        if let Some(expected_schedule) = expected_schedule {
+            assert_eq!(chat_event_schedule(&events), expected_schedule, "{model}");
+        }
     }
 
     for model in [
@@ -13345,8 +13716,9 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
         "gpt-direct-chat-stream-bad-refusal-late-finish-usage",
         "gpt-direct-chat-stream-bad-refusal-late-after-usage",
         "gpt-direct-chat-stream-bad-refusal-repeated-usage",
-        "gpt-direct-chat-stream-bad-refusal-content-prefix",
-        "gpt-direct-chat-stream-bad-refusal-refusal-prefix",
+        "gpt-direct-chat-stream-bad-refusal-tool-incomplete",
+        "gpt-direct-chat-stream-bad-refusal-tool-late",
+        "gpt-direct-chat-stream-bad-refusal-tool-eof",
     ] {
         let body = json!({
             "model":model,
@@ -13369,6 +13741,37 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
             !events.iter().any(|event| event["type"] == "message_stop"),
             "{model}"
         );
+        let expected_schedule = match model {
+            "gpt-direct-chat-stream-bad-refusal-tool-incomplete" => Some(vec![
+                "message_start",
+                "start:0:tool_use:actual",
+                "delta:0:{\"value\":",
+                "stop:0",
+                "error",
+            ]),
+            "gpt-direct-chat-stream-bad-refusal-tool-late" => Some(vec![
+                "message_start",
+                "start:0:tool_use:actual",
+                "delta:0:{}",
+                "stop:0",
+                "start:1:text:",
+                "delta:1:foo",
+                "delta:1:bar",
+                "stop:1",
+                "error",
+            ]),
+            "gpt-direct-chat-stream-bad-refusal-tool-eof" => Some(vec![
+                "message_start",
+                "start:0:tool_use:actual",
+                "delta:0:{}",
+                "stop:0",
+                "error",
+            ]),
+            _ => None,
+        };
+        if let Some(expected_schedule) = expected_schedule {
+            assert_eq!(chat_event_schedule(&events), expected_schedule, "{model}");
+        }
     }
 }
 
