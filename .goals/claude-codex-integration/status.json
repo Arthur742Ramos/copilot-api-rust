@@ -1,6 +1,6 @@
 {
   "goal_id": "claude-codex-integration",
-  "status": "building",
+  "status": "inspecting",
   "iteration": 27,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
@@ -136,6 +136,11 @@
       "iteration": 26,
       "verdict": "FAIL",
       "summary": "Public Responses and web-search fixtures cross the Axum boundary and gates pass, but independent output/retained reservations are not atomic; failed retained transitions leave stale output charges, and regular Responses overflow usage is recorded without a validated translated success."
+    },
+    {
+      "iteration": 27,
+      "verdict": "PASS",
+      "summary": "Transactional preflight now covers every Responses output/retained path with atomic exact/+1 and pressure tests; provider/direct fixtures record valid observed cost once while preserving error outcomes and all gates pass."
     }
   ]
 }
