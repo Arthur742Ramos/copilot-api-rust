@@ -1,8 +1,7 @@
 use axum::body::Bytes;
 use axum::http::HeaderMap;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 
-use crate::libs::error::AppError;
 use crate::routes::parse_json_body;
 
 use super::handler::handle_completion;
@@ -11,10 +10,10 @@ use super::handler::handle_completion;
 pub async fn post_chat_completions(headers: HeaderMap, body: Bytes) -> Response {
     let payload = match parse_json_body(&body) {
         Ok(v) => v,
-        Err(e) => return e.into_response(),
+        Err(e) => return e.into_openai_response(),
     };
     match handle_completion(payload, headers).await {
         Ok(response) => response,
-        Err(error) => AppError::into_response(error),
+        Err(error) => error.into_openai_response(),
     }
 }

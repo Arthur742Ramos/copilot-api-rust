@@ -48,6 +48,7 @@ use crate::routes::messages::responses_stream_translation::{
 };
 use crate::routes::messages::responses_translation::{
     translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
+    validate_raw_responses_usage,
 };
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, malformed_stream_error_events,
@@ -67,7 +68,8 @@ use crate::services::copilot::create_messages::{
     create_messages, CreateMessagesOptions, CreateMessagesResult,
 };
 use crate::services::copilot::create_responses::{
-    create_responses, CreateResponsesReturn, ResponsesRequestOptions, ResponsesTransport,
+    create_responses, CreateResponsesReturn, ResponsesBufferedContract, ResponsesRequestOptions,
+    ResponsesTransport,
 };
 use crate::services::copilot::get_models::Model;
 
@@ -219,9 +221,12 @@ pub async fn handle_with_chat_completions(
     .await?;
 
     match result {
-        ChatCompletionsResult::NonStreaming(response) => {
+        ChatCompletionsResult::NonStreaming { response, headers } => {
+            let anthropic_response = translate_to_anthropic(&response).map_err(|mut error| {
+                error.headers = headers;
+                AppError::Http(error)
+            })?;
             recorder.record(normalize_openai_usage(response.get("usage")));
-            let anthropic_response = translate_to_anthropic(&response);
             Ok(Json(anthropic_response).into_response())
         }
         ChatCompletionsResult::Streaming(upstream) => Ok(stream_chat_completions_response(
@@ -378,6 +383,7 @@ pub async fn handle_with_responses_api(
     let subagent_agent_id = opts.subagent_marker.as_ref().map(|m| m.agent_id.as_str());
     let mut responses_payload =
         translate_anthropic_messages_to_responses_payload(payload, subagent_agent_id)?;
+    let response_model = responses_payload.model.clone();
 
     // Capture context in-scope for the deferred stream body + summary line.
     let req_ctx = crate::libs::request_context::request_context_store();
@@ -440,6 +446,7 @@ pub async fn handle_with_responses_api(
             session_id: opts.session_id.as_deref(),
             compact_type: opts.compact_type,
             transport,
+            buffered_contract: ResponsesBufferedContract::Regular,
         },
     )
     .await?;
@@ -449,7 +456,10 @@ pub async fn handle_with_responses_api(
             let stream = async_stream::stream! {
                 let mut timer = StreamTimer::new("responses", stream_transport::TRANSLATED)
                     .with_request_context(req_ctx);
-                let mut state = ResponsesStreamState::new(Some(tool_search_name));
+                let mut state = ResponsesStreamState::new_with_model(
+                    Some(tool_search_name),
+                    Some(response_model),
+                );
                 let mut usage = UsageTokens::default();
 
                 let heartbeat = crate::libs::sse::sse_heartbeat_interval();
@@ -462,9 +472,11 @@ pub async fn handle_with_responses_api(
                             // Idle-but-alive upstream: keep downstream warm with a
                             // ping. Not content — leaves timer/TTFT untouched.
                             Err(_) => {
-                                yield Ok(Bytes::from_static(
-                                    crate::libs::sse::ANTHROPIC_PING_FRAME,
-                                ));
+                                if !state.translation_failed {
+                                    yield Ok(Bytes::from_static(
+                                        crate::libs::sse::ANTHROPIC_PING_FRAME,
+                                    ));
+                                }
                                 continue;
                             }
                         },
@@ -490,7 +502,9 @@ pub async fn handle_with_responses_api(
                     if chunk.event.as_deref() == Some("ping") {
                         // Pings are keep-alives, not content — don't count them
                         // toward TTFT (they'd systematically under-report it).
-                        yield Ok(Bytes::from_static(crate::libs::sse::ANTHROPIC_PING_FRAME));
+                        if !state.translation_failed {
+                            yield Ok(Bytes::from_static(crate::libs::sse::ANTHROPIC_PING_FRAME));
+                        }
                         continue;
                     }
                     if chunk.data.is_empty() {
@@ -518,26 +532,42 @@ pub async fn handle_with_responses_api(
                             return;
                         }
                     };
-                    match response_event.get("type").and_then(Value::as_str) {
+                    let observed_terminal = matches!(
+                        response_event.get("type").and_then(Value::as_str),
                         Some("response.completed") | Some("response.failed")
-                        | Some("response.incomplete") => {
-                            usage = normalize_responses_usage(
-                                response_event.get("response").and_then(|r| r.get("usage")),
-                            );
+                            | Some("response.incomplete")
+                    );
+                    if observed_terminal {
+                        if let Some(response) = response_event.get("response") {
+                            if validate_raw_responses_usage(response).is_ok() {
+                                usage = normalize_responses_usage(response.get("usage"));
+                            }
                         }
-                        _ => {}
                     }
 
                     for event in translate_responses_stream_event(&response_event, &mut state) {
                         if let Some(frame) = emit_event(&event) {
-                            timer.on_content_frame();
+                            if !matches!(&event, AnthropicStreamEventData::Error { .. }) {
+                                timer.on_content_frame();
+                            }
                             yield Ok(frame);
                         }
                     }
 
                     if state.message_completed {
-                        timer.mark_finished();
-                        break;
+                        if state.translation_failed {
+                            timer.mark_error();
+                            // Preserve source-observed terminal usage for cost/quota
+                            // accounting even though translation failed. Once the
+                            // upstream terminal has been observed, finalization can
+                            // complete without reading any trailing frames.
+                            if observed_terminal {
+                                break;
+                            }
+                        } else {
+                            timer.mark_finished();
+                            break;
+                        }
                     }
                 }
 
@@ -563,15 +593,18 @@ pub async fn handle_with_responses_api(
             Ok(sse_response(stream))
         }
         CreateResponsesReturn::Result(response) => {
+            let raw_response = serde_json::to_value(&response.parsed).unwrap_or(Value::Null);
+            if validate_raw_responses_usage(&raw_response).is_ok() {
+                recorder.record(normalize_responses_usage(raw_response.get("usage")));
+            }
             let anthropic_response =
-                translate_responses_result_to_anthropic(&response, Some(&tool_search_name));
-            let usage_value = response
-                .usage
-                .as_ref()
-                .map(|u| serde_json::to_value(u).unwrap_or(Value::Null));
-            recorder.record(normalize_responses_usage(usage_value.as_ref()));
+                translate_responses_result_to_anthropic(&response.parsed, Some(&tool_search_name))?;
             Ok(Json(anthropic_response).into_response())
         }
+        CreateResponsesReturn::CompactResult(_) => Err(crate::libs::error::HttpError::internal(
+            "Messages Responses flow unexpectedly returned a compact result",
+        )
+        .into()),
     }
 }
 
@@ -1021,12 +1054,12 @@ mod tests {
     #[tokio::test]
     async fn public_translated_driver_stops_after_malformed_choices() {
         let upstream = upstream_sse_response(concat!(
-            "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: {\"usage\":{}}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{}}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
             "data: {\"error\":{\"type\":\"server_error\",\"message\":\"late error\"}}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
             "data: [DONE]\n\n",
         ))
         .await;
@@ -1063,24 +1096,24 @@ mod tests {
             (
                 "delta/reasoning",
                 concat!(
-                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"partial thought\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":42},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"partial thought\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":42},\"finish_reason\":null}]}\n\n",
                 ),
             ),
             (
                 "tool/function",
                 concat!(
-                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":{}}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":{}}}]},\"finish_reason\":null}]}\n\n",
                 ),
             ),
             (
                 "usage/details",
                 concat!(
-                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":0.5}}}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":0.5}}}\n\n",
                 ),
             ),
         ];
@@ -1090,9 +1123,9 @@ mod tests {
                 "{}{}",
                 prefix,
                 concat!(
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
                     "data: {\"error\":{\"type\":\"server_error\",\"message\":\"late error\"}}\n\n",
-                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
                     "data: [DONE]\n\n",
                 )
             );

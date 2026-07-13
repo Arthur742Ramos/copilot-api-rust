@@ -2,22 +2,21 @@
 
 use axum::body::Bytes;
 use axum::http::HeaderMap;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 
-use crate::libs::error::AppError;
 use crate::routes::parse_json_body;
 
 use super::handler::handle_responses;
 
-/// POST `/responses` (and `/v1/responses`). The thin route fn converts handler
-/// errors via `AppError::into_response`, mirroring the TS `forwardError` wrap.
+/// POST `/responses` (and `/v1/responses`). Errors use the OpenAI envelope
+/// expected by Codex rather than the crate's Anthropic default.
 pub async fn post_responses(headers: HeaderMap, body: Bytes) -> Response {
     let payload = match parse_json_body(&body) {
         Ok(v) => v,
-        Err(e) => return e.into_response(),
+        Err(e) => return e.into_openai_response(),
     };
     match handle_responses(payload, headers).await {
         Ok(response) => response,
-        Err(error) => AppError::into_response(error),
+        Err(error) => error.into_openai_response(),
     }
 }

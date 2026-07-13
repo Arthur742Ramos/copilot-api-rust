@@ -261,6 +261,7 @@ mod tests {
             kind: kind.to_string(),
             budget_tokens: budget,
             display: None,
+            extra: Default::default(),
         }
     }
 

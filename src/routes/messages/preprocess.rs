@@ -851,6 +851,18 @@ pub fn strip_tool_reference_turn_boundary(payload: &mut Value) {
         if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
             continue;
         }
+        // Stripping the synthetic boundary can leave tool-result-only content.
+        // Preserve the original carrier whenever it has open
+        // message-level extensions so downstream translators can attach them
+        // to the semantically corresponding user message (or reject an
+        // unrepresentable split) instead of silently losing them.
+        if msg.as_object().is_some_and(|message| {
+            message
+                .keys()
+                .any(|key| !matches!(key.as_str(), "role" | "content"))
+        }) {
+            continue;
+        }
         let content = match msg.get("content").and_then(|c| c.as_array()) {
             Some(c) => c,
             None => continue,
@@ -894,6 +906,17 @@ pub fn merge_tool_result_for_claude(payload: &mut Value, skip_last_message: bool
             continue;
         }
         if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        // Coalescing can remove every ordinary user block. Preserve the
+        // original carrier whenever it has open message-level extensions so
+        // downstream translators can attach them to the semantically
+        // corresponding user message (or reject an unrepresentable split).
+        if msg.as_object().is_some_and(|message| {
+            message
+                .keys()
+                .any(|key| !matches!(key.as_str(), "role" | "content"))
+        }) {
             continue;
         }
         let content = match msg.get("content").and_then(|c| c.as_array()) {

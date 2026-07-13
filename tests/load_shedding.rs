@@ -33,7 +33,7 @@ fn request(method: Method, path: &str) -> Request<Body> {
         .expect("valid request")
 }
 
-async fn assert_overloaded(response: Response<Body>, expect_body: bool) {
+async fn assert_overloaded(response: Response<Body>, expect_body: bool, path: &str) {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers().get("retry-after").unwrap(), "1");
     let body = response
@@ -47,8 +47,14 @@ async fn assert_overloaded(response: Response<Body>, expect_body: bool) {
         return;
     }
     let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON overload body");
-    assert_eq!(value["type"], "error");
-    assert_eq!(value["error"]["type"], "overloaded_error");
+    if copilot_api::libs::error::is_openai_native_path(path) {
+        assert!(value.get("type").is_none());
+        assert_eq!(value["error"]["type"], "server_error");
+        assert_eq!(value["error"]["code"], "server_overloaded");
+    } else {
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "overloaded_error");
+    }
 }
 
 fn guarded_test_router(controller: AdmissionController, router: Router) -> Router {
@@ -94,6 +100,8 @@ async fn configured_overload_covers_upstream_routes_but_not_control_plane() {
         (Method::POST, "/v1/images/generations"),
         (Method::POST, "/responses"),
         (Method::POST, "/v1/responses"),
+        (Method::POST, "/responses/compact"),
+        (Method::POST, "/v1/responses/compact"),
         (Method::POST, "/v1/messages"),
         (Method::POST, "/v1/messages/count_tokens"),
         (Method::POST, "/test-provider/v1/messages"),
@@ -108,7 +116,7 @@ async fn configured_overload_covers_upstream_routes_but_not_control_plane() {
             .oneshot(request(method, path))
             .await
             .expect("router response");
-        assert_overloaded(response, expect_body).await;
+        assert_overloaded(response, expect_body, path).await;
     }
 
     for path in ["/", "/version", "/readyz", "/admin/config"] {
@@ -204,7 +212,7 @@ async fn streaming_permit_is_held_until_body_completion() {
         .oneshot(request(Method::GET, "/work"))
         .await
         .expect("overload response");
-    assert_overloaded(excess, true).await;
+    assert_overloaded(excess, true, "/work").await;
 
     release.add_permits(1);
     let last = body

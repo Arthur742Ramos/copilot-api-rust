@@ -6,6 +6,12 @@ not a claim that every Anthropic product endpoint is emulated.
 
 ## Reference audited
 
+- Client target: **Claude Code 2.1.207**, official release
+  [`v2.1.207`](https://github.com/anthropics/claude-code/releases/tag/v2.1.207).
+- Credential-free client-shaped boundary evidence:
+  `tests/client_compatibility.rs::claude_code_2_1_207_contract_crosses_public_axum_boundary`.
+- Combined Claude Code/Codex setup, headers, versions, and transport matrix:
+  [`claude-code-codex-compatibility.md`](./claude-code-codex-compatibility.md).
 - Reference implementation:
   [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api) at
   commit

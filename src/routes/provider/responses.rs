@@ -18,13 +18,16 @@ use serde_json::{json, Value};
 
 use crate::libs::error::{http_error_from_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
-use crate::libs::request_context::request_context_store;
 use crate::libs::token_usage::{
-    create_provider_token_usage_recorder, normalize_responses_usage, TokenUsageRecorder,
-    UsageTokens,
+    create_request_scoped_provider_token_usage_recorder, normalize_responses_usage,
+    TokenUsageRecorder, UsageTokens,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
+};
+use crate::routes::responses::{
+    stream_guard::{ResponsesStreamGuard, ResponsesTerminal},
+    stream_id_sync::StreamIdTracker,
 };
 use crate::services::codex::create_responses::forward_codex_responses;
 use crate::services::codex::get_models::get_codex_models;
@@ -73,7 +76,11 @@ pub async fn handle_provider_responses_for_provider(
     compact_input_by_latest_compaction(&mut payload);
 
     let is_stream = payload.stream.unwrap_or(false);
-    let recorder = create_provider_responses_usage_recorder(&payload, &provider);
+    let recorder = create_request_scoped_provider_token_usage_recorder(
+        "responses",
+        payload.model.clone(),
+        provider.clone(),
+    );
 
     if provider_config.name == "codex" {
         let upstream_response =
@@ -98,11 +105,17 @@ pub async fn handle_provider_responses_for_provider(
             return stream_provider_responses(upstream_response, &provider, recorder, true).await;
         }
 
+        let status = upstream_response.status();
+        let resp_headers = upstream_response.headers().clone();
         let response_body = read_responses_result(upstream_response).await?;
         recorder.record(normalize_responses_usage(
-            usage_value(&response_body).as_ref(),
+            usage_value(&response_body.value).as_ref(),
         ));
-        return Ok(Json(response_body).into_response());
+        return Ok(build_proxy_response_from_parts(
+            status,
+            &resp_headers,
+            response_body.bytes,
+        ));
     }
 
     let upstream_response =
@@ -126,38 +139,34 @@ pub async fn handle_provider_responses_for_provider(
     let resp_headers = upstream_response.headers().clone();
     let bytes = crate::libs::http::read_bytes_capped(upstream_response)
         .await
-        .map_err(|e| {
-            AppError::Other(anyhow::anyhow!(
-                "Failed to read provider response body: {e}"
+        .map_err(|error| {
+            AppError::Http(crate::libs::error::HttpError::new(
+                if error.contains("too large") {
+                    "Upstream Responses body exceeded the maximum allowed size."
+                } else {
+                    "The upstream Responses body could not be read."
+                },
+                StatusCode::BAD_GATEWAY,
+                HeaderMap::new(),
+                String::new(),
             ))
         })?;
 
-    if let Ok(body_value) = serde_json::from_slice::<Value>(&bytes) {
-        recorder.record(normalize_responses_usage(body_value.get("usage")));
-    }
+    let body_value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        AppError::Http(crate::libs::error::HttpError::new(
+            "The upstream Responses body was not valid JSON.",
+            StatusCode::BAD_GATEWAY,
+            HeaderMap::new(),
+            String::new(),
+        ))
+    })?;
+    recorder.record(normalize_responses_usage(body_value.get("usage")));
 
     Ok(build_proxy_response_from_parts(
         status,
         &resp_headers,
         bytes,
     ))
-}
-
-/// Mirrors `createProviderResponsesUsageRecorder`: session id derived from the
-/// request-context session affinity.
-fn create_provider_responses_usage_recorder(
-    payload: &ResponsesPayload,
-    provider: &str,
-) -> TokenUsageRecorder {
-    let session_affinity = request_context_store()
-        .and_then(|s| s.session_affinity)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let mut recorder =
-        create_provider_token_usage_recorder("responses", payload.model.clone(), provider, None);
-    recorder.session_id = Some(session_affinity.unwrap_or_default());
-    recorder
 }
 
 /// Mirrors `streamProviderResponses`: peek the first event for a leading `error`
@@ -217,27 +226,84 @@ async fn stream_provider_responses(
         }
     }
 
+    let provider_label = provider.to_string();
     let body = Body::from_stream(async_stream::stream! {
         let mut usage = UsageTokens::default();
+        let mut guard = ResponsesStreamGuard::new();
+        let mut ids = StreamIdTracker::new();
 
-        // Emit the already-peeked first chunk, then the rest.
-        if let Some(frame) = render_responses_chunk(&first_chunk, normalize_codex, &mut usage) {
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
-        }
-
-        while let Some(item) = event_stream.next().await {
+        let combined = futures_util::stream::once(async move {
+            Ok::<_, std::io::Error>(first_chunk)
+        })
+        .chain(event_stream);
+        futures_util::pin_mut!(combined);
+        while let Some(item) = combined.next().await {
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {
-                    yield Err(err);
+                    tracing::warn!(
+                        error = %err,
+                        provider = %provider_label,
+                        "Provider Responses stream failed"
+                    );
+                    if let Some(frame) = guard.fail(
+                        "upstream_transport_error",
+                        "The upstream Responses stream was interrupted.",
+                    ) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
                     return;
                 }
             };
-            if let Some(frame) = render_responses_chunk(&chunk, normalize_codex, &mut usage) {
-                yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+
+            let processed = match guard.process(&chunk, &mut ids) {
+                Ok(Some(processed)) => processed,
+                Ok(None) => continue,
+                Err(reason) => {
+                    tracing::warn!(
+                        reason,
+                        provider = %provider_label,
+                        "Rejected malformed provider Responses stream event"
+                    );
+                    if let Some(frame) = guard.fail(
+                        "invalid_stream",
+                        "The upstream Responses stream returned malformed data.",
+                    ) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
+
+            if normalize_codex {
+                crate::libs::codex_rate_limit::log_codex_rate_limits_event(&processed.value);
+            }
+            if let Some(next) = responses_stream_event_usage(&processed.value) {
+                usage = next;
+            }
+
+            let terminal = processed.terminal;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(processed.frame));
+            if let Some(terminal) = terminal {
+                if terminal == ResponsesTerminal::Failed {
+                    tracing::warn!(
+                        provider = %provider_label,
+                        "Provider Responses stream ended with failure"
+                    );
+                }
+                recorder.record(usage);
+                return;
             }
         }
 
+        if let Some(frame) = guard.fail(
+            "upstream_eof",
+            "The upstream Responses stream ended before a terminal event.",
+        ) {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+        }
         recorder.record(usage);
     });
 
@@ -250,45 +316,6 @@ async fn stream_provider_responses(
         .unwrap())
 }
 
-/// Render one upstream Responses SSE chunk, optionally normalizing Codex events
-/// (re-serialize + set the SSE event name to the JSON `type`) and updating usage
-/// from terminal events.
-fn render_responses_chunk(
-    chunk: &crate::libs::sse::SseEvent,
-    normalize_codex: bool,
-    usage: &mut UsageTokens,
-) -> Option<String> {
-    let mut data = chunk.data.clone();
-    let mut event_name = chunk.event.clone();
-
-    if !chunk.data.is_empty() && chunk.data != "[DONE]" {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&chunk.data) {
-            // The codex branch logs `codex.rate_limits` events (TS
-            // `parseResponsesProviderStreamChunk` does this when the provider is
-            // codex, which is exactly when `normalize_codex` is set).
-            if normalize_codex {
-                crate::libs::codex_rate_limit::log_codex_rate_limits_event(&parsed);
-            }
-            if let Some(next) = responses_stream_event_usage(&parsed) {
-                *usage = next;
-            }
-            if normalize_codex {
-                if let Some(event_type) = parsed.get("type").and_then(Value::as_str) {
-                    event_name = Some(event_type.to_string());
-                }
-                if let Ok(reser) = serde_json::to_string(&parsed) {
-                    data = reser;
-                }
-            }
-        }
-    }
-
-    match event_name {
-        Some(name) => Some(format!("event: {name}\ndata: {data}\n\n")),
-        None => Some(format!("data: {data}\n\n")),
-    }
-}
-
 /// Mirrors `getResponsesStreamEventUsage`: usage from the terminal events.
 fn responses_stream_event_usage(event: &Value) -> Option<UsageTokens> {
     match event.get("type").and_then(Value::as_str) {
@@ -299,14 +326,38 @@ fn responses_stream_event_usage(event: &Value) -> Option<UsageTokens> {
     }
 }
 
-/// Read a non-streaming Codex responses body into a JSON `Value`.
-async fn read_responses_result(response: reqwest::Response) -> Result<Value, AppError> {
-    let bytes = response
-        .bytes()
+struct BufferedResponsesBody {
+    bytes: Bytes,
+    value: Value,
+}
+
+/// Read a non-streaming Codex responses body without reserializing its JSON.
+async fn read_responses_result(
+    response: reqwest::Response,
+) -> Result<BufferedResponsesBody, AppError> {
+    let bytes = crate::libs::http::read_bytes_capped(response)
         .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Failed to read codex response body: {e}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| AppError::Other(anyhow::anyhow!("Failed to parse codex response body: {e}")))
+        .map_err(|error| {
+            AppError::Http(crate::libs::error::HttpError::new(
+                if error.contains("too large") {
+                    "Upstream Responses body exceeded the maximum allowed size."
+                } else {
+                    "The upstream Responses body could not be read."
+                },
+                StatusCode::BAD_GATEWAY,
+                HeaderMap::new(),
+                String::new(),
+            ))
+        })?;
+    let value = serde_json::from_slice(&bytes).map_err(|_| {
+        AppError::Http(crate::libs::error::HttpError::new(
+            "The upstream Responses body was not valid JSON.",
+            StatusCode::BAD_GATEWAY,
+            HeaderMap::new(),
+            String::new(),
+        ))
+    })?;
+    Ok(BufferedResponsesBody { bytes, value })
 }
 
 fn usage_value(body: &Value) -> Option<Value> {

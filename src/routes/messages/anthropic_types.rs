@@ -122,6 +122,20 @@ pub struct AnthropicTool {
     pub defer_loading: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_location: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_inclusion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(flatten)]
@@ -135,6 +149,8 @@ pub struct AnthropicToolChoice {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `thinking`: `{ type: "enabled"|"adaptive"; budget_tokens?; display? }`.
@@ -146,6 +162,8 @@ pub struct AnthropicThinkingConfig {
     pub budget_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `output_config`: `{ effort? }`.
@@ -153,6 +171,8 @@ pub struct AnthropicThinkingConfig {
 pub struct AnthropicOutputConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `metadata`: `{ user_id? }`. Open shape.
@@ -281,6 +301,8 @@ pub struct AnthropicMessageStart {
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
     pub usage: AnthropicUsage,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl Default for AnthropicMessageStart {
@@ -294,6 +316,7 @@ impl Default for AnthropicMessageStart {
             stop_reason: None,
             stop_sequence: None,
             usage: AnthropicUsage::default(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -338,6 +361,10 @@ pub struct AnthropicMessageDeltaUsage {
     pub cache_creation_input_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// `error` event body.
@@ -406,30 +433,96 @@ impl AnthropicStreamEventData {
 // Streaming translation state
 // ---------------------------------------------------------------------------
 
+/// Aggregate UTF-8 payload-content budget shared by translated Chat and
+/// Responses streams. Protocol framing and fixed discriminator strings are not
+/// counted; dynamic client-visible text, signatures, tool metadata/arguments,
+/// and serialized extensions are.
+#[derive(Debug, Clone, Default)]
+pub struct TranslatedOutputBudget {
+    pub used_bytes: usize,
+}
+
+impl TranslatedOutputBudget {
+    pub fn try_reserve(&mut self, additional: usize) -> bool {
+        let Some(total) = self.used_bytes.checked_add(additional) else {
+            return false;
+        };
+        if total > crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES {
+            return false;
+        }
+        self.used_bytes = total;
+        true
+    }
+}
+
 /// Per-tool-call tracking entry inside `AnthropicStreamState.tool_calls`,
 /// keyed by the OpenAI tool index.
 #[derive(Debug, Clone, Default)]
 pub struct AnthropicStreamToolCall {
-    pub id: String,
-    pub name: String,
+    pub id: Option<String>,
+    pub name: Option<String>,
     pub anthropic_block_index: i64,
     /// Argument fragments for calls that cannot be emitted yet because another
     /// tool block is active. Anthropic content blocks are strictly sequential,
     /// while OpenAI may interleave parallel tool-call indices.
     pub buffered_arguments: Vec<String>,
+    /// Full ordered argument text used to validate the terminal JSON object.
+    pub arguments: String,
+    /// First-delta tool/function extensions preserved on the tool_use block.
+    pub extra: serde_json::Map<String, Value>,
     pub started: bool,
+}
+
+/// Source-ordered output that cannot be emitted while an Anthropic tool block
+/// is open. Chat deltas can interleave text/reasoning and parallel tool calls,
+/// while Anthropic content blocks must remain strictly sequential.
+#[derive(Debug, Clone)]
+pub enum AnthropicStreamDeferredOutput {
+    Text {
+        text: String,
+        /// True only for ordinary `ChoiceDelta.content`. Reasoning fallbacks
+        /// share the text scheduler but are not refusal-mirror authority.
+        source_content: bool,
+    },
+    ToolCall(i64),
+    ReasoningOpaque(String),
 }
 
 /// `AnthropicStreamState` — plain mutable scratch state for the streaming
 /// translator. NOT a wire type (no serde).
 #[derive(Debug, Clone, Default)]
 pub struct AnthropicStreamState {
+    /// Stable OpenAI chunk identity established by the first chunk.
+    pub chat_id: Option<String>,
+    pub chat_model: Option<String>,
+    pub chat_created: Option<i64>,
+    pub chat_service_tier: Option<Option<String>>,
+    pub chat_system_fingerprint: Option<Option<String>>,
+    pub chat_top_level_extras: serde_json::Map<String, Value>,
+    pub chat_usage: Option<AnthropicUsage>,
+    pub chat_usage_source: Option<Value>,
+    pub chat_output_seen: bool,
+    pub chat_refusal_text: Option<String>,
+    /// Ordinary Chat `content` observed from the source, including fragments
+    /// currently deferred behind tool blocks. Refusal reconciliation uses this.
+    pub chat_content_seen: String,
+    /// Ordinary Chat `content` for which an Anthropic text delta was actually
+    /// emitted. This advances only after the event is appended.
+    pub chat_content_emitted: String,
+    /// Aggregate client-visible payload accounting across emitted and deferred
+    /// text, reasoning, tools, signatures, and material extensions.
+    pub output_budget: TranslatedOutputBudget,
+    pub chat_finish_reason: Option<String>,
+    /// True after a finish chunk carried usage or one post-finish usage-only
+    /// chunk was accepted. Success stays pending until [DONE]/EOF so a later
+    /// chunk can still invalidate the stream.
+    pub chat_terminal_usage_seen: bool,
     pub message_start_sent: bool,
     pub content_block_index: i64,
     pub content_block_open: bool,
     pub thinking_block_open: bool,
     pub pending_message_delta: Option<AnthropicStreamEventData>,
-    pub deferred_content: Option<String>,
+    pub deferred_output: std::collections::VecDeque<AnthropicStreamDeferredOutput>,
     /// openAIToolIndex -> { id, name, anthropic_block_index }
     pub tool_calls: std::collections::HashMap<i64, AnthropicStreamToolCall>,
     /// First-seen order for deterministic serialization of parallel calls.

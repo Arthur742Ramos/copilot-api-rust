@@ -96,6 +96,11 @@ fn tool_name(tool: &Value) -> Option<&str> {
     tool.get("name").and_then(Value::as_str)
 }
 
+fn is_deferred_tool_definition(tool: &Value) -> bool {
+    tool_name(tool).is_some_and(is_deferred_tool_name)
+        && tool.get("defer_loading") == Some(&Value::Bool(true))
+}
+
 pub fn has_bridge_tool_search_tool(tools: Option<&[Value]>) -> bool {
     tools.is_some_and(|tools| {
         tools
@@ -118,11 +123,7 @@ pub fn resolve_bridge_tool_search_name(tools: Option<&[Value]>) -> String {
 }
 
 pub fn has_deferred_tool_candidate(tools: Option<&[Value]>) -> bool {
-    tools.is_some_and(|tools| {
-        tools
-            .iter()
-            .any(|tool| tool_name(tool).is_some_and(is_deferred_tool_name))
-    })
+    tools.is_some_and(|tools| tools.iter().any(is_deferred_tool_definition))
 }
 
 pub fn should_enable_responses_tool_search(model: &str, tools: Option<&[Value]>) -> bool {
@@ -164,8 +165,8 @@ pub fn has_deferred_namespace_tool(tools: Option<&[Value]>) -> bool {
 pub fn list_deferred_tool_names(tools: &[Value]) -> Vec<String> {
     let mut set: IndexSet<String> = IndexSet::new();
     for tool in tools {
-        if let Some(name) = tool_name(tool) {
-            if is_deferred_tool_name(name) {
+        if is_deferred_tool_definition(tool) {
+            if let Some(name) = tool_name(tool) {
                 set.insert(name.to_string());
             }
         }

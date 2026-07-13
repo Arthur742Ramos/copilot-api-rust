@@ -66,8 +66,8 @@ pub fn init_build_info() {
 
 /// Record an upstream Copilot request's latency under
 /// `copilot_upstream_request_seconds`, labelled by a bounded `endpoint`
-/// (messages | chat | responses | embeddings | models) and a coarse `status`
-/// class. This measures
+/// (messages | chat | responses | responses_compact | embeddings | models) and
+/// a coarse `status` class. This measures
 /// time-to-response-headers (the `send().await`), i.e. upstream TTFB — NOT the
 /// time to consume a streaming body. Paired with the proxy_stream_* histograms,
 /// it lets you separate "slow to respond" from "long but healthy output".
@@ -79,6 +79,27 @@ pub fn record_upstream_request(endpoint: &'static str, status: UpstreamStatus, e
         "status" => status.as_str(),
     )
     .record(elapsed_secs);
+    record_request_context_status(status);
+}
+
+/// Provider equivalent of [`record_upstream_request`]. Provider names are
+/// intentionally not labels: configured aliases are unbounded. Endpoint and
+/// coarse status are fixed-cardinality labels shared with the direct metric.
+pub fn record_provider_upstream_request(
+    endpoint: &'static str,
+    status: UpstreamStatus,
+    elapsed_secs: f64,
+) {
+    metrics::histogram!(
+        "provider_upstream_request_seconds",
+        "endpoint" => endpoint,
+        "status" => status.as_str(),
+    )
+    .record(elapsed_secs);
+    record_request_context_status(status);
+}
+
+fn record_request_context_status(status: UpstreamStatus) {
     // Feed the per-request triage summary so `request.completed` can correlate
     // the upstream-status class with flow/transport/TTFT. This runs in-scope
     // (during the upstream `send().await`), so the task-local context is live;

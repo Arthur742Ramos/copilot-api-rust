@@ -1,0 +1,146 @@
+{
+  "goal_id": "claude-codex-integration",
+  "status": "completed",
+  "iteration": 27,
+  "builder_model": "OpenAI:GPT-5.6-Sol",
+  "inspector_model": "OpenAI:GPT-5.6-Luna",
+  "initial_sha": "8b7472013665b168737dbb055d9f98f4f735b6d5",
+  "created_at": "2026-07-12T11:06:14.239-04:00",
+  "history": [
+    {
+      "iteration": 1,
+      "verdict": "FAIL",
+      "summary": "Valid Codex 0.144.1 reasoning, compaction, and image input items are rejected before provider dispatch; docs also overstate npm evidence."
+    },
+    {
+      "iteration": 2,
+      "verdict": "FAIL",
+      "summary": "Codex optional fields and id-less compaction continuation pass, but rs1 optional-reasoning carriers are silently dropped by Claude request translation."
+    },
+    {
+      "iteration": 3,
+      "verdict": "FAIL",
+      "summary": "All four rs1 request carriers pass, but non-stream Responses reasoning with an empty summary text still loses its opaque carrier."
+    },
+    {
+      "iteration": 4,
+      "verdict": "FAIL",
+      "summary": "Aggregate-empty carrier cases pass, but stream/non-stream reasoning diverges on leading whitespace and multi-summary separators."
+    },
+    {
+      "iteration": 5,
+      "verdict": "FAIL",
+      "summary": "Framing equivalence passes, but reasoning_text.delta is dropped and missing/duplicate output-item lifecycle can lose or duplicate reasoning while reporting success."
+    },
+    {
+      "iteration": 6,
+      "verdict": "FAIL",
+      "summary": "Reasoning lifecycle and bounded-state fixes pass, but valid Codex completed/incomplete terminals without response.status are rejected by the bridge."
+    },
+    {
+      "iteration": 7,
+      "verdict": "FAIL",
+      "summary": "Statusless terminals pass, but the bridge still requires response.created.model, accepts terminal id conflicts, and coerces malformed usage to zero."
+    },
+    {
+      "iteration": 8,
+      "verdict": "FAIL",
+      "summary": "Terminal identity and usage fixes pass, but malformed required function-call scalars still coerce to empty tool identity and successful Anthropic completion."
+    },
+    {
+      "iteration": 9,
+      "verdict": "FAIL",
+      "summary": "Stream scalar validation passes, but non-stream tool-search optional IDs are dropped and malformed function outputs become end_turn success."
+    },
+    {
+      "iteration": 10,
+      "verdict": "FAIL",
+      "summary": "Scalar parity and web fixtures pass, but nullable terminal status is over-rejected, full-created web-search snapshots are not reconciled, and raw output variants become empty end_turn success."
+    },
+    {
+      "iteration": 11,
+      "verdict": "FAIL",
+      "summary": "Nullable statuses and raw variants now pass, but model-less web snapshots fail, optional usage details and IDs are over-rejected, nested details can conflict silently, and native non-stream nulls are elided."
+    },
+    {
+      "iteration": 12,
+      "verdict": "FAIL",
+      "summary": "Web authority and raw-byte forwarding largely pass, but direct Copilot compaction rejects valid id-less output and malformed structured snapshot fields are silently accepted."
+    },
+    {
+      "iteration": 13,
+      "verdict": "FAIL",
+      "summary": "Direct compact buffering, native errors, headers, metrics, and authority validation pass, but provider compact skips typed validation/usage metrics and annotation omission can false-conflict."
+    },
+    {
+      "iteration": 14,
+      "verdict": "FAIL",
+      "summary": "Direct/provider compact and annotation parity now pass, but malformed web-search request collections are silently filtered or forwarded with invalid shapes."
+    },
+    {
+      "iteration": 15,
+      "verdict": "FAIL",
+      "summary": "Web request policy and deferred-reference validation now pass, but undefined tool choices and shallow nested JSON schemas still reach translation/provider paths."
+    },
+    {
+      "iteration": 16,
+      "verdict": "FAIL",
+      "summary": "Catalog choices, recursive bounds, boolean schemas, source types, and deferred references pass, but schema primitive semantics and unknown tool-choice/tool fields are still lost or accepted."
+    },
+    {
+      "iteration": 17,
+      "verdict": "FAIL",
+      "summary": "Schema semantics, catalog choices, collision checks, and extension preservation mostly pass, but top-level/message extras and stop_sequences are still dropped and empty schema name arrays remain accepted."
+    },
+    {
+      "iteration": 18,
+      "verdict": "FAIL",
+      "summary": "Responses extensions, route-aware stop_sequences, schema empty arrays, and gates pass, but the supported Chat Completions Messages bridge still silently drops top-level, message, and structured-system extras without public regressions."
+    },
+    {
+      "iteration": 19,
+      "verdict": "FAIL",
+      "summary": "Chat request extras, collisions, split carriers, structured content, and no-dispatch policy pass, but reverse Chat responses still drop open fields and turn malformed choices, tool calls, arguments, and usage into successful Anthropic output."
+    },
+    {
+      "iteration": 20,
+      "verdict": "FAIL",
+      "summary": "Non-stream Chat validation, extras, sanitized 502s, and provider/direct fixtures pass, but Chat SSE still defaults identity/index/usage, accepts finish/tool conflicts, and diverges on OpenAI-optional usage semantics."
+    },
+    {
+      "iteration": 21,
+      "verdict": "FAIL",
+      "summary": "Chat SSE identity, terminal, usage, extras, and adversarial failure handling pass, but official optional tool-fragment forms are over-rejected, refusal/logprobs policies diverge, and nested usage service tiers accept invalid enums."
+    },
+    {
+      "iteration": 22,
+      "verdict": "FAIL",
+      "summary": "Optional tool fragments, service-tier enums, logprobs rejection, and executed provider/direct fixtures pass, but refusal deltas are treated as complete values and JSON/SSE refusal preservation still diverges."
+    },
+    {
+      "iteration": 23,
+      "verdict": "FAIL",
+      "summary": "Refusal fragments, mirror/interleaving, bounds, unsafe-carrier removal, and provider/direct cases pass, but deferred tool content is counted as emitted before refusal suffix reconciliation and can reorder client-visible text."
+    },
+    {
+      "iteration": 24,
+      "verdict": "FAIL",
+      "summary": "Source-ordered scheduler, refusal/tool/reasoning ordering, terminal handling, bounds fixtures, and provider/direct cases pass, but direct reasoning and opaque output bypass the aggregate emitted-response size bound."
+    },
+    {
+      "iteration": 25,
+      "verdict": "FAIL",
+      "summary": "Shared Chat budgets, exact/overflow UTF-8 fixtures, scheduler cleanup, and reasoning/signature accounting pass, but Responses function-argument state is over-reserved, web-search records usage before budget validation, and no public Responses budget fixtures exist."
+    },
+    {
+      "iteration": 26,
+      "verdict": "FAIL",
+      "summary": "Public Responses and web-search fixtures cross the Axum boundary and gates pass, but independent output/retained reservations are not atomic; failed retained transitions leave stale output charges, and regular Responses overflow usage is recorded without a validated translated success."
+    },
+    {
+      "iteration": 27,
+      "verdict": "PASS",
+      "summary": "Transactional preflight now covers every Responses output/retained path with atomic exact/+1 and pressure tests; provider/direct fixtures record valid observed cost once while preserving error outcomes and all gates pass."
+    }
+  ]
+}

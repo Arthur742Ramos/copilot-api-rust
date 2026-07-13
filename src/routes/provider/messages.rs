@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::libs::config::{ModelConfig, ResolvedProviderConfig};
+use crate::libs::config::{provider_uses_responses_api, ModelConfig, ResolvedProviderConfig};
 use crate::libs::error::{anthropic_error_response, http_error_from_response, AppError};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{
@@ -40,6 +40,7 @@ use crate::routes::messages::responses_stream_translation::{
 };
 use crate::routes::messages::responses_translation::{
     translate_anthropic_messages_to_responses_payload, translate_responses_result_to_anthropic,
+    validate_raw_responses_usage, validate_responses_request_controls,
 };
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, malformed_stream_error_events,
@@ -47,9 +48,10 @@ use crate::routes::messages::stream_translation::{
     transport_stream_error_events,
 };
 use crate::routes::messages::web_search::fulfill::{
-    build_synthetic_stream_events, collect_web_search_responses_stream_result,
+    build_synthetic_stream_events, collect_web_search_responses_stream_result_with_usage_observer,
     has_web_search_server_tool, is_web_search_only_request, prepare_web_search_responses_payload,
     reconstruct_web_search_response, strip_web_search_server_tool,
+    validate_reconstructed_payload_budget, validate_web_search_result,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
@@ -83,6 +85,11 @@ pub async fn post_provider_messages(
             return AppError::BadRequest(format!("Invalid request payload: {e}")).into_response()
         }
     };
+    if provider_uses_responses_api(&provider) {
+        if let Err(error) = validate_responses_request_controls(&payload, provider == "codex") {
+            return error.into_response();
+        }
+    }
     if payload.model.trim().is_empty() {
         return AppError::BadRequest(
             "model: field required and must be a non-empty string".to_string(),
@@ -125,6 +132,9 @@ pub async fn handle_provider_messages_for_provider(
             format!("Provider '{provider}' not found or disabled"),
         ));
     };
+    if provider_config.provider_type == "openai-responses" {
+        validate_responses_request_controls(&payload, provider == "codex")?;
+    }
 
     let model_config = provider_config
         .models
@@ -323,9 +333,11 @@ async fn handle_openai_responses_provider_web_search_messages(
         DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO,
     );
     compact_input_by_latest_compaction(&mut responses_payload);
+    let requested_response_model = responses_payload.model.clone();
 
     let is_codex = provider_config.name == "codex";
     let error_prefix = format!("{provider} web search responses stream");
+    let recorder = create_provider_messages_usage_recorder(&payload, provider);
 
     let body: ResponsesResult = if is_codex {
         let upstream_response =
@@ -340,7 +352,20 @@ async fn handle_openai_responses_provider_web_search_messages(
             .into());
         }
         let stream = Box::pin(crate::libs::sse::events(upstream_response));
-        collect_web_search_responses_stream_result(stream, &error_prefix).await?
+        let mut observed_usage = None;
+        let collected = collect_web_search_responses_stream_result_with_usage_observer(
+            stream,
+            &error_prefix,
+            Some(&requested_response_model),
+            |terminal| {
+                observed_usage = Some(normalize_responses_usage(terminal.get("usage")));
+            },
+        )
+        .await;
+        if let Some(usage) = observed_usage {
+            recorder.record(usage);
+        }
+        collected?
     } else {
         let upstream_response =
             forward_provider_responses(provider_config, &responses_payload, headers).await?;
@@ -358,9 +383,27 @@ async fn handle_openai_responses_provider_web_search_messages(
         let content_type = response_content_type(&upstream_response);
         if content_type.contains("text/event-stream") {
             let stream = Box::pin(crate::libs::sse::events(upstream_response));
-            collect_web_search_responses_stream_result(stream, &error_prefix).await?
+            let mut observed_usage = None;
+            let collected = collect_web_search_responses_stream_result_with_usage_observer(
+                stream,
+                &error_prefix,
+                Some(&requested_response_model),
+                |terminal| {
+                    observed_usage = Some(normalize_responses_usage(terminal.get("usage")));
+                },
+            )
+            .await;
+            if let Some(usage) = observed_usage {
+                recorder.record(usage);
+            }
+            collected?
         } else {
-            read_responses_result(upstream_response).await?
+            let result = read_responses_result(upstream_response).await?;
+            let raw = serde_json::to_value(&result).unwrap_or(Value::Null);
+            if validate_raw_responses_usage(&raw).is_ok() {
+                recorder.record(normalize_responses_usage(raw.get("usage")));
+            }
+            result
         }
     };
 
@@ -392,6 +435,7 @@ fn stream_responses_provider_messages(
     let recorder = create_provider_messages_usage_recorder(payload, provider);
     let tool_search_name =
         resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
+    let response_model = payload.model.clone();
     let provider_label = provider.to_string();
     let event_stream = crate::libs::sse::events(upstream);
 
@@ -400,7 +444,10 @@ fn stream_responses_provider_messages(
         let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)
             .with_request_context(crate::libs::request_context::request_context_store());
         let mut usage = UsageTokens::default();
-        let mut state = ResponsesStreamState::new(Some(tool_search_name));
+        let mut state = ResponsesStreamState::new_with_model(
+            Some(tool_search_name),
+            Some(response_model),
+        );
         futures_util::pin_mut!(event_stream);
 
         while let Some(item) = event_stream.next().await {
@@ -422,9 +469,11 @@ fn stream_responses_provider_messages(
             };
 
             if chunk.event.as_deref() == Some("ping") {
-                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                    b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
-                ));
+                if !state.translation_failed {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                    ));
+                }
                 continue;
             }
 
@@ -464,20 +513,36 @@ fn stream_responses_provider_messages(
                 crate::libs::codex_rate_limit::log_codex_rate_limits_event(&parsed);
             }
 
-            match parsed.get("type").and_then(Value::as_str) {
+            let observed_terminal = matches!(
+                parsed.get("type").and_then(Value::as_str),
                 Some("response.completed") | Some("response.failed")
-                | Some("response.incomplete") => {
-                    usage = normalize_responses_usage(
-                        parsed.get("response").and_then(|r| r.get("usage")),
-                    );
+                    | Some("response.incomplete")
+            );
+            if observed_terminal {
+                if let Some(response) = parsed.get("response") {
+                    if validate_raw_responses_usage(response).is_ok() {
+                        usage = normalize_responses_usage(response.get("usage"));
+                    }
                 }
-                _ => {}
             }
 
             for event in translate_responses_stream_event(&parsed, &mut state) {
                 if let Some(frame) = emit_event(&event) {
-                    timer.on_content_frame();
+                    if !matches!(&event, AnthropicStreamEventData::Error { .. }) {
+                        timer.on_content_frame();
+                    }
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
+            }
+            if state.message_completed {
+                if state.translation_failed {
+                    timer.mark_error();
+                    if observed_terminal {
+                        break;
+                    }
+                } else {
+                    timer.mark_finished();
+                    break;
                 }
             }
         }
@@ -492,6 +557,8 @@ fn stream_responses_provider_messages(
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
             }
+        } else if state.translation_failed {
+            timer.mark_error();
         } else {
             timer.mark_finished();
         }
@@ -510,13 +577,15 @@ fn respond_responses_provider_messages_json(
     provider: &str,
 ) -> Result<Response, AppError> {
     let recorder = create_provider_messages_usage_recorder(payload, provider);
-    recorder.record(normalize_responses_usage(
-        responses_usage_value(body).as_ref(),
-    ));
+    let raw = serde_json::to_value(body).unwrap_or(Value::Null);
+    if validate_raw_responses_usage(&raw).is_ok() {
+        recorder.record(normalize_responses_usage(raw.get("usage")));
+    }
 
     let tool_search_name =
         resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
-    let anthropic_response = translate_responses_result_to_anthropic(body, Some(&tool_search_name));
+    let anthropic_response =
+        translate_responses_result_to_anthropic(body, Some(&tool_search_name))?;
     Ok(Json(anthropic_response).into_response())
 }
 
@@ -528,10 +597,7 @@ fn respond_web_search_provider_messages_json(
     payload: &AnthropicMessagesPayload,
     provider: &str,
 ) -> Result<Response, AppError> {
-    let recorder = create_provider_messages_usage_recorder(payload, provider);
-    recorder.record(normalize_responses_usage(
-        responses_usage_value(body).as_ref(),
-    ));
+    validate_web_search_result(body)?;
 
     let request_id = if body.id.is_empty() {
         format!("{provider}:{}", payload.model)
@@ -539,6 +605,7 @@ fn respond_web_search_provider_messages_json(
         body.id.clone()
     };
     let (_extract, response) = reconstruct_web_search_response(payload, body, &request_id);
+    validate_reconstructed_payload_budget(&response)?;
 
     if !payload.stream.unwrap_or(false) {
         return Ok(Json(response.to_json()).into_response());
@@ -580,13 +647,6 @@ async fn read_responses_result(response: reqwest::Response) -> Result<ResponsesR
                 "Failed to read or parse provider responses body: {e}"
             ))
         })
-}
-
-/// The `usage` from a [`ResponsesResult`] as a `Value`, for `normalize_responses_usage`.
-fn responses_usage_value(body: &ResponsesResult) -> Option<Value> {
-    body.usage
-        .as_ref()
-        .and_then(|u| serde_json::to_value(u).ok())
 }
 
 /// Mirrors `applyModelDefaults` for the Anthropic payload (typed top_k is i64;
@@ -941,7 +1001,8 @@ fn apply_context_cache_control(
         Some(Value::Array(mut parts)) => {
             if let Some(last) = parts.last_mut() {
                 if let Some(obj) = last.as_object_mut() {
-                    obj.insert("cache_control".to_string(), cache_control);
+                    obj.entry("cache_control".to_string())
+                        .or_insert(cache_control);
                 }
             }
             message.content = Some(Value::Array(parts));
@@ -1241,11 +1302,13 @@ async fn respond_openai_compatible_provider_messages_json(
     payload: &AnthropicMessagesPayload,
     provider: &str,
 ) -> Result<Response, AppError> {
-    let body: Value = read_json(upstream).await?;
+    let (body, headers) = read_chat_json(upstream).await?;
     let recorder = create_provider_messages_usage_recorder(payload, provider);
+    let anthropic_response = translate_to_anthropic(&body).map_err(|mut error| {
+        error.headers = headers;
+        AppError::Http(error)
+    })?;
     recorder.record(normalize_openai_usage(body.get("usage")));
-
-    let anthropic_response = translate_to_anthropic(&body);
     Ok(Json(anthropic_response).into_response())
 }
 
@@ -1311,6 +1374,21 @@ async fn read_json(response: reqwest::Response) -> Result<Value, AppError> {
                 "Failed to read or parse provider response body: {e}"
             ))
         })
+}
+
+async fn read_chat_json(response: reqwest::Response) -> Result<(Value, HeaderMap), AppError> {
+    let headers = crate::libs::error::upstream_response_headers(&response);
+    let value = crate::libs::http::read_json_capped(response)
+        .await
+        .map_err(|error| {
+            tracing::warn!(?error, "invalid provider Chat Completions response body");
+            let mut error = crate::libs::error::HttpError::bad_gateway(
+                "The upstream Chat Completions response body was malformed.",
+            );
+            error.headers = headers.clone();
+            AppError::Http(error)
+        })?;
+    Ok((value, headers))
 }
 
 /// Render one translated Anthropic event as an SSE frame (`event: {type}\ndata:
@@ -1469,12 +1547,12 @@ mod tests {
     #[tokio::test]
     async fn provider_translated_driver_stops_after_malformed_choices() {
         let upstream = upstream_sse_response(concat!(
-            "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":\"not-an-array\"}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":\"not-an-array\"}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
             "data: {\"error\":{\"type\":\"server_error\",\"message\":\"late error\"}}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
             "data: [DONE]\n\n",
         ))
         .await;
@@ -1517,24 +1595,24 @@ mod tests {
             (
                 "delta/reasoning",
                 concat!(
-                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"partial thought\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_opaque\":[]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"partial thought\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_opaque\":[]},\"finish_reason\":null}]}\n\n",
                 ),
             ),
             (
                 "tool/function",
                 concat!(
-                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":\"bad\",\"function\":{\"arguments\":\"late fragment\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"deferred\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":\"bad\",\"function\":{\"arguments\":\"late fragment\"}}]},\"finish_reason\":null}]}\n\n",
                 ),
             ),
             (
                 "usage/details",
                 concat!(
-                    "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\"bad\",\"completion_tokens\":[]}}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":\"bad\",\"completion_tokens\":[]}}\n\n",
                 ),
             ),
         ];
@@ -1544,9 +1622,9 @@ mod tests {
                 "{}{}",
                 prefix,
                 concat!(
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late success\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
                     "data: {\"error\":{\"type\":\"server_error\",\"message\":\"late error\"}}\n\n",
-                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
                     "data: [DONE]\n\n",
                 )
             );

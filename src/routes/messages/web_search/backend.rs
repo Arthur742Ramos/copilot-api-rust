@@ -19,6 +19,8 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::libs::error::AppError;
+use crate::routes::messages::request_validation::merge_open_object_extensions;
 use crate::services::copilot::create_responses::ResponsesResult;
 
 /// `WebSearchSource` — a single deduped source extracted from a `url_citation`.
@@ -39,6 +41,9 @@ pub struct WebSearchExtract {
     pub sources: Vec<WebSearchSource>,
     /// Search queries the backend actually ran.
     pub queries: Vec<String>,
+    /// Original Responses web-search call id, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
 }
 
 /// `WebSearchToolConfig` — the Anthropic-side configuration that drives the
@@ -64,13 +69,16 @@ pub struct WebSearchToolConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub user_location: Option<Value>,
+    #[serde(default, flatten)]
+    pub extensions: Map<String, Value>,
 }
 
 /// Builds the Responses API `web_search` tool object from the Anthropic config.
 ///
 /// Insertion order (preserved by `preserve_order`): `type`, then `filters`
 /// (only when at least one domain filter is present), then `user_location`.
-pub fn build_responses_web_search_tool(config: &WebSearchToolConfig) -> Value {
+#[allow(clippy::result_large_err)]
+pub fn build_responses_web_search_tool(config: &WebSearchToolConfig) -> Result<Value, AppError> {
     let mut tool = Map::new();
     tool.insert("type".to_string(), Value::String("web_search".to_string()));
 
@@ -99,7 +107,8 @@ pub fn build_responses_web_search_tool(config: &WebSearchToolConfig) -> Value {
         tool.insert("user_location".to_string(), user_location.clone());
     }
 
-    Value::Object(tool)
+    merge_open_object_extensions(&config.extensions, &[], &mut tool, "web_search tool")?;
+    Ok(Value::Object(tool))
 }
 
 /// `isValidUrlCitation`: a `url_citation` annotation with a non-empty `url` not
@@ -170,14 +179,18 @@ fn collect_query(item: &Value, queries: &mut Vec<String>) {
     {
         if !list.is_empty() {
             for query in list {
-                if let Some(query) = query.as_str() {
+                if let Some(query) = query.as_str().filter(|query| !query.is_empty()) {
                     queries.push(query.to_string());
                 }
             }
             return;
         }
     }
-    if let Some(query) = action.and_then(|a| a.get("query")).and_then(Value::as_str) {
+    if let Some(query) = action
+        .and_then(|a| a.get("query"))
+        .and_then(Value::as_str)
+        .filter(|query| !query.is_empty())
+    {
         queries.push(query.to_string());
     }
 }
@@ -189,6 +202,7 @@ pub fn extract_web_search_result(result: &ResponsesResult) -> WebSearchExtract {
     let mut sources: Vec<WebSearchSource> = Vec::new();
     let mut seen_urls: HashSet<String> = HashSet::new();
     let mut queries: Vec<String> = Vec::new();
+    let mut tool_use_id: Option<String> = None;
 
     for item in &result.output {
         // Read each output item loosely, matching the TS field access. The
@@ -205,6 +219,13 @@ pub fn extract_web_search_result(result: &ResponsesResult) -> WebSearchExtract {
         }
         if item_type == Some("web_search_call") {
             collect_query(&item_val, &mut queries);
+            if tool_use_id.is_none() {
+                tool_use_id = item_val
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+            }
         }
     }
 
@@ -213,13 +234,17 @@ pub fn extract_web_search_result(result: &ResponsesResult) -> WebSearchExtract {
     let answer_text = if !joined_trimmed.is_empty() {
         joined_trimmed.to_string()
     } else {
-        result.output_text.trim().to_string()
+        match result.output_text.as_deref() {
+            Some(output_text) => output_text.trim().to_string(),
+            None => String::new(),
+        }
     };
 
     WebSearchExtract {
         answer_text,
         sources,
         queries,
+        tool_use_id,
     }
 }
 
@@ -230,7 +255,7 @@ mod tests {
     #[test]
     fn build_tool_with_no_filters_or_location() {
         let config = WebSearchToolConfig::default();
-        let tool = build_responses_web_search_tool(&config);
+        let tool = build_responses_web_search_tool(&config).expect("valid tool");
         assert_eq!(tool, serde_json::json!({ "type": "web_search" }));
     }
 
@@ -240,8 +265,9 @@ mod tests {
             allowed_domains: Some(vec!["a.com".to_string(), "b.com".to_string()]),
             blocked_domains: Some(vec!["c.com".to_string()]),
             user_location: None,
+            extensions: Map::new(),
         };
-        let tool = build_responses_web_search_tool(&config);
+        let tool = build_responses_web_search_tool(&config).expect("valid tool");
         assert_eq!(
             tool,
             serde_json::json!({
@@ -263,8 +289,9 @@ mod tests {
             allowed_domains: Some(vec![]),
             blocked_domains: Some(vec![]),
             user_location: None,
+            extensions: Map::new(),
         };
-        let tool = build_responses_web_search_tool(&config);
+        let tool = build_responses_web_search_tool(&config).expect("valid tool");
         assert_eq!(tool, serde_json::json!({ "type": "web_search" }));
     }
 
@@ -274,8 +301,9 @@ mod tests {
             allowed_domains: None,
             blocked_domains: None,
             user_location: Some(serde_json::json!({ "type": "approximate", "country": "US" })),
+            extensions: Map::new(),
         };
-        let tool = build_responses_web_search_tool(&config);
+        let tool = build_responses_web_search_tool(&config).expect("valid tool");
         assert_eq!(
             tool,
             serde_json::json!({
@@ -291,8 +319,9 @@ mod tests {
             allowed_domains: None,
             blocked_domains: Some(vec!["spam.com".to_string()]),
             user_location: None,
+            extensions: Map::new(),
         };
-        let tool = build_responses_web_search_tool(&config);
+        let tool = build_responses_web_search_tool(&config).expect("valid tool");
         assert_eq!(
             tool,
             serde_json::json!({

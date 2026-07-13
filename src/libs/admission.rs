@@ -172,8 +172,9 @@ pub async fn admit_request(
     request: Request,
     next: Next,
 ) -> Response {
+    let openai_native = crate::libs::error::is_openai_native_path(request.uri().path());
     let Some(permit) = controller.try_acquire() else {
-        return overload_response();
+        return overload_response(openai_native);
     };
 
     let response = next.run(request).await;
@@ -189,18 +190,27 @@ fn attach_permit(response: Response, permit: AdmissionPermit) -> Response {
     Response::from_parts(parts, Body::new(guarded))
 }
 
-fn overload_response() -> Response {
-    let mut response = (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "type": "error",
-            "error": {
-                "type": "overloaded_error",
-                "message": "Proxy concurrency limit reached. Retry shortly.",
-            }
-        })),
-    )
-        .into_response();
+fn overload_response(openai_native: bool) -> Response {
+    let mut response = if openai_native {
+        crate::libs::error::openai_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            Some("server_overloaded"),
+            "Proxy concurrency limit reached. Retry shortly.",
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Proxy concurrency limit reached. Retry shortly.",
+                }
+            })),
+        )
+            .into_response()
+    };
     response.headers_mut().insert(
         header::RETRY_AFTER,
         HeaderValue::from(OVERLOAD_RETRY_AFTER_SECS),

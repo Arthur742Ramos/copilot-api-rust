@@ -22,7 +22,7 @@ pub struct ChatCompletionsOptions {
 /// The result of a chat-completions call: either a fully-buffered JSON response
 /// (non-streaming) or a streaming reqwest response whose SSE body is forwarded.
 pub enum ChatCompletionsResult {
-    NonStreaming(Value),
+    NonStreaming { response: Value, headers: HeaderMap },
     Streaming(reqwest::Response),
 }
 
@@ -108,10 +108,21 @@ pub async fn create_chat_completions(
     if payload.stream.unwrap_or(false) {
         Ok(ChatCompletionsResult::Streaming(response))
     } else {
+        let response_headers = crate::libs::error::upstream_response_headers(&response);
         let json = crate::libs::http::read_json_capped::<Value>(response)
             .await
-            .map_err(|e| HttpError::internal(format!("Failed to parse chat completions: {e}")))?;
-        Ok(ChatCompletionsResult::NonStreaming(json))
+            .map_err(|error| {
+                tracing::warn!(?error, "invalid Chat Completions response body");
+                let mut error = HttpError::bad_gateway(
+                    "The upstream Chat Completions response body was malformed.",
+                );
+                error.headers = response_headers.clone();
+                error
+            })?;
+        Ok(ChatCompletionsResult::NonStreaming {
+            response: json,
+            headers: response_headers,
+        })
     }
 }
 

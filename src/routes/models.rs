@@ -6,8 +6,12 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
-use crate::libs::error::{anthropic_error_response, AppError};
+use crate::libs::config::{
+    get_config, get_model_mappings, get_provider_config, resolve_mapped_model,
+};
+use crate::libs::error::{openai_error_response, AppError};
 use crate::libs::models::{is_context_1m_model, strip_context_1m_suffix, to_client_model_id};
+use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::state;
 use crate::libs::utils::cache_models;
 use crate::services::copilot::get_models::Model;
@@ -16,16 +20,24 @@ use crate::services::copilot::get_models::Model;
 pub async fn get_models_route() -> Response {
     match build_models().await {
         Ok(value) => Json(value).into_response(),
-        Err(error) => AppError::into_response(error),
+        Err(error) => error.into_openai_response(),
     }
 }
 
 /// GET /models/:id — retrieve a single model object (OpenAI Models API). Honors
 /// the non-standard `[1m]` 1M-context variant suffix, and 404s an unknown id.
 pub async fn get_model_route(Path(requested): Path<String>) -> Response {
+    let resolved = resolve_mapped_model(&requested);
+    if let Some(model) = provider_model_record(&resolved, Some(&requested)) {
+        return Json(model).into_response();
+    }
+
     if state::with_state(|s| s.models.is_none()) {
+        if state::with_state(|s| s.provider_only.is_some()) {
+            return model_not_found(&requested);
+        }
         if let Err(error) = cache_models().await {
-            return AppError::into_response(AppError::Other(error));
+            return AppError::Other(error).into_openai_response();
         }
     }
 
@@ -38,8 +50,8 @@ pub async fn get_model_route(Path(requested): Path<String>) -> Response {
 
     // Normalize the requested id the same way the list route advertises ids, so
     // a date-suffixed / raw upstream id resolves like every other endpoint.
-    let want_1m = is_context_1m_model(&requested);
-    let base_requested = to_client_model_id(strip_context_1m_suffix(&requested));
+    let want_1m = is_context_1m_model(&resolved);
+    let base_requested = to_client_model_id(strip_context_1m_suffix(&resolved));
 
     let found = models
         .data
@@ -56,16 +68,22 @@ pub async fn get_model_route(Path(requested): Path<String>) -> Response {
                 .max_context_window_tokens
                 .unwrap_or(0)
                 >= 1_000_000;
-            Json(shape_model(model, want_1m && is_1m_capable)).into_response()
+            let shaped = shape_model(model, want_1m && is_1m_capable);
+            if requested == resolved {
+                Json(shaped).into_response()
+            } else {
+                Json(shape_mapped_model(shaped, &requested, &resolved)).into_response()
+            }
         }
         None => model_not_found(&requested),
     }
 }
 
 fn model_not_found(id: &str) -> Response {
-    anthropic_error_response(
+    openai_error_response(
         StatusCode::NOT_FOUND,
-        "not_found_error",
+        "invalid_request_error",
+        Some("model_not_found"),
         format!("The model `{id}` does not exist."),
     )
 }
@@ -94,8 +112,46 @@ fn shape_model(model: &Model, as_1m: bool) -> Value {
     obj
 }
 
+fn shape_mapped_model(mut model: Value, alias: &str, target: &str) -> Value {
+    if let Some(map) = model.as_object_mut() {
+        map.insert("id".to_string(), json!(alias));
+        map.insert("claude_model_id".to_string(), json!(alias));
+        map.insert("mapped_to".to_string(), json!(target));
+    }
+    model
+}
+
+fn provider_model_record(model_id: &str, alias: Option<&str>) -> Option<Value> {
+    let parsed = parse_provider_model_alias(model_id)?;
+    let provider = get_provider_config(&parsed.provider)?;
+    if let Some(models) = provider.models.as_ref() {
+        if !models.contains_key(&parsed.model) {
+            return None;
+        }
+    }
+    let id = alias.unwrap_or(model_id);
+    Some(json!({
+        "id": id,
+        "object": "model",
+        "type": "model",
+        "created": 0,
+        "created_at": "1970-01-01T00:00:00.000Z",
+        "owned_by": parsed.provider,
+        "display_name": parsed.model,
+        "claude_model_id": id,
+        "mapped_to": model_id,
+    }))
+}
+
 async fn build_models() -> Result<Value, AppError> {
-    if state::with_state(|s| s.models.is_none()) {
+    let config = get_config();
+    // Normal Copilot startup primes this cache before serving. In provider-only
+    // mode it is intentionally absent; do not trigger unrelated GitHub
+    // initialization there. Outside provider-only mode, a missing cache must be
+    // populated even when mappings exist because they may target Copilot models.
+    let (models_missing, provider_only) =
+        state::with_state(|state| (state.models.is_none(), state.provider_only.is_some()));
+    if models_missing && !provider_only {
         cache_models().await.map_err(AppError::Other)?;
     }
 
@@ -106,7 +162,7 @@ async fn build_models() -> Result<Value, AppError> {
             .unwrap_or_default()
     });
 
-    let data: Vec<Value> = models
+    let mut data: Vec<Value> = models
         .into_iter()
         .map(|model| {
             let context_window = model
@@ -118,6 +174,52 @@ async fn build_models() -> Result<Value, AppError> {
             shape_model(&model, is_1m)
         })
         .collect();
+
+    if let Some(providers) = config.providers.as_ref() {
+        for provider_name in providers.keys() {
+            let Some(provider) = get_provider_config(provider_name) else {
+                continue;
+            };
+            if let Some(provider_models) = provider.models.as_ref() {
+                for model_name in provider_models.keys() {
+                    let id = format!("{provider_name}/{model_name}");
+                    if !data.iter().any(|model| model["id"] == id) {
+                        data.push(json!({
+                            "id": id,
+                            "object": "model",
+                            "type": "model",
+                            "created": 0,
+                            "created_at": "1970-01-01T00:00:00.000Z",
+                            "owned_by": provider_name,
+                            "display_name": model_name,
+                            "claude_model_id": id,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    for (alias, target) in get_model_mappings() {
+        if data.iter().any(|model| model["id"] == alias) {
+            continue;
+        }
+        let mapped = data
+            .iter()
+            .find(|model| model["id"] == target)
+            .cloned()
+            .map(|model| shape_mapped_model(model, &alias, &target))
+            .or_else(|| provider_model_record(&target, Some(&alias)));
+        if let Some(mapped) = mapped {
+            data.push(mapped);
+        } else {
+            tracing::warn!(
+                alias,
+                target,
+                "Omitting model mapping whose target is not available"
+            );
+        }
+    }
 
     Ok(json!({
         "object": "list",
@@ -158,5 +260,17 @@ mod tests {
         let obj = shape_model(&sample_model(), true);
         assert_eq!(obj["id"], "gpt-5-mini");
         assert_eq!(obj["claude_model_id"], "gpt-5-mini[1m]");
+    }
+
+    #[test]
+    fn mapped_model_keeps_openai_and_anthropic_aliases_aligned() {
+        let obj = shape_mapped_model(
+            shape_model(&sample_model(), false),
+            "coding-default",
+            "gpt-5-mini",
+        );
+        assert_eq!(obj["id"], "coding-default");
+        assert_eq!(obj["claude_model_id"], "coding-default");
+        assert_eq!(obj["mapped_to"], "gpt-5-mini");
     }
 }
