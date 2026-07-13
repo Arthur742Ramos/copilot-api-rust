@@ -199,7 +199,7 @@ async fn handle_provider_compact(
     );
     let upstream_start = std::time::Instant::now();
     let upstream_result = if config.name == "codex" {
-        forward_codex_compact(payload, &headers, &config.base_url).await
+        forward_codex_compact(&payload, &headers, &config.base_url).await
     } else {
         forward_provider_responses_compact(&config, &payload, &headers).await
     };

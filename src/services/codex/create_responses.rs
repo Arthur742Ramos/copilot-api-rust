@@ -356,7 +356,7 @@ pub async fn forward_codex_responses(
 /// Forward the unary Codex `/responses/compact` contract without applying the
 /// generation-only payload normalization used by [`forward_codex_responses`].
 pub async fn forward_codex_compact(
-    payload: ResponsesPayload,
+    payload: &ResponsesPayload,
     request_headers: &axum::http::HeaderMap,
     base_url: &str,
 ) -> Result<reqwest::Response, HttpError> {
@@ -365,7 +365,7 @@ pub async fn forward_codex_compact(
     if custom_base_url {
         crate::services::providers::provider_proxy::validate_upstream_url(&url)?;
     }
-    let body = serialize_json_body(&payload).map_err(|e| {
+    let body = serialize_json_body(payload).map_err(|e| {
         HttpError::internal(format!("Failed to serialize codex compact payload: {e}"))
     })?;
     send_codex_request(body, request_headers, &url, Some(false), custom_base_url).await

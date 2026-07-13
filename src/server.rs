@@ -158,8 +158,8 @@ pub fn build_router_with_admission(
         // gets the same error shape as every other client error. Listed AFTER
         // (outside) DefaultBodyLimit so it sees that layer's response.
         .layer(from_fn(normalize_oversize_response))
-        // Convert a panic in any handler into a route-native 500 JSON response
-        // instead of an abruptly reset connection.
+        // Convert handler/inner-middleware panics while still inside the request
+        // tracing layers, so those layers observe the route-native 500 response.
         .layer(from_fn(panic_middleware))
         // Per-request access logging (method/path/status/latency) for all
         // requests, including those rejected by auth. The default `on_response`
@@ -184,8 +184,13 @@ pub fn build_router_with_admission(
         // Outermost application middleware: establishes the trace_id span +
         // task-local RequestContext so EVERY inner layer (metrics + TraceLayer
         // access logs) and handler runs within the span. Must remain the last
-        // `.layer()` call.
+        // application-observability `.layer()` call.
         .layer(from_fn(trace_middleware))
+        // Absolute outer safety net: panics in trace/metrics/access-log
+        // middleware must also become route-native JSON instead of resetting the
+        // connection. The inner catcher above keeps normal handler panics visible
+        // to observability middleware; this one protects the observability stack.
+        .layer(from_fn(panic_middleware))
 }
 
 /// Select the route families that can consume upstream connections. Exact
@@ -668,6 +673,10 @@ mod tests {
         panic!("fixture panic")
     }
 
+    async fn panic_before_next(_req: Request, _next: Next) -> Response {
+        panic!("fixture middleware panic")
+    }
+
     async fn panic_response(path: &str) -> serde_json::Value {
         let app = Router::new()
             .route("/v1/responses", get(panic_handler))
@@ -696,5 +705,33 @@ mod tests {
         let anthropic = panic_response("/v1/messages").await;
         assert_eq!(anthropic["type"], "error");
         assert_eq!(anthropic["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn outer_panic_catcher_protects_panicking_middleware() {
+        for (path, expected_type) in [
+            ("/v1/responses", "server_error"),
+            ("/v1/messages", "api_error"),
+        ] {
+            let app = Router::new()
+                .route("/v1/responses", get(|| async { "ok" }))
+                .route("/v1/messages", get(|| async { "ok" }))
+                .layer(from_fn(panic_before_next))
+                .layer(from_fn(panic_middleware));
+            let response = app
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .expect("outer panic middleware responds");
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect panic body")
+                .to_bytes();
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("panic body is JSON");
+            assert_eq!(json["error"]["type"], expected_type);
+        }
     }
 }
