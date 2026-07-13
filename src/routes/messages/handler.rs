@@ -148,6 +148,13 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     }
     validate_generation_request(&payload)?;
     validate_messages_request_shape(&payload)?;
+    // Claude Code 2.1.207 may append turn-local `system` messages even though
+    // the public Anthropic wire schema normally places system content at the
+    // top level. Validate that compatibility shape first, then normalize it
+    // before model/provider resolution so every early dispatch receives only
+    // canonical user/assistant messages.
+    normalize_system_messages(&mut payload);
+    validate_messages_request_shape(&payload)?;
 
     // 1. Resolve configured model mappings.
     let requested_model = model_of(&payload);
@@ -210,8 +217,6 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     }
 
     // 4. Anthropic preprocessing.
-    normalize_system_messages(&mut payload);
-
     crate::libs::premium_interactions::check_premium_interactions()?;
 
     sanitize_ide_tools(&mut payload);

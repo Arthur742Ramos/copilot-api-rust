@@ -956,10 +956,49 @@ fn validate_messages(
         let path = format!("messages[{message_index}]");
         let message = required_object(message, &path)?;
         let role = required_nonempty_string(message, "role", &path)?;
+        if role == "system" {
+            for key in message.keys() {
+                if !matches!(key.as_str(), "role" | "content") {
+                    return Err(invalid(
+                        &format!("{path}.{key}"),
+                        "system message extensions cannot be represented safely",
+                    ));
+                }
+            }
+            match message.get("content") {
+                Some(Value::String(_)) => {}
+                Some(Value::Array(blocks)) => {
+                    for (block_index, block) in blocks.iter().enumerate() {
+                        let block_path = format!("{path}.content[{block_index}]");
+                        let block = required_object(block, &block_path)?;
+                        if required_nonempty_string(block, "type", &block_path)? != "text" {
+                            return Err(invalid(
+                                &format!("{block_path}.type"),
+                                "must equal \"text\"",
+                            ));
+                        }
+                        if !block.get("text").is_some_and(Value::is_string) {
+                            return Err(invalid(
+                                &format!("{block_path}.text"),
+                                "field required and must be a string",
+                            ));
+                        }
+                        validate_cache_control_field(block, &block_path)?;
+                    }
+                }
+                _ => {
+                    return Err(invalid(
+                        &format!("{path}.content"),
+                        "field required and must be a string or text-block array",
+                    ))
+                }
+            }
+            continue;
+        }
         if !matches!(role, "user" | "assistant") {
             return Err(invalid(
                 &format!("{path}.role"),
-                "must equal \"user\" or \"assistant\"",
+                "must equal \"user\", \"assistant\", or \"system\"",
             ));
         }
         match message.get("content") {

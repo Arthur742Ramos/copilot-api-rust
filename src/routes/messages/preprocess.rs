@@ -250,8 +250,8 @@ pub fn normalize_claude_code_billing_header_in_system(payload: &mut Value) {
 
 /// `normalizeSystemMessages`: merge any `system`-role messages into the previous
 /// pushed user message (after the last `tool_result`, or prepended) or into
-/// `payload.system` when first; a `system` message following an assistant is
-/// silently dropped.
+/// `payload.system` when there is no preceding user message. System content is
+/// never silently discarded.
 pub fn normalize_system_messages(payload: &mut Value) {
     normalize_claude_code_billing_header_in_system(payload);
 
@@ -291,8 +291,15 @@ pub fn normalize_system_messages(payload: &mut Value) {
                         &normalized_content,
                     ));
                 }
-                // previous is assistant (or non-user): silently drop.
-                _ => {}
+                // A system message after an assistant cannot be attached to that
+                // assistant turn. Preserve it in the top-level system prompt
+                // rather than silently discarding client instructions.
+                _ => {
+                    system = Some(merge_system_prompt_content(
+                        system.as_ref(),
+                        &normalized_content,
+                    ));
+                }
             }
             continue;
         }
@@ -1256,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_system_messages_silent_drop_after_assistant() {
+    fn normalize_system_messages_preserves_content_after_assistant() {
         let payload_template = json!({
             "messages": [
                 { "role": "assistant", "content": "prior answer" },
@@ -1267,14 +1274,16 @@ mod tests {
         normalize_system_messages(&mut payload);
 
         let messages = payload.get("messages").unwrap().as_array().unwrap();
-        // The system message following the assistant is silently dropped.
         assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].get("role").and_then(|r| r.as_str()),
             Some("assistant")
         );
-        // System content was NOT merged anywhere.
-        assert!(payload.get("system").is_none());
+        let system = payload
+            .get("system")
+            .and_then(Value::as_str)
+            .expect("system message is preserved at the top level");
+        assert!(system.contains("secret system note"));
     }
 
     #[test]

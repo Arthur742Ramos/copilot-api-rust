@@ -9510,6 +9510,7 @@ async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
         ],
         "messages":[
             {"role":"user","content":[{"type":"text","text":"inspect"}]},
+            {"role":"system","content":"Runtime guidance from Claude Code."},
             {
                 "role":"assistant",
                 "content":[
@@ -9608,6 +9609,15 @@ async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
         .expect("captured non-streaming Messages request");
     assert_eq!(first.body["model"], "claude-sonnet-4-6");
     assert_eq!(first.body["fixture_top_level_extension"]["keep"], true);
+    let forwarded_messages = first.body["messages"]
+        .as_array()
+        .expect("forwarded Messages array");
+    assert!(forwarded_messages
+        .iter()
+        .all(|message| message["role"] != "system"));
+    assert!(forwarded_messages[0]["content"]
+        .to_string()
+        .contains("Runtime guidance from Claude Code."));
     assert_eq!(first.headers["x-api-key"], UPSTREAM_KEY);
     assert_eq!(first.headers["anthropic-version"], "2023-06-01");
     assert!(first.headers["anthropic-beta"]
