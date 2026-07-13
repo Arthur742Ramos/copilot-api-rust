@@ -75,6 +75,7 @@ fn validate_selected_responses_controls(
             "service_tier",
             "temperature",
             "top_p",
+            "context_management",
         ]
         .into_iter()
         .any(has_non_null)

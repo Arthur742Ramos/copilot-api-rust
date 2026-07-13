@@ -1203,6 +1203,115 @@ fn validate_output_config(payload: &Map<String, Value>) -> Result<(), AppError> 
     validate_extension_collisions(config, &["effort"], &["effort", "summary"], "output_config")
 }
 
+fn validate_context_management(payload: &Map<String, Value>) -> Result<(), AppError> {
+    let Some(context_management) = payload.get("context_management") else {
+        return Ok(());
+    };
+    if context_management.is_null() {
+        return Ok(());
+    }
+    let context_management = required_object(context_management, "context_management")?;
+    let edits = context_management
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            invalid(
+                "context_management.edits",
+                "field required and must be an array",
+            )
+        })?;
+    for (index, edit) in edits.iter().enumerate() {
+        let path = format!("context_management.edits[{index}]");
+        let edit = required_object(edit, &path)?;
+        let kind = required_nonempty_string(edit, "type", &path)?;
+        if kind != "clear_thinking_20251015" {
+            continue;
+        }
+        match edit.get("keep") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(keep)) if keep == "all" => {}
+            Some(Value::String(_)) => {
+                return Err(invalid(
+                    &format!("{path}.keep"),
+                    "string value must equal \"all\"",
+                ))
+            }
+            Some(Value::Object(keep)) => {
+                if required_nonempty_string(keep, "type", &format!("{path}.keep"))?
+                    != "thinking_turns"
+                {
+                    return Err(invalid(
+                        &format!("{path}.keep.type"),
+                        "must equal \"thinking_turns\"",
+                    ));
+                }
+                match keep.get("value").and_then(Value::as_u64) {
+                    Some(value) if value > 0 => {}
+                    _ => {
+                        return Err(invalid(
+                            &format!("{path}.keep.value"),
+                            "field required and must be a positive integer",
+                        ))
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(invalid(
+                    &format!("{path}.keep"),
+                    "must be \"all\", a thinking_turns object, or null",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bridge transports cannot apply Anthropic's history-edit strategies after
+/// Messages have already been translated. Claude Code 2.1.207 sends
+/// `clear_thinking_20251015` with `keep: "all"` for large-context sessions;
+/// that edit is a semantic no-op and is therefore safe to omit. Every other
+/// edit fails explicitly instead of silently changing conversation history.
+#[allow(clippy::result_large_err)]
+pub(crate) fn validate_translated_context_management(
+    context_management: Option<&Value>,
+    target: &str,
+) -> Result<(), AppError> {
+    let Some(context_management) = context_management.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let object = context_management.as_object().ok_or_else(|| {
+        AppError::BadRequest("context_management must be an object or null".to_string())
+    })?;
+    if let Some(key) = object.keys().find(|key| key.as_str() != "edits") {
+        return Err(AppError::BadRequest(format!(
+            "context_management.{key} cannot be represented by {target}"
+        )));
+    }
+    let edits = object
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "context_management.edits must be an array for translated requests".to_string(),
+            )
+        })?;
+    for (index, edit) in edits.iter().enumerate() {
+        let is_noop = edit.as_object().is_some_and(|edit| {
+            edit.get("type").and_then(Value::as_str) == Some("clear_thinking_20251015")
+                && edit.get("keep").and_then(Value::as_str) == Some("all")
+                && edit
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "keep"))
+        });
+        if !is_noop {
+            return Err(AppError::BadRequest(format!(
+                "context_management.edits[{index}] cannot be represented by {target}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_optional_string_list(
     payload: &Map<String, Value>,
     field: &str,
@@ -1225,6 +1334,7 @@ pub fn validate_messages_request_shape(payload: &Value) -> Result<(), AppError> 
     validate_metadata(payload)?;
     validate_thinking(payload)?;
     validate_output_config(payload)?;
+    validate_context_management(payload)?;
     validate_optional_string_list(payload, "stop_sequences")?;
     if let Some(cache_control) = payload.get("cache_control") {
         validate_cache_control(cache_control, "cache_control")?;

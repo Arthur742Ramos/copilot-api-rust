@@ -221,6 +221,11 @@ pub struct AnthropicMessagesPayload {
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<AnthropicOutputConfig>,
+    /// Anthropic context-management edit object. It remains raw so native
+    /// Messages transports can forward future edit variants unchanged; bridge
+    /// transports explicitly accept only semantic no-ops they can preserve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<AnthropicMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -33,7 +33,8 @@ use crate::routes::messages::anthropic_types::{
     AnthropicUsage,
 };
 use crate::routes::messages::request_validation::{
-    collect_open_object_extensions, merge_open_object_extensions, ANTHROPIC_TOOL_KNOWN_FIELDS,
+    collect_open_object_extensions, merge_open_object_extensions,
+    validate_translated_context_management, ANTHROPIC_TOOL_KNOWN_FIELDS,
 };
 use crate::services::copilot::create_responses::{
     FunctionCallOutputContent, InputField, MessageContent, ReasoningSummaryText,
@@ -305,11 +306,7 @@ pub fn translate_anthropic_messages_to_responses_payload(
     // missing value to 0 so the 12800 floor applies.
     let max_output_tokens = payload.max_tokens.unwrap_or(0).max(12800);
 
-    let resolved_effort = payload
-        .output_config
-        .as_ref()
-        .and_then(|config| config.effort.clone())
-        .unwrap_or_else(|| get_reasoning_effort_for_model(&payload.model));
+    let resolved_effort = resolve_responses_reasoning_effort(payload);
     tracing::info!(
         target: "audit",
         model = %payload.model,
@@ -371,6 +368,10 @@ pub(crate) fn validate_responses_request_controls(
     payload: &AnthropicMessagesPayload,
     codex_transport: bool,
 ) -> Result<(), AppError> {
+    validate_translated_context_management(
+        payload.context_management.as_ref(),
+        "OpenAI Responses",
+    )?;
     if payload
         .stop_sequences
         .as_ref()
@@ -408,6 +409,28 @@ pub(crate) fn validate_responses_request_controls(
         ));
     }
     Ok(())
+}
+
+fn resolve_responses_reasoning_effort(payload: &AnthropicMessagesPayload) -> String {
+    let configured = get_reasoning_effort_for_model(&payload.model);
+    resolve_responses_reasoning_effort_value(
+        payload
+            .output_config
+            .as_ref()
+            .and_then(|config| config.effort.as_deref()),
+        &configured,
+    )
+}
+
+fn resolve_responses_reasoning_effort_value(requested: Option<&str>, configured: &str) -> String {
+    match requested {
+        // Claude's Messages wire currently tops out at `high`, while the
+        // configured Sol profile supports and requests `max`. Promote only that
+        // top Claude tier; explicit lower effort values remain authoritative.
+        Some("high") if configured == "max" => configured.to_string(),
+        Some(requested) => requested.to_string(),
+        None => configured.to_string(),
+    }
 }
 
 fn should_apply_phase(_model: &str) -> bool {
@@ -2652,6 +2675,18 @@ fn convert_tool_result_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_high_effort_promotes_to_configured_sol_max() {
+        assert_eq!(
+            resolve_responses_reasoning_effort_value(Some("high"), "max"),
+            "max"
+        );
+        assert_eq!(
+            resolve_responses_reasoning_effort_value(Some("medium"), "max"),
+            "medium"
+        );
+    }
 
     #[test]
     fn reasoning_signature_splits_on_last_at() {

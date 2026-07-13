@@ -20,6 +20,7 @@ use crate::routes::messages::anthropic_types::{
 };
 use crate::routes::messages::request_validation::{
     collect_open_object_extensions, merge_open_object_extensions,
+    validate_translated_context_management,
 };
 use crate::routes::messages::stream_translation::{
     nonnegative_i64, safe_upstream_error_message, safe_upstream_error_type,
@@ -247,6 +248,10 @@ pub fn translate_to_openai_with_options(
 
 #[allow(clippy::result_large_err)]
 fn validate_chat_config_extensions(payload: &AnthropicMessagesPayload) -> Result<(), AppError> {
+    validate_translated_context_management(
+        payload.context_management.as_ref(),
+        "Chat Completions",
+    )?;
     if payload.cache_control.is_some() {
         return Err(AppError::BadRequest(
             "cache_control cannot be represented by the Chat Completions request object"

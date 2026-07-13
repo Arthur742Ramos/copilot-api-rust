@@ -8641,6 +8641,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
     let response_models = [
         "gpt-fixture",
         "gpt-5.4",
+        "gpt-5.6-sol",
         "gpt-rate-limit",
         "gpt-upstream-500",
         "gpt-forbidden",
@@ -9148,6 +9149,10 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
             "coding-default".to_string(),
             json!("responses-fixture/gpt-fixture"),
         )])),
+        model_reasoning_efforts: Some(BTreeMap::from([(
+            "gpt-5.6-sol".to_string(),
+            "max".to_string(),
+        )])),
         message_api_web_search_model: web_search_model.map(str::to_string),
         use_responses_api_context_management: Some(false),
         use_responses_api_web_search: Some(false),
@@ -9625,6 +9630,54 @@ async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
         .unwrap()
         .contains("prompt-caching"));
     assert!(first.headers.get("authorization").is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_code_sol_profile_accepts_noop_context_management_at_max_effort() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let (status, _) = send(post_json(
+        "/v1/messages?beta=true",
+        json!({
+            "model":"responses-fixture/gpt-5.6-sol",
+            "max_tokens":1024,
+            "system":"You are Claude Code.",
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"inspect"}]},
+                {"role":"system","content":"Runtime guidance from Claude Code."}
+            ],
+            "thinking":{"type":"adaptive","display":"omitted"},
+            "context_management":{
+                "edits":[{"type":"clear_thinking_20251015","keep":"all"}]
+            },
+            "output_config":{"effort":"high"},
+            "stream":false
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("translated Responses request captured");
+    assert_eq!(captured.body["model"], "gpt-5.6-sol");
+    assert_eq!(captured.body["reasoning"]["effort"], "max");
+    assert!(captured.body.get("context_management").is_none());
+    assert!(captured.body["input"]
+        .as_array()
+        .expect("Responses input")
+        .iter()
+        .all(|item| item["role"] != "system"));
+    assert!(captured.body["input"][0]["content"]
+        .to_string()
+        .contains("Runtime guidance from Claude Code."));
 }
 
 #[tokio::test]
