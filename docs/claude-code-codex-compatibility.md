@@ -321,14 +321,27 @@ requires `content_filter`; `content_filter` without representable text/refusal,
 late refusal after either a usage-bearing finish or usage-only terminal,
 malformed values, and repeated terminals fail once.
 
-The scheduler separately bounds and tracks source-observed ordinary content,
-ordinary content whose Anthropic delta was actually emitted, all emitted text,
-and source-ordered deferred output. An open tool block is closed first; deferred
-text and later complete tool blocks then drain in first-observed order; only
-after every ordinary prefix was emitted may a refusal-only suffix be emitted,
-followed by the terminal. Text is never emitted inside a tool block. Reasoning
-fallback text uses the same ordered queue without becoming refusal authority,
-so it cannot overwrite or falsely satisfy ordinary-content assertions.
+The scheduler separately tracks source-observed ordinary content, ordinary
+content actually emitted, and source-ordered deferred output, while one checked
+16 MiB aggregate budget covers dynamic client-visible payload bytes across both
+emitted and deferred states. It counts UTF-8 text/refusal/reasoning, generated
+thinking placeholders, opaque signatures, tool ids/names/argument fragments,
+serialized material extensions, and reconstructed synthetic web-search
+blocks/citations. Deferred bytes reserve capacity once and are not charged
+again when emitted. Fixed protocol discriminator strings, JSON/SSE event
+framing, message id/model routing metadata, and numeric counters are excluded;
+the bounded protocol-native terminal error control message is also exempt so an
+overflow can always be reported. The separate raw/state buffering caps still
+apply.
+
+An open tool block is closed first; deferred text and later complete tool blocks
+then drain in first-observed order; only after every ordinary prefix was emitted
+may a refusal-only suffix be emitted, followed by the terminal. Text is never
+emitted inside a tool block. Direct/deferred reasoning and opaque carriers use
+the same budgeted emitters. Reasoning fallback text uses the ordered queue
+without becoming refusal authority, so it cannot overwrite or falsely satisfy
+ordinary-content assertions. An overflow closes any open block, emits one
+Anthropic error, and suppresses every later success.
 The Anthropic `message_delta`/`message_stop` pair remains pending until
 upstream `[DONE]` or clean EOF, so trailing records cannot hide behind an
 already-emitted success.
@@ -774,7 +787,7 @@ Status means deterministic, credential-free evidence exists.
 | Truncation | status-optional incomplete terminals map known reasons to `max_tokens`/`refusal`; unknown reasons error once | `response.incomplete` remains terminal, never completed | public statusless terminal and failure regressions |
 | Compaction | Messages carriers round-trip with or without an item `id` | unary compact output without `id`, then successful continuation | non-stream/stream carrier tests and compact-to-next-turn boundary regression |
 | Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss | native Responses web-search output | request-policy, paired partial/terminal-only output, and conflict fixtures |
-| Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity, source-ordered tool/text/refusal scheduling, and strict one-choice/optional-usage state | not Codex 0.144.1's wire API | public provider/direct captures, split/partial/deferred/multi-tool refusal ordering, split-carrier, malformed-body/chunk, status/header, usage, and collision fixtures |
+| Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity, source-ordered scheduling, and a shared aggregate translated-payload budget | not Codex 0.144.1's wire API | public provider/direct captures, split/partial/deferred/multi-tool refusal ordering, exact/overflow reasoning/opaque/mixed UTF-8 budgets, malformed chunks, status/header, usage, and collisions |
 | Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
 
 The detailed Claude-specific matrix remains in

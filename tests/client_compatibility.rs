@@ -462,6 +462,47 @@ fn chat_completions_fixture(body: &Value) -> Response {
     Json(response).into_response()
 }
 
+const BUDGET_FIXTURE_FRAGMENT_BYTES: usize = 256 * 1024;
+
+fn ascii_payload_fragments(mut bytes: usize) -> Vec<String> {
+    let mut fragments = Vec::new();
+    while bytes > 0 {
+        let length = bytes.min(BUDGET_FIXTURE_FRAGMENT_BYTES);
+        fragments.push("r".repeat(length));
+        bytes -= length;
+    }
+    fragments
+}
+
+fn utf8_payload_fragments(mut bytes: usize) -> Vec<String> {
+    let mut fragments = Vec::new();
+    while bytes > 0 {
+        let length = bytes.min(BUDGET_FIXTURE_FRAGMENT_BYTES);
+        let mut fragment = "é".repeat(length / 2);
+        if length % 2 == 1 {
+            fragment.push('x');
+        }
+        debug_assert_eq!(fragment.len(), length);
+        fragments.push(fragment);
+        bytes -= length;
+    }
+    fragments
+}
+
+fn opaque_signature_fragments(over_by: usize) -> Vec<String> {
+    const PARTS: usize = 128;
+    let placeholder_bytes = copilot_api::routes::messages::utils::THINKING_TEXT.len() * PARTS;
+    let signature_bytes = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+        .checked_sub(placeholder_bytes)
+        .and_then(|bytes| bytes.checked_add(over_by))
+        .expect("opaque fixture budget");
+    let base = signature_bytes / PARTS;
+    let remainder = signature_bytes % PARTS;
+    (0..PARTS)
+        .map(|index| "s".repeat(base + usize::from(index < remainder)))
+        .collect()
+}
+
 fn chat_completions_stream_fixture(model: &str) -> Response {
     let chunk = |choices: Value, usage: Value| {
         json!({
@@ -917,6 +958,128 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
                 ),
                 terminal,
             ]
+        }
+        "gpt-chat-stream-budget-reasoning-exact"
+        | "gpt-direct-chat-stream-budget-reasoning-exact"
+        | "gpt-chat-stream-bad-budget-reasoning-over"
+        | "gpt-direct-chat-stream-bad-budget-reasoning-over" => {
+            let over_by = usize::from(model.contains("-over"));
+            let mut chunks: Vec<Value> = ascii_payload_fragments(
+                copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES + over_by,
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(index, reasoning)| {
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{
+                            "role":(index == 0).then_some("assistant"),
+                            "reasoning_text":reasoning
+                        },
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                )
+            })
+            .collect();
+            chunks.push(finish());
+            chunks
+        }
+        "gpt-chat-stream-budget-opaque-exact"
+        | "gpt-direct-chat-stream-budget-opaque-exact"
+        | "gpt-chat-stream-bad-budget-opaque-over"
+        | "gpt-direct-chat-stream-bad-budget-opaque-over" => {
+            let over_by = usize::from(model.contains("-over"));
+            let mut chunks: Vec<Value> = opaque_signature_fragments(over_by)
+                .into_iter()
+                .enumerate()
+                .map(|(index, signature)| {
+                    chunk(
+                        json!([{
+                            "index":0,
+                            "delta":{
+                                "role":(index == 0).then_some("assistant"),
+                                "reasoning_opaque":signature
+                            },
+                            "finish_reason":null
+                        }]),
+                        Value::Null,
+                    )
+                })
+                .collect();
+            chunks.push(finish());
+            chunks
+        }
+        "gpt-chat-stream-budget-mixed-utf8-exact"
+        | "gpt-direct-chat-stream-budget-mixed-utf8-exact"
+        | "gpt-chat-stream-bad-budget-mixed-utf8-over"
+        | "gpt-direct-chat-stream-bad-budget-mixed-utf8-over" => {
+            let over_by = usize::from(model.contains("-over"));
+            let tool_id = "budget-call";
+            let tool_name = "actual";
+            let arguments = "{}";
+            let reasoning = "reason";
+            let signature = "sig";
+            let fixed = reasoning.len()
+                + tool_id.len()
+                + tool_name.len()
+                + arguments.len()
+                + copilot_api::routes::messages::utils::THINKING_TEXT.len()
+                + signature.len();
+            let filler_bytes = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+                .checked_sub(fixed)
+                .and_then(|bytes| bytes.checked_add(over_by))
+                .expect("mixed budget fixture");
+            let mut chunks = vec![
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"role":"assistant","reasoning_text":reasoning},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"tool_calls":[{
+                            "index":0,
+                            "id":tool_id,
+                            "type":"function",
+                            "function":{"name":tool_name,"arguments":arguments}
+                        }]},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+                chunk(
+                    json!([{
+                        "index":0,
+                        "delta":{"reasoning_opaque":signature},
+                        "finish_reason":null
+                    }]),
+                    Value::Null,
+                ),
+            ];
+            chunks.extend(
+                utf8_payload_fragments(filler_bytes)
+                    .into_iter()
+                    .map(|content| {
+                        chunk(
+                            json!([{
+                                "index":0,
+                                "delta":{"content":content},
+                                "finish_reason":null
+                            }]),
+                            Value::Null,
+                        )
+                    }),
+            );
+            let mut terminal = finish();
+            terminal["choices"][0]["finish_reason"] = json!("tool_calls");
+            chunks.push(terminal);
+            chunks
         }
         "gpt-chat-stream-tier-valid" => {
             let mut first = text();
@@ -7997,6 +8160,9 @@ fn configure_direct_copilot(fixture: &Fixture) {
         "gpt-direct-chat-stream-refusal-partial",
         "gpt-direct-chat-stream-refusal-tool-deferred",
         "gpt-direct-chat-stream-refusal-multiple-tools",
+        "gpt-direct-chat-stream-budget-reasoning-exact",
+        "gpt-direct-chat-stream-budget-opaque-exact",
+        "gpt-direct-chat-stream-budget-mixed-utf8-exact",
         "gpt-direct-chat-stream-tier-late",
         "gpt-direct-chat-stream-bad-tier",
         "gpt-direct-chat-stream-bad-refusal",
@@ -8009,6 +8175,9 @@ fn configure_direct_copilot(fixture: &Fixture) {
         "gpt-direct-chat-stream-bad-refusal-tool-incomplete",
         "gpt-direct-chat-stream-bad-refusal-tool-late",
         "gpt-direct-chat-stream-bad-refusal-tool-eof",
+        "gpt-direct-chat-stream-bad-budget-reasoning-over",
+        "gpt-direct-chat-stream-bad-budget-opaque-over",
+        "gpt-direct-chat-stream-bad-budget-mixed-utf8-over",
     ];
     let models = ModelsResponse {
         object: "list".to_string(),
@@ -8436,6 +8605,9 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-chat-stream-refusal-partial",
         "gpt-chat-stream-refusal-tool-deferred",
         "gpt-chat-stream-refusal-multiple-tools",
+        "gpt-chat-stream-budget-reasoning-exact",
+        "gpt-chat-stream-budget-opaque-exact",
+        "gpt-chat-stream-budget-mixed-utf8-exact",
         "gpt-chat-stream-tier-valid",
         "gpt-chat-stream-tier-late",
         "gpt-chat-stream-bad-missing-id",
@@ -8478,6 +8650,9 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-chat-stream-bad-refusal-tool-incomplete",
         "gpt-chat-stream-bad-refusal-tool-late",
         "gpt-chat-stream-bad-refusal-tool-eof",
+        "gpt-chat-stream-bad-budget-reasoning-over",
+        "gpt-chat-stream-bad-budget-opaque-over",
+        "gpt-chat-stream-bad-budget-mixed-utf8-over",
         "gpt-chat-stream-bad-tool-late-extra",
         "gpt-chat-stream-bad-tool-missing-terminal",
     ]
@@ -8602,6 +8777,30 @@ fn chat_event_schedule(events: &[Value]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+fn translated_payload_bytes(events: &[Value]) -> usize {
+    events
+        .iter()
+        .map(|event| match event["type"].as_str() {
+            Some("content_block_start") if event["content_block"]["type"] == "tool_use" => {
+                event["content_block"]["id"].as_str().map_or(0, str::len)
+                    + event["content_block"]["name"].as_str().map_or(0, str::len)
+            }
+            Some("content_block_delta") => [
+                event.pointer("/delta/text"),
+                event.pointer("/delta/thinking"),
+                event.pointer("/delta/signature"),
+                event.pointer("/delta/partial_json"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::len)
+            .sum(),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn codex_request(model: &str, stream: bool) -> Value {
@@ -13439,6 +13638,31 @@ async fn claude_chat_sse_strict_identity_usage_extras_and_tools_cross_public_bou
         ]
     );
 
+    for model in [
+        "gpt-chat-stream-budget-reasoning-exact",
+        "gpt-chat-stream-budget-opaque-exact",
+        "gpt-chat-stream-budget-mixed-utf8-exact",
+    ] {
+        let (status, body) =
+            send(post_json("/v1/messages", request(model), Some(CLIENT_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert_eq!(
+            translated_payload_bytes(&events),
+            copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES,
+            "{model}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+        assert!(!events.iter().any(|event| event["type"] == "error"));
+    }
+
     for (model, tier, fingerprint) in [
         ("gpt-chat-stream-tier-valid", "scale", None),
         (
@@ -13512,6 +13736,9 @@ async fn claude_chat_sse_malformed_matrix_errors_once_without_later_success() {
         "gpt-chat-stream-bad-refusal-tool-incomplete",
         "gpt-chat-stream-bad-refusal-tool-late",
         "gpt-chat-stream-bad-refusal-tool-eof",
+        "gpt-chat-stream-bad-budget-reasoning-over",
+        "gpt-chat-stream-bad-budget-opaque-over",
+        "gpt-chat-stream-bad-budget-mixed-utf8-over",
         "gpt-chat-stream-bad-tool-late-extra",
         "gpt-chat-stream-bad-tool-missing-terminal",
     ];
@@ -13553,6 +13780,13 @@ async fn claude_chat_sse_malformed_matrix_errors_once_without_later_success() {
             "{model}"
         );
         assert_eq!(events.last().unwrap()["type"], "error", "{model}");
+        if model.contains("bad-budget-") {
+            assert!(
+                translated_payload_bytes(&events)
+                    <= copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES,
+                "{model}"
+            );
+        }
         let expected_schedule = match model {
             "gpt-chat-stream-bad-refusal-tool-incomplete" => Some(vec![
                 "message_start",
@@ -13607,6 +13841,9 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
         "gpt-direct-chat-stream-refusal-partial",
         "gpt-direct-chat-stream-refusal-tool-deferred",
         "gpt-direct-chat-stream-refusal-multiple-tools",
+        "gpt-direct-chat-stream-budget-reasoning-exact",
+        "gpt-direct-chat-stream-budget-opaque-exact",
+        "gpt-direct-chat-stream-budget-mixed-utf8-exact",
         "gpt-direct-chat-stream-tier-late",
     ] {
         let body = json!({
@@ -13704,6 +13941,13 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
         if let Some(expected_schedule) = expected_schedule {
             assert_eq!(chat_event_schedule(&events), expected_schedule, "{model}");
         }
+        if model.contains("-budget-") {
+            assert_eq!(
+                translated_payload_bytes(&events),
+                copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES,
+                "{model}"
+            );
+        }
     }
 
     for model in [
@@ -13719,6 +13963,9 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
         "gpt-direct-chat-stream-bad-refusal-tool-incomplete",
         "gpt-direct-chat-stream-bad-refusal-tool-late",
         "gpt-direct-chat-stream-bad-refusal-tool-eof",
+        "gpt-direct-chat-stream-bad-budget-reasoning-over",
+        "gpt-direct-chat-stream-bad-budget-opaque-over",
+        "gpt-direct-chat-stream-bad-budget-mixed-utf8-over",
     ] {
         let body = json!({
             "model":model,
@@ -13741,6 +13988,13 @@ async fn claude_direct_chat_sse_matches_provider_identity_and_optional_usage_pol
             !events.iter().any(|event| event["type"] == "message_stop"),
             "{model}"
         );
+        if model.contains("bad-budget-") {
+            assert!(
+                translated_payload_bytes(&events)
+                    <= copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES,
+                "{model}"
+            );
+        }
         let expected_schedule = match model {
             "gpt-direct-chat-stream-bad-refusal-tool-incomplete" => Some(vec![
                 "message_start",

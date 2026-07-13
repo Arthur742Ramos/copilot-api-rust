@@ -25,6 +25,7 @@ use crate::libs::tool_search::{format_tool_search_bridge_arguments, BRIDGE_TOOL_
 use super::anthropic_types::{
     AnthropicContentBlockDelta, AnthropicErrorBody, AnthropicMessageDeltaBody,
     AnthropicMessageDeltaUsage, AnthropicMessageStart, AnthropicStreamEventData, AnthropicUsage,
+    TranslatedOutputBudget,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,8 @@ const MAX_CONSECUTIVE_FUNCTION_CALL_WHITESPACE: i64 = 20;
 const MAX_TRACKED_OUTPUT_ITEMS: usize = 4096;
 const MAX_TRACKED_CONTENT_PARTS: usize = 4096;
 const MAX_BUFFERED_TRANSLATION_BYTES: usize = MAX_UPSTREAM_RESPONSE_BYTES;
+const MAX_TRANSLATED_ERROR_MESSAGE_BYTES: usize = 1024;
+const DEFAULT_TRANSLATED_ERROR_MESSAGE: &str = "The upstream Responses stream reported an error.";
 
 /// Imported from [`super::utils`] so all translation modules share one source of
 /// truth for the "Thinking..." placeholder.
@@ -118,7 +121,9 @@ pub struct ResponsesStreamState {
     pub reasoning_state_by_output_index: HashMap<i64, ReasoningItemStreamState>,
     pub last_sequence_number: Option<i64>,
     pub last_sequence_event: Option<Value>,
+    pub last_sequence_event_bytes: usize,
     pub buffered_translation_bytes: usize,
+    pub output_budget: TranslatedOutputBudget,
     pub tracked_reasoning_parts: usize,
     pub tracked_text_parts: usize,
     pub output_text_by_key: HashMap<String, String>,
@@ -155,7 +160,9 @@ impl ResponsesStreamState {
             reasoning_state_by_output_index: HashMap::new(),
             last_sequence_number: None,
             last_sequence_event: None,
+            last_sequence_event_bytes: 0,
             buffered_translation_bytes: 0,
+            output_budget: TranslatedOutputBudget::default(),
             tracked_reasoning_parts: 0,
             tracked_text_parts: 0,
             output_text_by_key: HashMap::new(),
@@ -246,6 +253,14 @@ pub fn translate_responses_stream_event(
 
 /// Mirrors the TS `buildErrorEvent`.
 pub fn build_error_event(message: &str) -> AnthropicStreamEventData {
+    let message = if message.is_empty()
+        || message.len() > MAX_TRANSLATED_ERROR_MESSAGE_BYTES
+        || message.chars().any(char::is_control)
+    {
+        DEFAULT_TRANSLATED_ERROR_MESSAGE
+    } else {
+        message
+    };
     AnthropicStreamEventData::Error {
         error: AnthropicErrorBody {
             kind: "api_error".to_string(),
@@ -363,6 +378,21 @@ fn validate_event_sequence(
             return Err("The Responses stream reused a sequence number for a different event.");
         }
     }
+    let snapshot_bytes = serde_json::to_vec(event)
+        .map_err(|_| "A Responses stream event could not be serialized.")?
+        .len();
+    let retained_without_snapshot = state
+        .buffered_translation_bytes
+        .checked_sub(state.last_sequence_event_bytes)
+        .ok_or("The Responses stream sequence snapshot accounting was inconsistent.")?;
+    let retained_with_snapshot = retained_without_snapshot
+        .checked_add(snapshot_bytes)
+        .ok_or("The Responses stream exceeded the translation buffer limit.")?;
+    if retained_with_snapshot > MAX_BUFFERED_TRANSLATION_BYTES {
+        return Err("The Responses stream exceeded the translation buffer limit.");
+    }
+    state.buffered_translation_bytes = retained_with_snapshot;
+    state.last_sequence_event_bytes = snapshot_bytes;
     state.last_sequence_number = Some(sequence);
     state.last_sequence_event = Some(event.clone());
     Ok(false)
@@ -380,6 +410,37 @@ fn reserve_buffered_translation_bytes(
     }
     state.buffered_translation_bytes = total;
     Ok(())
+}
+
+fn reserve_output_payload(
+    state: &mut ResponsesStreamState,
+    additional: usize,
+) -> Result<(), &'static str> {
+    if state.output_budget.try_reserve(additional) {
+        Ok(())
+    } else {
+        Err("The Responses stream exceeded the translated output payload limit.")
+    }
+}
+
+fn reserve_function_call_metadata_if_new(
+    state: &mut ResponsesStreamState,
+    output_index: i64,
+    tool_call_id: Option<&str>,
+    name: &str,
+) -> Result<(), &'static str> {
+    if state
+        .function_call_state_by_output_index
+        .contains_key(&output_index)
+    {
+        return Ok(());
+    }
+    let id = stable_tool_use_id(tool_call_id, None, output_index);
+    let additional = id
+        .len()
+        .checked_add(name.len())
+        .ok_or("The Responses stream exceeded the translated output payload limit.")?;
+    reserve_output_payload(state, additional)
 }
 
 fn reserve_json_value(state: &mut ResponsesStreamState, value: &Value) -> Result<(), &'static str> {
@@ -587,6 +648,7 @@ fn close_all_open_blocks(
     state.reasoning_state_by_output_index.clear();
     state.last_sequence_number = None;
     state.last_sequence_event = None;
+    state.last_sequence_event_bytes = 0;
     state.buffered_translation_bytes = 0;
     state.tracked_reasoning_parts = 0;
     state.tracked_text_parts = 0;
@@ -757,8 +819,12 @@ fn append_function_call_arguments(
     if arguments.is_empty() {
         return Ok(());
     }
+    reserve_output_payload(state, arguments.len())?;
     reserve_buffered_translation_bytes(state, arguments.len())?;
     let active = function_call_is_active(state, output_index);
+    if !active {
+        reserve_buffered_translation_bytes(state, arguments.len())?;
+    }
     let Some(call) = state
         .function_call_state_by_output_index
         .get_mut(&output_index)
@@ -1104,6 +1170,14 @@ fn handle_output_item_added(
         Some(d) => d,
         None => return events,
     };
+    if let Err(message) = reserve_function_call_metadata_if_new(
+        state,
+        details.output_index,
+        details.tool_call_id.as_deref(),
+        &details.name,
+    ) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
 
     open_function_call_block(
         state,
@@ -1448,6 +1522,11 @@ fn handle_output_item_done(
                 ),
             )
         };
+        if let Err(message) =
+            reserve_function_call_metadata_if_new(state, output_index, call_id.as_deref(), &name)
+        {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
         open_function_call_block(
             state,
             output_index,
@@ -1501,6 +1580,21 @@ fn handle_output_item_done(
             "A compaction item had missing, empty, or invalid encrypted_content.",
         )
         .expect("compaction item validated above");
+        let signature = encode_compaction_carrier_signature(encrypted_content, id);
+        let additional = match THINKING_TEXT.len().checked_add(signature.len()) {
+            Some(additional) => additional,
+            None => {
+                return terminate_responses_stream_with_error(
+                    state,
+                    build_error_event(
+                        "The Responses stream exceeded the translated output payload limit.",
+                    ),
+                )
+            }
+        };
+        if let Err(message) = reserve_output_payload(state, additional) {
+            return terminate_responses_stream_with_error(state, build_error_event(message));
+        }
 
         let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
 
@@ -1515,9 +1609,7 @@ fn handle_output_item_done(
 
         events.push(AnthropicStreamEventData::ContentBlockDelta {
             index: block_index,
-            delta: AnthropicContentBlockDelta::SignatureDelta {
-                signature: encode_compaction_carrier_signature(encrypted_content, id),
-            },
+            delta: AnthropicContentBlockDelta::SignatureDelta { signature },
         });
         state.block_has_delta.insert(block_index);
         return events;
@@ -1646,6 +1738,22 @@ fn handle_output_item_done(
         return events;
     };
 
+    let signature = encode_reasoning_signature(encrypted_content, id);
+    let additional = match display_text.len().checked_add(signature.len()) {
+        Some(additional) => additional,
+        None => {
+            return terminate_responses_stream_with_error(
+                state,
+                build_error_event(
+                    "The Responses stream exceeded the translated output payload limit.",
+                ),
+            )
+        }
+    };
+    if let Err(message) = reserve_output_payload(state, additional) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
+
     let block_index = open_thinking_block_if_needed(state, output_index, &mut events);
     events.push(AnthropicStreamEventData::ContentBlockDelta {
         index: block_index,
@@ -1655,7 +1763,6 @@ fn handle_output_item_done(
     });
     state.block_has_delta.insert(block_index);
 
-    let signature = encode_reasoning_signature(encrypted_content, id);
     events.push(AnthropicStreamEventData::ContentBlockDelta {
         index: block_index,
         delta: AnthropicContentBlockDelta::SignatureDelta { signature },
@@ -1686,6 +1793,7 @@ fn append_output_text(
     if text.is_empty() {
         return Ok(());
     }
+    reserve_output_payload(state, text.len())?;
     reserve_buffered_translation_bytes(state, text.len())?;
     state
         .output_text_by_key
@@ -1885,6 +1993,9 @@ fn handle_function_call_arguments_done(
     if let Err(message) =
         reconcile_function_call_arguments(state, output_index, final_arguments, &mut events)
     {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
+    if let Err(message) = reserve_buffered_translation_bytes(state, final_arguments.len()) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     if let Some(call) = state
@@ -2233,6 +2344,9 @@ fn handle_reasoning_summary_text_done(
     if let Err(message) = reserve_buffered_translation_bytes(state, suffix.len()) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
+    if let Err(message) = reserve_buffered_translation_bytes(state, text.len()) {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
     // `text.done` is the authoritative complete text for this summary part.
     // Assign rather than append so prior deltas cannot duplicate content.
     let part = state
@@ -2322,6 +2436,9 @@ fn handle_output_text_done(
     if let Err(message) =
         reconcile_output_text(state, output_index, content_index, text, &mut events)
     {
+        return terminate_responses_stream_with_error(state, build_error_event(message));
+    }
+    if let Err(message) = reserve_buffered_translation_bytes(state, text.len()) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
     state.output_text_done_by_key.insert(key, text.to_string());
@@ -3712,5 +3829,92 @@ mod tests {
             [AnthropicStreamEventData::Error { .. }]
         ));
         assert!(state.message_completed);
+    }
+
+    #[test]
+    fn aggregate_output_budget_counts_utf8_and_fails_once() {
+        let mut state = started_state();
+        assert!(translate_responses_stream_event(
+            &json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{
+                    "type":"message",
+                    "id":"message-budget",
+                    "role":"assistant",
+                    "content":[]
+                }
+            }),
+            &mut state,
+        )
+        .is_empty());
+        state.output_budget.used_bytes = MAX_UPSTREAM_RESPONSE_BYTES - "é".len();
+        let exact = translate_responses_stream_event(
+            &json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "content_index":0,
+                "delta":"é"
+            }),
+            &mut state,
+        );
+        assert!(exact.iter().any(|event| matches!(
+            event,
+            AnthropicStreamEventData::ContentBlockDelta {
+                delta: AnthropicContentBlockDelta::TextDelta { text },
+                ..
+            } if text == "é"
+        )));
+        assert_eq!(state.output_budget.used_bytes, MAX_UPSTREAM_RESPONSE_BYTES);
+
+        let overflow = translate_responses_stream_event(
+            &json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "content_index":0,
+                "delta":"x"
+            }),
+            &mut state,
+        );
+        assert_eq!(
+            overflow
+                .iter()
+                .filter(|event| matches!(event, AnthropicStreamEventData::Error { .. }))
+                .count(),
+            1
+        );
+        assert!(!overflow
+            .iter()
+            .any(|event| matches!(event, AnthropicStreamEventData::MessageStop)));
+        assert!(state.message_completed);
+        assert!(translate_responses_stream_event(
+            &json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "content_index":0,
+                "delta":"later"
+            }),
+            &mut state,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn sequence_snapshot_replacement_is_byte_accounted() {
+        let mut state = create_responses_stream_state(None);
+        state.buffered_translation_bytes = 7;
+        let first = json!({"type":"ping","sequence_number":1,"payload":"first"});
+        assert_eq!(validate_event_sequence(&first, &mut state), Ok(false));
+        let first_bytes = serde_json::to_vec(&first).unwrap().len();
+        assert_eq!(state.last_sequence_event_bytes, first_bytes);
+        assert_eq!(state.buffered_translation_bytes, 7 + first_bytes);
+        assert_eq!(validate_event_sequence(&first, &mut state), Ok(true));
+        assert_eq!(state.buffered_translation_bytes, 7 + first_bytes);
+
+        let second = json!({"type":"ping","sequence_number":2,"payload":"x"});
+        assert_eq!(validate_event_sequence(&second, &mut state), Ok(false));
+        let second_bytes = serde_json::to_vec(&second).unwrap().len();
+        assert_eq!(state.last_sequence_event_bytes, second_bytes);
+        assert_eq!(state.buffered_translation_bytes, 7 + second_bytes);
     }
 }

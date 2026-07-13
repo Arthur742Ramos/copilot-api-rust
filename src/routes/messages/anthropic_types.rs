@@ -433,6 +433,28 @@ impl AnthropicStreamEventData {
 // Streaming translation state
 // ---------------------------------------------------------------------------
 
+/// Aggregate UTF-8 payload-content budget shared by translated Chat and
+/// Responses streams. Protocol framing and fixed discriminator strings are not
+/// counted; dynamic client-visible text, signatures, tool metadata/arguments,
+/// and serialized extensions are.
+#[derive(Debug, Clone, Default)]
+pub struct TranslatedOutputBudget {
+    pub used_bytes: usize,
+}
+
+impl TranslatedOutputBudget {
+    pub fn try_reserve(&mut self, additional: usize) -> bool {
+        let Some(total) = self.used_bytes.checked_add(additional) else {
+            return false;
+        };
+        if total > crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES {
+            return false;
+        }
+        self.used_bytes = total;
+        true
+    }
+}
+
 /// Per-tool-call tracking entry inside `AnthropicStreamState.tool_calls`,
 /// keyed by the OpenAI tool index.
 #[derive(Debug, Clone, Default)]
@@ -487,9 +509,9 @@ pub struct AnthropicStreamState {
     /// Ordinary Chat `content` for which an Anthropic text delta was actually
     /// emitted. This advances only after the event is appended.
     pub chat_content_emitted: String,
-    /// Every client-visible Anthropic text delta actually emitted, including
-    /// reasoning fallbacks and refusal-only suffixes.
-    pub chat_text_emitted: String,
+    /// Aggregate client-visible payload accounting across emitted and deferred
+    /// text, reasoning, tools, signatures, and material extensions.
+    pub output_budget: TranslatedOutputBudget,
     pub chat_finish_reason: Option<String>,
     /// True after a finish chunk carried usage or one post-finish usage-only
     /// chunk was accepted. Success stays pending until [DONE]/EOF so a later
@@ -501,7 +523,6 @@ pub struct AnthropicStreamState {
     pub thinking_block_open: bool,
     pub pending_message_delta: Option<AnthropicStreamEventData>,
     pub deferred_output: std::collections::VecDeque<AnthropicStreamDeferredOutput>,
-    pub deferred_output_bytes: usize,
     /// openAIToolIndex -> { id, name, anthropic_block_index }
     pub tool_calls: std::collections::HashMap<i64, AnthropicStreamToolCall>,
     /// First-seen order for deterministic serialization of parallel calls.

@@ -577,6 +577,10 @@ fn validate_finish_reason(
             .as_deref()
             .is_some_and(|value| !value.is_empty())
         || delta
+            .reasoning_opaque
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || delta
             .refusal
             .as_deref()
             .is_some_and(|value| !value.is_empty())
@@ -855,7 +859,10 @@ pub fn translate_chunk_to_anthropic_events(
         }) => (delta, finish_reason, usage, usage_present),
     };
 
-    handle_message_start(state, &mut events);
+    if handle_message_start(state, &mut events).is_err() {
+        events.extend(malformed_stream_error_events(state));
+        return events;
+    }
 
     let source_content = delta
         .content
@@ -869,6 +876,10 @@ pub fn translate_chunk_to_anthropic_events(
             .is_some_and(|value| !value.is_empty())
         || delta
             .reasoning_content
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || delta
+            .reasoning_opaque
             .as_deref()
             .is_some_and(|value| !value.is_empty())
         || delta
@@ -889,7 +900,13 @@ pub fn translate_chunk_to_anthropic_events(
             .push_str(&fragment);
     }
 
-    let reasoning_fallback = handle_thinking_text(&delta, state, &mut events);
+    let reasoning_fallback = match handle_thinking_text(&delta, state, &mut events) {
+        Ok(fallback) => fallback,
+        Err(()) => {
+            events.extend(malformed_stream_error_events(state));
+            return events;
+        }
+    };
     if reasoning_fallback
         .map(|text| schedule_text_fragment(text, false, state, &mut events))
         .transpose()
@@ -939,8 +956,13 @@ pub fn flush_pending_anthropic_stream_events(
     let mut events: Vec<AnthropicStreamEventData> = Vec::new();
 
     if state.pending_message_delta.is_some() {
-        complete_pending_message(state, &mut events, None);
-        return events;
+        if complete_pending_message(state, &mut events, None).is_ok() {
+            return events;
+        }
+        return terminal_stream_error_events(
+            state,
+            protocol_error_event("The translated model stream exceeded the output payload limit."),
+        );
     }
 
     terminal_stream_error_events(
@@ -1087,6 +1109,7 @@ fn close_open_content_block(
 fn emit_text_fragment(
     text: &str,
     source_content: bool,
+    already_budgeted: bool,
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
 ) -> Result<(), ()> {
@@ -1096,12 +1119,7 @@ fn emit_text_fragment(
     if is_tool_block_open(state) {
         return Err(());
     }
-    if state
-        .chat_text_emitted
-        .len()
-        .checked_add(text.len())
-        .is_none_or(|length| length > crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
-    {
+    if !already_budgeted && !state.output_budget.try_reserve(text.len()) {
         return Err(());
     }
     if source_content {
@@ -1130,7 +1148,6 @@ fn emit_text_fragment(
             text: text.to_string(),
         },
     });
-    state.chat_text_emitted.push_str(text);
     if source_content {
         state.chat_content_emitted.push_str(text);
     }
@@ -1145,11 +1162,9 @@ fn defer_text_fragment(
     if text.is_empty() {
         return Ok(());
     }
-    state.deferred_output_bytes = state
-        .deferred_output_bytes
-        .checked_add(text.len())
-        .filter(|length| *length <= crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
-        .ok_or(())?;
+    if !state.output_budget.try_reserve(text.len()) {
+        return Err(());
+    }
     if let Some(AnthropicStreamDeferredOutput::Text {
         text: existing,
         source_content: existing_source,
@@ -1170,11 +1185,10 @@ fn defer_text_fragment(
 }
 
 fn defer_reasoning_opaque(signature: String, state: &mut AnthropicStreamState) -> Result<(), ()> {
-    state.deferred_output_bytes = state
-        .deferred_output_bytes
-        .checked_add(signature.len())
-        .filter(|length| *length <= crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
-        .ok_or(())?;
+    let additional = THINKING_TEXT.len().checked_add(signature.len()).ok_or(())?;
+    if !state.output_budget.try_reserve(additional) {
+        return Err(());
+    }
     state
         .deferred_output
         .push_back(AnthropicStreamDeferredOutput::ReasoningOpaque(signature));
@@ -1196,14 +1210,14 @@ fn complete_pending_message(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
     usage: Option<&AnthropicUsage>,
-) {
+) -> Result<(), ()> {
     if state.terminal_event_emitted {
         state.pending_message_delta = None;
-        return;
+        return Ok(());
     }
 
-    let Some(pending) = state.pending_message_delta.take() else {
-        return;
+    let Some(pending) = state.pending_message_delta.clone() else {
+        return Ok(());
     };
 
     let pending = match (usage, pending) {
@@ -1215,11 +1229,22 @@ fn complete_pending_message(
         }
         (_, pending) => pending,
     };
+    if let AnthropicStreamEventData::MessageDelta {
+        usage: Some(usage), ..
+    } = &pending
+    {
+        let additional = delta_usage_dynamic_payload_bytes(usage)?;
+        if !state.output_budget.try_reserve(additional) {
+            return Err(());
+        }
+    }
 
+    let _ = state.pending_message_delta.take();
     events.push(pending);
     events.push(AnthropicStreamEventData::MessageStop);
     state.message_stop_emitted = true;
     state.terminal_event_emitted = true;
+    Ok(())
 }
 
 fn anthropic_delta_usage(usage: &AnthropicUsage) -> AnthropicMessageDeltaUsage {
@@ -1249,7 +1274,6 @@ fn close_stream_for_error(
     state.tool_calls.clear();
     state.tool_call_order.clear();
     state.deferred_output.clear();
-    state.deferred_output_bytes = 0;
     state.pending_message_delta = None;
 }
 
@@ -1272,7 +1296,7 @@ fn flush_reconciled_refusal(
         return Ok(());
     }
     let suffix = suffix.to_string();
-    emit_text_fragment(&suffix, false, state, events)
+    emit_text_fragment(&suffix, false, false, state, events)
 }
 
 fn schedule_terminal_output(
@@ -1366,6 +1390,7 @@ fn handle_tool_calls(
 
     for tool_call in &delta.tool_calls {
         let index = tool_call.index;
+        reserve_tool_delta_payload(state, tool_call)?;
         if tool_call.first {
             state.tool_call_order.push(index);
             state.tool_calls.insert(
@@ -1423,6 +1448,69 @@ fn handle_tool_calls(
             }
         }
         try_start_front_tool_call(state, events)?;
+    }
+    Ok(())
+}
+
+fn serialized_extension_bytes(extra: &Map<String, Value>) -> Result<usize, ()> {
+    if extra.is_empty() {
+        return Ok(0);
+    }
+    serde_json::to_vec(&Value::Object(extra.clone()))
+        .map(|value| value.len())
+        .map_err(|_| ())
+}
+
+fn usage_dynamic_payload_bytes(usage: &AnthropicUsage) -> Result<usize, ()> {
+    usage
+        .service_tier
+        .as_ref()
+        .map_or(0, String::len)
+        .checked_add(serialized_extension_bytes(&usage.extra)?)
+        .ok_or(())
+}
+
+fn delta_usage_dynamic_payload_bytes(usage: &AnthropicMessageDeltaUsage) -> Result<usize, ()> {
+    usage
+        .service_tier
+        .as_ref()
+        .map_or(0, String::len)
+        .checked_add(serialized_extension_bytes(&usage.extra)?)
+        .ok_or(())
+}
+
+fn reserve_tool_delta_payload(
+    state: &mut AnthropicStreamState,
+    delta: &ValidatedToolDelta,
+) -> Result<(), ()> {
+    let existing = state.tool_calls.get(&delta.index);
+    let mut additional = delta.arguments.as_ref().map_or(0, String::len);
+    if existing.and_then(|call| call.id.as_ref()).is_none() {
+        additional = additional
+            .checked_add(delta.id.as_ref().map_or(0, String::len))
+            .ok_or(())?;
+    }
+    if existing.and_then(|call| call.name.as_ref()).is_none() {
+        additional = additional
+            .checked_add(delta.name.as_ref().map_or(0, String::len))
+            .ok_or(())?;
+    }
+    let old_extra_size = existing
+        .map(|call| serialized_extension_bytes(&call.extra))
+        .transpose()?
+        .unwrap_or(0);
+    let new_extra_size = if let Some(existing) = existing {
+        let mut merged = existing.extra.clone();
+        merge_tool_extensions(&mut merged, &delta.extra)?;
+        serialized_extension_bytes(&merged)?
+    } else {
+        serialized_extension_bytes(&delta.extra)?
+    };
+    additional = additional
+        .checked_add(new_extra_size.saturating_sub(old_extra_size))
+        .ok_or(())?;
+    if !state.output_budget.try_reserve(additional) {
+        return Err(());
     }
     Ok(())
 }
@@ -1509,11 +1597,7 @@ fn flush_deferred_output(
                 text,
                 source_content,
             } => {
-                state.deferred_output_bytes = state
-                    .deferred_output_bytes
-                    .checked_sub(text.len())
-                    .ok_or(())?;
-                emit_text_fragment(&text, source_content, state, events)?;
+                emit_text_fragment(&text, source_content, true, state, events)?;
             }
             AnthropicStreamDeferredOutput::ToolCall(index) => {
                 close_open_content_block(state, events);
@@ -1521,17 +1605,10 @@ fn flush_deferred_output(
                 close_open_content_block(state, events);
             }
             AnthropicStreamDeferredOutput::ReasoningOpaque(signature) => {
-                state.deferred_output_bytes = state
-                    .deferred_output_bytes
-                    .checked_sub(signature.len())
-                    .ok_or(())?;
                 close_open_content_block(state, events);
-                emit_complete_reasoning_opaque(&signature, events, state);
+                emit_complete_reasoning_opaque(&signature, true, events, state)?;
             }
         }
-    }
-    if state.deferred_output_bytes != 0 {
-        return Err(());
     }
     Ok(())
 }
@@ -1559,7 +1636,7 @@ fn schedule_text_fragment(
     if state.active_tool_call_index.is_some() || !state.deferred_output.is_empty() {
         return defer_text_fragment(text, source_content, state);
     }
-    emit_text_fragment(&text, source_content, state, events)
+    emit_text_fragment(&text, source_content, false, state, events)
 }
 
 fn schedule_reasoning_opaque(
@@ -1571,24 +1648,22 @@ fn schedule_reasoning_opaque(
         return Ok(());
     };
     if state.thinking_block_open {
-        close_thinking_block(state, events, signature);
-        return Ok(());
+        return close_thinking_block(state, events, signature, false);
     }
     if state.active_tool_call_index.is_some() || !state.deferred_output.is_empty() {
         return defer_reasoning_opaque(signature, state);
     }
     close_open_content_block(state, events);
-    emit_complete_reasoning_opaque(&signature, events, state);
-    Ok(())
+    emit_complete_reasoning_opaque(&signature, false, events, state)
 }
 
 /// `handleMessageStart`.
 fn handle_message_start(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) {
+) -> Result<(), ()> {
     if state.message_start_sent {
-        return;
+        return Ok(());
     }
 
     let usage = state.chat_usage.clone().unwrap_or_else(|| {
@@ -1610,18 +1685,30 @@ fn handle_message_start(
         usage,
         extra: state.chat_top_level_extras.clone(),
     };
+    let additional = serialized_extension_bytes(&message.extra)?
+        .checked_add(usage_dynamic_payload_bytes(&message.usage)?)
+        .ok_or(())?;
+    if !state.output_budget.try_reserve(additional) {
+        return Err(());
+    }
 
     events.push(AnthropicStreamEventData::MessageStart { message });
     state.message_start_sent = true;
+    Ok(())
 }
 
 /// `handleReasoningOpaque` — emit a complete thinking block (start, default
 /// thinking_delta, signature_delta, stop) for an opaque reasoning blob.
 fn emit_complete_reasoning_opaque(
     signature: &str,
+    already_budgeted: bool,
     events: &mut Vec<AnthropicStreamEventData>,
     state: &mut AnthropicStreamState,
-) {
+) -> Result<(), ()> {
+    let additional = THINKING_TEXT.len().checked_add(signature.len()).ok_or(())?;
+    if !already_budgeted && !state.output_budget.try_reserve(additional) {
+        return Err(());
+    }
     events.push(AnthropicStreamEventData::ContentBlockStart {
         index: state.content_block_index,
         content_block: serde_json::json!({ "type": "thinking", "thinking": "" }),
@@ -1642,6 +1729,7 @@ fn emit_complete_reasoning_opaque(
         index: state.content_block_index,
     });
     state.content_block_index += 1;
+    Ok(())
 }
 
 /// `handleThinkingText`.
@@ -1649,14 +1737,16 @@ fn handle_thinking_text(
     delta: &DeltaView,
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
-) -> Option<String> {
+) -> Result<Option<String>, ()> {
     // `delta.reasoning_text ?? delta.reasoning_content`
     let reasoning_text = delta
         .reasoning_text
         .clone()
         .or_else(|| delta.reasoning_content.clone());
 
-    let reasoning_text = reasoning_text.filter(|s| !s.is_empty())?;
+    let Some(reasoning_text) = reasoning_text.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
 
     // compatible with copilot API returning content->reasoning_text->reasoning_opaque
     // in different deltas; abnormal claude-model server behaviour.
@@ -1664,9 +1754,12 @@ fn handle_thinking_text(
         || state.active_tool_call_index.is_some()
         || !state.deferred_output.is_empty()
     {
-        return Some(reasoning_text);
+        return Ok(Some(reasoning_text));
     }
 
+    if !state.output_budget.try_reserve(reasoning_text.len()) {
+        return Err(());
+    }
     if !state.thinking_block_open {
         events.push(AnthropicStreamEventData::ContentBlockStart {
             index: state.content_block_index,
@@ -1681,16 +1774,23 @@ fn handle_thinking_text(
             thinking: reasoning_text,
         },
     });
-    None
+    Ok(None)
 }
 
 fn close_thinking_block(
     state: &mut AnthropicStreamState,
     events: &mut Vec<AnthropicStreamEventData>,
     signature: String,
-) {
+    already_budgeted: bool,
+) -> Result<(), ()> {
     if !state.thinking_block_open {
-        return;
+        return Ok(());
+    }
+    if !already_budgeted
+        && !signature.is_empty()
+        && !state.output_budget.try_reserve(signature.len())
+    {
+        return Err(());
     }
     events.push(AnthropicStreamEventData::ContentBlockDelta {
         index: state.content_block_index,
@@ -1701,6 +1801,7 @@ fn close_thinking_block(
     });
     state.content_block_index += 1;
     state.thinking_block_open = false;
+    Ok(())
 }
 
 /// `closeThinkingBlockIfOpen`.
@@ -1711,7 +1812,7 @@ fn close_thinking_block_if_open(
     if !state.thinking_block_open {
         return;
     }
-    close_thinking_block(state, events, String::new());
+    let _ = close_thinking_block(state, events, String::new(), true);
 }
 
 // ---------------------------------------------------------------------------
@@ -3507,7 +3608,7 @@ mod tests {
         );
         assert_eq!(state.chat_content_seen, "foo");
         assert_eq!(state.chat_content_emitted, "foo");
-        assert_eq!(state.chat_text_emitted, "foobar");
+        assert_eq!(state.output_budget.used_bytes, 18);
     }
 
     #[test]
@@ -3560,7 +3661,6 @@ mod tests {
         );
         assert!(!events.iter().any(|event| event["type"] == "message_stop"));
         assert!(state.deferred_output.is_empty());
-        assert_eq!(state.deferred_output_bytes, 0);
     }
 
     #[test]
@@ -3610,7 +3710,7 @@ mod tests {
         assert_eq!(text, "thoughtfoo");
         assert_eq!(state.chat_content_seen, "foo");
         assert_eq!(state.chat_content_emitted, "foo");
-        assert_eq!(state.chat_text_emitted, "thoughtfoo");
+        assert_eq!(state.output_budget.used_bytes, 22);
         assert_single_open_block_invariant(&all);
     }
 
@@ -3703,7 +3803,7 @@ mod tests {
         );
         assert_eq!(state.chat_content_seen, "foo");
         assert_eq!(state.chat_content_emitted, "foo");
-        assert_eq!(state.chat_text_emitted, "thoughtfoo");
+        assert_eq!(state.output_budget.used_bytes, 42);
         assert_single_open_block_invariant(&all);
     }
 
@@ -3713,14 +3813,22 @@ mod tests {
 
         let mut emitted_state = AnthropicStreamState::default();
         let mut emitted_events = Vec::new();
-        emit_text_fragment(&exact, false, &mut emitted_state, &mut emitted_events)
-            .expect("exact emitted-text bound is accepted");
+        emit_text_fragment(
+            &exact,
+            false,
+            false,
+            &mut emitted_state,
+            &mut emitted_events,
+        )
+        .expect("exact emitted-text bound is accepted");
         let event_count = emitted_events.len();
         assert_eq!(
-            emitted_state.chat_text_emitted.len(),
+            emitted_state.output_budget.used_bytes,
             crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
         );
-        assert!(emit_text_fragment("x", false, &mut emitted_state, &mut emitted_events).is_err());
+        assert!(
+            emit_text_fragment("x", false, false, &mut emitted_state, &mut emitted_events).is_err()
+        );
         assert_eq!(emitted_events.len(), event_count);
 
         let mut deferred_state = AnthropicStreamState {
@@ -3747,7 +3855,7 @@ mod tests {
         defer_text_fragment(exact, false, &mut deferred_state)
             .expect("exact deferred-text bound is accepted");
         assert_eq!(
-            deferred_state.deferred_output_bytes,
+            deferred_state.output_budget.used_bytes,
             crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
         );
 
@@ -3774,6 +3882,60 @@ mod tests {
         );
         assert!(!events.iter().any(|event| event["type"] == "message_stop"));
         assert!(deferred_state.deferred_output.is_empty());
-        assert_eq!(deferred_state.deferred_output_bytes, 0);
+        assert_eq!(
+            deferred_state.output_budget.used_bytes,
+            crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
+    fn repeated_opaque_reasoning_uses_exact_aggregate_budget() {
+        const PARTS: usize = 128;
+        let placeholder_bytes = THINKING_TEXT.len() * PARTS;
+        let signature_bytes = crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES - placeholder_bytes;
+        let base = signature_bytes / PARTS;
+        let remainder = signature_bytes % PARTS;
+        let mut state = AnthropicStreamState::default();
+        for index in 0..PARTS {
+            let events = translate_chunk_to_anthropic_events(
+                &json!({
+                    "id":"opaque-budget",
+                    "model":"m",
+                    "choices":[{
+                        "index":0,
+                        "delta":{"reasoning_opaque":"s".repeat(base + usize::from(index < remainder))},
+                        "finish_reason":null
+                    }]
+                }),
+                &mut state,
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AnthropicStreamEventData::Error { .. })),
+                "part {index}"
+            );
+        }
+        assert_eq!(
+            state.output_budget.used_bytes,
+            crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
+        );
+        let finish = translate_chunk_to_anthropic_events(
+            &json!({
+                "id":"opaque-budget",
+                "model":"m",
+                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+            }),
+            &mut state,
+        );
+        assert!(
+            !finish
+                .iter()
+                .any(|event| matches!(event, AnthropicStreamEventData::Error { .. })),
+            "finish={finish:?} state={state:?}"
+        );
+        assert!(flush_pending_anthropic_stream_events(&mut state)
+            .iter()
+            .any(|event| matches!(event, AnthropicStreamEventData::MessageStop)));
     }
 }

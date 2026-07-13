@@ -42,7 +42,9 @@ use crate::libs::token_usage::{
 use crate::libs::utils::{
     generate_request_id_from_payload, get_root_session_id, get_uuid, parse_user_id_metadata,
 };
-use crate::routes::messages::anthropic_types::{AnthropicMessagesPayload, AnthropicTool};
+use crate::routes::messages::anthropic_types::{
+    AnthropicMessagesPayload, AnthropicTool, TranslatedOutputBudget,
+};
 use crate::routes::messages::preprocess::{get_compact_type, normalize_system_messages};
 use crate::routes::messages::responses_translation::{
     optional_nonnull_string_field, parse_and_validate_output_item,
@@ -65,6 +67,8 @@ use crate::services::copilot::create_responses::{
 };
 
 const LOG_TAG: &str = "messages-web-search";
+const MAX_COLLECTED_OUTPUT_ITEMS: usize = 4096;
+const MAX_COLLECTED_TEXT_PARTS: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -604,12 +608,39 @@ struct CollectedOutputTextPart {
 
 #[derive(Debug, Default)]
 struct WebSearchResponsesStreamCollection {
+    buffered_bytes: usize,
     created_response: Option<Value>,
     output_items_by_index: BTreeMap<i64, CollectedOutputItem>,
     terminal_response: Option<Value>,
     terminal_kind: Option<ResponsesTerminalKind>,
     /// keyed by `"{output_index}:{content_index}"`.
     text_parts_by_key: HashMap<String, CollectedOutputTextPart>,
+}
+
+#[allow(clippy::result_large_err)]
+fn reserve_collection_bytes(
+    state: &mut WebSearchResponsesStreamCollection,
+    additional: usize,
+) -> Result<(), AppError> {
+    state.buffered_bytes = state
+        .buffered_bytes
+        .checked_add(additional)
+        .filter(|bytes| *bytes <= crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES)
+        .ok_or_else(|| {
+            invalid_web_search_stream("the accumulated web-search stream exceeded its byte limit")
+        })?;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn reserve_collection_json(
+    state: &mut WebSearchResponsesStreamCollection,
+    value: &Value,
+) -> Result<(), AppError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| invalid_web_search_stream("a collected value could not be serialized"))?
+        .len();
+    reserve_collection_bytes(state, bytes)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -726,17 +757,44 @@ fn get_or_create_output_text_part<'a>(
     let content_index = required_nonnegative_event_index(event, "content_index")?;
     let item_id = optional_event_string(event, "item_id")?.map(str::to_string);
     let key = format!("{output_index}:{content_index}");
+    if !state.text_parts_by_key.contains_key(&key) {
+        if state.text_parts_by_key.len() >= MAX_COLLECTED_TEXT_PARTS {
+            return Err(invalid_web_search_stream(
+                "the web-search stream emitted too many text parts",
+            ));
+        }
+        let retained_bytes = key
+            .len()
+            .checked_add(item_id.as_ref().map_or(0, String::len))
+            .ok_or_else(|| {
+                invalid_web_search_stream(
+                    "the accumulated web-search stream exceeded its byte limit",
+                )
+            })?;
+        reserve_collection_bytes(state, retained_bytes)?;
+        state.text_parts_by_key.insert(
+            key.clone(),
+            CollectedOutputTextPart {
+                annotations: Vec::new(),
+                content_index,
+                done_text: None,
+                item_id: item_id.clone(),
+                output_index,
+                text: String::new(),
+            },
+        );
+    }
+    let late_item_id_bytes = state
+        .text_parts_by_key
+        .get(&key)
+        .filter(|part| part.item_id.is_none())
+        .and(item_id.as_ref())
+        .map_or(0, String::len);
+    reserve_collection_bytes(state, late_item_id_bytes)?;
     let part = state
         .text_parts_by_key
-        .entry(key)
-        .or_insert_with(|| CollectedOutputTextPart {
-            annotations: Vec::new(),
-            content_index,
-            done_text: None,
-            item_id: item_id.clone(),
-            output_index,
-            text: String::new(),
-        });
+        .get_mut(&key)
+        .expect("text part inserted above");
     if part.item_id.is_some() && item_id.is_some() && part.item_id != item_id {
         return Err(invalid_web_search_stream(
             "a text part changed its output item id",
@@ -803,12 +861,45 @@ fn collect_done_content_part(
             ))
         }
     };
-    let part = get_or_create_output_text_part(event, state)?;
-    if part.done_text.as_deref().is_some_and(|done| done != text) {
-        return Err(invalid_web_search_stream(
-            "response.content_part.done conflicted with output_text.done",
-        ));
-    }
+    let current_len = {
+        let part = get_or_create_output_text_part(event, state)?;
+        if part.done_text.as_deref().is_some_and(|done| done != text) {
+            return Err(invalid_web_search_stream(
+                "response.content_part.done conflicted with output_text.done",
+            ));
+        }
+        part.text.len()
+    };
+    let text_bytes = text
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_sub(current_len))
+        .ok_or_else(|| {
+            invalid_web_search_stream("the accumulated web-search stream exceeded its byte limit")
+        })?;
+    let annotation_bytes = annotations.iter().try_fold(0usize, |total, annotation| {
+        let bytes = serde_json::to_vec(annotation)
+            .map_err(|_| invalid_web_search_stream("an annotation could not be serialized"))?
+            .len();
+        total.checked_add(bytes).ok_or_else(|| {
+            invalid_web_search_stream("the accumulated web-search stream exceeded its byte limit")
+        })
+    })?;
+    reserve_collection_bytes(
+        state,
+        text_bytes.checked_add(annotation_bytes).ok_or_else(|| {
+            invalid_web_search_stream("the accumulated web-search stream exceeded its byte limit")
+        })?,
+    )?;
+    let key = format!(
+        "{}:{}",
+        required_nonnegative_event_index(event, "output_index")?,
+        required_nonnegative_event_index(event, "content_index")?
+    );
+    let part = state
+        .text_parts_by_key
+        .get_mut(&key)
+        .expect("text part validated above");
     part.text = text.to_string();
     part.done_text = Some(text.to_string());
     part.annotations.extend(annotations);
@@ -855,6 +946,7 @@ fn collect_web_search_responses_stream_event(
                 })?;
             validate_created_status(response).map_err(invalid_web_search_stream)?;
             validate_web_search_snapshot_fields(response, OutputValidationPhase::Added)?;
+            reserve_collection_json(state, response)?;
             state.created_response = Some(response.clone());
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
@@ -875,6 +967,7 @@ fn collect_web_search_responses_stream_event(
             if terminal_kind == ResponsesTerminalKind::Completed {
                 validate_web_search_snapshot_fields(response, OutputValidationPhase::Done)?;
             }
+            reserve_collection_json(state, response)?;
             state.terminal_response = Some(response.clone());
             state.terminal_kind = Some(terminal_kind);
         }
@@ -892,6 +985,14 @@ fn collect_web_search_responses_stream_event(
                 OutputValidationPhase::Done
             };
             parse_and_validate_output_item(item, phase).map_err(invalid_web_search_stream)?;
+            reserve_collection_json(state, item)?;
+            if !state.output_items_by_index.contains_key(&output_index)
+                && state.output_items_by_index.len() >= MAX_COLLECTED_OUTPUT_ITEMS
+            {
+                return Err(invalid_web_search_stream(
+                    "the web-search stream emitted too many output items",
+                ));
+            }
             let lifecycle = state.output_items_by_index.entry(output_index).or_default();
             if phase == OutputValidationPhase::Added {
                 if lifecycle.added.as_ref().is_some_and(|added| added != item)
@@ -919,6 +1020,7 @@ fn collect_web_search_responses_stream_event(
             let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
                 invalid_web_search_stream("response.output_text.delta had an invalid delta")
             })?;
+            reserve_collection_bytes(state, delta.len())?;
             let part = get_or_create_output_text_part(event, state)?;
             if part.done_text.is_some() {
                 return Err(invalid_web_search_stream(
@@ -931,17 +1033,39 @@ fn collect_web_search_responses_stream_event(
             let text = event.get("text").and_then(Value::as_str).ok_or_else(|| {
                 invalid_web_search_stream("response.output_text.done had invalid text")
             })?;
-            let part = get_or_create_output_text_part(event, state)?;
-            if part.done_text.as_deref().is_some_and(|done| done != text) {
-                return Err(invalid_web_search_stream(
-                    "conflicting response.output_text.done events were emitted",
-                ));
-            }
-            if !text.starts_with(&part.text) {
-                return Err(invalid_web_search_stream(
-                    "response.output_text.done conflicted with streamed text",
-                ));
-            }
+            let current_len = {
+                let part = get_or_create_output_text_part(event, state)?;
+                if part.done_text.as_deref().is_some_and(|done| done != text) {
+                    return Err(invalid_web_search_stream(
+                        "conflicting response.output_text.done events were emitted",
+                    ));
+                }
+                if !text.starts_with(&part.text) {
+                    return Err(invalid_web_search_stream(
+                        "response.output_text.done conflicted with streamed text",
+                    ));
+                }
+                part.text.len()
+            };
+            let additional = text
+                .len()
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_sub(current_len))
+                .ok_or_else(|| {
+                    invalid_web_search_stream(
+                        "the accumulated web-search stream exceeded its byte limit",
+                    )
+                })?;
+            reserve_collection_bytes(state, additional)?;
+            let key = format!(
+                "{}:{}",
+                required_nonnegative_event_index(event, "output_index")?,
+                required_nonnegative_event_index(event, "content_index")?
+            );
+            let part = state
+                .text_parts_by_key
+                .get_mut(&key)
+                .expect("text part validated above");
             part.text = text.to_string();
             part.done_text = Some(text.to_string());
         }
@@ -955,6 +1079,7 @@ fn collect_web_search_responses_stream_event(
                     )
                 })?
                 .clone();
+            reserve_collection_json(state, &annotation)?;
             get_or_create_output_text_part(event, state)?
                 .annotations
                 .push(annotation);
@@ -2174,11 +2299,75 @@ pub async fn handle_web_search_via_responses(
             .as_ref(),
     ));
 
+    validate_reconstructed_payload_budget(&response)?;
+
     if !wants_stream {
         return Ok(Json(response.to_json()).into_response());
     }
 
     Ok(synthetic_stream_response(&response))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_reconstructed_payload_budget(
+    response: &ReconstructedWebSearchResponse,
+) -> Result<(), AppError> {
+    let mut content_bytes = 0usize;
+    for block in &response.content {
+        let mut payload = block.as_object().cloned().unwrap_or_default();
+        payload.remove("type");
+        if !payload.is_empty() {
+            let block_bytes = serde_json::to_vec(&payload)
+                .map_err(|_| {
+                    invalid_web_search_stream("reconstructed content could not be serialized")
+                })?
+                .len();
+            content_bytes = content_bytes.checked_add(block_bytes).ok_or_else(|| {
+                invalid_web_search_stream(
+                    "the reconstructed output payload exceeded its byte limit",
+                )
+            })?;
+        }
+    }
+    let usage_extensions = response
+        .usage
+        .as_object()
+        .map(|usage| {
+            usage
+                .iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "input_tokens"
+                            | "output_tokens"
+                            | "cache_creation_input_tokens"
+                            | "cache_read_input_tokens"
+                    )
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Map<String, Value>>()
+        })
+        .unwrap_or_default();
+    let usage_bytes = if usage_extensions.is_empty() {
+        0
+    } else {
+        serde_json::to_vec(&usage_extensions)
+            .map_err(|_| invalid_web_search_stream("reconstructed usage could not be serialized"))?
+            .len()
+    };
+    let additional = content_bytes
+        .checked_add(usage_bytes)
+        .and_then(|bytes| bytes.checked_add(response.stop_sequence.as_ref().map_or(0, String::len)))
+        .ok_or_else(|| {
+            invalid_web_search_stream("the reconstructed output payload exceeded its byte limit")
+        })?;
+    let mut budget = TranslatedOutputBudget::default();
+    if !budget.try_reserve(additional) {
+        return Err(invalid_web_search_stream(
+            "the reconstructed output payload exceeded its byte limit",
+        ));
+    }
+    Ok(())
 }
 
 /// Small wrapper applying the `metadata.user_id` session id to a recorder, since
@@ -2624,6 +2813,95 @@ mod tests {
         assert_eq!(events[9]["delta"]["stop_reason"], "end_turn");
         assert_eq!(events[9]["usage"]["output_tokens"], 9);
         assert_eq!(events[10]["type"], "message_stop");
+    }
+
+    #[test]
+    fn empty_stream_text_parts_are_count_bounded() {
+        let mut state = WebSearchResponsesStreamCollection {
+            created_response: Some(json!({"id":"response"})),
+            ..Default::default()
+        };
+        state.output_items_by_index.insert(
+            0,
+            CollectedOutputItem {
+                added: Some(json!({
+                    "type":"message",
+                    "id":"message",
+                    "role":"assistant",
+                    "content":[]
+                })),
+                done: None,
+            },
+        );
+        for content_index in 0..MAX_COLLECTED_TEXT_PARTS {
+            state.text_parts_by_key.insert(
+                format!("0:{content_index}"),
+                CollectedOutputTextPart {
+                    content_index: content_index as i64,
+                    output_index: 0,
+                    ..Default::default()
+                },
+            );
+        }
+        let error = collect_web_search_responses_stream_event(
+            &json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "content_index":MAX_COLLECTED_TEXT_PARTS,
+                "item_id":"message",
+                "delta":""
+            }),
+            &mut state,
+        )
+        .expect_err("the next empty text part exceeds the collection bound");
+        assert!(error.to_string().contains("too many text parts"));
+    }
+
+    #[test]
+    fn late_text_part_item_id_is_byte_accounted() {
+        let mut state = WebSearchResponsesStreamCollection {
+            created_response: Some(json!({"id":"response"})),
+            ..Default::default()
+        };
+        state.output_items_by_index.insert(
+            0,
+            CollectedOutputItem {
+                added: Some(json!({
+                    "type":"message",
+                    "id":"message",
+                    "role":"assistant",
+                    "content":[]
+                })),
+                done: None,
+            },
+        );
+        collect_web_search_responses_stream_event(
+            &json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "content_index":0,
+                "delta":""
+            }),
+            &mut state,
+        )
+        .expect("id-less text part");
+        let before = state.buffered_bytes;
+        collect_web_search_responses_stream_event(
+            &json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "content_index":0,
+                "item_id":"message",
+                "delta":""
+            }),
+            &mut state,
+        )
+        .expect("late item id");
+        assert_eq!(state.buffered_bytes - before, "message".len());
+        assert_eq!(
+            state.text_parts_by_key["0:0"].item_id.as_deref(),
+            Some("message")
+        );
     }
 
     #[test]
