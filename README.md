@@ -27,7 +27,7 @@ at a local endpoint backed by GitHub Copilot.
 See the [Claude Code / Anthropic API compatibility
 matrix](./docs/claude-code-api-compatibility.md) for audited behaviors,
 intentional divergences, and explicit scope limits.
-The combined [Claude Code 2.1.207 and Codex CLI 0.144.1 compatibility
+The combined [Claude Code 2.1.209 and Codex CLI 0.144.1 compatibility
 guide](./docs/claude-code-codex-compatibility.md) includes exact setup,
 headers, transport evidence, failure behavior, and an opt-in local canary.
 

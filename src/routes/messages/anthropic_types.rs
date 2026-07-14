@@ -578,6 +578,9 @@ pub struct AnthropicStreamState {
     pub content_block_index: i64,
     pub content_block_open: bool,
     pub thinking_block_open: bool,
+    /// Hide upstream Chat reasoning when the Anthropic request explicitly uses
+    /// adaptive thinking with `display: "omitted"`.
+    pub suppress_thinking: bool,
     pub pending_message_delta: Option<AnthropicStreamEventData>,
     pub deferred_output: std::collections::VecDeque<AnthropicStreamDeferredOutput>,
     /// openAIToolIndex -> { id, name, anthropic_block_index }

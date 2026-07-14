@@ -1,4 +1,4 @@
-//! Credential-free black-box compatibility coverage for Claude Code 2.1.207 and
+//! Credential-free black-box compatibility coverage for Claude Code 2.1.209 and
 //! Codex CLI 0.144.1.
 //!
 //! Requests enter through the production Axum router. Provider traffic is sent to
@@ -519,11 +519,16 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
         })
     };
     let text = || {
+        let content = if model == "gpt-chat-cli-smoke" {
+            "OK"
+        } else {
+            "Hello"
+        };
         chunk(
             json!([{
                 "index":0,
                 "logprobs":null,
-                "delta":{"role":"assistant","content":"Hello"},
+                "delta":{"role":"assistant","content":content},
                 "finish_reason":null
             }]),
             Value::Null,
@@ -9078,6 +9083,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
     .collect();
     let chat_models = [
         "gpt-chat-fixture",
+        "gpt-chat-cli-smoke",
         "gpt-chat-scalar-fixture",
         "gpt-chat-response-extras",
         "gpt-chat-response-malformed-json",
@@ -9905,7 +9911,7 @@ async fn anthropic_provider_strips_only_versioned_translated_carriers() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
-async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
+async fn claude_code_2_1_209_contract_crosses_public_axum_boundary() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
     configure(&fixture);
@@ -9955,7 +9961,7 @@ async fn claude_code_2_1_207_contract_crosses_public_axum_boundary() {
             .unwrap(),
     );
     req.headers_mut()
-        .insert("user-agent", "claude-code/2.1.207".parse().unwrap());
+        .insert("user-agent", "claude-code/2.1.209".parse().unwrap());
     let (status, body) = send(req).await;
     assert_eq!(status, StatusCode::OK);
     let body = json_body(&body);
@@ -10077,7 +10083,7 @@ async fn claude_inline_system_role_is_normalized_before_provider_dispatch() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
-async fn claude_code_2_1_207_controls_cross_responses_bridge() {
+async fn claude_code_2_1_209_controls_cross_responses_bridge() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
     configure(&fixture);
@@ -10162,6 +10168,74 @@ async fn claude_code_2_1_207_controls_cross_responses_bridge() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_anthropic_invalid_request(&response, "unrepresentable context management");
+    assert_eq!(fixture.requests().len(), before);
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_code_2_1_209_controls_cross_chat_bridge() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let request = post_json(
+        "/v1/messages?beta=true",
+        json!({
+            "model":"chat-fixture/gpt-chat-response-extras",
+            "max_tokens":32000,
+            "messages":[{"role":"user","content":"Hello"}],
+            "tools":[{
+                "name":"actual",
+                "description":"Run the fixture tool",
+                "input_schema":{"type":"object","properties":{}}
+            }],
+            "thinking":{"type":"adaptive","display":"omitted"},
+            "output_config":{"effort":"high"},
+            "context_management":{
+                "edits":[{"type":"clear_thinking_20251015","keep":"all"}]
+            },
+            "stream":false
+        }),
+        Some(CLIENT_KEY),
+    );
+    let (status, response) = send(request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let response = json_body(&response);
+    assert!(response["content"]
+        .as_array()
+        .expect("Anthropic response content")
+        .iter()
+        .all(|block| block["type"] != "thinking"));
+
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/chat/completions")
+        .expect("captured translated Chat Completions request");
+    assert_eq!(capture.body["reasoning_effort"], "high");
+    assert!(capture.body.get("context_management").is_none());
+
+    let before = fixture.requests().len();
+    let (status, response) = send(post_json(
+        "/v1/messages",
+        json!({
+            "model":"chat-fixture/gpt-chat-fixture",
+            "max_tokens":128,
+            "messages":[{"role":"user","content":"Hello"}],
+            "context_management":{
+                "edits":[{"type":"clear_tool_uses_20250919"}]
+            }
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_anthropic_invalid_request(&response, "unrepresentable Chat context management");
     assert_eq!(fixture.requests().len(), before);
 }
 
@@ -15974,9 +16048,15 @@ async fn claude_unsupported_source_types_fail_before_admission_or_dispatch() {
         let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
         assert_anthropic_invalid_request(&response, label);
-        assert!(json_body(&response)["error"]["message"]
+        let response_json = json_body(&response);
+        let message = response_json["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("source.type")));
+            .expect("invalid source diagnostic");
+        assert!(message.contains("source.type"));
+        if label.contains("file source") {
+            assert!(message.contains("Anthropic Files API"));
+            assert!(!message.contains("Responses translation"));
+        }
         assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
     }
 }
@@ -18089,7 +18169,7 @@ fn assert_claude_code_canary_success(output: &std::process::Output, label: &str)
 ///
 /// `cargo test --test client_compatibility installed_claude_code_cli_smoke -- --ignored --nocapture`
 #[tokio::test]
-#[ignore = "requires Claude Code 2.1.207 installed; loopback-only opt-in canary"]
+#[ignore = "requires Claude Code 2.1.209 installed; loopback-only opt-in canary"]
 #[serial_test::serial(client_compatibility)]
 async fn installed_claude_code_cli_smoke() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
@@ -18116,8 +18196,8 @@ async fn installed_claude_code_cli_smoke() {
         .await
         .expect("Claude Code CLI must be installed");
     assert!(
-        String::from_utf8_lossy(&version.stdout).contains("2.1.207"),
-        "this canary is pinned to Claude Code 2.1.207"
+        String::from_utf8_lossy(&version.stdout).contains("2.1.209"),
+        "this canary is pinned to Claude Code 2.1.209"
     );
 
     let claude_home =
@@ -18168,6 +18248,21 @@ async fn installed_claude_code_cli_smoke() {
     assert!(responses_capture.body["reasoning"].get("summary").is_none());
     assert!(responses_capture.body.get("context_management").is_none());
     assert!(responses_capture.body["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty()));
+
+    let output =
+        run_claude_code_canary(addr, &claude_home, "chat-fixture/gpt-chat-cli-smoke").await;
+    assert_claude_code_canary_success(&output, "Chat-bridge Claude Code canary");
+    let chat_capture = fixture
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request.path == "/v1/chat/completions" && request.body["model"] == "gpt-chat-cli-smoke"
+        })
+        .expect("Claude Code request reached Chat Completions provider");
+    assert_eq!(chat_capture.body["stream"], true);
+    assert!(chat_capture.body["tools"]
         .as_array()
         .is_some_and(|tools| !tools.is_empty()));
 

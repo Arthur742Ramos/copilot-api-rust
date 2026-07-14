@@ -901,18 +901,24 @@ pub fn translate_chunk_to_anthropic_events(
             .push_str(&fragment);
     }
 
-    let reasoning_fallback = match handle_thinking_text(&delta, state, &mut events) {
-        Ok(fallback) => fallback,
-        Err(()) => {
-            events.extend(malformed_stream_error_events(state));
-            return events;
-        }
+    let reasoning_failed = if state.suppress_thinking {
+        false
+    } else {
+        let reasoning_fallback = match handle_thinking_text(&delta, state, &mut events) {
+            Ok(fallback) => fallback,
+            Err(()) => {
+                events.extend(malformed_stream_error_events(state));
+                return events;
+            }
+        };
+        reasoning_fallback
+            .map(|text| schedule_text_fragment(text, false, state, &mut events))
+            .transpose()
+            .is_err()
+            || schedule_reasoning_opaque(delta.reasoning_opaque.clone(), state, &mut events)
+                .is_err()
     };
-    if reasoning_fallback
-        .map(|text| schedule_text_fragment(text, false, state, &mut events))
-        .transpose()
-        .is_err()
-        || schedule_reasoning_opaque(delta.reasoning_opaque.clone(), state, &mut events).is_err()
+    if reasoning_failed
         || handle_tool_calls(&delta, state, &mut events).is_err()
         || source_content
             .map(|text| schedule_text_fragment(text, true, state, &mut events))
@@ -2444,6 +2450,40 @@ mod tests {
                 json!({ "type": "message_stop" }),
             ]
         );
+    }
+
+    #[test]
+    fn omitted_display_suppresses_streamed_reasoning() {
+        let mut state = AnthropicStreamState {
+            suppress_thinking: true,
+            ..Default::default()
+        };
+        let events = to_values(&translate_chunk_to_anthropic_events(
+            &json!({
+                "id": "x",
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "reasoning_text": "hidden reasoning",
+                        "reasoning_opaque": "hidden signature",
+                        "content": "visible answer"
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            &mut state,
+        ));
+
+        assert!(events.iter().all(|event| {
+            event.pointer("/content_block/type").and_then(Value::as_str) != Some("thinking")
+                && event.pointer("/delta/type").and_then(Value::as_str) != Some("thinking_delta")
+                && event.pointer("/delta/type").and_then(Value::as_str) != Some("signature_delta")
+        }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/delta/text").and_then(Value::as_str) == Some("visible answer")
+        }));
+        assert!(!state.thinking_block_open);
     }
 
     #[test]

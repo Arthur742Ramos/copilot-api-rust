@@ -7,11 +7,11 @@ OpenAI endpoint.
 
 ## Audit identity and reproducible evidence
 
-Audited on **2026-07-13**:
+Audited on **2026-07-14**:
 
 | Client/reference | Exact identity | Evidence |
 |---|---|---|
-| Claude Code | **2.1.207**, release [`v2.1.207`](https://github.com/anthropics/claude-code/releases/tag/v2.1.207) | Official release tag; installed `claude --version` → `2.1.207 (Claude Code)` |
+| Claude Code | **2.1.209**, release [`v2.1.209`](https://github.com/anthropics/claude-code/releases/tag/v2.1.209) | Official release tag; installed `claude --version` → `2.1.209 (Claude Code)` |
 | OpenAI Codex CLI | **0.144.1**, release [`rust-v0.144.1`](https://github.com/openai/codex/releases/tag/rust-v0.144.1) | Source commit [`44918ea10c0f99151c6710411b4322c2f5c96bea`](https://github.com/openai/codex/tree/44918ea10c0f99151c6710411b4322c2f5c96bea); `codex --version` |
 | TypeScript reference | `caozhiyuan/copilot-api` | Commit [`cd8207cb70ede07771bf37a04accfbf2af76d980`](https://github.com/caozhiyuan/copilot-api/tree/cd8207cb70ede07771bf37a04accfbf2af76d980) |
 | Rust boundary harness | this repository | `cargo test --test client_compatibility` |
@@ -35,13 +35,17 @@ Its HTTP client posts to `responses`, its remote compactor posts to
 Continuation item optionality is audited against
 [`protocol/src/models.rs`](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/protocol/src/models.rs#L932-L1163).
 
+Claude Code 2.1.208 and 2.1.209 were reviewed against the 2.1.207 capture. Their
+release notes contain no endpoint, header, beta, request-shape, or SSE lifecycle
+changes, so the established Messages wire contract remains unchanged.
+
 The normal test suite never starts the production port, contacts an external
 provider, or consumes quota. `tests/client_compatibility.rs` enters through the
 real public Axum router and uses an ephemeral loopback Axum upstream. It captures
 the forwarded request and supplies deterministic Anthropic JSON/SSE, OpenAI
 JSON/SSE, HTTP failures, malformed frames, and premature EOF.
 
-## Claude Code 2.1.207 setup
+## Claude Code 2.1.209 setup
 
 Claude Code uses the Anthropic base URL **without** `/v1`:
 
@@ -51,6 +55,8 @@ Claude Code uses the Anthropic base URL **without** `/v1`:
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:4141",
     "ANTHROPIC_AUTH_TOKEN": "your-copilot-api-client-key",
     "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5"
   }
 }
@@ -240,7 +246,7 @@ onto the non-message item would change its scope.
 Canonical request/message collisions (`input`, `phase`, `status`, and similar)
 and the unsafe `stop` bypass fail explicitly before provider dispatch.
 
-Claude Code 2.1.207 also sends adaptive thinking with `display: "omitted"`,
+Claude Code 2.1.209 also sends adaptive thinking with `display: "omitted"`,
 `output_config.effort`, and
 `context_management.edits=[{type:"clear_thinking_20251015",keep:"all"}]`.
 The Responses bridge maps effort, suppresses reasoning summaries when display is
@@ -833,7 +839,7 @@ advertised as `provider/model` records.
 
 Status means deterministic, credential-free evidence exists.
 
-| Contract | Claude Code 2.1.207 | Codex CLI 0.144.1 | Evidence |
+| Contract | Claude Code 2.1.209 | Codex CLI 0.144.1 | Evidence |
 |---|---|---|---|
 | Native public protocol | Anthropic Messages JSON/SSE | OpenAI Responses JSON/SSE | `client_compatibility` positive boundary tests |
 | Streaming and non-streaming | Supported | Supported | fixture captures and native response assertions |
@@ -842,7 +848,7 @@ Status means deterministic, credential-free evidence exists.
 | Tool definitions/results | tool use/result, multi-turn; explicit choices bind to one compatible catalog entry; recursive object/boolean schemas are shape/bound validated; deferred references preserve explicit order/duplicates; malformed definitions, identities, arguments, and result collections fail before dispatch | function/custom/tool-search calls and outputs, including optional IDs | catalog choice, recursive schema, request collection, deferred reference, optional-item, and paired JSON/SSE boundary audits |
 | Parallel/interleaved calls | serialized only where Anthropic requires it; inactive arguments own one replaceable buffer | native interleaved Responses events | stream ordering/ID assertions plus provider/direct near-limit argument replacement fixtures |
 | Prompt caching | `cache_control` and beta headers on native transports; top-level cache control is rejected for translated Responses/Chat transports | `prompt_cache_key`, cached usage | boundary capture and usage assertions |
-| Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, and incomplete/out-of-order regressions |
+| Thinking/reasoning | exact optional carriers; lossless summary/content whitespace and `U+2063\n\n` part boundaries; `display:"omitted"` suppresses reasoning on Responses and Chat bridges; carrier-aware empty placeholders; fail-closed SSE lifecycle | reasoning items with every optional ID/encrypted-content combination and 0.144.1 summary/content events | public request-carrier, framing, content-delta, replay, current-client transport, and incomplete/out-of-order regressions |
 | Usage | strict nonnegative input/output/cache mapping; malformed Responses usage errors once; valid observed consumption is recorded once on translation/reconstruction failure without an `ok` outcome or client success | OpenAI cached/reasoning token details | public valid/absent/partial/type/range/overflow fixtures, per-model quota totals, and `claude_web_search_overflow_records_cost_without_translated_success` |
 | Model routing | aliases, `[1m]`, provider models; model-less created events use validated request context | aliases and `provider/model` | model helpers and public model-less-created boundary tests |
 | Unknown fields/output variants | representable open-object extensions retain value/order; canonical collisions and scalar-target extensions fail explicitly; unsupported raw outputs fail explicitly | typed extensions and all raw variants preserved natively | captured tool/choice/content/config sentinels, collision fixtures, paired raw-variant failures, and native passthrough audit |
@@ -925,7 +931,7 @@ This implementation intentionally differs where client correctness is stronger:
 ## Optional installed-client canary
 
 Normal CI does not execute installed CLIs. Loopback-only canaries are available
-when **exactly Claude Code 2.1.207** or **Codex 0.144.1** is installed:
+when **exactly Claude Code 2.1.209** or **Codex 0.144.1** is installed:
 
 ```sh
 cargo test --test client_compatibility installed_claude_code_cli_smoke \
@@ -938,5 +944,6 @@ cargo test --test client_compatibility installed_codex_cli_smoke \
 Each uses an isolated client home, a fake key, an ephemeral public proxy
 listener, and an ephemeral upstream fixture. The Claude canary runs one-shot safe mode and verifies its `?beta=true`,
 24 built-in tool schemas, adaptive thinking, context management, inline-system
-normalization, and version/beta headers through both native Messages and the
-Responses bridge. Neither canary uses port 4141 or an external provider.
+normalization, and version/beta headers through native Messages, Responses, and
+Chat Completions transports. Neither canary uses port 4141 or an external
+provider.
