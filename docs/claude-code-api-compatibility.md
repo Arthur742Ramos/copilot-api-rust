@@ -53,6 +53,7 @@ Status terms:
 | Metadata / `user_id` and safe unknown JSON fields | Supported | `anthropic_types.rs` tests `messages_payload_round_trips_byte_stable` and `response_round_trips_unknown_usage_and_top_level_fields` | Unknown fields survive native typed round trips via flattened maps; translated transports preserve fields they can represent safely. |
 | Web-search server tool bridge | Supported | `src/routes/messages/web_search/`; provider web-search tests | Fulfilled requests preserve Anthropic content and usage shapes. |
 | Model mapping, endpoint normalization, warmup/small-model selection, and `[1m]` beta injection | Supported | `handler.rs`; model/config tests; `create_messages.rs::beta_header_keeps_context_1m_beta`; installed Claude canary | The alias is resolved before transport selection, ordinary no-tool requests retain their selected model, only identified subagent warmups use the small model, and the 1M beta is injected idempotently. |
+| High-fan-out Ultracode workflows | Supported | `tests/load_shedding.rs::ultracode_sized_messages_burst_is_bounded_and_recovers_without_cross_talk`; installed Claude Code Ultracode audit | A 64-request current-client-shaped burst is bounded at the configured limit, preserves per-worker responses, releases permits on completion and cancellation, and accepts a full recovery wave. A live 16-worker Claude Code 2.1.209 Ultracode run also completed after deliberate overload/retry pressure. |
 
 ## Response and streaming matrix
 

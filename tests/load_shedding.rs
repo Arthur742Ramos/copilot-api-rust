@@ -3,21 +3,27 @@
 
 mod common;
 
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request, Response, StatusCode};
 use axum::middleware::from_fn_with_state;
 use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::Router;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use bytes::Bytes;
 use copilot_api::libs::admission::{admission_middleware, AdmissionController};
+use copilot_api::libs::config::{
+    set_cached_config_for_test, AppConfig, AuthConfig, ModelConfig, ProviderConfig,
+};
 use futures_util::future::join_all;
 use http_body_util::BodyExt;
+use serde_json::{json, Map, Value};
 use tower::ServiceExt;
 use tower_http::catch_panic::CatchPanicLayer;
 
@@ -357,4 +363,275 @@ async fn burst_of_126_requests_is_bounded_without_an_upstream() {
     assert_eq!(next.status(), StatusCode::OK);
     drop(next);
     assert_eq!(controller.current(), 0);
+}
+
+#[derive(Clone, Default)]
+struct UltracodeUpstreamState {
+    requests: Arc<AtomicUsize>,
+    sessions: Arc<Mutex<HashSet<String>>>,
+}
+
+async fn ultracode_messages_upstream(
+    State(state): State<UltracodeUpstreamState>,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    state.requests.fetch_add(1, Ordering::Relaxed);
+    let session = body
+        .pointer("/metadata/user_id")
+        .and_then(Value::as_str)
+        .expect("stress request carries a session id")
+        .to_string();
+    state
+        .sessions
+        .lock()
+        .expect("session capture lock")
+        .insert(session.clone());
+    let model = body["model"].as_str().expect("stress model");
+    let response_id = format!("msg_{session}");
+    let text = format!("OK:{session}");
+    let events = [
+        (
+            "message_start",
+            json!({
+                "type":"message_start",
+                "message":{
+                    "id":response_id,
+                    "type":"message",
+                    "role":"assistant",
+                    "model":model,
+                    "content":[],
+                    "stop_reason":Value::Null,
+                    "stop_sequence":Value::Null,
+                    "usage":{"input_tokens":1,"output_tokens":0}
+                }
+            }),
+        ),
+        (
+            "content_block_start",
+            json!({
+                "type":"content_block_start",
+                "index":0,
+                "content_block":{"type":"text","text":""}
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"text_delta","text":text}
+            }),
+        ),
+        (
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        ),
+        (
+            "message_delta",
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"end_turn","stop_sequence":Value::Null},
+                "usage":{"output_tokens":1}
+            }),
+        ),
+        ("message_stop", json!({"type":"message_stop"})),
+    ];
+    let body = events
+        .into_iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+        .collect::<String>();
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .expect("valid stress response")
+}
+
+fn configure_ultracode_provider(base_url: String) {
+    let models = BTreeMap::from([("claude-stress".to_string(), ModelConfig::default())]);
+    let providers = BTreeMap::from([(
+        "ultracode-fixture".to_string(),
+        ProviderConfig {
+            provider_type: Some("anthropic".to_string()),
+            enabled: Some(true),
+            base_url: Some(base_url),
+            api_key: Some("fixture-key".to_string()),
+            auth_type: Some("x-api-key".to_string()),
+            models: Some(models),
+            adjust_input_tokens: Some(false),
+            extra: Map::new(),
+        },
+    )]);
+    set_cached_config_for_test(AppConfig {
+        auth: Some(AuthConfig {
+            api_keys: Some(Vec::new()),
+            admin_api_key: None,
+        }),
+        providers: Some(providers),
+        ..Default::default()
+    });
+}
+
+fn ultracode_messages_request(index: usize) -> Request<Body> {
+    let session = format!("ultracode-worker-{index:03}");
+    let tools = (0..24)
+        .map(|tool| {
+            json!({
+                "name":format!("fixture_tool_{tool:02}"),
+                "description":"A deterministic Claude Code stress-test tool.",
+                "input_schema":{
+                    "type":"object",
+                    "properties":{"value":{"type":"string"}},
+                    "required":["value"]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = json!({
+        "model":"ultracode-fixture/claude-stress",
+        "max_tokens":32000,
+        "system":[{
+            "type":"text",
+            "text":"You are an isolated Ultracode worker.",
+            "cache_control":{"type":"ephemeral"}
+        }],
+        "messages":[{"role":"user","content":"Return the worker sentinel."}],
+        "tools":tools,
+        "thinking":{"type":"adaptive","display":"omitted"},
+        "output_config":{"effort":"xhigh"},
+        "context_management":{
+            "edits":[{"type":"clear_thinking_20251015","keep":"all"}]
+        },
+        "metadata":{"user_id":session},
+        "stream":true
+    });
+    Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages?beta=true")
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14,context-management-2025-06-27",
+        )
+        .header("user-agent", "claude-code/2.1.209")
+        .header("x-claude-code-session-id", format!("session-{index:03}"))
+        .body(Body::from(body.to_string()))
+        .expect("valid Ultracode request")
+}
+
+async fn assert_worker_stream(response: Response<Body>, index: usize) {
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("worker stream body")
+        .to_bytes();
+    let body = String::from_utf8(body.to_vec()).expect("worker stream is UTF-8");
+    assert!(body.contains("event: message_start"));
+    assert!(body.contains(&format!("OK:ultracode-worker-{index:03}")));
+    assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn ultracode_sized_messages_burst_is_bounded_and_recovers_without_cross_talk() {
+    const BURST: usize = 64;
+    const LIMIT: usize = 8;
+
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let upstream_state = UltracodeUpstreamState::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(ultracode_messages_upstream))
+        .with_state(upstream_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Ultracode fixture");
+    let address = listener.local_addr().expect("Ultracode fixture address");
+    let (shutdown, receiver) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream)
+            .with_graceful_shutdown(async {
+                let _ = receiver.await;
+            })
+            .await
+            .expect("serve Ultracode fixture");
+    });
+    configure_ultracode_provider(format!("http://{address}"));
+
+    let controller = limited(LIMIT);
+    let app = copilot_api::server::build_router_with_admission(controller.clone());
+    let responses = join_all((0..BURST).map(|index| {
+        let app = app.clone();
+        async move {
+            (
+                index,
+                app.oneshot(ultracode_messages_request(index))
+                    .await
+                    .expect("router response"),
+            )
+        }
+    }))
+    .await;
+
+    let mut accepted = Vec::new();
+    let mut rejected = 0;
+    for (index, response) in responses {
+        if response.status() == StatusCode::OK {
+            accepted.push((index, response));
+        } else {
+            assert_overloaded(response, true, "/v1/messages").await;
+            rejected += 1;
+        }
+    }
+    assert_eq!(accepted.len(), LIMIT);
+    assert_eq!(rejected, BURST - LIMIT);
+    assert_eq!(controller.current(), LIMIT);
+    assert_eq!(upstream_state.requests.load(Ordering::Relaxed), LIMIT);
+    assert_eq!(
+        upstream_state
+            .sessions
+            .lock()
+            .expect("session capture lock")
+            .len(),
+        LIMIT
+    );
+
+    for (position, (index, response)) in accepted.into_iter().enumerate() {
+        if position % 2 == 0 {
+            assert_worker_stream(response, index).await;
+        } else {
+            drop(response);
+        }
+    }
+    assert_eq!(controller.current(), 0);
+
+    let recovery = join_all((BURST..BURST + LIMIT).map(|index| {
+        let app = app.clone();
+        async move {
+            (
+                index,
+                app.oneshot(ultracode_messages_request(index))
+                    .await
+                    .expect("recovery response"),
+            )
+        }
+    }))
+    .await;
+    for (index, response) in recovery {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_worker_stream(response, index).await;
+    }
+    assert_eq!(controller.current(), 0);
+    assert_eq!(upstream_state.requests.load(Ordering::Relaxed), LIMIT * 2);
+    assert_eq!(
+        upstream_state
+            .sessions
+            .lock()
+            .expect("session capture lock")
+            .len(),
+        LIMIT * 2
+    );
+
+    let _ = shutdown.send(());
+    let _ = server.await;
 }

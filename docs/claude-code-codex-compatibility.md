@@ -947,3 +947,31 @@ listener, and an ephemeral upstream fixture. The Claude canary runs one-shot saf
 normalization, and version/beta headers through native Messages, Responses, and
 Chat Completions transports. Neither canary uses port 4141 or an external
 provider.
+
+## Ultracode parallel stress
+
+Claude Code's `ultracode` prompt trigger was audited directly with version
+2.1.209 in an isolated workspace. The run launched exactly 16 workers in one
+parallel barrier through a scratch proxy configured with
+`--max-concurrent-requests 8`.
+
+- Active upstream requests never exceeded 8.
+- Ten excess attempts received the complete Anthropic `overloaded_error`
+  response with `Retry-After: 1`; Claude Code retried and completed all 16
+  logical workers.
+- The run ended with zero active permits, no malformed/truncated stream, and no
+  response cross-talk.
+
+The credential-free regression
+`tests/load_shedding.rs::ultracode_sized_messages_burst_is_bounded_and_recovers_without_cross_talk`
+drives an even larger 64-request Messages burst through the production router.
+Every request carries the current Claude Code headers, adaptive-thinking and
+context-management controls, 24 tool schemas, a unique session, and a streaming
+response. It verifies exact admission, overload envelopes, mixed completion and
+cancellation cleanup, unique worker output, and a full second-wave recovery.
+
+The default remains unlimited for backward compatibility. For long Ultracode
+runs, configure `--max-concurrent-requests 64` (or
+`COPILOT_API_MAX_CONCURRENT_REQUESTS=64`) to retain desktop resource headroom
+without throttling Claude Code's normal worker fan-out. Lower limits are safe,
+but intentionally trade throughput for retry-driven load shedding.
