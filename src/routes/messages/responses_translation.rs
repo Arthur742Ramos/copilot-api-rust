@@ -236,12 +236,15 @@ pub(crate) fn is_versioned_reasoning_carrier_signature(signature: &str) -> bool 
     };
     serde_json::from_str::<Value>(raw)
         .ok()
-        .and_then(|value| value.as_object().cloned())
-        .is_some_and(|value| value.contains_key("encrypted_content") && value.contains_key("id"))
+        .is_some_and(|value| {
+            value.as_object().is_some_and(|value| {
+                value.contains_key("encrypted_content") && value.contains_key("id")
+            })
+        })
 }
 
 fn is_reasoning_carrier_signature(signature: &str) -> bool {
-    signature.contains('@') || is_versioned_reasoning_carrier_signature(signature)
+    is_versioned_reasoning_carrier_signature(signature)
 }
 
 // ---------------------------------------------------------------------------
@@ -2732,6 +2735,30 @@ mod tests {
 
         assert_eq!(reasoning["effort"], "none");
         assert!(reasoning.get("summary").is_none());
+    }
+
+    #[test]
+    fn unversioned_signature_with_at_is_not_a_responses_carrier() {
+        assert!(!is_reasoning_carrier_signature("sig@opaque"));
+        let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "native reasoning",
+                    "signature": "sig@opaque"
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let error = translate_anthropic_messages_to_responses_payload(&payload, None)
+            .expect_err("native thinking cannot be losslessly represented by Responses");
+        assert!(error
+            .to_string()
+            .contains("Unsupported assistant content block"));
     }
 
     #[test]

@@ -15844,6 +15844,7 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
     );
     assert_eq!(content[1]["future_document_block"]["keep"], true);
 
+    let open_signature = encode_reasoning_signature(Some("enc"), Some("id"));
     let open_blocks_body = json!({
         "model":"responses-fixture/gpt-fixture",
         "max_tokens":128,
@@ -15853,7 +15854,7 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
                 {
                     "type":"thinking",
                     "thinking":"analysis",
-                    "signature":"enc@id",
+                    "signature":open_signature,
                     "future_thinking_block":{"keep":true}
                 },
                 {

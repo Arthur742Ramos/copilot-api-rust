@@ -58,6 +58,7 @@ pub fn raise_nofile_soft_limit(_target: u64) -> std::io::Result<Option<NofileLim
     Ok(None)
 }
 
+#[cfg(any(unix, test))]
 fn desired_soft_limit(current: u64, hard: Option<u64>, target: u64) -> u64 {
     let allowed = hard.map_or(target, |hard| target.min(hard));
     current.max(allowed)
