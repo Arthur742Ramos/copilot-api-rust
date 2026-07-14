@@ -33,7 +33,8 @@ use crate::routes::messages::anthropic_types::{
     AnthropicUsage,
 };
 use crate::routes::messages::request_validation::{
-    collect_open_object_extensions, merge_open_object_extensions, ANTHROPIC_TOOL_KNOWN_FIELDS,
+    collect_open_object_extensions, merge_open_object_extensions,
+    validate_translated_context_management, ANTHROPIC_TOOL_KNOWN_FIELDS,
 };
 use crate::services::copilot::create_responses::{
     FunctionCallOutputContent, InputField, MessageContent, ReasoningSummaryText,
@@ -109,49 +110,6 @@ fn normalize_tool_schema(schema: Option<&Value>) -> Value {
         Some(other) => other.clone(),
         None => Value::Object(Map::new()),
     }
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_anthropic_context_management_for_responses(
-    value: Option<&Value>,
-) -> Result<(), AppError> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(());
-    };
-    let object = value.as_object().ok_or_else(|| {
-        AppError::BadRequest("context_management must be an object when provided".to_string())
-    })?;
-    if object.keys().any(|key| key != "edits") {
-        return Err(AppError::BadRequest(
-            "context_management contains fields that cannot be represented by Responses"
-                .to_string(),
-        ));
-    }
-    let edits = object
-        .get("edits")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            AppError::BadRequest("context_management.edits must be an array".to_string())
-        })?;
-    for (index, edit) in edits.iter().enumerate() {
-        let edit = edit.as_object().ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "context_management.edits[{index}] must be an object"
-            ))
-        })?;
-        let is_keep_all_thinking = edit.get("type").and_then(Value::as_str)
-            == Some("clear_thinking_20251015")
-            && edit.get("keep").and_then(Value::as_str) == Some("all")
-            && edit
-                .keys()
-                .all(|key| matches!(key.as_str(), "type" | "keep"));
-        if !is_keep_all_thinking {
-            return Err(AppError::BadRequest(format!(
-                "context_management.edits[{index}] cannot be represented by Responses; only clear_thinking_20251015 with keep=\"all\" is a safe no-op"
-            )));
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +351,7 @@ pub fn translate_anthropic_messages_to_responses_payload(
         merge_open_object_extensions(&output_config.extra, &[], &mut reasoning, "output_config")?;
     }
 
-    validate_anthropic_context_management_for_responses(payload.extra.get("context_management"))?;
+    validate_translated_context_management(payload.extra.get("context_management"), "Responses")?;
     let extra = collect_open_object_extensions(
         &payload.extra,
         &["context_management"],

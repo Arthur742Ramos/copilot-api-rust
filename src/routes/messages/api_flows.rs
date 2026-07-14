@@ -40,7 +40,8 @@ use crate::routes::messages::anthropic_types::{
     AnthropicMessagesPayload, AnthropicStreamEventData, AnthropicStreamState,
 };
 use crate::routes::messages::non_stream_translation::{
-    translate_to_anthropic, translate_to_openai,
+    chat_suppresses_thinking, translate_to_anthropic_with_options, translate_to_openai,
+    TranslateToAnthropicOptions,
 };
 use crate::routes::messages::responses_stream_translation::{
     build_error_event, terminate_responses_stream_with_error, translate_responses_stream_event,
@@ -188,6 +189,7 @@ pub async fn handle_with_chat_completions(
     payload: &AnthropicMessagesPayload,
     opts: FlowOptions,
 ) -> Result<Response, AppError> {
+    let suppress_thinking = chat_suppresses_thinking(payload);
     let mut openai_payload = translate_to_openai(payload)?;
     prepare_copilot_chat_completions_payload(&mut openai_payload);
 
@@ -223,7 +225,11 @@ pub async fn handle_with_chat_completions(
 
     match result {
         ChatCompletionsResult::NonStreaming { response, headers } => {
-            let anthropic_response = translate_to_anthropic(&response).map_err(|mut error| {
+            let anthropic_response = translate_to_anthropic_with_options(
+                &response,
+                TranslateToAnthropicOptions { suppress_thinking },
+            )
+            .map_err(|mut error| {
                 error.headers = headers;
                 AppError::Http(error)
             })?;
@@ -231,7 +237,10 @@ pub async fn handle_with_chat_completions(
             Ok(Json(anthropic_response).into_response())
         }
         ChatCompletionsResult::Streaming(upstream) => Ok(stream_chat_completions_response(
-            upstream, recorder, req_ctx,
+            upstream,
+            recorder,
+            req_ctx,
+            suppress_thinking,
         )),
     }
 }
@@ -240,11 +249,15 @@ fn stream_chat_completions_response(
     upstream: reqwest::Response,
     recorder: TokenUsageRecorder,
     req_ctx: Option<crate::libs::request_context::RequestContext>,
+    suppress_thinking: bool,
 ) -> Response {
     let stream = async_stream::stream! {
         let mut timer = StreamTimer::new("chat_completions", stream_transport::TRANSLATED)
             .with_request_context(req_ctx);
-        let mut state = AnthropicStreamState::default();
+        let mut state = AnthropicStreamState {
+            suppress_thinking,
+            ..Default::default()
+        };
         let mut usage = UsageTokens::default();
 
         let heartbeat = crate::libs::sse::sse_heartbeat_interval();
@@ -1066,7 +1079,7 @@ mod tests {
         ))
         .await;
         let recorder = create_copilot_token_usage_recorder("chat_completions", "m", None);
-        let response = stream_chat_completions_response(upstream, recorder, None);
+        let response = stream_chat_completions_response(upstream, recorder, None, false);
         let body = response
             .into_body()
             .collect()
@@ -1133,7 +1146,7 @@ mod tests {
             );
             let upstream = upstream_sse_response(&stream).await;
             let recorder = create_copilot_token_usage_recorder("chat_completions", "m", None);
-            let response = stream_chat_completions_response(upstream, recorder, None);
+            let response = stream_chat_completions_response(upstream, recorder, None, false);
             let body = response
                 .into_body()
                 .collect()

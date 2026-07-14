@@ -20,6 +20,7 @@ use crate::routes::messages::anthropic_types::{
 };
 use crate::routes::messages::request_validation::{
     collect_open_object_extensions, merge_open_object_extensions,
+    validate_translated_context_management,
 };
 use crate::routes::messages::stream_translation::{
     nonnegative_i64, safe_upstream_error_message, safe_upstream_error_type,
@@ -258,7 +259,7 @@ pub fn translate_to_openai_with_options(
     }
     let request_extensions = collect_open_object_extensions(
         &payload.extra,
-        &[],
+        &["context_management"],
         CHAT_REQUEST_CANONICAL_FIELDS,
         "request",
     )?;
@@ -275,6 +276,10 @@ pub fn translate_to_openai_with_options(
 
 #[allow(clippy::result_large_err)]
 fn validate_chat_config_extensions(payload: &AnthropicMessagesPayload) -> Result<(), AppError> {
+    validate_translated_context_management(
+        payload.extra.get("context_management"),
+        "Chat Completions",
+    )?;
     if payload.cache_control.is_some() {
         return Err(AppError::BadRequest(
             "cache_control cannot be represented by the Chat Completions request object"
@@ -289,9 +294,13 @@ fn validate_chat_config_extensions(payload: &AnthropicMessagesPayload) -> Result
         )?;
     }
     if let Some(thinking) = &payload.thinking {
-        if thinking.display.as_ref().is_some() {
+        if thinking
+            .display
+            .as_ref()
+            .is_some_and(|display| display != "omitted")
+        {
             return Err(AppError::BadRequest(
-                "thinking.display cannot be represented by Chat Completions".to_string(),
+                "thinking.display can only be \"omitted\" on Chat Completions".to_string(),
             ));
         }
         reject_unrepresentable_extensions(
@@ -308,6 +317,14 @@ fn validate_chat_config_extensions(payload: &AnthropicMessagesPayload) -> Result
         )?;
     }
     Ok(())
+}
+
+pub(crate) fn chat_suppresses_thinking(payload: &AnthropicMessagesPayload) -> bool {
+    payload
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking.display.as_ref())
+        .is_some_and(|display| display == "omitted")
 }
 
 #[allow(clippy::result_large_err)]
@@ -1358,8 +1375,21 @@ fn translate_anthropic_tool_choice_to_openai(
 /// Strictly translate one completed OpenAI Chat Completion into an Anthropic
 /// message. Any malformed consumed field is an upstream protocol failure, never
 /// an empty/defaulted success.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TranslateToAnthropicOptions {
+    pub suppress_thinking: bool,
+}
+
 #[allow(clippy::result_large_err)]
 pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, HttpError> {
+    translate_to_anthropic_with_options(response, TranslateToAnthropicOptions::default())
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn translate_to_anthropic_with_options(
+    response: &Value,
+    options: TranslateToAnthropicOptions,
+) -> Result<AnthropicResponse, HttpError> {
     let object = response
         .as_object()
         .ok_or_else(|| malformed_chat_response("response was not an object"))?;
@@ -1451,7 +1481,13 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
             ));
         }
     }
-    let mut content = translate_chat_reasoning(message)?;
+    let reasoning = translate_chat_reasoning(message)?;
+    let suppressed_reasoning_was_present = options.suppress_thinking && !reasoning.is_empty();
+    let mut content = if options.suppress_thinking {
+        Vec::new()
+    } else {
+        reasoning
+    };
     content.extend(text_content);
     let tool_blocks = translate_chat_tool_calls(message.get("tool_calls"))?;
     let has_tool_calls = !tool_blocks.is_empty();
@@ -1468,7 +1504,10 @@ pub fn translate_to_anthropic(response: &Value) -> Result<AnthropicResponse, Htt
         ));
     }
     let refusal_present = refusal.is_some();
-    if content.is_empty() && !(finish_reason == "content_filter" && refusal_present) {
+    if content.is_empty()
+        && !suppressed_reasoning_was_present
+        && !(finish_reason == "content_filter" && refusal_present)
+    {
         return Err(malformed_chat_response(
             "completed choice contained no representable output",
         ));
@@ -2359,6 +2398,55 @@ mod tests {
         );
         assert_eq!(out.usage.input_tokens, 10);
         assert_eq!(out.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn translate_to_anthropic_suppresses_reasoning_when_display_is_omitted() {
+        let response = json!({
+            "id": "chatcmpl-hidden-reasoning",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-5",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "visible answer",
+                    "reasoning_text": "hidden reasoning",
+                    "reasoning_opaque": "opaque-signature"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        });
+
+        let out = translate_to_anthropic_with_options(
+            &response,
+            TranslateToAnthropicOptions {
+                suppress_thinking: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.content,
+            vec![json!({"type":"text","text":"visible answer"})]
+        );
+
+        let mut reasoning_only = response;
+        reasoning_only["choices"][0]["message"]["content"] = Value::Null;
+        let out = translate_to_anthropic_with_options(
+            &reasoning_only,
+            TranslateToAnthropicOptions {
+                suppress_thinking: true,
+            },
+        )
+        .unwrap();
+        assert!(out.content.is_empty());
     }
 
     #[test]

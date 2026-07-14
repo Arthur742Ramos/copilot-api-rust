@@ -31,7 +31,8 @@ use crate::routes::messages::anthropic_types::{
     AnthropicMessagesPayload, AnthropicStreamEventData, AnthropicStreamState,
 };
 use crate::routes::messages::non_stream_translation::{
-    translate_to_anthropic, translate_to_openai_with_options, TranslateToOpenAiOptions,
+    chat_suppresses_thinking, translate_to_anthropic_with_options,
+    translate_to_openai_with_options, TranslateToAnthropicOptions, TranslateToOpenAiOptions,
 };
 use crate::routes::messages::preprocess::{
     normalize_system_messages, strip_translated_reasoning_blocks,
@@ -1239,6 +1240,7 @@ fn stream_openai_compatible_provider_messages(
     provider: &str,
 ) -> Response {
     let recorder = create_provider_messages_usage_recorder(payload, provider);
+    let suppress_thinking = chat_suppresses_thinking(payload);
     let event_stream = crate::libs::sse::events(upstream);
 
     let body = Body::from_stream(async_stream::stream! {
@@ -1246,7 +1248,10 @@ fn stream_openai_compatible_provider_messages(
         let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)
             .with_request_context(crate::libs::request_context::request_context_store());
         let mut usage = UsageTokens::default();
-        let mut state = AnthropicStreamState::default();
+        let mut state = AnthropicStreamState {
+            suppress_thinking,
+            ..Default::default()
+        };
         futures_util::pin_mut!(event_stream);
 
         while let Some(item) = event_stream.next().await {
@@ -1377,7 +1382,13 @@ async fn respond_openai_compatible_provider_messages_json(
 ) -> Result<Response, AppError> {
     let (body, headers) = read_chat_json(upstream).await?;
     let recorder = create_provider_messages_usage_recorder(payload, provider);
-    let anthropic_response = translate_to_anthropic(&body).map_err(|mut error| {
+    let anthropic_response = translate_to_anthropic_with_options(
+        &body,
+        TranslateToAnthropicOptions {
+            suppress_thinking: chat_suppresses_thinking(payload),
+        },
+    )
+    .map_err(|mut error| {
         error.headers = headers;
         AppError::Http(error)
     })?;

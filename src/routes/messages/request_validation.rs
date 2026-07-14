@@ -107,6 +107,48 @@ fn invalid(path: &str, expectation: &str) -> AppError {
     AppError::BadRequest(format!("{path}: {expectation}"))
 }
 
+pub(crate) fn validate_translated_context_management(
+    value: Option<&Value>,
+    target: &str,
+) -> Result<(), AppError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let object = value.as_object().ok_or_else(|| {
+        AppError::BadRequest("context_management must be an object when provided".to_string())
+    })?;
+    if object.keys().any(|key| key != "edits") {
+        return Err(AppError::BadRequest(format!(
+            "context_management contains fields that cannot be represented by {target}"
+        )));
+    }
+    let edits = object
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError::BadRequest("context_management.edits must be an array".to_string())
+        })?;
+    for (index, edit) in edits.iter().enumerate() {
+        let edit = edit.as_object().ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "context_management.edits[{index}] must be an object"
+            ))
+        })?;
+        let is_keep_all_thinking = edit.get("type").and_then(Value::as_str)
+            == Some("clear_thinking_20251015")
+            && edit.get("keep").and_then(Value::as_str) == Some("all")
+            && edit
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "keep"));
+        if !is_keep_all_thinking {
+            return Err(AppError::BadRequest(format!(
+                "context_management.edits[{index}] cannot be represented by {target}; only clear_thinking_20251015 with keep=\"all\" is a safe no-op"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Require the model identifier shared by generation and token-count routes.
 /// This must run before model mapping, provider resolution, or estimation so an
 /// empty identifier cannot silently select a fallback model.
@@ -684,7 +726,7 @@ fn validate_source(block: &Map<String, Value>, path: &str) -> Result<(), AppErro
         "file" => {
             return Err(invalid(
                 &format!("{source_path}.type"),
-                "file sources are not supported by the Responses translation",
+                "file sources require the Anthropic Files API, which this proxy does not expose",
             ))
         }
         unsupported => {

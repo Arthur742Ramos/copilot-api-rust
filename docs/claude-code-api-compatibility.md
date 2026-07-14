@@ -6,10 +6,10 @@ not a claim that every Anthropic product endpoint is emulated.
 
 ## Reference audited
 
-- Client target: **Claude Code 2.1.207**, official release
-  [`v2.1.207`](https://github.com/anthropics/claude-code/releases/tag/v2.1.207).
+- Client target: **Claude Code 2.1.209**, official release
+  [`v2.1.209`](https://github.com/anthropics/claude-code/releases/tag/v2.1.209).
 - Credential-free client-shaped boundary evidence:
-  `tests/client_compatibility.rs::claude_code_2_1_207_contract_crosses_public_axum_boundary`.
+  `tests/client_compatibility.rs::claude_code_2_1_209_contract_crosses_public_axum_boundary`.
 - Combined Claude Code/Codex setup, headers, versions, and transport matrix:
   [`claude-code-codex-compatibility.md`](./claude-code-codex-compatibility.md).
 - Reference implementation:
@@ -17,7 +17,8 @@ not a claim that every Anthropic product endpoint is emulated.
   commit
   [`65ab96bd806f47c35443aa58b65134d45a345570`](https://github.com/caozhiyuan/copilot-api/tree/65ab96bd806f47c35443aa58b65134d45a345570)
   (`dev`).
-- Retrieved/audited: **2026-07-12T04:22:34Z**.
+- Retrieved/audited: **2026-07-14T18:15:16Z**. Releases 2.1.208 and
+  2.1.209 introduced no Messages wire-contract changes.
 - Compared surfaces: `src/routes/messages/` (handler, token counting,
   preprocessing, request, non-streaming and both streaming translators),
   `src/routes/provider/messages/`, `src/routes/models.ts`, `src/lib/error.ts`, and
@@ -45,13 +46,14 @@ Status terms:
 | Provider-scoped and provider/model-alias count-token routes | **Fixed here** | `src/routes/provider/count_tokens.rs`; tests `unknown_provider_count_tokens_returns_complete_anthropic_404`, `provider_model_alias_count_tokens_returns_complete_anthropic_404`, `direct_and_alias_count_tokens_malformed_json_returns_anthropic_400`, `direct_and_alias_count_tokens_invalid_payloads_return_anthropic_400`, and `direct_and_alias_count_tokens_body_limits_return_anthropic_413` | Direct and alias dispatch now share complete Anthropic envelopes for provider resolution, raw JSON parsing, typed-payload validation, and request-size rejection. |
 | Required `model`, non-empty `messages`, positive integer `max_tokens` | **Fixed here** | `validate_generation_request`; test `generation_validation_requires_messages_and_positive_max_tokens`; router test `generation_requires_positive_max_tokens_before_upstream_dispatch` | Generation now fails as a stable 400 before admission/accounting instead of silently acquiring a transport-specific default. `count_tokens` intentionally does not require `max_tokens`. |
 | String and structured system prompts | Supported | `src/routes/messages/preprocess.rs`; request translation tests | Normalizes multiple system representations while preserving cache-control data. |
-| User/assistant text, image, document/PDF, tool-use, and tool-result blocks | Supported | `src/routes/messages/non_stream_translation.rs` and `responses_translation.rs`; tests including `tool_result_message_comes_before_user_message` and `tool_result_image_moves_to_user_message_when_unsupported` | Unsupported provider media capabilities return a client error or use the provider's documented fallback rather than panicking. |
+| User/assistant text, image, document/PDF, tool-use, and tool-result blocks | Supported | `src/routes/messages/non_stream_translation.rs` and `responses_translation.rs`; tests including `tool_result_message_comes_before_user_message` and `tool_result_image_moves_to_user_message_when_unsupported` | Base64 and URL media sources are supported. Files API IDs are rejected explicitly because this proxy does not expose Anthropic's `/v1/files` lifecycle. Unsupported provider media capabilities return a client error or use the provider's documented fallback rather than panicking. |
 | Tool definitions and `auto` / `any` / named `tool` / `none` choice | Supported | `translate_anthropic_tools_to_openai`; test `tool_choice_maps_variants` | Object schemas missing `properties` are normalized for OpenAI-compatible providers. |
 | Prompt caching and `cache_control` | Supported | `src/routes/messages/preprocess.rs`; `api_flows.rs` cache marker tests | Cache markers and tool-result merge behavior match Claude Code request patterns. |
-| Extended/adaptive thinking and reasoning signatures | Supported | `non_stream_translation.rs`; `responses_translation.rs`; streaming translator tests; `create_messages.rs` beta tests | Includes compaction-carrier and reasoning signature round trips. |
+| Extended/adaptive thinking and reasoning signatures | **Fixed here** | `non_stream_translation.rs`; `responses_translation.rs`; streaming translator tests; `create_messages.rs` beta tests; `claude_code_2_1_209_controls_cross_chat_bridge` | Includes compaction-carrier and reasoning signature round trips. Chat-backed models now accept Claude Code's `display:"omitted"` control, suppress upstream reasoning blocks, map effort, and consume the safe keep-all context-management edit instead of forwarding Anthropic-only controls to an OpenAI-compatible provider. |
 | Metadata / `user_id` and safe unknown JSON fields | Supported | `anthropic_types.rs` tests `messages_payload_round_trips_byte_stable` and `response_round_trips_unknown_usage_and_top_level_fields` | Unknown fields survive native typed round trips via flattened maps; translated transports preserve fields they can represent safely. |
 | Web-search server tool bridge | Supported | `src/routes/messages/web_search/`; provider web-search tests | Fulfilled requests preserve Anthropic content and usage shapes. |
 | Model mapping, endpoint normalization, warmup/small-model selection, and `[1m]` beta injection | Supported | `handler.rs`; model/config tests; `create_messages.rs::beta_header_keeps_context_1m_beta`; installed Claude canary | The alias is resolved before transport selection, ordinary no-tool requests retain their selected model, only identified subagent warmups use the small model, and the 1M beta is injected idempotently. |
+| High-fan-out Ultracode workflows | Supported | `tests/load_shedding.rs::ultracode_sized_messages_burst_is_bounded_and_recovers_without_cross_talk`; installed Claude Code Ultracode audit | A 64-request current-client-shaped burst is bounded at the configured limit, preserves per-worker responses, releases permits on completion and cancellation, and accepts a full recovery wave. A live 16-worker Claude Code 2.1.209 Ultracode run also completed after deliberate overload/retry pressure. |
 
 ## Response and streaming matrix
 
@@ -118,6 +120,8 @@ Status terms:
 
 - Anthropic endpoints other than Messages, Messages token counting, and model
   discovery.
+- Anthropic Files API uploads and `source.type: "file"` references. Use base64
+  or URL media sources with Messages requests.
 - Live credential/provider availability, quota policy, model quality, or exact
   upstream rollout timing; the regression suite is credential-free.
 - Blind passthrough of unknown beta headers, private/internal response headers,

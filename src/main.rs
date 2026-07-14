@@ -731,9 +731,29 @@ async fn read_line() -> String {
     .unwrap_or_default()
 }
 
-/// Mirrors the `--claude-code` branch of start.ts: prints the tip, prompts for
-/// a primary + small model, builds the env-setup command, and copies it to the
-/// clipboard (falling back to printing it on clipboard failure).
+fn claude_code_env_vars<'a>(
+    server_url: &'a str,
+    selected_model: &'a str,
+    selected_small_model: &'a str,
+) -> [(&'static str, &'a str); 12] {
+    [
+        ("ANTHROPIC_BASE_URL", server_url),
+        ("ANTHROPIC_AUTH_TOKEN", "dummy"),
+        ("ANTHROPIC_MODEL", selected_model),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", selected_model),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", selected_model),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", selected_small_model),
+        ("DISABLE_NON_ESSENTIAL_MODEL_CALLS", "1"),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0"),
+        ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false"),
+        ("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "true"),
+        ("CLAUDE_CODE_ENABLE_AWAY_SUMMARY", "0"),
+    ]
+}
+
+/// Prints the setup tip, prompts for a primary + small model, builds the
+/// env-setup command, and copies it to the clipboard.
 async fn run_claude_code_setup(server_url: &str) {
     use crate::libs::shell::generate_env_script;
 
@@ -758,20 +778,7 @@ async fn run_claude_code_setup(server_url: &str) {
     let selected_small_model =
         select_model("Select a small model to use with Claude Code", &model_ids).await;
 
-    let env_vars: [(&str, &str); 12] = [
-        ("ANTHROPIC_BASE_URL", server_url),
-        ("ANTHROPIC_AUTH_TOKEN", "dummy"),
-        ("ANTHROPIC_MODEL", &selected_model),
-        ("ANTHROPIC_DEFAULT_SONNET_MODEL", &selected_model),
-        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &selected_small_model),
-        ("DISABLE_NON_ESSENTIAL_MODEL_CALLS", "1"),
-        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-        ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0"),
-        ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false"),
-        ("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "true"),
-        ("CLAUDE_CODE_ENABLE_AWAY_SUMMARY", "0"),
-        ("CLAUDE_PLUGIN_ENABLE_QUESTION_RULES", "true"),
-    ];
+    let env_vars = claude_code_env_vars(server_url, &selected_model, &selected_small_model);
 
     let command = generate_env_script(&env_vars, "claude");
 
@@ -897,5 +904,33 @@ mod cli_tests {
             Cli::try_parse_from(["copilot-api", "start", "--max-concurrent-requests", "0",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn claude_code_setup_pins_every_model_tier() {
+        let env_vars = claude_code_env_vars(
+            "http://127.0.0.1:4141",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        );
+        let env: std::collections::BTreeMap<_, _> = env_vars.into_iter().collect();
+
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").copied(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").copied(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").copied(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").copied(),
+            Some("claude-haiku-4-5")
+        );
+        assert!(!env.contains_key("CLAUDE_PLUGIN_ENABLE_QUESTION_RULES"));
     }
 }
