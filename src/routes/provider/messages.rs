@@ -33,7 +33,9 @@ use crate::routes::messages::anthropic_types::{
 use crate::routes::messages::non_stream_translation::{
     translate_to_anthropic, translate_to_openai_with_options, TranslateToOpenAiOptions,
 };
-use crate::routes::messages::preprocess::normalize_system_messages;
+use crate::routes::messages::preprocess::{
+    normalize_system_messages, strip_translated_reasoning_blocks,
+};
 use crate::routes::messages::request_validation::validate_messages_request_shape;
 use crate::routes::messages::responses_stream_translation::{
     build_error_event, terminate_responses_stream_with_error, translate_responses_stream_event,
@@ -194,7 +196,11 @@ pub async fn handle_provider_messages_for_provider(
             .await
         }
         _ => {
-            // anthropic passthrough
+            // Native Anthropic passthrough cannot accept reasoning carriers
+            // manufactured by a prior translated turn.
+            let mut payload_value = serde_json::to_value(&payload)?;
+            strip_translated_reasoning_blocks(&mut payload_value);
+            payload = serde_json::from_value(payload_value)?;
             apply_missing_extra_body(&mut payload, model_config.as_ref());
 
             let upstream_response =
@@ -794,7 +800,7 @@ fn create_openai_compatible_payload(
 
     apply_missing_extra_body_chat(&mut openai_payload, model_config);
 
-    apply_openai_compatible_extra_body_thinking_budget(&mut openai_payload, model_config);
+    apply_openai_compatible_extra_body_thinking_budget(&mut openai_payload, model_config, payload);
 
     if !chat_payload_has_own(&openai_payload, "parallel_tool_calls") {
         openai_payload
@@ -833,7 +839,10 @@ fn apply_openai_compatible_thinking_budget(
 }
 
 fn request_thinking_budget(payload: &AnthropicMessagesPayload) -> Option<i64> {
-    let budget = payload.thinking.as_ref().and_then(|t| t.budget_tokens)?;
+    let budget = payload
+        .thinking
+        .as_ref()
+        .and_then(|t| t.budget_tokens.as_ref().copied())?;
     Some(budget)
 }
 
@@ -841,7 +850,18 @@ fn request_thinking_budget(payload: &AnthropicMessagesPayload) -> Option<i64> {
 fn apply_openai_compatible_extra_body_thinking_budget(
     openai_payload: &mut ChatCompletionsPayload,
     model_config: Option<&ModelConfig>,
+    source: &AnthropicMessagesPayload,
 ) {
+    if source
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.kind == "disabled")
+    {
+        openai_payload.extra.remove("thinking_budget");
+        openai_payload.extra.remove("reasoning_effort");
+        return;
+    }
+
     let Some(extra_body) = model_config.and_then(|m| m.extra_body.as_ref()) else {
         return;
     };
@@ -1470,6 +1490,31 @@ mod tests {
             .expect("receive provider SSE response");
         server.await.expect("provider SSE test server task");
         response
+    }
+
+    #[test]
+    fn disabled_thinking_removes_provider_budget_overrides() {
+        let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
+            "model": "gpt-provider",
+            "max_tokens": 64,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let model_config = ModelConfig {
+            extra_body: Some(
+                json!({"thinking_budget": 32_000, "reasoning_effort": "high"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ..Default::default()
+        };
+
+        let translated = create_openai_compatible_payload(&payload, Some(&model_config)).unwrap();
+
+        assert!(translated.extra.get("thinking_budget").is_none());
+        assert!(translated.extra.get("reasoning_effort").is_none());
     }
 
     #[test]

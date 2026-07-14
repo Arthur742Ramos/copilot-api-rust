@@ -90,6 +90,28 @@ async fn post_roundtrips_a_mapping() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn post_rejects_whitespace_only_mapping_values() {
+    init_home();
+    set_config(&[], Some(ADMIN_KEY));
+
+    for mappings in [
+        json!({"   ": "target-model"}),
+        json!({"source-model": "   "}),
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/admin/config/model-mappings")
+            .header("authorization", format!("Bearer {ADMIN_KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"modelMappings": mappings}).to_string()))
+            .unwrap();
+        let (status, _) = send(request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn post_with_invalid_shape_returns_400() {
     init_home();
     set_config(&[], Some(ADMIN_KEY));

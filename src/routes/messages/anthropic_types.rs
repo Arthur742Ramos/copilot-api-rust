@@ -11,7 +11,7 @@
 //! Open shapes carry a `#[serde(flatten)] extra` map so unknown keys round-trip
 //! unchanged, matching the JS passthrough semantics.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -153,15 +153,72 @@ pub struct AnthropicToolChoice {
     pub extra: serde_json::Map<String, Value>,
 }
 
-/// `thinking`: `{ type: "enabled"|"adaptive"; budget_tokens?; display? }`.
+/// A field whose wire representation distinguishes omission from explicit null.
+/// Serde's ordinary `Option<T>` collapses both states, which is not lossless for
+/// native Messages passthrough.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OptionalNullable<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> OptionalNullable<T> {
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    pub fn as_ref(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Missing | Self::Null => None,
+        }
+    }
+}
+
+impl<T> From<Option<T>> for OptionalNullable<T> {
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(value) => Self::Value(value),
+            None => Self::Missing,
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for OptionalNullable<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Missing | Self::Null => serializer.serialize_none(),
+            Self::Value(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptionalNullable<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
+/// `thinking`: `{ type: "enabled"|"adaptive"|"disabled"; budget_tokens?; display? }`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnthropicThinkingConfig {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget_tokens: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display: Option<String>,
+    #[serde(default, skip_serializing_if = "OptionalNullable::is_missing")]
+    pub budget_tokens: OptionalNullable<i64>,
+    #[serde(default, skip_serializing_if = "OptionalNullable::is_missing")]
+    pub display: OptionalNullable<String>,
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
@@ -560,6 +617,25 @@ mod tests {
         let input = r#"{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}"#;
         let payload: AnthropicMessagesPayload = serde_json::from_str(input).unwrap();
         assert_eq!(payload.max_tokens, None);
+    }
+
+    #[test]
+    fn thinking_nullable_display_remains_present_on_native_round_trip() {
+        let input = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {
+                "type": "adaptive",
+                "display": null,
+                "future_thinking": {"keep": true}
+            }
+        });
+        let payload: AnthropicMessagesPayload = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(
+            payload.thinking.as_ref().unwrap().display,
+            OptionalNullable::Null
+        );
+        assert_eq!(serde_json::to_value(payload).unwrap(), input);
     }
 
     #[test]

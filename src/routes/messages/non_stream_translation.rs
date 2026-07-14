@@ -37,6 +37,28 @@ use crate::services::copilot::get_models::Model;
 /// empty, so we add a default thinking text.
 pub use super::utils::THINKING_TEXT;
 
+const CHAT_REASONING_SIGNATURE_PREFIX: &str = "cr1#";
+
+pub fn encode_chat_reasoning_signature(signature: &str) -> String {
+    format!(
+        "{CHAT_REASONING_SIGNATURE_PREFIX}{}",
+        json!({"signature": signature})
+    )
+}
+
+fn decode_chat_reasoning_signature(signature: &str) -> Option<String> {
+    let raw = signature.strip_prefix(CHAT_REASONING_SIGNATURE_PREFIX)?;
+    serde_json::from_str::<Value>(raw)
+        .ok()?
+        .get("signature")?
+        .as_str()
+        .map(str::to_string)
+}
+
+pub(crate) fn is_chat_reasoning_carrier_signature(signature: &str) -> bool {
+    decode_chat_reasoning_signature(signature).is_some()
+}
+
 /// Inserted into the tool message when rich content had to be relocated to a
 /// user message because the upstream does not support it in tool messages.
 pub const RICH_TOOL_RESULT_MOVED_TEXT: &str =
@@ -218,12 +240,18 @@ pub fn translate_to_openai_with_options(
     if let Some(budget) = thinking_budget {
         extra.insert("thinking_budget".to_string(), json!(budget));
     }
-    if let Some(effort) = payload
-        .output_config
+    let thinking_disabled = payload
+        .thinking
         .as_ref()
-        .and_then(|config| config.effort.as_ref())
-    {
-        extra.insert("reasoning_effort".to_string(), json!(effort));
+        .is_some_and(|thinking| thinking.kind == "disabled");
+    if !thinking_disabled {
+        if let Some(effort) = payload
+            .output_config
+            .as_ref()
+            .and_then(|config| config.effort.as_ref())
+        {
+            extra.insert("reasoning_effort".to_string(), json!(effort));
+        }
     }
     if let Some(service_tier) = &payload.service_tier {
         extra.insert("service_tier".to_string(), json!(service_tier));
@@ -261,7 +289,7 @@ fn validate_chat_config_extensions(payload: &AnthropicMessagesPayload) -> Result
         )?;
     }
     if let Some(thinking) = &payload.thinking {
-        if thinking.display.is_some() {
+        if thinking.display.as_ref().is_some() {
             return Err(AppError::BadRequest(
                 "thinking.display cannot be represented by Chat Completions".to_string(),
             ));
@@ -317,6 +345,10 @@ fn thinking_budget_from_model(
         _ => return None,
     };
 
+    if thinking.kind == "disabled" {
+        return None;
+    }
+
     let supports = &model.capabilities.supports;
     let limits = &model.capabilities.limits;
 
@@ -326,7 +358,11 @@ fn thinking_budget_from_model(
     );
 
     // thinking.budget_tokens ??= maxThinkingBudget
-    let budget_tokens = thinking.budget_tokens.unwrap_or(max_thinking_budget);
+    let budget_tokens = thinking
+        .budget_tokens
+        .as_ref()
+        .copied()
+        .unwrap_or(max_thinking_budget);
 
     if max_thinking_budget > 0 {
         let bt = std::cmp::min(budget_tokens, max_thinking_budget);
@@ -813,7 +849,7 @@ fn handle_assistant_message(
         let b = *block;
         let s = b.get("signature").and_then(|s| s.as_str()).unwrap_or("");
         if !s.is_empty() {
-            Some(s.to_string())
+            Some(decode_chat_reasoning_signature(s).unwrap_or_else(|| s.to_string()))
         } else {
             None
         }
@@ -1692,12 +1728,12 @@ fn translate_chat_reasoning(message: &Map<String, Value>) -> Result<Vec<Value>, 
         (Some(thinking), Some(signature)) => Ok(vec![json!({
             "type":"thinking",
             "thinking":thinking,
-            "signature":signature
+            "signature":encode_chat_reasoning_signature(&signature)
         })]),
         (None, Some(signature)) => Ok(vec![json!({
             "type":"thinking",
             "thinking":THINKING_TEXT,
-            "signature":signature
+            "signature":encode_chat_reasoning_signature(&signature)
         })]),
         (Some(_), None) => Err(malformed_chat_response(
             "reasoning text was missing its opaque signature",
@@ -2215,8 +2251,8 @@ mod tests {
         // requested budget 10000 -> clamped to 4999, then max(4999, 1024) = 4999
         let thinking = AnthropicThinkingConfig {
             kind: "enabled".to_string(),
-            budget_tokens: Some(10000),
-            display: None,
+            budget_tokens: Some(10000).into(),
+            display: Default::default(),
             extra: Default::default(),
         };
         assert_eq!(
@@ -2227,13 +2263,22 @@ mod tests {
         // requested budget 100 -> below min -> raised to 1024
         let thinking_low = AnthropicThinkingConfig {
             kind: "enabled".to_string(),
-            budget_tokens: Some(100),
-            display: None,
+            budget_tokens: Some(100).into(),
+            display: Default::default(),
             extra: Default::default(),
         };
         assert_eq!(
             thinking_budget_from_model(Some(&thinking_low), Some(&model)),
             Some(1024)
+        );
+
+        let disabled = AnthropicThinkingConfig {
+            kind: "disabled".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            thinking_budget_from_model(Some(&disabled), Some(&model)),
+            None
         );
     }
 
@@ -2244,8 +2289,8 @@ mod tests {
         model.capabilities.limits.max_output_tokens = Some(0);
         let thinking = AnthropicThinkingConfig {
             kind: "enabled".to_string(),
-            budget_tokens: Some(500),
-            display: None,
+            budget_tokens: Some(500).into(),
+            display: Default::default(),
             extra: Default::default(),
         };
         assert_eq!(

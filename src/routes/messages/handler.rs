@@ -29,7 +29,9 @@ use crate::routes::messages::preprocess::{
     merge_tool_result_for_claude, normalize_system_messages, prepare_messages_api_payload,
     sanitize_ide_tools, strip_tool_reference_turn_boundary,
 };
-use crate::routes::messages::request_validation::validate_messages_request_shape;
+use crate::routes::messages::request_validation::{
+    validate_messages_request_shape, validate_required_model,
+};
 use crate::routes::messages::responses_translation::validate_responses_request_controls;
 use crate::routes::messages::web_search::fulfill::{
     resolve_web_search_route, ResolveWebSearchRouteOptions, WebSearchRoute,
@@ -153,17 +155,8 @@ fn validate_selected_responses_controls(
 pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
     let mut payload = body;
 
-    // Reject a missing/empty `model` up front: a legitimate client always sends
-    // a concrete model id. Without this, an empty string flows through model
-    // resolution and silently succeeds against a default — a 200 for what is
-    // really an invalid request.
-    if model_of(&payload).trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "model: field required and must be a non-empty string".to_string(),
-        ));
-    }
-    validate_generation_request(&payload)?;
     validate_messages_request_shape(&payload)?;
+    validate_generation_request(&payload)?;
     normalize_system_messages(&mut payload);
     validate_generation_request(&payload)?;
 
@@ -171,6 +164,7 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
     let requested_model = model_of(&payload);
     let mapped_model = resolve_mapped_model(&requested_model);
     set_model(&mut payload, &mapped_model);
+    validate_required_model(&payload)?;
     if mapped_model != requested_model {
         tracing::debug!("Resolved model mapping: {requested_model} -> {mapped_model}");
     }
@@ -364,6 +358,8 @@ pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Respon
 /// acquiring transport-specific defaults.
 #[allow(clippy::result_large_err)]
 fn validate_generation_request(payload: &Value) -> Result<(), AppError> {
+    validate_required_model(payload)?;
+
     match payload.get("messages") {
         Some(Value::Array(messages)) if !messages.is_empty() => {}
         Some(Value::Array(_)) => {
@@ -484,21 +480,36 @@ mod tests {
     #[test]
     fn generation_validation_requires_messages_and_positive_max_tokens() {
         assert!(validate_generation_request(&serde_json::json!({
+            "model": "claude-test",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1
         }))
         .is_ok());
 
         for invalid in [
-            serde_json::json!({"messages": [], "max_tokens": 1}),
-            serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}),
             serde_json::json!({
+                "model": "claude-test",
+                "messages": [],
+                "max_tokens": 1
+            }),
+            serde_json::json!({
+                "model": "claude-test",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            serde_json::json!({
+                "model": "claude-test",
                 "messages": [{"role": "user", "content": "hi"}],
                 "max_tokens": 0
             }),
             serde_json::json!({
+                "model": "claude-test",
                 "messages": [{"role": "user", "content": "hi"}],
                 "max_tokens": 1.5
+            }),
+            serde_json::json!({
+                "model": " ",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1
             }),
         ] {
             assert!(matches!(

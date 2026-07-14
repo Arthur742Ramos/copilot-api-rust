@@ -22,7 +22,8 @@ use super::anthropic_types::{
     AnthropicStreamState, AnthropicStreamToolCall, AnthropicUsage,
 };
 use super::non_stream_translation::{
-    empty_chat_completion_usage, map_openai_chat_completion_usage, parse_chat_service_tier,
+    empty_chat_completion_usage, encode_chat_reasoning_signature, map_openai_chat_completion_usage,
+    parse_chat_service_tier,
 };
 use super::request_validation::collect_open_object_extensions;
 use super::utils::map_openai_stop_reason_to_anthropic;
@@ -1647,6 +1648,7 @@ fn schedule_reasoning_opaque(
     let Some(signature) = signature.filter(|signature| !signature.is_empty()) else {
         return Ok(());
     };
+    let signature = encode_chat_reasoning_signature(&signature);
     if state.thinking_block_open {
         return close_thinking_block(state, events, signature, false);
     }
@@ -3795,15 +3797,19 @@ mod tests {
                 "message_stop",
             ]
         );
+        let expected_signature = encode_chat_reasoning_signature("signature");
         assert_eq!(
             all.iter()
                 .find(|event| event["delta"]["type"] == "signature_delta")
                 .and_then(|event| event["delta"]["signature"].as_str()),
-            Some("signature")
+            Some(expected_signature.as_str())
         );
         assert_eq!(state.chat_content_seen, "foo");
         assert_eq!(state.chat_content_emitted, "foo");
-        assert_eq!(state.output_budget.used_bytes, 42);
+        assert_eq!(
+            state.output_budget.used_bytes,
+            42 + encode_chat_reasoning_signature("signature").len() - "signature".len()
+        );
         assert_single_open_block_invariant(&all);
     }
 
@@ -3891,8 +3897,9 @@ mod tests {
     #[test]
     fn repeated_opaque_reasoning_uses_exact_aggregate_budget() {
         const PARTS: usize = 128;
-        let placeholder_bytes = THINKING_TEXT.len() * PARTS;
-        let signature_bytes = crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES - placeholder_bytes;
+        let carrier_overhead = encode_chat_reasoning_signature("").len();
+        let fixed_bytes = (THINKING_TEXT.len() + carrier_overhead) * PARTS;
+        let signature_bytes = crate::libs::http::MAX_UPSTREAM_RESPONSE_BYTES - fixed_bytes;
         let base = signature_bytes / PARTS;
         let remainder = signature_bytes % PARTS;
         let mut state = AnthropicStreamState::default();

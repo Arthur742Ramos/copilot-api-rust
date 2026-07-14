@@ -491,9 +491,13 @@ fn utf8_payload_fragments(mut bytes: usize) -> Vec<String> {
 
 fn opaque_signature_fragments(over_by: usize) -> Vec<String> {
     const PARTS: usize = 128;
-    let placeholder_bytes = copilot_api::routes::messages::utils::THINKING_TEXT.len() * PARTS;
+    let carrier_overhead =
+        copilot_api::routes::messages::non_stream_translation::encode_chat_reasoning_signature("")
+            .len();
+    let fixed_bytes =
+        (copilot_api::routes::messages::utils::THINKING_TEXT.len() + carrier_overhead) * PARTS;
     let signature_bytes = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
-        .checked_sub(placeholder_bytes)
+        .checked_sub(fixed_bytes)
         .and_then(|bytes| bytes.checked_add(over_by))
         .expect("opaque fixture budget");
     let base = signature_bytes / PARTS;
@@ -1026,7 +1030,7 @@ fn chat_completions_stream_fixture(model: &str) -> Response {
                 + tool_name.len()
                 + arguments.len()
                 + copilot_api::routes::messages::utils::THINKING_TEXT.len()
-                + signature.len();
+                + copilot_api::routes::messages::non_stream_translation::encode_chat_reasoning_signature(signature).len();
             let filler_bytes = copilot_api::libs::http::MAX_UPSTREAM_RESPONSE_BYTES
                 .checked_sub(fixed)
                 .and_then(|bytes| bytes.checked_add(over_by))
@@ -8699,6 +8703,34 @@ fn configure_direct_claude_canary(fixture: &Fixture) {
     });
 }
 
+fn configure_direct_lossless_claude(fixture: &Fixture) {
+    configure(fixture);
+    let mut model = Model {
+        id: "claude-lossless-controls".to_string(),
+        name: "claude-lossless-controls".to_string(),
+        supported_endpoints: Some(vec!["/v1/messages".to_string()]),
+        ..Default::default()
+    };
+    model.capabilities.supports.adaptive_thinking = Some(true);
+    model.capabilities.supports.reasoning_effort = Some(vec![
+        "low".to_string(),
+        "medium".to_string(),
+        "high".to_string(),
+    ]);
+    let models = ModelsResponse {
+        object: "list".to_string(),
+        data: vec![model],
+    };
+    copilot_api::libs::state::with_state_mut(|state| {
+        state.provider_only = None;
+        state.copilot_token = Some("direct-copilot-token".to_string());
+        state.copilot_api_url = Some(fixture.base_url.clone());
+        state.account_type = "individual".to_string();
+        state.models = Some(Arc::new(models));
+        state.premium_interactions = None;
+    });
+}
+
 fn configure_direct_web_search(fixture: &Fixture, model: &str) {
     configure_direct_copilot(fixture);
     let mut config = (*copilot_api::libs::config::get_config()).clone();
@@ -9564,19 +9596,311 @@ fn aggregate_empty_reasoning_cases(
     ]
 }
 
-fn reasoning_content_framing_cases() -> Vec<(&'static str, String, &'static str)> {
+fn reasoning_content_framing_cases() -> Vec<(&'static str, String, String)> {
     vec![
         (
             "gpt-reasoning-leading-text",
             "  analysis  ".to_string(),
-            "encrypted-leading@reasoning-leading",
+            encode_reasoning_signature(Some("encrypted-leading"), Some("reasoning-leading")),
         ),
         (
             "gpt-reasoning-multiple-parts",
             ["  first ", "", "\tsecond\n", ""].join(REASONING_SUMMARY_SEPARATOR),
-            "encrypted-parts@reasoning-parts",
+            encode_reasoning_signature(Some("encrypted-parts"), Some("reasoning-parts")),
         ),
     ]
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn native_messages_preserve_explicit_controls_and_signed_history() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure_direct_lossless_claude(&fixture);
+
+    let thinking = json!({
+        "type": "adaptive",
+        "display": "omitted",
+        "future_thinking": {"keep": true}
+    });
+    let responses_signature = encode_reasoning_signature(Some("encrypted"), Some("reasoning-id"));
+    let chat_signature =
+        copilot_api::routes::messages::non_stream_translation::encode_chat_reasoning_signature(
+            "opaque",
+        );
+    let signed_history = json!([
+        {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "native-signature",
+            "future_history": {"keep": true}
+        },
+        {"type": "text", "text": "prior answer", "future_text": true},
+        {"type": "thinking", "thinking": "Thinking...", "signature": "sig@opaque"},
+        {"type": "thinking", "thinking": "translated", "signature": responses_signature},
+        {"type": "thinking", "thinking": "translated", "signature": chat_signature}
+    ]);
+    let expected_signed_history = json!([
+        {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "native-signature",
+            "future_history": {"keep": true}
+        },
+        {"type": "text", "text": "prior answer", "future_text": true},
+        {"type": "thinking", "thinking": "Thinking...", "signature": "sig@opaque"}
+    ]);
+    let output_config = json!({
+        "effort": "max",
+        "format": {
+            "type": "json_schema",
+            "schema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        "task_budget": {"type": "tokens", "total": 20_000},
+        "future_output": {"keep": true},
+        "nullable_extension": null
+    });
+
+    let mut request = post_json(
+        "/v1/messages",
+        json!({
+            "model": "claude-lossless-controls",
+            "max_tokens": 128,
+            "thinking": thinking.clone(),
+            "output_config": output_config,
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": signed_history.clone()},
+                {"role": "user", "content": "continue"}
+            ],
+            "stream": false
+        }),
+        Some(CLIENT_KEY),
+    );
+    request
+        .headers_mut()
+        .insert("anthropic-beta", "task-budgets-2026-03-13".parse().unwrap());
+    let (status, response) = send(request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/messages")
+        .expect("native Messages request reached upstream");
+    assert_eq!(capture.body["thinking"], thinking);
+    assert_eq!(
+        capture.body["messages"][1]["content"],
+        expected_signed_history
+    );
+    assert_eq!(capture.body["output_config"]["effort"], "high");
+    assert_eq!(
+        capture.body["output_config"]["format"]["type"],
+        "json_schema"
+    );
+    assert_eq!(
+        capture.body["output_config"]["task_budget"]["total"],
+        20_000
+    );
+    assert_eq!(capture.body["output_config"]["future_output"]["keep"], true);
+    assert!(capture.body["output_config"]["nullable_extension"].is_null());
+    assert_eq!(capture.headers["anthropic-beta"], "task-budgets-2026-03-13");
+
+    let nullable_thinking = json!({
+        "type": "adaptive",
+        "display": null,
+        "future_thinking": {"keep": true}
+    });
+    let (status, response) = send(post_json(
+        "/v1/messages",
+        json!({
+            "model": "claude-lossless-controls",
+            "max_tokens": 32,
+            "thinking": nullable_thinking.clone(),
+            "messages": [{"role": "user", "content": "null controls"}],
+            "stream": false
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let nullable_capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| request.path == "/v1/messages")
+        .expect("nullable native Messages request reached upstream");
+    assert_eq!(nullable_capture.body["thinking"], nullable_thinking);
+
+    let (status, response) = send(post_json(
+        "/v1/messages",
+        json!({
+            "model": "claude-lossless-controls",
+            "max_tokens": 32,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "no thinking"}],
+            "stream": false
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let disabled_capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| request.path == "/v1/messages")
+        .expect("disabled-thinking native Messages request reached upstream");
+    assert_eq!(
+        disabled_capture.body["thinking"],
+        json!({"type": "disabled"})
+    );
+
+    for invalid_thinking in [
+        json!({"type": "adaptive", "budget_tokens": null}),
+        json!({"type": "adaptive", "budget_tokens": 1024}),
+        json!({"type": "disabled", "display": null}),
+        json!({"type": "disabled", "budget_tokens": 1024}),
+        json!({"type": "enabled"}),
+    ] {
+        let before = fixture.requests().len();
+        let (status, response) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model": "claude-lossless-controls",
+                "max_tokens": 32,
+                "thinking": invalid_thinking,
+                "messages": [{"role": "user", "content": "invalid thinking controls"}],
+                "stream": false
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_anthropic_invalid_request(&response, "invalid thinking controls");
+        assert_eq!(fixture.requests().len(), before);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn translated_messages_honor_disabled_thinking() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    for (model, expected_path) in [
+        ("responses-fixture/gpt-fixture", "/v1/responses"),
+        ("chat-fixture/gpt-chat-fixture", "/v1/chat/completions"),
+    ] {
+        let (status, response) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model": model,
+                "max_tokens": 64,
+                "thinking": {"type": "disabled"},
+                "output_config": {"effort": "high"},
+                "messages": [{"role": "user", "content": "no reasoning"}],
+                "stream": false
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model}: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let capture = fixture
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|request| request.path == expected_path)
+            .unwrap_or_else(|| panic!("{model}: translated request reached {expected_path}"));
+        if expected_path == "/v1/responses" {
+            assert_eq!(capture.body["reasoning"]["effort"], "none");
+            assert!(capture.body["reasoning"].get("summary").is_none());
+        } else {
+            assert!(capture.body.get("thinking_budget").is_none());
+            assert!(capture.body.get("reasoning_effort").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn anthropic_provider_strips_only_versioned_translated_carriers() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let responses_signature = encode_reasoning_signature(Some("encrypted"), Some("reasoning-id"));
+    let chat_signature =
+        copilot_api::routes::messages::non_stream_translation::encode_chat_reasoning_signature(
+            "opaque",
+        );
+    let expected_history = json!([
+        {"type": "thinking", "thinking": "", "signature": "native-signature"},
+        {"type": "thinking", "thinking": "Thinking...", "signature": "sig@opaque"},
+        {"type": "text", "text": "prior"}
+    ]);
+    let (status, response) = send(post_json(
+        "/anthropic-fixture/v1/messages",
+        json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "native-signature"},
+                    {"type": "thinking", "thinking": "Thinking...", "signature": "sig@opaque"},
+                    {"type": "thinking", "thinking": "translated", "signature": responses_signature},
+                    {"type": "thinking", "thinking": "translated", "signature": chat_signature},
+                    {"type": "text", "text": "prior"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ],
+            "stream": false
+        }),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let capture = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| request.path == "/v1/messages")
+        .expect("Anthropic provider request reached upstream");
+    assert_eq!(capture.body["messages"][1]["content"], expected_history);
 }
 
 #[tokio::test]
@@ -9954,7 +10278,7 @@ async fn claude_optional_reasoning_carriers_cross_public_messages_boundary() {
 
     for (case, encrypted_content, id) in [
         (
-            "legacy-both",
+            "versioned-both",
             Some("enc-public-both"),
             Some("reasoning-public-both"),
         ),
@@ -9966,14 +10290,10 @@ async fn claude_optional_reasoning_carriers_cross_public_messages_boundary() {
         ("versioned-both-empty", Some(""), Some("")),
     ] {
         let signature = encode_reasoning_signature(encrypted_content, id);
-        if case == "legacy-both" {
-            assert_eq!(signature, "enc-public-both@reasoning-public-both");
-        } else {
-            assert!(
-                signature.starts_with("rs1#"),
-                "{case}: expected versioned carrier"
-            );
-        }
+        assert!(
+            signature.starts_with("rs1#"),
+            "{case}: expected versioned carrier"
+        );
 
         let request = json!({
             "model":"responses-fixture/gpt-fixture",
@@ -10193,7 +10513,7 @@ async fn claude_reasoning_content_framing_stream_matches_nonstream_exactly() {
             .filter_map(|event| event["delta"]["signature"].as_str())
             .collect();
         assert_eq!(thinking, expected_thinking, "{model}");
-        assert_eq!(signatures, [expected_signature], "{model}");
+        assert_eq!(signatures, [expected_signature.as_str()], "{model}");
         if model == "gpt-reasoning-multiple-parts" {
             assert_eq!(
                 thinking.matches(REASONING_SUMMARY_SEPARATOR).count(),
@@ -10223,10 +10543,9 @@ async fn claude_reasoning_content_deltas_cross_public_stream_losslessly() {
     let response = json_body(&body);
     assert_eq!(response["content"][0]["type"], "thinking");
     assert_eq!(response["content"][0]["thinking"], expected);
-    assert_eq!(
-        response["content"][0]["signature"],
-        "encrypted-content@reasoning-content"
-    );
+    let expected_signature =
+        encode_reasoning_signature(Some("encrypted-content"), Some("reasoning-content"));
+    assert_eq!(response["content"][0]["signature"], expected_signature);
 
     let stream = json!({
         "model":"responses-fixture/gpt-reasoning-summary-content",
@@ -10254,7 +10573,7 @@ async fn claude_reasoning_content_deltas_cross_public_stream_losslessly() {
         .collect();
     assert_eq!(
         signatures,
-        ["encrypted-content@reasoning-content"],
+        [expected_signature.as_str()],
         "reasoning carrier must be emitted exactly once"
     );
 
@@ -10295,32 +10614,32 @@ async fn claude_reasoning_lifecycle_replays_and_adjacent_variants_are_determinis
         (
             "gpt-lifecycle-duplicate-reasoning-done",
             "once",
-            "encrypted-life@reasoning-life",
+            encode_reasoning_signature(Some("encrypted-life"), Some("reasoning-life")),
         ),
         (
             "gpt-lifecycle-duplicate-added",
             "once",
-            "encrypted-life@reasoning-life",
+            encode_reasoning_signature(Some("encrypted-life"), Some("reasoning-life")),
         ),
         (
             "gpt-lifecycle-summary-done-without-part",
             "buffered-authoritative",
-            "encrypted-life@reasoning-life",
+            encode_reasoning_signature(Some("encrypted-life"), Some("reasoning-life")),
         ),
         (
             "gpt-lifecycle-late-reasoning-id",
             "late-id",
-            "encrypted-late@reasoning-late",
+            encode_reasoning_signature(Some("encrypted-late"), Some("reasoning-late")),
         ),
         (
             "gpt-lifecycle-duplicate-delta-sequence",
             "sequence-once",
-            "encrypted-life@reasoning-life",
+            encode_reasoning_signature(Some("encrypted-life"), Some("reasoning-life")),
         ),
         (
             "gpt-lifecycle-empty-content-part",
             "\u{2063}\n\nsecond",
-            "encrypted-life@reasoning-life",
+            encode_reasoning_signature(Some("encrypted-life"), Some("reasoning-life")),
         ),
     ] {
         let request = json!({
@@ -10364,7 +10683,7 @@ async fn claude_reasoning_lifecycle_replays_and_adjacent_variants_are_determinis
             })
             .filter_map(|event| event["delta"]["signature"].as_str())
             .collect();
-        assert_eq!(signatures, [expected_signature], "{model}");
+        assert_eq!(signatures, [expected_signature.as_str()], "{model}");
     }
 }
 
@@ -11634,7 +11953,7 @@ async fn claude_json_and_sse_outputs_match_for_valid_families() {
                     );
                     assert_eq!(
                         json_response["content"][0]["signature"],
-                        "opaque@reasoning-scalar"
+                        encode_reasoning_signature(Some("opaque"), Some("reasoning-scalar"))
                     );
                 } else {
                     assert_eq!(json_response["content"][0]["thinking"], THINKING_TEXT);
@@ -13952,7 +14271,12 @@ async fn claude_chat_response_extensions_and_usage_survive_provider_boundary() {
 
     assert_eq!(response["content"][0]["type"], "thinking");
     assert_eq!(response["content"][0]["thinking"], "reason");
-    assert_eq!(response["content"][0]["signature"], "opaque");
+    assert_eq!(
+        response["content"][0]["signature"],
+        copilot_api::routes::messages::non_stream_translation::encode_chat_reasoning_signature(
+            "opaque"
+        )
+    );
     assert_eq!(response["content"][1]["type"], "text");
     assert_eq!(response["content"][1]["text"], "chat text");
     assert_eq!(
