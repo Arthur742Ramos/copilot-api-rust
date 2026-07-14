@@ -11,7 +11,7 @@
 //!   or generic `/v1/responses`), including the web-search-only sub-flow.
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -37,6 +37,7 @@ use crate::routes::messages::preprocess::{
     normalize_system_messages, strip_translated_reasoning_blocks,
 };
 use crate::routes::messages::request_validation::validate_messages_request_shape;
+use crate::routes::messages::responses_result_collector::collect_responses_stream_result_with_usage_observer;
 use crate::routes::messages::responses_stream_translation::{
     build_error_event, terminate_responses_stream_with_error, translate_responses_stream_event,
     ResponsesStreamState,
@@ -63,7 +64,7 @@ use crate::routes::responses::utils::{
 use crate::services::codex::create_responses::forward_codex_responses;
 use crate::services::codex::get_models::get_codex_models;
 use crate::services::copilot::create_chat_completions::ChatCompletionsPayload;
-use crate::services::copilot::create_responses::ResponsesResult;
+use crate::services::copilot::create_responses::{ResponsesEventStream, ResponsesResult};
 use crate::services::providers::provider_proxy::{
     forward_provider_chat_completions, forward_provider_messages, forward_provider_responses,
 };
@@ -255,6 +256,8 @@ async fn handle_openai_responses_provider_messages(
     headers: &HeaderMap,
 ) -> Result<Response, AppError> {
     let max_prompt_tokens = codex_max_prompt_tokens(provider_config, &payload.model);
+    let wants_stream = payload.stream == Some(true);
+    let is_codex = provider_config.name == "codex";
 
     let mut responses_payload = translate_anthropic_messages_to_responses_payload(&payload, None)?;
 
@@ -265,12 +268,14 @@ async fn handle_openai_responses_provider_messages(
     );
     compact_input_by_latest_compaction(&mut responses_payload);
 
-    let is_stream = responses_payload.stream.unwrap_or(false);
-    let is_codex = provider_config.name == "codex";
+    let requested_response_model = responses_payload.model.clone();
 
     if is_codex {
+        let codex_headers =
+            prepare_codex_messages_transport(&mut responses_payload, headers, wants_stream);
         let upstream_response =
-            forward_codex_responses(responses_payload, headers, &provider_config.base_url).await?;
+            forward_codex_responses(responses_payload, &codex_headers, &provider_config.base_url)
+                .await?;
 
         // forward_codex_responses relays non-401 errors verbatim, so guard the
         // status here too (mirrors the generic branch below) to avoid wrapping a
@@ -285,17 +290,32 @@ async fn handle_openai_responses_provider_messages(
             .into());
         }
 
-        if is_stream {
+        if wants_stream {
             return Ok(stream_responses_provider_messages(
                 upstream_response,
                 &payload,
                 provider,
-                is_codex,
+                true,
             ));
         }
 
-        let body = read_responses_result(upstream_response).await?;
-        return respond_responses_provider_messages_json(&body, &payload, provider);
+        let recorder = create_provider_messages_usage_recorder(&payload, provider);
+        let stream: ResponsesEventStream = Box::pin(crate::libs::sse::events(upstream_response));
+        let mut observed_usage = None;
+        let collected = collect_responses_stream_result_with_usage_observer(
+            stream,
+            &format!("{provider} responses stream"),
+            Some(&requested_response_model),
+            |terminal| {
+                observed_usage = Some(normalize_responses_usage(terminal.get("usage")));
+            },
+        )
+        .await;
+        if let Some(usage) = observed_usage {
+            recorder.record(usage);
+        }
+        let body = collected?;
+        return translate_responses_provider_messages_json(&body, &payload);
     }
 
     let upstream_response =
@@ -311,7 +331,7 @@ async fn handle_openai_responses_provider_messages(
         .into());
     }
 
-    if is_stream {
+    if wants_stream {
         return Ok(stream_responses_provider_messages(
             upstream_response,
             &payload,
@@ -423,6 +443,22 @@ async fn handle_openai_responses_provider_web_search_messages(
     };
 
     respond_web_search_provider_messages_json(&body, &payload, provider)
+}
+
+fn prepare_codex_messages_transport(
+    payload: &mut crate::services::copilot::create_responses::ResponsesPayload,
+    headers: &HeaderMap,
+    wants_stream: bool,
+) -> HeaderMap {
+    if !wants_stream {
+        payload.stream = Some(true);
+    }
+    let mut upstream_headers = headers.clone();
+    upstream_headers.insert(
+        header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    upstream_headers
 }
 
 /// `codex` provider only: the configured model's `max_prompt_tokens` (used as the
@@ -597,6 +633,14 @@ fn respond_responses_provider_messages_json(
         recorder.record(normalize_responses_usage(raw.get("usage")));
     }
 
+    translate_responses_provider_messages_json(body, payload)
+}
+
+#[allow(clippy::result_large_err)]
+fn translate_responses_provider_messages_json(
+    body: &ResponsesResult,
+    payload: &AnthropicMessagesPayload,
+) -> Result<Response, AppError> {
     let tool_search_name =
         resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
     let anthropic_response =
@@ -1490,6 +1534,57 @@ mod tests {
             .expect("receive provider SSE response");
         server.await.expect("provider SSE test server task");
         response
+    }
+
+    #[test]
+    fn codex_messages_transport_forces_sse_without_changing_client_intent() {
+        for stream in [None, Some(false), Some(true)] {
+            let mut payload: crate::services::copilot::create_responses::ResponsesPayload =
+                serde_json::from_value(json!({"model": "gpt-5.4", "stream": stream})).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+
+            let upstream_headers =
+                prepare_codex_messages_transport(&mut payload, &headers, stream == Some(true));
+
+            assert_eq!(payload.stream, Some(true));
+            assert_eq!(upstream_headers[header::ACCEPT], "text/event-stream");
+            assert_eq!(headers[header::ACCEPT], "application/json");
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_nonstream_collector_returns_anthropic_json() {
+        let upstream = upstream_sse_response(concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex\",\"object\":\"response\",\"created_at\":1,\"model\":\"gpt-5.4\",\"output\":[],\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_codex\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"OK\",\"annotations\":[]}]}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex\",\"object\":\"response\",\"created_at\":1,\"model\":\"gpt-5.4\",\"output\":[],\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let stream: ResponsesEventStream = Box::pin(crate::libs::sse::events(upstream));
+        let result = collect_responses_stream_result_with_usage_observer(
+            stream,
+            "codex responses stream",
+            Some("gpt-5.4"),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
+            "model":"gpt-5.4","max_tokens":64,
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .unwrap();
+
+        let response = translate_responses_provider_messages_json(&result, &payload).unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "message");
+        assert_eq!(value["content"][0]["text"], "OK");
+        assert_eq!(value["stop_reason"], "end_turn");
+        assert_eq!(value["usage"]["input_tokens"], 4);
+        assert_eq!(value["usage"]["output_tokens"], 2);
     }
 
     #[test]

@@ -10641,6 +10641,11 @@ async fn claude_reasoning_lifecycle_replays_and_adjacent_variants_are_determinis
             "\u{2063}\n\nsecond",
             encode_reasoning_signature(Some("encrypted-life"), Some("reasoning-life")),
         ),
+        (
+            "gpt-lifecycle-terminal-omitted-output",
+            "once",
+            encode_reasoning_signature(Some("encrypted-life"), Some("reasoning-life")),
+        ),
     ] {
         let request = json!({
             "model":format!("responses-fixture/{model}"),
@@ -10825,7 +10830,6 @@ async fn claude_incomplete_or_out_of_order_response_items_fail_once_without_succ
         "gpt-lifecycle-sparse-summary-index",
         "gpt-lifecycle-sparse-content-index",
         "gpt-lifecycle-terminal-untracked-output",
-        "gpt-lifecycle-terminal-omitted-output",
         "gpt-lifecycle-terminal-mismatched-output",
         "gpt-lifecycle-missing-terminal-response",
         "gpt-lifecycle-terminal-status-mismatch",

@@ -588,7 +588,7 @@ fn required_nonnegative_index(
     Ok(index)
 }
 
-fn validate_event_sequence(
+pub(crate) fn validate_event_sequence(
     event: &Value,
     state: &mut ResponsesStreamState,
 ) -> Result<bool, &'static str> {
@@ -3569,6 +3569,7 @@ fn handle_response_completed(
     };
     let terminal_output_mismatch = match response.get("output") {
         None | Some(Value::Null) => false,
+        Some(Value::Array(output)) if output.is_empty() => false,
         Some(Value::Array(output)) => {
             match output_array_digests(output, OutputValidationPhase::Done) {
                 Ok(digests) => digests != lifecycle_final,
