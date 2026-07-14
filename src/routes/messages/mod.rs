@@ -8,6 +8,7 @@ pub mod handler;
 pub mod non_stream_translation;
 pub mod preprocess;
 pub mod request_validation;
+pub mod responses_result_collector;
 pub mod responses_stream_translation;
 pub mod responses_translation;
 pub mod route;
