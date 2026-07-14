@@ -47,7 +47,15 @@ pub async fn post_model_mappings_route(body: Bytes) -> Response {
         Err(_) => return invalid_request("Invalid request body."),
     };
 
-    // Mirror setModelMappings(): validation/persistence failures throw -> 500.
+    if parsed
+        .model_mappings
+        .iter()
+        .any(|(source, target)| source.trim().is_empty() || target.trim().is_empty())
+    {
+        return invalid_request("Model mapping source and target must be non-empty strings.");
+    }
+
+    // Persistence/reload failures remain server errors after request validation.
     match set_model_mappings(&parsed.model_mappings) {
         Ok(updated) => Json(json!({
             "configPath": config_path_string(),

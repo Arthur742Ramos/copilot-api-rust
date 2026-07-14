@@ -22,6 +22,7 @@ use crate::routes::messages::anthropic_types::{
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+const TASK_BUDGETS_BETA: &str = "task-budgets-2026-03-13";
 /// The 1M-context beta. Requested implicitly via the `[1m]` model-id suffix
 /// (see `libs::models`); the handler folds it into the `anthropic-beta` header,
 /// so it must survive the allowlist filter below.
@@ -33,6 +34,7 @@ static ALLOWED_ANTHROPIC_BETAS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         INTERLEAVED_THINKING_BETA,
         CONTEXT_MANAGEMENT_BETA,
         ADVANCED_TOOL_USE_BETA,
+        TASK_BUDGETS_BETA,
         CONTEXT_1M_BETA,
     ])
 });
@@ -88,7 +90,7 @@ fn build_anthropic_beta_header(
     }
 
     if thinking
-        .and_then(|t| t.budget_tokens)
+        .and_then(|t| t.budget_tokens.as_ref().copied())
         .map(|b| b != 0)
         .unwrap_or(false)
         && !is_adaptive_thinking
@@ -263,8 +265,8 @@ mod tests {
     fn thinking(kind: &str, budget: Option<i64>) -> AnthropicThinkingConfig {
         AnthropicThinkingConfig {
             kind: kind.to_string(),
-            budget_tokens: budget,
-            display: None,
+            budget_tokens: budget.into(),
+            display: Default::default(),
             extra: Default::default(),
         }
     }
@@ -294,6 +296,12 @@ mod tests {
         // must survive the allowlist filter.
         let out = build_anthropic_beta_header(Some(CONTEXT_1M_BETA), None, "claude-opus-4.8");
         assert_eq!(out.as_deref(), Some(CONTEXT_1M_BETA));
+    }
+
+    #[test]
+    fn beta_header_keeps_task_budgets_beta() {
+        let out = build_anthropic_beta_header(Some(TASK_BUDGETS_BETA), None, "claude-opus-4.8");
+        assert_eq!(out.as_deref(), Some(TASK_BUDGETS_BETA));
     }
 
     #[test]

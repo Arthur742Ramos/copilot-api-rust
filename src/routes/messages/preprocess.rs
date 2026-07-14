@@ -24,12 +24,13 @@ use crate::libs::compact::{
 use crate::libs::config::{
     get_configured_reasoning_effort_for_model, get_reasoning_effort_for_model,
 };
-use crate::libs::models::normalize_sdk_model_id;
 use crate::routes::messages::anthropic_types::{
     CLAUDE_CODE_BILLING_HEADER_PREFIX, IDE_EXECUTE_CODE_TOOL, IDE_GET_DIAGNOSTICS_DESCRIPTION,
     IDE_GET_DIAGNOSTICS_TOOL, PDF_FILE_READ_PREFIX, SUBAGENT_START_HOOK_ADDITIONAL_PREFIX,
     SYSTEM_REMINDER_END, SYSTEM_REMINDER_START, TOOL_REFERENCE_TURN_BOUNDARY,
 };
+use crate::routes::messages::non_stream_translation::is_chat_reasoning_carrier_signature;
+use crate::routes::messages::responses_translation::is_versioned_reasoning_carrier_signature;
 use crate::services::copilot::get_models::Model;
 
 // `/(^|;\s*)cch=[^;]+;/u`
@@ -310,30 +311,6 @@ pub fn normalize_system_messages(payload: &mut Value) {
                 obj.remove("system");
             }
         }
-    }
-}
-
-// --- version helpers --------------------------------------------------------
-
-fn is_version_at_least(version: &str, minimum_major: i64, minimum_minor: i64) -> bool {
-    let mut parts = version.split('.');
-    let major_part = parts.next().unwrap_or("");
-    let minor_part = parts.next().unwrap_or("0");
-
-    let major: Result<i64, _> = major_part.parse();
-    let minor: Result<i64, _> = minor_part.parse();
-    let (major, minor) = match (major, minor) {
-        (Ok(a), Ok(b)) => (a, b),
-        _ => return false,
-    };
-
-    major > minimum_major || (major == minimum_major && minor >= minimum_minor)
-}
-
-fn should_summarize_thinking_display_for_model(model: &str) -> bool {
-    match normalize_sdk_model_id(model) {
-        Some(n) => is_version_at_least(&n.version, 4, 7),
-        None => false,
     }
 }
 
@@ -1068,71 +1045,71 @@ fn strip_tool_eager_input_streaming(payload: &mut Value) {
     }
 }
 
-/// `filterAssistantThinkingBlocks`: keep `thinking` only if `thinking` truthy
-/// AND `!= "Thinking..."` AND `signature` truthy AND `!signature.includes("@")`.
-fn filter_assistant_thinking_blocks(payload: &mut Value) {
-    let messages = match payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        Some(m) => m,
-        None => return,
+/// Remove reasoning carriers manufactured by the translated Responses/Chat
+/// paths before a conversation switches to native Messages. Native signatures
+/// (including omitted/empty displayed thinking) remain untouched.
+pub(crate) fn strip_translated_reasoning_blocks(payload: &mut Value) {
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
     };
 
-    for msg in messages.iter_mut() {
-        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let content = match msg.get("content").and_then(|c| c.as_array()) {
-            Some(c) => c.clone(),
-            None => continue,
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
         };
-
-        let filtered: Vec<Value> = content
-            .into_iter()
-            .filter(|block| {
-                if block_type(block) != "thinking" {
-                    return true;
-                }
-                let thinking_ok = block
-                    .get("thinking")
-                    .and_then(|t| t.as_str())
-                    .map(|t| !t.is_empty() && t != "Thinking...")
-                    .unwrap_or(false);
-                let signature_ok = block
-                    .get("signature")
-                    .and_then(|s| s.as_str())
-                    .map(|s| !s.is_empty() && !s.contains('@'))
-                    .unwrap_or(false);
-                thinking_ok && signature_ok
-            })
-            .collect();
-        msg["content"] = Value::Array(filtered);
+        content.retain(|block| {
+            if block_type(block) != "thinking" {
+                return true;
+            }
+            let signature = block
+                .get("signature")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            !is_versioned_reasoning_carrier_signature(signature)
+                && !is_chat_reasoning_carrier_signature(signature)
+        });
     }
 }
 
-/// `prepareMessagesApiPayload`: cache-control normalization, eager-input
-/// stripping, thinking-block filtering, then adaptive-thinking / reasoning
-/// effort resolution.
+/// Normalize native Messages-only controls without rewriting caller-owned
+/// objects or genuine native signed assistant history. Structural validation
+/// runs before this function, so opaque thinking signatures and extension
+/// fields are forwarded unchanged.
 pub fn prepare_messages_api_payload(payload: &mut Value, selected_model: Option<&Model>) {
     strip_cache_control(payload);
     apply_top_level_cache_control(payload);
     strip_tool_eager_input_streaming(payload);
-    filter_assistant_thinking_blocks(payload);
+    strip_translated_reasoning_blocks(payload);
 
-    let has_thinking = truthy(payload.get("thinking"));
+    let Some(selected_model) = selected_model else {
+        return;
+    };
 
     let tool_choice_type = payload
         .get("tool_choice")
         .and_then(|tc| tc.get("type"))
         .and_then(|t| t.as_str());
     let disable_think = tool_choice_type == Some("any") || tool_choice_type == Some("tool");
+    let adaptive_thinking = selected_model.capabilities.supports.adaptive_thinking == Some(true);
 
-    let adaptive_thinking = selected_model
-        .map(|m| m.capabilities.supports.adaptive_thinking == Some(true))
-        .unwrap_or(false);
+    let has_explicit_thinking = payload
+        .get("thinking")
+        .is_some_and(|thinking| !thinking.is_null());
+    if adaptive_thinking && !disable_think && !has_explicit_thinking {
+        // Align the proxy default with VS Code Copilot, but never overwrite an
+        // explicit client choice (including `display: "omitted"`).
+        payload["thinking"] = json!({
+            "type": "adaptive",
+            "display": "summarized"
+        });
+    }
 
     if !adaptive_thinking || disable_think {
         return;
     }
-    let selected_model = selected_model.unwrap();
 
     let model = payload
         .get("model")
@@ -1140,22 +1117,10 @@ pub fn prepare_messages_api_payload(payload: &mut Value, selected_model: Option<
         .unwrap_or("")
         .to_string();
 
-    let mut thinking = json!({ "type": "adaptive" });
-    // align with vscode copilot
-    if !has_thinking {
-        thinking["display"] = json!("summarized");
-    }
-    if should_summarize_thinking_display_for_model(&model) {
-        thinking["display"] = json!("summarized");
-    }
-    payload["thinking"] = thinking;
-
     // Effort precedence: an explicit `modelReasoningEfforts` entry in config wins
     // over the client-supplied `output_config.effort`, which in turn wins over the
-    // built-in default. This lets an operator force e.g. `max` for a model even
-    // when the client hardcodes a lower effort (the Copilot CLI always sends
-    // `effort: "high"`). Models without a configured override still honor the
-    // client's choice.
+    // built-in default. Only the `effort` member is updated; structured output,
+    // task-budget, and future extension fields remain caller-owned.
     let client_effort = payload
         .get("output_config")
         .and_then(|oc| oc.get("effort"))
@@ -1190,9 +1155,14 @@ pub fn prepare_messages_api_payload(payload: &mut Value, selected_model: Option<
             model = %model,
             effort = "none",
             api = "messages",
-            "resolved reasoning effort (output_config cleared; model declares no supported efforts)"
+            "resolved reasoning effort (effort removed; model declares no supported efforts)"
         );
-        payload["output_config"] = json!({});
+        if let Some(output_config) = payload
+            .get_mut("output_config")
+            .and_then(Value::as_object_mut)
+        {
+            output_config.remove("effort");
+        }
     } else {
         tracing::info!(
             target: "audit",
@@ -1201,7 +1171,17 @@ pub fn prepare_messages_api_payload(payload: &mut Value, selected_model: Option<
             api = "messages",
             "resolved reasoning effort"
         );
-        payload["output_config"] = json!({ "effort": effort });
+        if let Some(payload) = payload.as_object_mut() {
+            let output_config = payload
+                .entry("output_config".to_string())
+                .or_insert_with(|| json!({}));
+            if output_config.is_null() {
+                *output_config = json!({});
+            }
+            if let Some(output_config) = output_config.as_object_mut() {
+                output_config.insert("effort".to_string(), Value::String(effort));
+            }
+        }
     }
 }
 
@@ -1330,14 +1310,32 @@ mod tests {
             "messages": [
                 { "role": "user", "content": "hi" }
             ],
-            "output_config": { "effort": "none" }
+            "output_config": {
+                "effort": "none",
+                "format": {"type": "json_schema", "schema": {"type": "object"}},
+                "task_budget": {"type": "tokens", "total": 20_000},
+                "future_output": {"keep": true},
+                "nullable_extension": null
+            }
         });
+        let expected_format = payload["output_config"]["format"].clone();
+        let expected_task_budget = payload["output_config"]["task_budget"].clone();
         prepare_messages_api_payload(&mut payload, Some(&model));
 
-        // "none" is normalized to "low" (which is in the model's list).
+        // "none" is normalized to "low" (which is in the model's list), while
+        // every caller-owned sibling remains unchanged.
         assert_eq!(payload["output_config"]["effort"].as_str(), Some("low"));
-        // adaptive thinking applied.
-        assert_eq!(payload["thinking"]["type"].as_str(), Some("adaptive"));
+        assert_eq!(payload["output_config"]["format"], expected_format);
+        assert_eq!(
+            payload["output_config"]["task_budget"],
+            expected_task_budget
+        );
+        assert_eq!(payload["output_config"]["future_output"]["keep"], true);
+        assert!(payload["output_config"]["nullable_extension"].is_null());
+        assert_eq!(
+            payload["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
     }
 
     #[test]
@@ -1351,6 +1349,106 @@ mod tests {
         });
         prepare_messages_api_payload(&mut payload, Some(&model));
         assert_eq!(payload["output_config"]["effort"].as_str(), Some("medium"));
+    }
+
+    #[test]
+    fn prepare_messages_api_payload_preserves_native_and_strips_translated_history() {
+        let model = model_with_adaptive(Some(vec!["low", "medium", "high"]));
+        let explicit_thinking = json!({
+            "type": "adaptive",
+            "display": "omitted",
+            "future_thinking": {"keep": true}
+        });
+        let responses_signature =
+            crate::routes::messages::responses_translation::encode_reasoning_signature(
+                Some("encrypted"),
+                Some("reasoning-id"),
+            );
+        let chat_signature =
+            crate::routes::messages::non_stream_translation::encode_chat_reasoning_signature(
+                "opaque",
+            );
+        let history = json!([
+            {"type": "thinking", "thinking": "", "signature": "native-signature"},
+            {"type": "text", "text": "prior", "future_text": true},
+            {"type": "thinking", "thinking": "Thinking...", "signature": "sig@opaque"},
+            {"type": "thinking", "thinking": "translated", "signature": responses_signature},
+            {"type": "thinking", "thinking": "translated", "signature": chat_signature}
+        ]);
+        let expected_history = json!([
+            {"type": "thinking", "thinking": "", "signature": "native-signature"},
+            {"type": "text", "text": "prior", "future_text": true},
+            {"type": "thinking", "thinking": "Thinking...", "signature": "sig@opaque"}
+        ]);
+        let mut payload = json!({
+            "model": "claude-opus-4.8",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": history.clone()},
+                {"role": "user", "content": "continue"}
+            ],
+            "thinking": explicit_thinking.clone(),
+            "output_config": {"effort": "high"}
+        });
+
+        prepare_messages_api_payload(&mut payload, Some(&model));
+
+        assert_eq!(payload["thinking"], explicit_thinking);
+        assert_eq!(payload["messages"][1]["content"], expected_history);
+    }
+
+    #[test]
+    fn prepare_messages_api_payload_does_not_add_display_to_explicit_thinking() {
+        let model = model_with_adaptive(Some(vec!["low", "medium", "high"]));
+        let mut payload = json!({
+            "model": "claude-opus-4.8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"}
+        });
+
+        prepare_messages_api_payload(&mut payload, Some(&model));
+
+        assert_eq!(payload["thinking"], json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn prepare_messages_api_payload_injects_defaults_for_null_controls() {
+        let model = model_with_adaptive(Some(vec!["low", "medium", "high"]));
+        let mut payload = json!({
+            "model": "claude-opus-4.8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": null,
+            "output_config": null
+        });
+
+        prepare_messages_api_payload(&mut payload, Some(&model));
+
+        assert_eq!(
+            payload["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert!(payload["output_config"]["effort"].is_string());
+    }
+
+    #[test]
+    fn prepare_messages_api_payload_removes_only_unsupported_effort() {
+        let model = model_with_adaptive(Some(vec![]));
+        let mut payload = json!({
+            "model": "claude-opus-4.8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {
+                "effort": "high",
+                "format": {"type": "json_schema", "schema": {"type": "object"}},
+                "future_output": {"keep": true}
+            }
+        });
+
+        prepare_messages_api_payload(&mut payload, Some(&model));
+
+        assert!(payload["output_config"].get("effort").is_none());
+        assert_eq!(payload["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(payload["output_config"]["future_output"]["keep"], true);
     }
 
     #[test]
@@ -1374,12 +1472,19 @@ mod tests {
             "model": "claude-opus-4.8",
             "messages": [{ "role": "user", "content": "hi" }],
             // Client hardcodes a lower effort, as the Copilot CLI does.
-            "output_config": { "effort": "high" }
+            "output_config": {
+                "effort": "high",
+                "format": {"type": "json_schema", "schema": {"type": "object"}},
+                "future_output": {"keep": true}
+            }
         });
         prepare_messages_api_payload(&mut payload, Some(&model));
 
-        // The configured `max` overrides the client-supplied `high`.
+        // The configured `max` overrides the client-supplied `high` without
+        // replacing the rest of the caller's output configuration.
         assert_eq!(payload["output_config"]["effort"].as_str(), Some("max"));
+        assert_eq!(payload["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(payload["output_config"]["future_output"]["keep"], true);
 
         reset_cached_config_for_test();
     }

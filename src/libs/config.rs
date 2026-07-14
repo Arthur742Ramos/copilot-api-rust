@@ -497,11 +497,11 @@ pub fn get_model_mappings() -> BTreeMap<String, String> {
     let mut valid = BTreeMap::new();
     if let Some(mappings) = config.model_mappings.as_ref() {
         for (source, target) in mappings {
-            if source.is_empty() {
+            if source.trim().is_empty() {
                 continue;
             }
             if let Value::String(t) = target {
-                if !t.is_empty() {
+                if !t.trim().is_empty() {
                     valid.insert(source.clone(), t.clone());
                 }
             }
@@ -515,7 +515,7 @@ fn validate_model_mappings(
 ) -> Result<BTreeMap<String, Value>, anyhow::Error> {
     let mut validated = BTreeMap::new();
     for (source, target) in mappings {
-        if source.is_empty() || target.is_empty() {
+        if source.trim().is_empty() || target.trim().is_empty() {
             return Err(anyhow::anyhow!(
                 "Each model mapping must use non-empty source and target values."
             ));
@@ -541,7 +541,7 @@ pub fn resolve_mapped_model(model: &str) -> String {
         .model_mappings
         .as_ref()
         .and_then(|m| match m.get(model) {
-            Some(Value::String(t)) if !t.is_empty() => Some(t.clone()),
+            Some(Value::String(t)) if !t.trim().is_empty() => Some(t.clone()),
             _ => None,
         })
         .unwrap_or_else(|| model.to_string())
@@ -551,6 +551,7 @@ pub fn get_small_model() -> String {
     get_config()
         .small_model
         .clone()
+        .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| "gpt-5-mini".to_string())
 }
 
@@ -850,6 +851,41 @@ mod tests {
         assert_eq!(thresholds.get("gpt-5.6-terra"), Some(&(922_000.0 * 0.8)));
         assert_eq!(thresholds.get("gpt-5.6-luna"), Some(&(922_000.0 * 0.8)));
         assert_eq!(thresholds.get("gpt-5.4-mini"), Some(&(272_000.0 * 0.8)));
+    }
+
+    #[test]
+    fn model_mappings_reject_whitespace_only_source_or_target() {
+        for mappings in [
+            BTreeMap::from([("   ".to_string(), "target".to_string())]),
+            BTreeMap::from([("source".to_string(), "   ".to_string())]),
+        ] {
+            assert!(validate_model_mappings(&mappings).is_err());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn whitespace_only_mapping_target_is_not_resolved() {
+        set_cached_config_for_test(AppConfig {
+            model_mappings: Some(BTreeMap::from([(
+                "alias".to_string(),
+                Value::String("   ".to_string()),
+            )])),
+            ..Default::default()
+        });
+        assert_eq!(resolve_mapped_model("alias"), "alias");
+        reset_cached_config_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn whitespace_only_small_model_uses_default() {
+        set_cached_config_for_test(AppConfig {
+            small_model: Some("   ".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(get_small_model(), "gpt-5-mini");
+        reset_cached_config_for_test();
     }
 
     #[test]

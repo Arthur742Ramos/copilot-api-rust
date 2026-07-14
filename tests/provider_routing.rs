@@ -7,9 +7,12 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use common::{json_body, send, set_config};
+use copilot_api::libs::config::{set_cached_config_for_test, AppConfig};
 use copilot_api::libs::state;
 use serde_json::json;
 
@@ -195,6 +198,71 @@ async fn direct_and_alias_count_tokens_invalid_payloads_return_anthropic_400() {
             "{path} should identify the invalid field"
         );
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn direct_and_alias_count_tokens_require_nonempty_model() {
+    set_config(&[], None);
+
+    for path in [
+        "/some-provider/v1/messages/count_tokens",
+        "/v1/messages/count_tokens",
+    ] {
+        for body in [
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            json!({"model": "", "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"model": "   ", "messages": [{"role": "user", "content": "hi"}]}),
+        ] {
+            let (status, body) = send(post_count_tokens(path, body.to_string())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert_anthropic_error(
+                &body,
+                "invalid_request_error",
+                "model: field required and must be a non-empty string",
+            );
+        }
+    }
+
+    for path in [
+        "/some-provider/v1/messages/count_tokens",
+        "/v1/messages/count_tokens",
+    ] {
+        for body in ["null", "[]", "\"text\""] {
+            let (status, response) = send(post_count_tokens(path, body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            assert_anthropic_error(
+                &response,
+                "invalid_request_error",
+                "request: must be an object",
+            );
+        }
+    }
+
+    let (status, body) = send(post_count_tokens(
+        "/v1/messages/count_tokens",
+        count_tokens_body("some-model"),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json_body(&body)["input_tokens"].as_i64().is_some());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn count_tokens_ignores_a_mapping_with_a_blank_target() {
+    set_cached_config_for_test(AppConfig {
+        model_mappings: Some(BTreeMap::from([("alias".to_string(), json!("   "))])),
+        ..Default::default()
+    });
+
+    let (status, body) = send(post_count_tokens(
+        "/v1/messages/count_tokens",
+        count_tokens_body("alias"),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json_body(&body)["input_tokens"].as_i64().is_some());
 }
 
 #[tokio::test]

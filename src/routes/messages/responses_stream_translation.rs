@@ -4305,7 +4305,10 @@ mod tests {
             Some(AnthropicStreamEventData::ContentBlockDelta {
                 delta: AnthropicContentBlockDelta::SignatureDelta { signature },
                 ..
-            }) => assert_eq!(signature, "enc@r1"),
+            }) => assert_eq!(
+                signature,
+                &encode_reasoning_signature(Some("enc"), Some("r1"))
+            ),
             other => panic!("expected signature_delta, got {other:?}"),
         }
     }
@@ -4341,12 +4344,14 @@ mod tests {
                     ..
                 } if thinking == THINKING_TEXT
             )));
+            let expected_signature =
+                encode_reasoning_signature(Some("encrypted"), Some("reasoning-id"));
             assert!(events.iter().any(|event| matches!(
                 event,
                 AnthropicStreamEventData::ContentBlockDelta {
                     delta: AnthropicContentBlockDelta::SignatureDelta { signature },
                     ..
-                } if signature == "encrypted@reasoning-id"
+                } if signature == &expected_signature
             )));
 
             let mut state = started_state();
@@ -4546,12 +4551,14 @@ mod tests {
         });
         let expected = [" summary ", " raw content ", "second"].join(REASONING_SUMMARY_SEPARATOR);
         assert_eq!(thinking, Some(expected.as_str()));
+        let expected_signature =
+            encode_reasoning_signature(Some("encrypted-content"), Some("reasoning-content"));
         assert!(events.iter().any(|event| matches!(
             event,
             AnthropicStreamEventData::ContentBlockDelta {
                 delta: AnthropicContentBlockDelta::SignatureDelta { signature },
                 ..
-            } if signature == "encrypted-content@reasoning-content"
+            } if signature == &expected_signature
         )));
     }
 

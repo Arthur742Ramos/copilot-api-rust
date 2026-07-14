@@ -21,7 +21,9 @@ use crate::libs::tokenizer::get_token_count;
 use crate::routes::messages::anthropic_types::AnthropicMessagesPayload;
 use crate::routes::messages::non_stream_translation::translate_to_openai;
 use crate::routes::messages::preprocess::normalize_system_messages;
-use crate::routes::messages::request_validation::validate_messages_request_shape;
+use crate::routes::messages::request_validation::{
+    validate_messages_request_shape, validate_required_model, validate_required_model_id,
+};
 use crate::routes::provider::count_tokens::handle_provider_count_tokens_for_provider;
 use crate::services::copilot::get_models::Model;
 
@@ -97,6 +99,7 @@ async fn count_tokens_via_anthropic(payload: &AnthropicMessagesPayload) -> Optio
 #[allow(clippy::result_large_err)]
 pub async fn handle_count_tokens(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
     validate_messages_request_shape(&body)?;
+    validate_required_model(&body)?;
     let mut anthropic_payload: AnthropicMessagesPayload = match serde_json::from_value(body) {
         Ok(payload) => payload,
         Err(e) => {
@@ -109,6 +112,7 @@ pub async fn handle_count_tokens(body: Value, headers: HeaderMap) -> Result<Resp
     };
 
     anthropic_payload.model = resolve_mapped_model(&anthropic_payload.model);
+    validate_required_model_id(&anthropic_payload.model)?;
 
     // normalizeSystemMessages operates on a Value in the Rust port.
     let mut payload_value = serde_json::to_value(&anthropic_payload)?;

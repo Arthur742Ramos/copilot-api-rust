@@ -107,6 +107,30 @@ fn invalid(path: &str, expectation: &str) -> AppError {
     AppError::BadRequest(format!("{path}: {expectation}"))
 }
 
+/// Require the model identifier shared by generation and token-count routes.
+/// This must run before model mapping, provider resolution, or estimation so an
+/// empty identifier cannot silently select a fallback model.
+pub fn validate_required_model(payload: &Value) -> Result<(), AppError> {
+    match payload.get("model") {
+        Some(Value::String(model)) => validate_required_model_id(model),
+        _ => Err(invalid(
+            "model",
+            "field required and must be a non-empty string",
+        )),
+    }
+}
+
+pub fn validate_required_model_id(model: &str) -> Result<(), AppError> {
+    if model.trim().is_empty() {
+        Err(invalid(
+            "model",
+            "field required and must be a non-empty string",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn required_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>, AppError> {
     value
         .as_object()
@@ -1149,21 +1173,45 @@ fn validate_thinking(payload: &Map<String, Value>) -> Result<(), AppError> {
     }
     let thinking = required_object(thinking, "thinking")?;
     let kind = required_nonempty_string(thinking, "type", "thinking")?;
-    if !matches!(kind, "enabled" | "adaptive") {
+    if !matches!(kind, "enabled" | "adaptive" | "disabled") {
         return Err(invalid(
             "thinking.type",
-            "must equal \"enabled\" or \"adaptive\"",
+            "must equal \"enabled\", \"adaptive\", or \"disabled\"",
         ));
     }
-    match thinking.get("budget_tokens") {
-        None | Some(Value::Null) => {}
-        Some(value) if value.as_i64().is_some_and(|value| value > 0) => {}
-        Some(_) => {
-            return Err(invalid(
-                "thinking.budget_tokens",
-                "must be a positive integer or null",
-            ))
+    match kind {
+        "enabled" => {
+            match thinking.get("budget_tokens") {
+                Some(value) if value.as_i64().is_some_and(|value| value > 0) => {}
+                _ => return Err(invalid(
+                    "thinking.budget_tokens",
+                    "field required and must be a positive integer when thinking.type is enabled",
+                )),
+            }
         }
+        "adaptive" => {
+            if thinking.contains_key("budget_tokens") {
+                return Err(invalid(
+                    "thinking.budget_tokens",
+                    "is not permitted when thinking.type is adaptive",
+                ));
+            }
+        }
+        "disabled" => {
+            if thinking.contains_key("budget_tokens") {
+                return Err(invalid(
+                    "thinking.budget_tokens",
+                    "is not permitted when thinking.type is disabled",
+                ));
+            }
+            if thinking.contains_key("display") {
+                return Err(invalid(
+                    "thinking.display",
+                    "is not permitted when thinking.type is disabled",
+                ));
+            }
+        }
+        _ => unreachable!(),
     }
     validate_optional_string(thinking, "display", "thinking", true)?;
     validate_extension_collisions(

@@ -197,15 +197,10 @@ fn decode_compaction_carrier_signature(signature: &str) -> Option<CompactionCarr
     })
 }
 
-/// Preserve the legacy `encrypted_content@id` form when both fields exist.
-/// Codex 0.144.1 makes either field optional, so missing-field combinations use
-/// a small versioned JSON carrier that round-trips without inventing values.
+/// Use a versioned JSON carrier for every Responses reasoning signature so a
+/// later native-Messages turn can distinguish proxy-generated history from an
+/// opaque Anthropic signature without inspecting its character set.
 pub fn encode_reasoning_signature(encrypted_content: Option<&str>, id: Option<&str>) -> String {
-    if let (Some(encrypted_content), Some(id)) = (encrypted_content, id) {
-        if !encrypted_content.is_empty() && !id.is_empty() {
-            return format!("{encrypted_content}@{id}");
-        }
-    }
     format!(
         "{OPTIONAL_REASONING_SIGNATURE_PREFIX}{}",
         json!({"encrypted_content": encrypted_content, "id": id})
@@ -235,8 +230,21 @@ fn parse_reasoning_signature(signature: &str) -> (Option<String>, Option<String>
     }
 }
 
+pub(crate) fn is_versioned_reasoning_carrier_signature(signature: &str) -> bool {
+    let Some(raw) = signature.strip_prefix(OPTIONAL_REASONING_SIGNATURE_PREFIX) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .is_some_and(|value| {
+            value.as_object().is_some_and(|value| {
+                value.contains_key("encrypted_content") && value.contains_key("id")
+            })
+        })
+}
+
 fn is_reasoning_carrier_signature(signature: &str) -> bool {
-    signature.contains('@') || signature.starts_with(OPTIONAL_REASONING_SIGNATURE_PREFIX)
+    is_versioned_reasoning_carrier_signature(signature)
 }
 
 // ---------------------------------------------------------------------------
@@ -348,11 +356,19 @@ pub fn translate_anthropic_messages_to_responses_payload(
     // missing value to 0 so the 12800 floor applies.
     let max_output_tokens = payload.max_tokens.unwrap_or(0).max(12800);
 
-    let resolved_effort = payload
-        .output_config
+    let thinking_disabled = payload
+        .thinking
         .as_ref()
-        .and_then(|config| config.effort.clone())
-        .unwrap_or_else(|| get_reasoning_effort_for_model(&payload.model));
+        .is_some_and(|thinking| thinking.kind == "disabled");
+    let resolved_effort = if thinking_disabled {
+        "none".to_string()
+    } else {
+        payload
+            .output_config
+            .as_ref()
+            .and_then(|config| config.effort.clone())
+            .unwrap_or_else(|| get_reasoning_effort_for_model(&payload.model))
+    };
     tracing::info!(
         target: "audit",
         model = %payload.model,
@@ -361,11 +377,12 @@ pub fn translate_anthropic_messages_to_responses_payload(
         "resolved reasoning effort"
     );
     let mut reasoning = Map::from_iter([("effort".to_string(), json!(resolved_effort))]);
-    if payload
-        .thinking
-        .as_ref()
-        .and_then(|thinking| thinking.display.as_deref())
-        != Some("omitted")
+    if !thinking_disabled
+        && payload
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.display.as_ref().map(String::as_str))
+            != Some("omitted")
     {
         reasoning.insert("summary".to_string(), json!("detailed"));
     }
@@ -2703,6 +2720,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disabled_thinking_maps_to_no_reasoning_effort_or_summary() {
+        let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "max_tokens": 64,
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let translated = translate_anthropic_messages_to_responses_payload(&payload, None).unwrap();
+        let reasoning = translated.reasoning.unwrap();
+
+        assert_eq!(reasoning["effort"], "none");
+        assert!(reasoning.get("summary").is_none());
+    }
+
+    #[test]
+    fn unversioned_signature_with_at_is_not_a_responses_carrier() {
+        assert!(!is_reasoning_carrier_signature("sig@opaque"));
+        let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "native reasoning",
+                    "signature": "sig@opaque"
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let error = translate_anthropic_messages_to_responses_payload(&payload, None)
+            .expect_err("native thinking cannot be losslessly represented by Responses");
+        assert!(error
+            .to_string()
+            .contains("Unsupported assistant content block"));
+    }
+
+    #[test]
     fn reasoning_signature_splits_on_last_at() {
         let (enc, id) = parse_reasoning_signature("abc@def@id123");
         assert_eq!(enc.as_deref(), Some("abc@def"));
@@ -3093,11 +3152,12 @@ mod tests {
             anthropic.content[0].get("type").and_then(Value::as_str),
             Some("thinking")
         );
+        let expected_signature = encode_reasoning_signature(Some("ENC"), Some("rs_1"));
         assert_eq!(
             anthropic.content[0]
                 .get("signature")
                 .and_then(Value::as_str),
-            Some("ENC@rs_1")
+            Some(expected_signature.as_str())
         );
         assert_eq!(
             anthropic.content[1].get("text").and_then(Value::as_str),
@@ -3134,7 +3194,7 @@ mod tests {
         assert_eq!(anthropic.content[0]["thinking"], expected);
         assert_eq!(
             anthropic.content[0]["signature"],
-            "opaque@reasoning-content"
+            encode_reasoning_signature(Some("opaque"), Some("reasoning-content"))
         );
     }
 
@@ -3222,11 +3282,12 @@ mod tests {
             anthropic.content[0].get("thinking").and_then(Value::as_str),
             Some(THINKING_TEXT)
         );
+        let expected_signature = encode_reasoning_signature(Some("E"), Some("rs"));
         assert_eq!(
             anthropic.content[0]
                 .get("signature")
                 .and_then(Value::as_str),
-            Some("E@rs")
+            Some(expected_signature.as_str())
         );
     }
 
@@ -3277,7 +3338,10 @@ mod tests {
             assert_eq!(anthropic.content.len(), 1, "summary: {summary:?}");
             assert_eq!(anthropic.content[0]["type"], "thinking");
             assert_eq!(anthropic.content[0]["thinking"], THINKING_TEXT);
-            assert_eq!(anthropic.content[0]["signature"], "encrypted@reasoning-id");
+            assert_eq!(
+                anthropic.content[0]["signature"],
+                encode_reasoning_signature(Some("encrypted"), Some("reasoning-id"))
+            );
 
             let carrier_free = ResponsesResult {
                 id: "resp_carrier_free".to_string(),
@@ -3366,7 +3430,10 @@ mod tests {
             let anthropic = translate_responses_result_to_anthropic(&result, None).unwrap();
             let expected = segments.join(REASONING_SUMMARY_SEPARATOR);
             assert_eq!(anthropic.content[0]["thinking"], expected);
-            assert_eq!(anthropic.content[0]["signature"], "encrypted@reasoning-id");
+            assert_eq!(
+                anthropic.content[0]["signature"],
+                encode_reasoning_signature(Some("encrypted"), Some("reasoning-id"))
+            );
 
             let history: AnthropicMessagesPayload = serde_json::from_value(json!({
                 "model":"gpt-5.4",
