@@ -1,0 +1,14 @@
+{
+  "assetVersion": 1,
+  "validatedClients": {
+    "claudeCode": "2.1.210",
+    "codexCli": "0.144.1",
+    "openCode": "1.17.15"
+  },
+  "reference": {
+    "repository": "caozhiyuan/copilot-api",
+    "commit": "287d2d330c299bbdf3ed213a1bc05b1739aecf03",
+    "version": "1.14.9",
+    "auditedAt": "2026-07-15"
+  }
+}

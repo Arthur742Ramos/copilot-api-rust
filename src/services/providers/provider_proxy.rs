@@ -441,6 +441,40 @@ pub async fn forward_provider_responses(
 }
 
 #[allow(clippy::result_large_err)]
+fn resolve_provider_alpha_search_url(
+    cfg: &ResolvedProviderConfig,
+    query: Option<&str>,
+) -> Result<String, HttpError> {
+    let raw = format!("{}/v1/alpha/search", cfg.base_url.trim_end_matches('/'));
+    let mut url = url::Url::parse(&raw).map_err(|error| {
+        HttpError::internal(format!("Invalid provider alpha search URL: {error}"))
+    })?;
+    url.set_query(query.filter(|value| !value.is_empty()));
+    Ok(url.to_string())
+}
+
+/// POST `{base_url}/v1/alpha/search`, preserving all JSON fields and query
+/// parameters. Search is not retried automatically.
+pub async fn forward_provider_alpha_search(
+    cfg: &ResolvedProviderConfig,
+    body: bytes::Bytes,
+    request_headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<reqwest::Response, HttpError> {
+    let url = resolve_provider_alpha_search_url(cfg, query)?;
+    validate_upstream_url(&url)?;
+    restricted_upstream_client()
+        .post(url)
+        .headers(build_provider_upstream_headers(cfg, request_headers))
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| {
+            HttpError::internal(format!("Failed to forward provider alpha search: {error}"))
+        })
+}
+
+#[allow(clippy::result_large_err)]
 fn resolve_provider_images_url(
     cfg: &ResolvedProviderConfig,
     operation: ImagesOperation,
@@ -633,6 +667,7 @@ mod tests {
             api_key: api_key.to_string(),
             auth_type: auth_type.to_string(),
             models: Some(BTreeMap::new()),
+            capabilities: None,
             adjust_input_tokens: None,
         }
     }

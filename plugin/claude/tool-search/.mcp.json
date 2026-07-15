@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "tool_search": {
+      "type": "stdio",
+      "command": "copilot-api",
+      "args": ["mcp"],
+      "alwaysLoad": true
+    }
+  }
+}

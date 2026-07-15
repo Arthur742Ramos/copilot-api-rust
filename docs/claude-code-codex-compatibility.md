@@ -7,13 +7,14 @@ OpenAI endpoint.
 
 ## Audit identity and reproducible evidence
 
-Audited on **2026-07-14**:
+Audited on **2026-07-15**:
 
 | Client/reference | Exact identity | Evidence |
 |---|---|---|
-| Claude Code | **2.1.209**, release [`v2.1.209`](https://github.com/anthropics/claude-code/releases/tag/v2.1.209) | Official release tag; installed `claude --version` → `2.1.209 (Claude Code)` |
+| Claude Code | **2.1.210** | installed `claude --version` → `2.1.210 (Claude Code)` |
 | OpenAI Codex CLI | **0.144.1**, release [`rust-v0.144.1`](https://github.com/openai/codex/releases/tag/rust-v0.144.1) | Source commit [`44918ea10c0f99151c6710411b4322c2f5c96bea`](https://github.com/openai/codex/tree/44918ea10c0f99151c6710411b4322c2f5c96bea); `codex --version` |
-| TypeScript reference | `caozhiyuan/copilot-api` | Commit [`cd8207cb70ede07771bf37a04accfbf2af76d980`](https://github.com/caozhiyuan/copilot-api/tree/cd8207cb70ede07771bf37a04accfbf2af76d980) |
+| OpenCode | **1.17.15** | `npm view opencode-ai version`; plugin/config asset validation |
+| TypeScript reference | `caozhiyuan/copilot-api` `1.14.9` | Commit [`287d2d330c299bbdf3ed213a1bc05b1739aecf03`](https://github.com/caozhiyuan/copilot-api/tree/287d2d330c299bbdf3ed213a1bc05b1739aecf03) |
 | Rust boundary harness | this repository | `cargo test --test client_compatibility` |
 
 Useful audit commands:
@@ -45,7 +46,7 @@ real public Axum router and uses an ephemeral loopback Axum upstream. It capture
 the forwarded request and supplies deterministic Anthropic JSON/SSE, OpenAI
 JSON/SSE, HTTP failures, malformed frames, and premature EOF.
 
-## Claude Code 2.1.209 setup
+## Claude Code 2.1.210 setup
 
 Claude Code uses the Anthropic base URL **without** `/v1`:
 
@@ -126,10 +127,21 @@ codex
 Use a placeholder value when gateway `auth.apiKeys` is empty. Do not put a
 provider/OpenAI secret in this variable unless it is intentionally also your
 gateway client key; configured upstream providers have their own `apiKey`, and
-the gateway replaces inbound authorization before forwarding.
+the gateway replaces inbound authorization before forwarding. Guided
+`copilot-api auth` setup stores that upstream key in the protected provider
+credential store; inline `apiKey` remains a legacy-compatible input. The store
+is verified `0600` on Unix or protected by a verified current-user-only Windows
+DACL; inability to establish that boundary fails closed.
 
 The public Responses WebSocket transport is not exposed. Leave
-`supports_websockets` unset/false so Codex uses audited HTTP SSE.
+`supports_websockets` unset/false: Codex talks HTTP/SSE to this gateway. For a
+Codex-backed streaming provider, the gateway may use the reference's upstream
+WebSocket protocol internally. Before every request it completes a bounded
+ping/pong preflight, evicts and reopens a failed pooled socket once, and falls
+back to HTTP only for handshake/preflight failures before `response.create`.
+Ambiguous request-frame send errors are not replayed. Idle close/error/stale
+frames are observed in the background, cancellation evicts the socket, and only
+a terminal accepted by the full Responses lifecycle guard permits reuse.
 
 Codex 0.144.1 sends:
 
@@ -264,7 +276,7 @@ onto the non-message item would change its scope.
 Canonical request/message collisions (`input`, `phase`, `status`, and similar)
 and the unsafe `stop` bypass fail explicitly before provider dispatch.
 
-Claude Code 2.1.209 also sends adaptive thinking with `display: "omitted"`,
+Claude Code 2.1.210 retains adaptive thinking with `display: "omitted"`,
 `output_config.effort`, and
 `context_management.edits=[{type:"clear_thinking_20251015",keep:"all"}]`.
 The Responses bridge maps effort, suppresses reasoning summaries when display is
@@ -834,7 +846,7 @@ and
 in addition to the JSON/SSE framing regressions.
 
 The `U+2063` boundary follows the
-[audited TypeScript reference](https://github.com/caozhiyuan/copilot-api/blob/cd8207cb70ede07771bf37a04accfbf2af76d980/src/routes/messages/responses-translation.ts#L70-L75).
+[audited TypeScript reference](https://github.com/caozhiyuan/copilot-api/blob/287d2d330c299bbdf3ed213a1bc05b1739aecf03/src/routes/messages/responses-translation.ts).
 This proxy
 intentionally does **not** apply that reference's final `.trim()`, because
 preserving valid reasoning text and making JSON/SSE output identical is safer
@@ -859,7 +871,7 @@ advertised as `provider/model` records.
 
 Status means deterministic, credential-free evidence exists.
 
-| Contract | Claude Code 2.1.209 | Codex CLI 0.144.1 | Evidence |
+| Contract | Claude Code 2.1.210 | Codex CLI 0.144.1 | Evidence |
 |---|---|---|---|
 | Native public protocol | Anthropic Messages JSON/SSE | OpenAI Responses JSON/SSE | `client_compatibility` positive boundary tests |
 | Streaming and non-streaming | Supported | Supported | fixture captures and native response assertions |
@@ -878,7 +890,8 @@ Status means deterministic, credential-free evidence exists.
 | Web search | validated domain/location policy, native server-tool/result blocks in JSON and synthetic SSE; partial terminals reconcile without output loss; reconstructed overflow records observed cost but fails before response success | native Responses web-search output | request-policy, paired partial/terminal-only output, conflict, and provider/direct JSON/SSE overflow fixtures |
 | Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity, source-ordered scheduling, and a shared aggregate translated-payload budget | not Codex 0.144.1's wire API | public provider/direct captures, split/partial/deferred/multi-tool refusal ordering, exact/overflow reasoning/opaque/mixed UTF-8 budgets, malformed chunks, status/header, usage, and collisions |
 | Responses-to-Messages budgets | transactionally coupled retained/output ownership; exact/+1 UTF-8 text, reasoning/signature, block keys, lifecycle metadata, parallel tool arguments, authoritative growth/shrink, release, and terminal cleanup | native Responses remains protocol-native | `claude_responses_state_budgets_cross_provider_and_direct_boundaries` plus 38 retained/cross-budget unit invariants |
-| Public Responses WebSocket | not applicable | **Unsupported**; use HTTP SSE | intentional scope limit |
+| Public Responses WebSocket | not applicable | **Not exposed**; client uses HTTP SSE | intentional public-protocol limit |
+| Codex upstream Responses WebSocket | supported through translated Messages | supported internally with lifecycle-authorized pooling and pre-request-only fallback | deterministic handshake/preflight, reopen, idle close, malformed terminal, reuse, cancellation, heartbeat/silence, missing-terminal tests |
 
 The detailed Claude-specific matrix remains in
 [`claude-code-api-compatibility.md`](./claude-code-api-compatibility.md).

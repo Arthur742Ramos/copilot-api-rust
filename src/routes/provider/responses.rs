@@ -16,7 +16,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
+use crate::libs::config::resolve_effective_provider_config;
 use crate::libs::error::{http_error_from_response, AppError};
+use crate::libs::provider_capabilities::{supports, ProviderCapability};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{
     create_request_scoped_provider_token_usage_recorder, normalize_responses_usage,
@@ -29,9 +31,11 @@ use crate::routes::responses::{
     stream_guard::{ResponsesStreamGuard, ResponsesTerminal},
     stream_id_sync::StreamIdTracker,
 };
-use crate::services::codex::create_responses::forward_codex_responses;
+use crate::services::codex::create_responses::{
+    forward_codex_responses_selected, CodexResponsesReturn,
+};
 use crate::services::codex::get_models::get_codex_models;
-use crate::services::copilot::create_responses::ResponsesPayload;
+use crate::services::copilot::create_responses::{ResponsesEventStream, ResponsesPayload};
 use crate::services::providers::provider_proxy::forward_provider_responses;
 
 /// Mirrors `handleProviderResponsesForProvider`.
@@ -40,24 +44,23 @@ pub async fn handle_provider_responses_for_provider(
     provider: String,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let provider_config = resolve_provider_config(&provider).await;
-    let provider_config = match provider_config {
-        Some(cfg) if cfg.provider_type == "openai-responses" => cfg,
-        _ => {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": format!(
-                            "Provider '{provider}' does not support the /v1/responses endpoint"
-                        ),
-                        "type": "invalid_request_error",
-                    }
-                })),
-            )
-                .into_response());
-        }
+    let Some(provider_config) = resolve_provider_config(&provider).await? else {
+        return Ok(crate::libs::error::openai_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            Some("provider_not_found"),
+            format!("Provider '{provider}' not found or disabled"),
+        ));
     };
+    let provider_config = resolve_effective_provider_config(&provider_config, &payload.model);
+    if !supports(&provider_config, ProviderCapability::Responses) {
+        return Ok(crate::libs::error::openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("unsupported_provider_capability"),
+            format!("Provider '{provider}' does not support the /v1/responses endpoint"),
+        ));
+    }
 
     let max_prompt_tokens = if provider_config.name == "codex" {
         get_codex_models()
@@ -83,8 +86,14 @@ pub async fn handle_provider_responses_for_provider(
     );
 
     if provider_config.name == "codex" {
-        let upstream_response =
-            forward_codex_responses(payload, &headers, &provider_config.base_url).await?;
+        let selected =
+            forward_codex_responses_selected(payload, &headers, &provider_config.base_url).await?;
+        let upstream_response = match selected {
+            CodexResponsesReturn::Stream(stream) => {
+                return stream_provider_response_events(stream, &provider, recorder, true).await
+            }
+            CodexResponsesReturn::Http(response) => response,
+        };
 
         // forward_codex_responses only special-cases 401 (refresh + retry) and
         // otherwise hands back the live response verbatim, so a 4xx/5xx error
@@ -169,6 +178,45 @@ pub async fn handle_provider_responses_for_provider(
     ))
 }
 
+/// Provider-scoped OpenAI Responses route.
+pub async fn post_provider_responses(
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let value = match crate::routes::parse_json_body(&body) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => {
+            return crate::libs::error::openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("invalid_json"),
+                "request: must be a JSON object",
+            )
+        }
+        Err(error) => return error.into_openai_response(),
+    };
+    let mut payload: ResponsesPayload = match serde_json::from_value(value) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return AppError::BadRequest(format!("Invalid request payload: {error}"))
+                .into_openai_response()
+        }
+    };
+    if let Err(error) = crate::routes::responses::handler::validate_responses_payload(&payload) {
+        return error.into_openai_response();
+    }
+    if let Err(error) =
+        crate::routes::files::materialize_responses_file_references(&mut payload).await
+    {
+        return error.into_openai_response();
+    }
+    match handle_provider_responses_for_provider(payload, provider, headers).await {
+        Ok(response) => response,
+        Err(error) => error.into_openai_response(),
+    }
+}
+
 /// Mirrors `streamProviderResponses`: peek the first event for a leading `error`
 /// (surfaced as a JSON error response), then SSE-forward the remainder, applying
 /// the Codex normalize step and sniffing usage from terminal events.
@@ -178,8 +226,16 @@ async fn stream_provider_responses(
     recorder: TokenUsageRecorder,
     normalize_codex: bool,
 ) -> Result<Response, AppError> {
-    let mut event_stream = Box::pin(crate::libs::sse::events(upstream));
+    let event_stream: ResponsesEventStream = Box::pin(crate::libs::sse::events(upstream));
+    stream_provider_response_events(event_stream, provider, recorder, normalize_codex).await
+}
 
+async fn stream_provider_response_events(
+    mut event_stream: ResponsesEventStream,
+    provider: &str,
+    recorder: TokenUsageRecorder,
+    normalize_codex: bool,
+) -> Result<Response, AppError> {
     // Peek the first non-empty chunk to surface a leading `error` event as a
     // JSON error instead of an SSE stream.
     let first = match event_stream.next().await {

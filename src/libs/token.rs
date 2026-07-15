@@ -141,6 +141,7 @@ fn sync_codex_provider_config(enabled: Option<bool>) {
         auth_type: Some("oauth2".to_string()),
         api_key: existing.api_key,
         models: existing.models,
+        capabilities: existing.capabilities,
         adjust_input_tokens: existing.adjust_input_tokens,
         extra: existing.extra,
     };
@@ -577,7 +578,21 @@ pub async fn setup_github_token(force: bool) -> Result<(), anyhow::Error> {
     result
 }
 
+fn require_github_oauth_terminal(interactive: bool) -> Result<(), anyhow::Error> {
+    if interactive {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "GitHub Copilot OAuth requires an interactive terminal. \
+             Preconfigured services must provide --github-token, \
+             COPILOT_API_GITHUB_TOKEN, or a protected stored GitHub token."
+        )
+    }
+}
+
 async fn setup_github_token_inner(force: bool) -> Result<(), anyhow::Error> {
+    use std::io::IsTerminal;
+
     let github_token = read_github_token().await?;
 
     if let Some(token) = github_token {
@@ -590,6 +605,10 @@ async fn setup_github_token_inner(force: bool) -> Result<(), anyhow::Error> {
             return Ok(());
         }
     }
+
+    require_github_oauth_terminal(
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+    )?;
 
     tracing::info!("Not logged in, getting new access token");
     let response = get_device_code().await?;
@@ -658,6 +677,14 @@ mod tests {
         assert!(!refresh_already_done("tok-a", ""));
         // Caller's request had no token but a real one is present now.
         assert!(refresh_already_done("", "tok-b"));
+    }
+
+    #[test]
+    fn github_device_oauth_fails_closed_without_tty() {
+        assert!(require_github_oauth_terminal(true).is_ok());
+        let error = require_github_oauth_terminal(false).unwrap_err();
+        assert!(error.to_string().contains("interactive terminal"));
+        assert!(error.to_string().contains("COPILOT_API_GITHUB_TOKEN"));
     }
 
     /// Spawn a throwaway localhost HTTP server whose Nth request gets the status

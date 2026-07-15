@@ -6,21 +6,19 @@ not a claim that every Anthropic product endpoint is emulated.
 
 ## Reference audited
 
-- Client target: **Claude Code 2.1.209**, official release
-  [`v2.1.209`](https://github.com/anthropics/claude-code/releases/tag/v2.1.209).
-- Gateway model discovery was separately verified against installed **Claude
-  Code 2.1.210** on 2026-07-15.
+- Client target: **Claude Code 2.1.210**, installed and verified on 2026-07-15.
 - Credential-free client-shaped boundary evidence:
   `tests/client_compatibility.rs::claude_code_2_1_209_contract_crosses_public_axum_boundary`.
 - Combined Claude Code/Codex setup, headers, versions, and transport matrix:
   [`claude-code-codex-compatibility.md`](./claude-code-codex-compatibility.md).
+- Complete non-GUI endpoint/provider/plugin matrix:
+  [`non-gui-compatibility.md`](./non-gui-compatibility.md).
 - Reference implementation:
   [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api) at
   commit
-  [`65ab96bd806f47c35443aa58b65134d45a345570`](https://github.com/caozhiyuan/copilot-api/tree/65ab96bd806f47c35443aa58b65134d45a345570)
-  (`dev`).
-- Retrieved/audited: **2026-07-14T18:15:16Z**. Releases 2.1.208 and
-  2.1.209 introduced no Messages wire-contract changes.
+  [`287d2d330c299bbdf3ed213a1bc05b1739aecf03`](https://github.com/caozhiyuan/copilot-api/tree/287d2d330c299bbdf3ed213a1bc05b1739aecf03)
+  (`1.14.9`).
+- Retrieved/audited: **2026-07-15**.
 - Compared surfaces: `src/routes/messages/` (handler, token counting,
   preprocessing, request, non-streaming and both streaming translators),
   `src/routes/provider/messages/`, `src/routes/models.ts`, `src/lib/error.ts`, and
@@ -45,7 +43,7 @@ Status terms:
 | `POST /v1/messages/count_tokens` | Supported | `src/routes/messages/count_tokens_handler.rs`; tokenizer tests; `tests/provider_routing.rs::provider_model_alias_count_tokens_returns_complete_anthropic_404` | Uses Anthropic's counter when configured; otherwise uses the documented local estimate, including provider/model aliases. |
 | `/v1/files` upload/list/retrieve/content/delete lifecycle | Supported locally | `src/libs/file_store.rs`; `src/routes/files/`; tests `local_files_api_materializes_messages_and_responses_inputs` and `anthropic_upload_list_content_and_delete_round_trip` | Copilot has no Files API, so owner-scoped bytes remain under `COPILOT_API_HOME/files` and file references are expanded to inline base64 before dispatch. |
 | `GET /v1/models` and `GET /v1/models/:id` | Supported | `src/routes/models.rs` model-shape and discovery-alias tests | Returns Anthropic-shaped model records, standard context/effort metadata, response cursors, and `[1m]` aliases. Optional `claude-copilot:` aliases make non-Claude Copilot chat models pass Claude Code's discovery filter. |
-| Provider-scoped Messages route | Supported | `src/routes/provider/messages.rs`; `tests/provider_routing.rs::unknown_provider_returns_complete_anthropic_404` | Anthropic, OpenAI-compatible, Responses, and configured model aliases are covered. |
+| Provider-scoped Messages route | Supported | `src/routes/provider/messages.rs`; `tests/provider_routing.rs::unknown_provider_returns_complete_anthropic_404`; mixed-provider fixtures in `tests/non_gui_features.rs` | Anthropic, OpenAI-compatible, Responses, and configured model aliases are covered. `models.<model>.type` selects an effective protocol and matching auth default without dropping future model fields. |
 | Provider-scoped and provider/model-alias count-token routes | **Fixed here** | `src/routes/provider/count_tokens.rs`; tests `unknown_provider_count_tokens_returns_complete_anthropic_404`, `provider_model_alias_count_tokens_returns_complete_anthropic_404`, `direct_and_alias_count_tokens_malformed_json_returns_anthropic_400`, `direct_and_alias_count_tokens_invalid_payloads_return_anthropic_400`, and `direct_and_alias_count_tokens_body_limits_return_anthropic_413` | Direct and alias dispatch now share complete Anthropic envelopes for provider resolution, raw JSON parsing, typed-payload validation, and request-size rejection. |
 | Required `model`, non-empty `messages`, positive integer `max_tokens` | **Fixed here** | `validate_generation_request`; test `generation_validation_requires_messages_and_positive_max_tokens`; router test `generation_requires_positive_max_tokens_before_upstream_dispatch` | Generation now fails as a stable 400 before admission/accounting instead of silently acquiring a transport-specific default. `count_tokens` intentionally does not require `max_tokens`. |
 | String and structured system prompts | Supported | `src/routes/messages/preprocess.rs`; request translation tests | Normalizes multiple system representations while preserving cache-control data. |

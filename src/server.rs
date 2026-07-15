@@ -104,6 +104,14 @@ pub fn build_router_with_admission(
             post(crate::routes::responses::compact::post_responses_compact),
         )
         .route(
+            "/alpha/search",
+            post(crate::routes::alpha_search::post_alpha_search),
+        )
+        .route(
+            "/v1/alpha/search",
+            post(crate::routes::alpha_search::post_alpha_search),
+        )
+        .route(
             "/v1/messages",
             post(crate::routes::messages::route::post_messages),
         )
@@ -139,11 +147,47 @@ pub fn build_router_with_admission(
             post(crate::routes::provider::messages::post_provider_messages),
         )
         .route(
+            "/:provider/messages",
+            post(crate::routes::provider::messages::post_provider_messages),
+        )
+        .route(
             "/:provider/v1/messages/count_tokens",
             post(crate::routes::provider::count_tokens::post_provider_count_tokens),
         )
         .route(
+            "/:provider/messages/count_tokens",
+            post(crate::routes::provider::count_tokens::post_provider_count_tokens),
+        )
+        .route(
+            "/:provider/v1/chat/completions",
+            post(crate::routes::provider::chat_completions::post_provider_chat_completions),
+        )
+        .route(
+            "/:provider/chat/completions",
+            post(crate::routes::provider::chat_completions::post_provider_chat_completions),
+        )
+        .route(
+            "/:provider/v1/responses",
+            post(crate::routes::provider::responses::post_provider_responses),
+        )
+        .route(
+            "/:provider/responses",
+            post(crate::routes::provider::responses::post_provider_responses),
+        )
+        .route(
+            "/:provider/v1/responses/compact",
+            post(crate::routes::responses::compact::post_provider_responses_compact),
+        )
+        .route(
+            "/:provider/responses/compact",
+            post(crate::routes::responses::compact::post_provider_responses_compact),
+        )
+        .route(
             "/:provider/v1/models",
+            get(crate::routes::provider::models::get_provider_models),
+        )
+        .route(
+            "/:provider/models",
             get(crate::routes::provider::models::get_provider_models),
         )
         .route(
@@ -153,6 +197,22 @@ pub fn build_router_with_admission(
         .route(
             "/:provider/v1/images/edits",
             post(crate::routes::provider::images::post_provider_images_edits),
+        )
+        .route(
+            "/:provider/images/generations",
+            post(crate::routes::provider::images::post_provider_images_generations),
+        )
+        .route(
+            "/:provider/images/edits",
+            post(crate::routes::provider::images::post_provider_images_edits),
+        )
+        .route(
+            "/:provider/v1/alpha/search",
+            post(crate::routes::provider::alpha_search::post_provider_alpha_search),
+        )
+        .route(
+            "/:provider/alpha/search",
+            post(crate::routes::provider::alpha_search::post_provider_alpha_search),
         )
         .fallback(api_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
@@ -227,15 +287,32 @@ fn is_upstream_proxy_route(method: &Method, route: &str) -> bool {
         | "/v1/responses"
         | "/responses/compact"
         | "/v1/responses/compact"
+        | "/alpha/search"
+        | "/v1/alpha/search"
         | "/v1/messages"
         | "/v1/messages/count_tokens"
         | "/:provider/v1/messages"
+        | "/:provider/messages"
         | "/:provider/v1/messages/count_tokens"
+        | "/:provider/messages/count_tokens"
+        | "/:provider/v1/chat/completions"
+        | "/:provider/chat/completions"
+        | "/:provider/v1/responses"
+        | "/:provider/responses"
+        | "/:provider/v1/responses/compact"
+        | "/:provider/responses/compact"
         | "/:provider/v1/images/generations"
-        | "/:provider/v1/images/edits" => method == Method::POST,
-        "/models" | "/v1/models" | "/models/:id" | "/v1/models/:id" | "/:provider/v1/models" => {
-            method == Method::GET || method == Method::HEAD
-        }
+        | "/:provider/v1/images/edits"
+        | "/:provider/images/generations"
+        | "/:provider/images/edits"
+        | "/:provider/v1/alpha/search"
+        | "/:provider/alpha/search" => method == Method::POST,
+        "/models"
+        | "/v1/models"
+        | "/models/:id"
+        | "/v1/models/:id"
+        | "/:provider/v1/models"
+        | "/:provider/models" => method == Method::GET || method == Method::HEAD,
         _ => false,
     }
 }

@@ -53,9 +53,10 @@ pub struct PooledWebSocketRequest {
 /// Behavioural knobs for [`create_pooled_web_socket_stream`]. Mirrors
 /// `PooledWebSocketStreamOptions<TChunk>`.
 ///
-/// `create_chunk` / `is_terminal_chunk` are plain function pointers because the
-/// real callers pass free functions; this keeps the option struct `Clone` and
-/// avoids boxing.
+/// `create_chunk` is a plain function pointer because callers pass free
+/// functions; this keeps the option struct `Clone` and avoids boxing. Terminal
+/// authority comes from the shared Responses lifecycle guard, not a raw type
+/// predicate.
 #[derive(Clone)]
 pub struct PooledWebSocketStreamOptions {
     /// Build a chunk from one normalized WebSocket message payload.
@@ -69,8 +70,10 @@ pub struct PooledWebSocketStreamOptions {
     /// disables it, matching `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS=0` on the
     /// HTTP path.
     pub read_timeout: Option<Duration>,
-    /// Returns true once a chunk signals the end of the response.
-    pub is_terminal_chunk: fn(&SseChunk) -> bool,
+    /// Deadline for the protocol-level ping/pong health probe performed before
+    /// every application request frame. A probe failure is definitively
+    /// pre-request and is therefore safe for the caller to fall back to HTTP.
+    pub preflight_timeout: Duration,
     /// Error text if the socket fails to open.
     pub open_error_message: String,
     /// Error text if the socket errors mid-stream.
@@ -87,6 +90,7 @@ impl std::fmt::Debug for PooledWebSocketStreamOptions {
             .field("idle_timeout_ms", &self.idle_timeout_ms)
             .field("connect_timeout", &self.connect_timeout)
             .field("read_timeout", &self.read_timeout)
+            .field("preflight_timeout", &self.preflight_timeout)
             .field("open_error_message", &self.open_error_message)
             .field("stream_error_message", &self.stream_error_message)
             .field(
@@ -183,6 +187,51 @@ fn remove_pooled_entry(pool_key: &str, id: u64) {
     }
 }
 
+async fn watch_idle_connection(
+    pool_key: String,
+    id: u64,
+    conn: Arc<Conn>,
+    idle_timeout: Duration,
+    mut cancel: tokio::sync::oneshot::Receiver<()>,
+) {
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+
+    loop {
+        let mut websocket = conn.ws.lock().await;
+        tokio::select! {
+            _ = &mut cancel => return,
+            _ = &mut idle => {
+                drop(websocket);
+                remove_pooled_entry(&pool_key, id);
+                return;
+            }
+            next = websocket.next() => {
+                match next {
+                    Some(Ok(Message::Ping(_))) => {
+                        // Tungstenite queues the protocol-required pong while
+                        // reading the ping. Flush it before continuing to watch.
+                        if websocket.flush().await.is_err() {
+                            drop(websocket);
+                            remove_pooled_entry(&pool_key, id);
+                            return;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    // Any application frame after an accepted terminal is stale
+                    // protocol data. Close/error/EOF likewise makes the entry
+                    // unusable. In every case evict before the next acquire.
+                    Some(Ok(_)) | Some(Err(_)) | None => {
+                        drop(websocket);
+                        remove_pooled_entry(&pool_key, id);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Acquire / release
 // ---------------------------------------------------------------------------
@@ -195,11 +244,12 @@ struct RequestHandle {
     /// Entry identity in the pool (0 for non-pooled sockets).
     id: u64,
     pooled: bool,
+    reused: bool,
     idle_timeout_ms: u64,
     released: bool,
-    /// Set only after the terminal application frame has been consumed. A
-    /// client-cancelled stream may leave response frames queued on the socket,
-    /// so its connection must never return to the pool.
+    /// Set only after the shared lifecycle guard accepts a terminal application
+    /// frame. A cancelled or protocol-invalid stream may leave response frames
+    /// queued, so its connection must never return to the pool.
     reusable: bool,
 }
 
@@ -245,20 +295,19 @@ impl Drop for RequestHandle {
         let pool_key = self.pool_key.clone();
         let id = self.id;
         let idle_ms = self.idle_timeout_ms;
+        let conn = still_mapped.conn.clone();
 
         // Spawn requires a running runtime; in our server the stream is always
         // dropped within the tokio runtime. If somehow not, close immediately.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move {
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(idle_ms)) => {
-                            remove_pooled_entry(&pool_key, id);
-                        }
-                        // Cancelled (sender dropped on reuse or explicit remove).
-                        _ = rx => {}
-                    }
-                });
+                handle.spawn(watch_idle_connection(
+                    pool_key,
+                    id,
+                    conn,
+                    Duration::from_millis(idle_ms),
+                    rx,
+                ));
             }
             Err(_) => {
                 drop(pool);
@@ -325,6 +374,7 @@ async fn acquire(
             pool_key: request.pool_key.clone(),
             id,
             pooled: true,
+            reused: true,
             idle_timeout_ms,
             released: false,
             reusable: false,
@@ -367,6 +417,7 @@ async fn acquire(
                 pool_key: request.pool_key.clone(),
                 id,
                 pooled: true,
+                reused: false,
                 idle_timeout_ms,
                 released: false,
                 reusable: false,
@@ -396,6 +447,7 @@ async fn acquire(
                 pool_key: request.pool_key.clone(),
                 id: 0,
                 pooled: false,
+                reused: false,
                 idle_timeout_ms,
                 released: false,
                 reusable: false,
@@ -453,6 +505,61 @@ where
     }
 }
 
+async fn preflight_web_socket(
+    websocket: &mut WsStream,
+    timeout: Duration,
+    unavailable_message: &str,
+) -> Result<(), std::io::Error> {
+    let nonce = next_entry_id().to_be_bytes().to_vec();
+    let probe = async {
+        websocket
+            .send(Message::Ping(nonce.clone()))
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("{unavailable_message}: ping failed: {error}"))
+            })?;
+        loop {
+            match websocket.next().await {
+                Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
+                Some(Ok(Message::Ping(_))) => {
+                    websocket.flush().await.map_err(|error| {
+                        std::io::Error::other(format!(
+                            "{unavailable_message}: pong flush failed: {error}"
+                        ))
+                    })?;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                    return Err(std::io::Error::other(format!(
+                        "{unavailable_message}: stale application frame before request"
+                    )));
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err(std::io::Error::other(format!(
+                        "{unavailable_message}: connection closed before request"
+                    )));
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    return Err(std::io::Error::other(format!(
+                        "{unavailable_message}: health probe failed: {error}"
+                    )));
+                }
+            }
+        }
+    };
+
+    tokio::time::timeout(timeout, probe).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "{unavailable_message}: health probe timed out after {}ms",
+                timeout.as_millis()
+            ),
+        )
+    })?
+}
+
 /// Normalize a WebSocket frame into the SSE text payload, or `None` for control
 /// frames that carry no application data. Mirrors `normalizeWebSocketMessageData`.
 fn normalize_message(message: Message) -> Option<String> {
@@ -478,65 +585,92 @@ pub async fn create_pooled_web_socket_stream(
     request: PooledWebSocketRequest,
     options: PooledWebSocketStreamOptions,
 ) -> Result<impl Stream<Item = Result<SseChunk, std::io::Error>>, std::io::Error> {
-    // Complete the handshake before returning a stream. The caller can safely
-    // fall back to HTTP on this error because no application request frame has
-    // been sent yet.
-    let handle = acquire(&request, &options).await?;
+    let payload = serde_json::to_string(&request.payload).map_err(|error| {
+        std::io::Error::other(format!("{}: {error}", options.stream_error_message))
+    })?;
+    // Probe and send while still inside this async constructor. Every returned
+    // Err is therefore known to precede the application request frame and is
+    // safe for the caller's HTTP fallback. A request-frame send failure is
+    // ambiguous (the peer may have received bytes), so it becomes the first
+    // error item of an Ok stream and can never trigger a replay.
+    let mut handle = acquire(&request, &options).await?;
+    let (pool_key, id, pooled, initial_error) = loop {
+        let pool_key = handle.pool_key.clone();
+        let id = handle.id;
+        let pooled = handle.pooled;
+        let conn = handle.conn.clone();
+        let mut websocket = conn.ws.lock().await;
+        let unavailable_message = options
+            .unavailable_error_message
+            .as_deref()
+            .unwrap_or("Websocket connection became unavailable before the request started");
+        if let Err(error) = preflight_web_socket(
+            &mut websocket,
+            options.preflight_timeout,
+            unavailable_message,
+        )
+        .await
+        {
+            if pooled {
+                remove_pooled_entry(&pool_key, id);
+            }
+            let reopen = handle.reused;
+            drop(websocket);
+            drop(handle);
+            if reopen {
+                metrics::counter!("responses_websocket_pool_reopen_total").increment(1);
+                handle = acquire(&request, &options).await?;
+                continue;
+            }
+            return Err(error);
+        }
+
+        let initial_error = match await_optional_timeout(
+            options.read_timeout,
+            websocket.send(Message::Text(payload.clone())),
+        )
+        .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(std::io::Error::other(format!(
+                "{}: request frame send failed: {error}",
+                options.stream_error_message
+            ))),
+            Err(()) => Some(std::io::Error::other(format!(
+                "{}: timed out sending request frame after {}ms",
+                options.stream_error_message,
+                options
+                    .read_timeout
+                    .map(|value| value.as_millis())
+                    .unwrap_or_default()
+            ))),
+        };
+        break (pool_key, id, pooled, initial_error);
+    };
+
+    if initial_error.is_some() && pooled {
+        remove_pooled_entry(&pool_key, id);
+    }
 
     Ok(async_stream::stream! {
         // `handle` is held for the whole stream; its Drop runs the release path.
         let mut handle = handle;
-        let pool_key = handle.pool_key.clone();
-        let id = handle.id;
-        let pooled = handle.pooled;
-
-        let payload = match serde_json::to_string(&request.payload) {
-            Ok(text) => text,
-            Err(err) => {
-                if pooled {
-                    remove_pooled_entry(&pool_key, id);
-                }
-                yield Err(std::io::Error::other(format!(
-                    "{}: {err}",
-                    options.stream_error_message
-                )));
-                return;
-            }
-        };
-
-        // The live socket is serialized behind this async mutex for the request.
-        let conn = handle.conn.clone();
-        let mut ws = conn.ws.lock().await;
-
-        let read_timeout = options.read_timeout;
-
-        match await_optional_timeout(read_timeout, ws.send(Message::Text(payload))).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                if pooled {
-                    remove_pooled_entry(&pool_key, id);
-                }
-                yield Err(std::io::Error::other(format!(
-                    "{}: {err}",
-                    options.stream_error_message
-                )));
-                return;
-            }
-            Err(_elapsed) => {
-                if pooled {
-                    remove_pooled_entry(&pool_key, id);
-                }
-                yield Err(std::io::Error::other(format!(
-                    "{}: timed out sending request frame after {}ms",
-                    options.stream_error_message,
-                    read_timeout.map(|value| value.as_millis()).unwrap_or_default()
-                )));
-                return;
-            }
+        if let Some(error) = initial_error {
+            // The request frame may have reached the peer. Surface the error but
+            // deliberately do not return it from the constructor (which would
+            // make the caller replay over HTTP).
+            yield Err(error);
+            return;
         }
 
+        let conn = handle.conn.clone();
+        let mut websocket = conn.ws.lock().await;
+        let read_timeout = options.read_timeout;
+        let mut lifecycle = crate::routes::responses::stream_guard::ResponsesStreamGuard::new();
+        let mut ids = crate::routes::responses::stream_id_sync::StreamIdTracker::new();
+
         loop {
-            let next = match await_optional_timeout(read_timeout, ws.next()).await {
+            let next = match await_optional_timeout(read_timeout, websocket.next()).await {
                 Ok(next) => next,
                 Err(_elapsed) => {
                     // No frame (data or control) within the deadline: treat the
@@ -560,11 +694,24 @@ pub async fn create_pooled_web_socket_stream(
                         continue;
                     };
                     let chunk = (options.create_chunk)(data);
-                    let terminal = (options.is_terminal_chunk)(&chunk);
+                    let terminal = match lifecycle.process(&chunk, &mut ids) {
+                        Ok(Some(processed)) => processed.terminal.is_some(),
+                        Ok(None) => continue,
+                        Err(reason) => {
+                            if pooled {
+                                remove_pooled_entry(&pool_key, id);
+                            }
+                            yield Err(std::io::Error::other(format!(
+                                "{}: invalid Responses lifecycle ({reason})",
+                                options.stream_error_message
+                            )));
+                            return;
+                        }
+                    };
                     if terminal {
-                        // Mark clean before yielding: a downstream consumer may
-                        // drop immediately after this frame without polling us
-                        // again to execute the code below the yield.
+                        // Only the authoritative lifecycle guard can approve
+                        // reuse. Mark before yielding so an immediate downstream
+                        // drop after a valid terminal still schedules idle watch.
                         handle.mark_reusable();
                     }
                     yield Ok(chunk);
@@ -623,13 +770,75 @@ mod tests {
         chunk.event.as_deref() == Some("response.completed")
     }
 
+    async fn receive_request(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> String {
+        loop {
+            match websocket.next().await.expect("websocket frame").unwrap() {
+                Message::Ping(payload) => websocket
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("send preflight pong"),
+                Message::Text(payload) => return payload,
+                other => panic!("unexpected pre-request frame: {other:?}"),
+            }
+        }
+    }
+
+    async fn send_created(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        response_id: &str,
+    ) {
+        websocket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"response.created",
+                    "sequence_number":0,
+                    "response":{"id":response_id}
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("send response.created");
+    }
+
+    async fn send_completed(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        response_id: &str,
+    ) {
+        websocket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"response.completed",
+                    "sequence_number":2,
+                    "response":{"id":response_id}
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("send response.completed");
+    }
+
+    async fn wait_until_pool_entry_is_removed(pool_key: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !WEBSOCKET_POOL.lock().unwrap().contains_key(pool_key) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("pool entry should be removed");
+    }
+
     fn test_options() -> PooledWebSocketStreamOptions {
         PooledWebSocketStreamOptions {
             create_chunk: test_chunk,
             idle_timeout_ms: Some(5),
             connect_timeout: Duration::from_secs(2),
             read_timeout: Some(Duration::from_secs(2)),
-            is_terminal_chunk: test_terminal,
+            preflight_timeout: Duration::from_millis(250),
             open_error_message: "open failed".to_string(),
             stream_error_message: "stream failed".to_string(),
             terminal_chunk_missing_message: "terminal missing".to_string(),
@@ -711,6 +920,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_preflight_frame_returns_before_application_request_send() {
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind preflight listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(tcp).await.unwrap();
+            let first = websocket.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Ping(_)));
+            websocket
+                .send(Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"stale"}}"#.to_string(),
+                ))
+                .await
+                .unwrap();
+            // The peer must close without ever sending response.create.
+            if let Ok(Some(Ok(Message::Text(payload)))) =
+                tokio::time::timeout(Duration::from_millis(100), websocket.next()).await
+            {
+                panic!("application request was sent after failed preflight: {payload}");
+            }
+        });
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: format!("preflight-failure-{}", next_entry_id()),
+            url: format!("ws://{address}"),
+        };
+        let options = test_options();
+        let error = match create_pooled_web_socket_stream(request, options).await {
+            Ok(_) => panic!("failed preflight should be constructor error"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("stale application frame"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn client_cancellation_evicts_socket_instead_of_reusing_queued_frames() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio_tungstenite::accept_async;
@@ -729,12 +979,9 @@ mod tests {
                 accepted_server.fetch_add(1, Ordering::SeqCst);
                 handlers.push(tokio::spawn(async move {
                     let mut ws = accept_async(tcp).await.expect("websocket handshake");
-                    let request = ws
-                        .next()
-                        .await
-                        .expect("request frame")
-                        .expect("valid request frame");
-                    assert!(matches!(request, Message::Text(_)));
+                    let _request = receive_request(&mut ws).await;
+                    let response_id = format!("resp-cancel-{connection_index}");
+                    send_created(&mut ws, &response_id).await;
                     ws.send(Message::Text(
                         r#"{"type":"response.output_text.delta","delta":"old"}"#.to_string(),
                     ))
@@ -747,11 +994,7 @@ mod tests {
                         // request frame and that request consumes stale output.
                         let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
                     } else {
-                        ws.send(Message::Text(
-                            r#"{"type":"response.completed"}"#.to_string(),
-                        ))
-                        .await
-                        .expect("send terminal frame");
+                        send_completed(&mut ws, &response_id).await;
                     }
                 }));
             }
@@ -773,11 +1016,13 @@ mod tests {
                 .await
                 .expect("first websocket stream"),
         );
-        let first_chunk = first
+        let created = first
             .next()
             .await
             .expect("first chunk")
             .expect("valid first chunk");
+        assert_eq!(created.event.as_deref(), Some("response.created"));
+        let first_chunk = first.next().await.unwrap().unwrap();
         assert!(!test_terminal(&first_chunk));
         drop(first); // cancellation before response.completed
 
@@ -786,11 +1031,13 @@ mod tests {
                 .await
                 .expect("second websocket stream"),
         );
-        let _delta = second
+        let created = second
             .next()
             .await
-            .expect("second delta")
-            .expect("valid second delta");
+            .expect("second created")
+            .expect("valid second created");
+        assert_eq!(created.event.as_deref(), Some("response.created"));
+        let _delta = second.next().await.unwrap().unwrap();
         let terminal = second
             .next()
             .await
@@ -811,5 +1058,404 @@ mod tests {
         })
         .await
         .expect("idle-close task should evict the completed socket");
+    }
+
+    #[tokio::test]
+    async fn clean_terminal_stream_reuses_one_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reuse listener");
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            accepted_server.fetch_add(1, Ordering::SeqCst);
+            let mut websocket = accept_async(tcp).await.unwrap();
+            for request_number in 1..=2 {
+                let _request = receive_request(&mut websocket).await;
+                let response_id = format!("resp-reuse-{request_number}");
+                send_created(&mut websocket, &response_id).await;
+                websocket
+                    .send(Message::Text(format!(
+                        r#"{{"type":"response.output_text.delta","delta":"{request_number}"}}"#
+                    )))
+                    .await
+                    .unwrap();
+                send_completed(&mut websocket, &response_id).await;
+            }
+        });
+
+        let pool_key = format!("reuse-test-{}", next_entry_id());
+        let request = || PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: pool_key.clone(),
+            url: format!("ws://{address}"),
+        };
+        let mut options = test_options();
+        options.idle_timeout_ms = Some(1_000);
+
+        for _ in 0..2 {
+            let mut stream = Box::pin(
+                create_pooled_web_socket_stream(request(), options.clone())
+                    .await
+                    .unwrap(),
+            );
+            let created = stream.next().await.unwrap().expect("created");
+            assert_eq!(created.event.as_deref(), Some("response.created"));
+            assert!(!test_terminal(
+                &stream.next().await.unwrap().expect("delta")
+            ));
+            assert!(test_terminal(
+                &stream.next().await.unwrap().expect("terminal")
+            ));
+            assert!(stream.next().await.is_none());
+        }
+
+        server.await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let entry_id = WEBSOCKET_POOL
+            .lock()
+            .unwrap()
+            .get(&pool_key)
+            .map(|entry| entry.id);
+        if let Some(entry_id) = entry_id {
+            remove_pooled_entry(&pool_key, entry_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_close_after_terminal_is_evicted_before_next_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote-close listener");
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                accepted_server.fetch_add(1, Ordering::SeqCst);
+                let mut websocket = accept_async(tcp).await.unwrap();
+                let _request = receive_request(&mut websocket).await;
+                let response_id = format!("resp-remote-close-{connection_index}");
+                send_created(&mut websocket, &response_id).await;
+                send_completed(&mut websocket, &response_id).await;
+                if connection_index == 0 {
+                    websocket.close(None).await.unwrap();
+                }
+            }
+        });
+
+        let pool_key = format!("remote-close-test-{}", next_entry_id());
+        let request = || PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: pool_key.clone(),
+            url: format!("ws://{address}"),
+        };
+        let mut options = test_options();
+        options.idle_timeout_ms = Some(1_000);
+
+        let mut first = Box::pin(
+            create_pooled_web_socket_stream(request(), options.clone())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            first.next().await.unwrap().unwrap().event.as_deref(),
+            Some("response.created")
+        );
+        assert!(test_terminal(&first.next().await.unwrap().unwrap()));
+        assert!(first.next().await.is_none());
+        drop(first);
+        wait_until_pool_entry_is_removed(&pool_key).await;
+
+        let mut second = Box::pin(
+            create_pooled_web_socket_stream(request(), options)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            second.next().await.unwrap().unwrap().event.as_deref(),
+            Some("response.created")
+        );
+        assert!(test_terminal(&second.next().await.unwrap().unwrap()));
+        assert!(second.next().await.is_none());
+        server.await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn dead_reused_socket_is_preflighted_and_reopened_before_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reopen listener");
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+        let close_first = Arc::new(tokio::sync::Notify::new());
+        let close_first_server = close_first.clone();
+        let server = tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                accepted_server.fetch_add(1, Ordering::SeqCst);
+                let mut websocket = accept_async(tcp).await.unwrap();
+                let _request = receive_request(&mut websocket).await;
+                let response_id = format!("resp-reopen-{connection_index}");
+                send_created(&mut websocket, &response_id).await;
+                send_completed(&mut websocket, &response_id).await;
+                if connection_index == 0 {
+                    close_first_server.notified().await;
+                    websocket.close(None).await.unwrap();
+                }
+            }
+        });
+
+        let pool_key = format!("preflight-reopen-test-{}", next_entry_id());
+        let request = || PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: pool_key.clone(),
+            url: format!("ws://{address}"),
+        };
+        let mut options = test_options();
+        options.idle_timeout_ms = Some(1_000);
+
+        let mut first = Box::pin(
+            create_pooled_web_socket_stream(request(), options.clone())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            first.next().await.unwrap().unwrap().event.as_deref(),
+            Some("response.created")
+        );
+        assert!(test_terminal(&first.next().await.unwrap().unwrap()));
+        assert!(first.next().await.is_none());
+        drop(first);
+
+        // Cancel the background watcher to deterministically model a remote
+        // close racing with reuse. The stale entry remains mapped, so the second
+        // request must detect it in preflight and reopen before response.create.
+        {
+            let mut pool = WEBSOCKET_POOL.lock().unwrap();
+            pool.get_mut(&pool_key)
+                .expect("completed pooled entry")
+                .idle_cancel = None;
+        }
+        tokio::task::yield_now().await;
+        close_first.notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut second = Box::pin(
+            create_pooled_web_socket_stream(request(), options)
+                .await
+                .expect("dead pooled socket should reopen"),
+        );
+        assert_eq!(
+            second.next().await.unwrap().unwrap().event.as_deref(),
+            Some("response.created")
+        );
+        assert!(test_terminal(&second.next().await.unwrap().unwrap()));
+        assert!(second.next().await.is_none());
+        server.await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_terminal_evicts_socket_instead_of_marking_it_reusable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind malformed-terminal listener");
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                accepted_server.fetch_add(1, Ordering::SeqCst);
+                let mut websocket = accept_async(tcp).await.unwrap();
+                let _request = receive_request(&mut websocket).await;
+                if connection_index == 0 {
+                    websocket
+                        .send(Message::Text(
+                            r#"{"type":"response.completed","response":{"id":"malformed"}}"#
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                } else {
+                    send_created(&mut websocket, "resp-valid-after-malformed").await;
+                    send_completed(&mut websocket, "resp-valid-after-malformed").await;
+                }
+            }
+        });
+
+        let pool_key = format!("malformed-terminal-test-{}", next_entry_id());
+        let request = || PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: pool_key.clone(),
+            url: format!("ws://{address}"),
+        };
+        let mut options = test_options();
+        options.idle_timeout_ms = Some(1_000);
+
+        let mut malformed = Box::pin(
+            create_pooled_web_socket_stream(request(), options.clone())
+                .await
+                .unwrap(),
+        );
+        let error = malformed
+            .next()
+            .await
+            .unwrap()
+            .expect_err("terminal without response.created must fail");
+        assert!(error.to_string().contains("invalid Responses lifecycle"));
+        drop(malformed);
+        wait_until_pool_entry_is_removed(&pool_key).await;
+
+        let mut valid = Box::pin(
+            create_pooled_web_socket_stream(request(), options)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            valid.next().await.unwrap().unwrap().event.as_deref(),
+            Some("response.created")
+        );
+        assert!(test_terminal(&valid.next().await.unwrap().unwrap()));
+        assert!(valid.next().await.is_none());
+        server.await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ping_is_a_heartbeat_but_silence_is_bounded() {
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind heartbeat listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(tcp).await.unwrap();
+            let _request = receive_request(&mut websocket).await;
+            send_created(&mut websocket, "resp-heartbeat").await;
+            websocket.send(Message::Ping(vec![1, 2, 3])).await.unwrap();
+            send_completed(&mut websocket, "resp-heartbeat").await;
+        });
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: format!("heartbeat-test-{}", next_entry_id()),
+            url: format!("ws://{address}"),
+        };
+        let mut stream = Box::pin(
+            create_pooled_web_socket_stream(request, test_options())
+                .await
+                .unwrap(),
+        );
+        let created = stream.next().await.unwrap().unwrap();
+        assert_eq!(created.event.as_deref(), Some("response.created"));
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert!(
+            test_terminal(&terminal),
+            "control frames must not become events"
+        );
+        assert!(stream.next().await.is_none());
+        server.await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silence listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(tcp).await.unwrap();
+            let _request = receive_request(&mut websocket).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: format!("silence-test-{}", next_entry_id()),
+            url: format!("ws://{address}"),
+        };
+        let mut options = test_options();
+        options.read_timeout = Some(Duration::from_millis(20));
+        let mut stream = Box::pin(
+            create_pooled_web_socket_stream(request, options)
+                .await
+                .unwrap(),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("silence error")
+            .expect_err("silence must fail");
+        assert!(error.to_string().contains("no data within"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_without_terminal_is_an_explicit_failure() {
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(tcp).await.unwrap();
+            let _request = receive_request(&mut websocket).await;
+            send_created(&mut websocket, "resp-truncated").await;
+            websocket
+                .send(Message::Text(
+                    r#"{"type":"response.output_text.delta","delta":"partial"}"#.to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: format!("truncated-test-{}", next_entry_id()),
+            url: format!("ws://{address}"),
+        };
+        let mut stream = Box::pin(
+            create_pooled_web_socket_stream(request, test_options())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().event.as_deref(),
+            Some("response.created")
+        );
+        assert!(stream.next().await.unwrap().is_ok());
+        let error = stream
+            .next()
+            .await
+            .expect("terminal-missing error")
+            .expect_err("truncated stream must fail");
+        assert_eq!(error.to_string(), "terminal missing");
+        server.await.unwrap();
     }
 }

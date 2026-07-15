@@ -35,6 +35,8 @@ futures-util = "0.3"
 async-stream = "0.3"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+rpassword = "7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
@@ -63,6 +65,9 @@ libc = "0.2"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 serial_test = "3"

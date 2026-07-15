@@ -461,6 +461,7 @@ fn configure_ultracode_provider(base_url: String) {
             api_key: Some("fixture-key".to_string()),
             auth_type: Some("x-api-key".to_string()),
             models: Some(models),
+            capabilities: None,
             adjust_input_tokens: Some(false),
             extra: Map::new(),
         },

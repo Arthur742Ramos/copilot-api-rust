@@ -1,22 +1,24 @@
-//! Codex `/responses` HTTP transport.
+//! Codex `/responses` HTTP and pooled upstream WebSocket transports.
 //!
-//! Ported from services/codex/create-responses.ts. SCOPE: HTTP transport only.
-//! The pooled WebSocket transport (and its pool-key / chunk-translation helpers)
-//! is Phase 5; where the TS branches to websocket we take the HTTP path and
-//! leave a `// TODO Phase 5 WS` marker.
+//! Ported from services/codex/create-responses.ts. Streaming requests select the
+//! upstream WebSocket when enabled, with handshake/preflight-only fallback to
+//! HTTP. Unary and compaction requests remain HTTP.
 //!
 //! Conventions match the rest of the crate (see create_chat_completions.rs):
 //! services return `Result<_, HttpError>`; headers are built into a
 //! `reqwest::header::HeaderMap` and handed to `client().post(...).headers(...)`.
 
+use futures_util::StreamExt;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::libs::error::HttpError;
 use crate::libs::http::{client, serialize_json_body};
 use crate::libs::request_context::request_context_store;
 use crate::libs::state;
 use crate::services::copilot::create_responses::{
-    InputField, MessageContent, ResponseInputContent, ResponseInputItem, ResponsesPayload,
+    InputField, MessageContent, ResponseInputContent, ResponseInputItem, ResponsesEventStream,
+    ResponsesPayload,
 };
 
 /// Mirrors the TS `CODEX_API_BASE_URL`.
@@ -83,6 +85,275 @@ pub fn resolve_codex_compact_url(base_url: &str) -> String {
         return normalized.to_string();
     }
     format!("{}/compact", resolve_codex_responses_url(normalized))
+}
+
+pub enum CodexResponsesReturn {
+    Http(reqwest::Response),
+    Stream(ResponsesEventStream),
+}
+
+struct CodexWebsocketOutcome {
+    finished: bool,
+}
+
+impl Drop for CodexWebsocketOutcome {
+    fn drop(&mut self) {
+        if !self.finished {
+            metrics::counter!(
+                "copilot_responses_websocket_cancel_total",
+                "provider" => "codex"
+            )
+            .increment(1);
+        }
+    }
+}
+
+fn private_provider_override_enabled() -> bool {
+    std::env::var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn websocket_allowed_for_base_url(base_url: &str, allow_unpinned_custom_url: bool) -> bool {
+    let normalized = base_url.trim().trim_end_matches('/');
+    normalized.is_empty() || normalized == CODEX_API_BASE_URL || allow_unpinned_custom_url
+}
+
+fn use_codex_websocket() -> bool {
+    crate::libs::config::is_responses_api_web_socket_enabled()
+        && !crate::libs::http::proxy_from_env_enabled()
+}
+
+fn websocket_chunk(data: String) -> crate::libs::sse::SseEvent {
+    let parsed = serde_json::from_str::<Value>(&data).ok();
+    let event = parsed
+        .as_ref()
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let id = parsed
+        .as_ref()
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    crate::libs::sse::SseEvent { id, event, data }
+}
+
+fn websocket_terminal(chunk: &crate::libs::sse::SseEvent) -> bool {
+    serde_json::from_str::<Value>(&chunk.data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|event_type| {
+            matches!(
+                event_type.as_str(),
+                "response.completed" | "response.failed" | "response.incomplete" | "error"
+            )
+        })
+}
+
+fn codex_websocket_pool_key(
+    url: &str,
+    model: &str,
+    token: &str,
+    account_id: &str,
+    headers: &[(String, String)],
+) -> String {
+    let mut stable_headers = headers
+        .iter()
+        .filter(|(name, _)| !name.to_ascii_lowercase().contains("trace"))
+        .cloned()
+        .collect::<Vec<_>>();
+    stable_headers.sort();
+    let header_bytes = serde_json::to_vec(&stable_headers).unwrap_or_default();
+
+    let mut digest = Sha256::new();
+    digest.update(b"codex-responses-websocket-v1\0");
+    digest.update(url.as_bytes());
+    digest.update(b"\0");
+    digest.update(model.as_bytes());
+    digest.update(b"\0");
+    digest.update(token.as_bytes());
+    digest.update(b"\0");
+    digest.update(account_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(header_bytes);
+    format!("codex:{}", hex::encode(digest.finalize()))
+}
+
+#[allow(clippy::result_large_err)]
+pub async fn forward_codex_responses_websocket(
+    payload: ResponsesPayload,
+    request_headers: &axum::http::HeaderMap,
+    base_url: &str,
+) -> Result<ResponsesEventStream, HttpError> {
+    forward_codex_responses_websocket_inner(
+        payload,
+        request_headers,
+        base_url,
+        private_provider_override_enabled(),
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+async fn forward_codex_responses_websocket_inner(
+    mut payload: ResponsesPayload,
+    request_headers: &axum::http::HeaderMap,
+    base_url: &str,
+    allow_unpinned_custom_url: bool,
+) -> Result<ResponsesEventStream, HttpError> {
+    use crate::services::responses_websocket::{
+        create_pooled_web_socket_stream, create_web_socket_url, PooledWebSocketRequest,
+        PooledWebSocketStreamOptions,
+    };
+
+    if !websocket_allowed_for_base_url(base_url, allow_unpinned_custom_url) {
+        return Err(HttpError::internal(
+            "Custom Codex base URLs use HTTP because WebSocket DNS pinning is unavailable",
+        ));
+    }
+
+    normalize_codex_responses_payload(&mut payload);
+    let access_token =
+        state::with_state(|state| state.codex_access_token.clone()).unwrap_or_default();
+    let account_id = state::with_state(|state| state.codex_account_id.clone()).unwrap_or_default();
+    let mut ws_headers =
+        build_codex_responses_headers(request_headers, Some(false), &access_token)?;
+    ws_headers.insert(
+        reqwest::header::HeaderName::from_static("openai-beta"),
+        reqwest::header::HeaderValue::from_static("responses_websockets=2026-02-06"),
+    );
+    ws_headers.remove(reqwest::header::ACCEPT);
+    ws_headers.remove(reqwest::header::CONTENT_TYPE);
+    let headers = ws_headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    let http_url = resolve_codex_responses_url(base_url);
+    if !base_url.trim().is_empty() && !allow_unpinned_custom_url {
+        crate::services::providers::provider_proxy::validate_upstream_url(&http_url)?;
+    }
+    let url = create_web_socket_url(&http_url);
+    let pool_key =
+        codex_websocket_pool_key(&url, &payload.model, &access_token, &account_id, &headers);
+
+    let mut websocket_payload =
+        serde_json::to_value(&payload).map_err(|error| HttpError::internal(error.to_string()))?;
+    if let Some(object) = websocket_payload.as_object_mut() {
+        object.insert(
+            "type".to_string(),
+            Value::String("response.create".to_string()),
+        );
+        object.remove("stream");
+    }
+
+    let source = create_pooled_web_socket_stream(
+        PooledWebSocketRequest {
+            headers,
+            payload: websocket_payload,
+            pool_key,
+            url,
+        },
+        PooledWebSocketStreamOptions {
+            create_chunk: websocket_chunk,
+            idle_timeout_ms: None,
+            connect_timeout: crate::libs::http::UPSTREAM_CONNECT_TIMEOUT,
+            read_timeout: crate::libs::http::upstream_read_timeout(),
+            preflight_timeout: std::time::Duration::from_secs(2),
+            open_error_message: "Failed to create codex responses websocket".to_string(),
+            stream_error_message: "Codex responses websocket stream error".to_string(),
+            terminal_chunk_missing_message:
+                "Codex responses websocket ended without a terminal response".to_string(),
+            unavailable_error_message: None,
+        },
+    )
+    .await
+    .map_err(|error| HttpError::internal(error.to_string()))?;
+
+    let stream = async_stream::stream! {
+        let mut outcome_guard = CodexWebsocketOutcome { finished: false };
+        futures_util::pin_mut!(source);
+        let mut terminal_recorded = false;
+        while let Some(item) = source.next().await {
+            match &item {
+                Ok(chunk) if websocket_terminal(chunk) && !terminal_recorded => {
+                    terminal_recorded = true;
+                    let terminal = chunk.event.as_deref().unwrap_or("unknown");
+                    let outcome = match terminal {
+                        "response.completed" => "completed",
+                        "response.failed" => "failed",
+                        "response.incomplete" => "incomplete",
+                        "error" => "error",
+                        _ => "unknown",
+                    };
+                    metrics::counter!(
+                        "copilot_responses_websocket_terminal_total",
+                        "provider" => "codex",
+                        "outcome" => outcome
+                    )
+                    .increment(1);
+                    outcome_guard.finished = true;
+                }
+                Err(_) => {
+                    metrics::counter!(
+                        "copilot_responses_websocket_stream_error_total",
+                        "provider" => "codex"
+                    )
+                    .increment(1);
+                    outcome_guard.finished = true;
+                }
+                _ => {}
+            }
+            yield item;
+        }
+    };
+    Ok(Box::pin(stream))
+}
+
+pub async fn forward_codex_responses_selected(
+    payload: ResponsesPayload,
+    request_headers: &axum::http::HeaderMap,
+    base_url: &str,
+) -> Result<CodexResponsesReturn, HttpError> {
+    if payload.stream == Some(true) && use_codex_websocket() {
+        metrics::counter!(
+            "copilot_responses_websocket_attempt_total",
+            "provider" => "codex"
+        )
+        .increment(1);
+        match forward_codex_responses_websocket(payload.clone(), request_headers, base_url).await {
+            Ok(stream) => return Ok(CodexResponsesReturn::Stream(stream)),
+            Err(error) => {
+                // The pooled constructor returns Err only for handshake or
+                // ping/pong preflight failures before response.create. Ambiguous
+                // request-frame send failures are delivered inside an Ok stream,
+                // so replay is safe at this boundary and nowhere later.
+                metrics::counter!(
+                    "copilot_responses_websocket_fallback_total",
+                    "provider" => "codex"
+                )
+                .increment(1);
+                tracing::warn!(
+                    error = %error,
+                    "Codex Responses websocket unavailable before request send; falling back to HTTP"
+                );
+            }
+        }
+    }
+    forward_codex_responses(payload, request_headers, base_url)
+        .await
+        .map(CodexResponsesReturn::Http)
 }
 
 fn set_req_header(map: &mut reqwest::header::HeaderMap, name: &str, value: &str) {
@@ -323,9 +594,6 @@ fn get_text_block(block: &ResponseInputContent) -> Option<String> {
 /// payload, builds headers, and POSTs to the Codex responses endpoint. Returns
 /// the raw response; the caller checks `status` and forwards/streams the body.
 ///
-/// TODO Phase 5 WS: the TS branches to `forwardCodexResponsesOverWebSocket` when
-/// `payload.stream && transport === "websocket"`. That pooled-websocket path is
-/// Phase 5; here we always take the HTTP transport.
 pub async fn forward_codex_responses(
     mut payload: ResponsesPayload,
     request_headers: &axum::http::HeaderMap,
@@ -621,5 +889,131 @@ mod tests {
         // An empty threaded token is rejected, matching the old "token not loaded"
         // guard now that the access token no longer comes from state here.
         assert!(build_codex_responses_headers(&request_headers, Some(false), "").is_err());
+    }
+
+    #[test]
+    fn websocket_pool_key_is_stable_opaque_and_auth_scoped() {
+        let headers = vec![
+            ("user-agent".to_string(), "fixture".to_string()),
+            ("x-trace-id".to_string(), "ignored".to_string()),
+        ];
+        let first =
+            codex_websocket_pool_key("wss://example.test", "gpt", "token-a", "account", &headers);
+        let reordered = vec![
+            ("x-trace-id".to_string(), "different".to_string()),
+            ("user-agent".to_string(), "fixture".to_string()),
+        ];
+        assert_eq!(
+            first,
+            codex_websocket_pool_key(
+                "wss://example.test",
+                "gpt",
+                "token-a",
+                "account",
+                &reordered
+            )
+        );
+        assert_ne!(
+            first,
+            codex_websocket_pool_key("wss://example.test", "gpt", "token-b", "account", &headers)
+        );
+        assert!(!first.contains("token-a"));
+        assert!(!first.contains("account"));
+    }
+
+    #[test]
+    fn codex_websocket_terminal_set_is_exact() {
+        for terminal in [
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+            "error",
+        ] {
+            assert!(websocket_terminal(&websocket_chunk(
+                serde_json::json!({"type": terminal}).to_string()
+            )));
+        }
+        assert!(!websocket_terminal(&websocket_chunk(
+            serde_json::json!({"type":"response.output_text.delta"}).to_string()
+        )));
+        assert!(!websocket_terminal(&websocket_chunk("[DONE]".to_string())));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn codex_websocket_sends_beta_envelope_and_receives_terminal() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::handshake::server::Request as WsRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        state::with_state_mut(|state| {
+            state.codex_access_token = Some("fixture-access".to_string());
+            state.codex_account_id = Some("fixture-account".to_string());
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(tcp, |request: &WsRequest, response| {
+                assert_eq!(
+                    request.headers()["openai-beta"],
+                    "responses_websockets=2026-02-06"
+                );
+                assert_eq!(request.headers()["chatgpt-account-id"], "fixture-account");
+                assert!(!request.headers().contains_key("content-type"));
+                Ok(response)
+            })
+            .await
+            .unwrap();
+            let request = loop {
+                match websocket.next().await.unwrap().unwrap() {
+                    Message::Ping(payload) => websocket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("send preflight pong"),
+                    Message::Text(request) => break request,
+                    other => panic!("unexpected pre-request frame: {other:?}"),
+                }
+            };
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["type"], "response.create");
+            assert_eq!(request["model"], "gpt-fixture");
+            assert!(request.get("stream").is_none());
+            websocket
+                .send(Message::Text(
+                    r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_fixture"}}"#.to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    r#"{"type":"response.completed","sequence_number":1,"response":{"id":"resp_fixture"}}"#.to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let payload: ResponsesPayload =
+            serde_json::from_value(serde_json::json!({"model":"gpt-fixture","stream":true}))
+                .unwrap();
+        let mut stream = forward_codex_responses_websocket_inner(
+            payload,
+            &axum::http::HeaderMap::new(),
+            &format!("http://{address}"),
+            true,
+        )
+        .await
+        .unwrap();
+        let created = stream.next().await.unwrap().unwrap();
+        assert_eq!(created.event.as_deref(), Some("response.created"));
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert_eq!(terminal.event.as_deref(), Some("response.completed"));
+        assert!(stream.next().await.is_none());
+        server.await.unwrap();
+        state::with_state_mut(|state| {
+            state.codex_access_token = None;
+            state.codex_account_id = None;
+        });
     }
 }

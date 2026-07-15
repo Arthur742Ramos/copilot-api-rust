@@ -6,7 +6,7 @@ use axum::response::Response;
 use serde_json::Value;
 
 use crate::libs::compact::COMPACT_REQUEST;
-use crate::libs::config::resolve_mapped_model;
+use crate::libs::config::{resolve_effective_provider_config, resolve_mapped_model};
 use crate::libs::error::{openai_error_response, AppError, HttpError};
 use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::provider_resolver::resolve_provider_config;
@@ -176,7 +176,7 @@ async fn handle_provider_compact(
     provider: String,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let Some(config) = resolve_provider_config(&provider).await else {
+    let Some(config) = resolve_provider_config(&provider).await? else {
         return Ok(openai_error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
@@ -184,7 +184,11 @@ async fn handle_provider_compact(
             format!("Provider '{provider}' not found or disabled."),
         ));
     };
-    if config.provider_type != "openai-responses" {
+    let config = resolve_effective_provider_config(&config, &payload.model);
+    if !crate::libs::provider_capabilities::supports(
+        &config,
+        crate::libs::provider_capabilities::ProviderCapability::ResponsesCompact,
+    ) {
         return Ok(openai_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -247,4 +251,47 @@ async fn handle_provider_compact(
         &response_model,
         status,
     ))
+}
+
+pub async fn post_provider_responses_compact(
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let value = match parse_json_body(&body) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("invalid_json"),
+                "request: must be a JSON object",
+            )
+        }
+        Err(error) => return error.into_openai_response(),
+    };
+    let mut payload: ResponsesPayload = match serde_json::from_value(value) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return AppError::BadRequest(format!("Invalid request payload: {error}"))
+                .into_openai_response()
+        }
+    };
+    if let Err(error) = validate_responses_payload(&payload) {
+        return error.into_openai_response();
+    }
+    if payload.stream == Some(true) {
+        return AppError::BadRequest(
+            "stream: /responses/compact is a non-streaming endpoint".to_string(),
+        )
+        .into_openai_response();
+    }
+    payload.stream = None;
+    if let Err(error) = materialize_responses_file_references(&mut payload).await {
+        return error.into_openai_response();
+    }
+    match handle_provider_compact(payload, provider, headers).await {
+        Ok(response) => response,
+        Err(error) => error.into_openai_response(),
+    }
 }

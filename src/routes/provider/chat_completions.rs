@@ -8,14 +8,14 @@
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::response::Response;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::libs::config::ModelConfig;
+use crate::libs::config::{resolve_effective_provider_config, ModelConfig};
 use crate::libs::error::{http_error_from_response, AppError};
+use crate::libs::provider_capabilities::{supports, ProviderCapability};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{
     create_provider_token_usage_recorder, normalize_openai_usage, TokenUsageRecorder, UsageTokens,
@@ -29,24 +29,23 @@ pub async fn handle_provider_chat_completions(
     provider: String,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let provider_config = resolve_provider_config(&provider).await;
-    let provider_config = match provider_config {
-        Some(cfg) if cfg.provider_type == "openai-compatible" => cfg,
-        _ => {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": format!(
-                            "Provider '{provider}' does not support the /v1/chat/completions endpoint"
-                        ),
-                        "type": "invalid_request_error",
-                    }
-                })),
-            )
-                .into_response());
-        }
+    let Some(provider_config) = resolve_provider_config(&provider).await? else {
+        return Ok(crate::libs::error::openai_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            Some("provider_not_found"),
+            format!("Provider '{provider}' not found or disabled"),
+        ));
     };
+    let provider_config = resolve_effective_provider_config(&provider_config, &payload.model);
+    if !supports(&provider_config, ProviderCapability::ChatCompletions) {
+        return Ok(crate::libs::error::openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("unsupported_provider_capability"),
+            format!("Provider '{provider}' does not support the /v1/chat/completions endpoint"),
+        ));
+    }
 
     let model_config = provider_config
         .models
@@ -118,6 +117,37 @@ pub async fn handle_provider_chat_completions(
         &resp_headers,
         bytes,
     ))
+}
+
+/// Provider-scoped OpenAI Chat Completions route.
+pub async fn post_provider_chat_completions(
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let value = match crate::routes::parse_json_body(&body) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => {
+            return crate::libs::error::openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("invalid_json"),
+                "request: must be a JSON object",
+            )
+        }
+        Err(error) => return error.into_openai_response(),
+    };
+    let payload: ChatCompletionsPayload = match serde_json::from_value(value) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return AppError::BadRequest(format!("Invalid request payload: {error}"))
+                .into_openai_response()
+        }
+    };
+    match handle_provider_chat_completions(payload, provider, headers).await {
+        Ok(response) => response,
+        Err(error) => error.into_openai_response(),
+    }
 }
 
 /// Mirrors `applyProviderModelDefaults`.

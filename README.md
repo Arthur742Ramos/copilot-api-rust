@@ -382,6 +382,11 @@ Register it with Claude Code:
 claude mcp add copilot-api -- copilot-api mcp
 ```
 
+Release-ready Claude Code marketplace plugins and the OpenCode marker/config
+assets are in [`plugin/`](./plugin/README.md). They preserve subagent identity
+and register the same deferred `tool_search` bridge without machine-specific
+paths.
+
 Image generation requires Codex credentials:
 
 ```sh
@@ -391,6 +396,21 @@ copilot-api auth --provider codex
 The image path uses an undocumented Codex backend and can change without notice.
 
 ## Configuration
+
+Run `copilot-api auth` in a terminal for guided Copilot, Codex, DeepSeek,
+DashScope, OpenRouter, OpenCode Go, or custom provider setup. Built-in Copilot
+and Codex OAuth fail immediately without a TTY; preconfigured services reuse
+their protected credentials instead of invoking `auth`. Non-interactive custom
+provider automation uses `--api-key-env`; the secret is written to the
+owner-only credential store rather than `config.json`:
+
+```sh
+export TEAM_OPENAI_KEY='set-at-runtime'
+copilot-api auth --provider custom --name team-openai \
+  --type openai-responses --base-url https://provider.example.com \
+  --api-key-env TEAM_OPENAI_KEY --model gpt-example \
+  --capability responses,responses_compact,models,alpha_search
+```
 
 On first run, the gateway creates `config.json` in its platform-specific app-data
 directory. Run `copilot-api debug` to print the exact paths in use, or override
@@ -421,9 +441,13 @@ customize:
       "type": "openai-compatible",
       "enabled": true,
       "baseUrl": "https://provider.example.com",
-      "apiKey": "provider-secret",
       "authType": "authorization",
-      "models": {}
+      "capabilities": ["messages", "count_tokens", "models", "chat_completions", "responses", "responses_compact", "images", "alpha_search"],
+      "models": {
+        "gpt-responses": {
+          "type": "openai-responses"
+        }
+      }
     }
   },
   "modelMappings": {
@@ -447,6 +471,19 @@ Notes:
 - `adminApiKey` is generated automatically and always protects `/admin/*`.
 - Provider types are `anthropic`, `openai-compatible`, and
   `openai-responses`.
+- Provider API keys created by `copilot-api auth` live in the protected
+  `provider_credentials.json` store. Existing inline `apiKey` configuration
+  remains readable for backward compatibility; new setup does not write it.
+- Credential/config writes are owner-only from file creation onward: verified
+  `0600` on Unix and a protected single-user DACL on Windows. Unsupported
+  platforms or ACL failures fail closed before secrets/config are read or
+  written.
+- `capabilities` is optional. When absent, conservative defaults are derived
+  from the provider type; unsupported routes fail before upstream dispatch.
+- A model can override its provider protocol with
+  `models.<model>.type`. Capability checks, endpoint selection, and default auth
+  mode use this effective type; unknown model fields and future type values are
+  preserved, with unsupported type values falling back to the provider type.
 - The provider name `copilot` is reserved.
 - `claudeCodeModelDiscoveryAliases` is disabled by default. Enable it only when
   Claude Code's `/model` picker should include non-Claude Copilot models.
@@ -509,6 +546,7 @@ Admin routes always require the separately generated `auth.adminApiKey`.
 | `doctor` | Run auth, config, and provider preflight checks. |
 | `mcp` | Start the MCP bridge over stdio. |
 | `update` | Update a release binary in place. |
+| `completions <SHELL>` | Generate bash, zsh, fish, elvish, or PowerShell completions. |
 
 ### Global flags
 
@@ -541,7 +579,15 @@ Admin routes always require the separately generated `auth.adminApiKey`.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--provider <NAME>` | `copilot` | Authenticate `copilot` or `codex`. |
+| `--provider <NAME>` | guided in TTY; built-in OAuth fails outside TTY | Authenticate or configure `copilot`, `codex`, `opencode-go`, `deepseek`, `dashscope`, `openrouter`, or `custom`. |
+| `--name <NAME>` | none | Name a custom provider. |
+| `--type <TYPE>` | provider default | `anthropic`, `openai-compatible`, or `openai-responses`. |
+| `--base-url <URL>` | provider default | Provider base URL; credentials/query/fragment are rejected. |
+| `--auth-type <TYPE>` | protocol default | `x-api-key` or `authorization`. |
+| `--api-key-env <NAME>` | provider-specific variable | Read the provider key without exposing it in argv/config. |
+| `--model <NAME>` | none | Model choice; repeat or use commas. |
+| `--capability <NAME>` | protocol defaults | Explicit endpoint capabilities; repeat or use commas. |
+| `--probe` | `false` | Run the bounded provider health probe after setup. |
 | `--verbose` / `-v` | `false` | Enable debug logging. |
 | `--show-token` | `false` | Print the provider access token. |
 
@@ -574,6 +620,8 @@ Admin routes always require the separately generated `auth.adminApiKey`.
 | `COPILOT_API_RATE_LIMIT_MAX_WAIT_SECS` | Maximum projected wait before returning `429`. |
 | `COPILOT_API_ALLOW_REMOTE_NO_KEY` | Allow non-loopback binding with no API keys. |
 | `COPILOT_API_PROVIDER_ONLY` | Route all traffic through one configured provider. |
+| `COPILOT_API_PROVIDER_<NAME>_API_KEY` | Provider credential used by non-interactive auth/runtime resolution (`<NAME>` uppercased with punctuation as `_`). |
+| `COPILOT_API_PROVIDER_API_KEY` | Generic fallback credential for non-interactive provider setup. |
 | `COPILOT_API_LOG_FORMAT` | Set `json` for structured logs. |
 | `RUST_LOG` | Logging filter, such as `copilot_api=debug,hyper=warn`. |
 | `ANTHROPIC_API_KEY` | Optional exact Claude token counting only. |
@@ -609,6 +657,7 @@ concurrency setting.
 | `POST` | `/chat/completions`, `/v1/chat/completions` | OpenAI Chat Completions. |
 | `POST` | `/responses`, `/v1/responses` | OpenAI Responses. |
 | `POST` | `/responses/compact`, `/v1/responses/compact` | Responses compaction used by Codex CLI. |
+| `POST` | `/alpha/search`, `/v1/alpha/search` | Codex Alpha Search. |
 | `POST` | `/embeddings`, `/v1/embeddings` | OpenAI-compatible embeddings. |
 | `POST` | `/images/generations`, `/v1/images/generations` | Native Codex-backed OpenAI image generation. |
 | `POST` | `/images/edits`, `/v1/images/edits` | Native Codex-backed multipart image edits. |
@@ -622,11 +671,15 @@ concurrency setting.
 | `GET`, `POST` | `/admin/config/providers` | List or upsert providers. |
 | `GET` | `/admin/providers/health` | Probe enabled providers. |
 | `POST` | `/admin/config/reload` | Reload `config.json` without restarting. |
-| `POST` | `/:provider/v1/messages` | Provider-routed Anthropic Messages. |
-| `POST` | `/:provider/v1/messages/count_tokens` | Provider-routed token counting. |
-| `GET` | `/:provider/v1/models` | Provider-routed model discovery. |
-| `POST` | `/:provider/v1/images/generations` | Provider-routed image generation. |
-| `POST` | `/:provider/v1/images/edits` | Provider-routed multipart image edits. |
+| `POST` | `/:provider[/v1]/messages` | Provider-routed Anthropic Messages. |
+| `POST` | `/:provider[/v1]/messages/count_tokens` | Provider-routed token counting. |
+| `POST` | `/:provider[/v1]/chat/completions` | Provider-routed Chat Completions. |
+| `POST` | `/:provider[/v1]/responses` | Provider-routed Responses. |
+| `POST` | `/:provider[/v1]/responses/compact` | Provider-routed Responses compaction. |
+| `POST` | `/:provider[/v1]/alpha/search` | Provider-routed Alpha Search. |
+| `GET` | `/:provider[/v1]/models` | Provider-routed model discovery. |
+| `POST` | `/:provider[/v1]/images/generations` | Provider-routed image generation. |
+| `POST` | `/:provider[/v1]/images/edits` | Provider-routed multipart image edits. |
 
 General API-key auth applies to proxy, token, metrics, usage, and file routes.
 Admin endpoints additionally require `auth.adminApiKey`.
@@ -639,8 +692,9 @@ Admin endpoints additionally require `auth.adminApiKey`.
   current rollout.
 - Anthropic compatibility targets Messages, token counting, models, and local
   file references; this is not an emulator for every Anthropic product API.
-- The public OpenAI Responses WebSocket transport is not exposed. HTTP/SSE is
-  the supported Codex CLI path.
+- The public OpenAI Responses WebSocket transport is not exposed. Clients use
+  HTTP/SSE; Codex-backed streams may use the pooled upstream WebSocket with
+  pre-send-only fallback and strict terminal accounting.
 - Local Files API IDs are expanded before dispatch; provider-hosted file IDs and
   Anthropic `container_upload` blocks are not supported.
 - Exact Claude token counts require an Anthropic key. Without one, counts are
@@ -654,6 +708,8 @@ See:
 
 - [Claude Code / Anthropic API compatibility](./docs/claude-code-api-compatibility.md)
 - [Claude Code and Codex CLI compatibility](./docs/claude-code-codex-compatibility.md)
+- [Non-GUI endpoint/provider audit](./docs/non-gui-compatibility.md)
+- [Claude Code and OpenCode plugin integration](./plugin/README.md)
 
 ## Contributing
 

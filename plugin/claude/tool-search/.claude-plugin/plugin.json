@@ -1,0 +1,8 @@
+{
+  "name": "tool-search",
+  "description": "Register the copilot-api deferred tool_search MCP bridge",
+  "version": "1.0.0",
+  "author": {
+    "name": "copilot-api-rust maintainers"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "copilot-api": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "copilot-api",
+      "options": {
+        "baseURL": "http://127.0.0.1:4141",
+        "apiKey": "local-gateway"
+      },
+      "models": {
+        "claude-opus-4.8": {
+          "name": "Claude Opus 4.8 through copilot-api"
+        }
+      }
+    }
+  },
+  "mcp": {
+    "tool_search": {
+      "type": "local",
+      "command": ["copilot-api", "mcp"],
+      "enabled": true
+    }
+  }
+}

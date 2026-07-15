@@ -32,6 +32,7 @@ const GENERATE_IMAGE_PROMPT_DESCRIPTION: &str = "Text description of the image t
 /// Reads line-delimited JSON-RPC 2.0 requests from stdin and writes framed
 /// responses to stdout, one JSON object per line, flushing after each.
 pub async fn run_mcp_server() -> anyhow::Result<()> {
+    crate::libs::paths::ensure_paths().await?;
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
@@ -253,13 +254,22 @@ async fn handle_generate_image_call(id: Value, params: Option<&Value>) -> Value 
     // is passed — create_codex_image authenticates from global state, not
     // headers.
     let provider_config = match resolve_provider_config("codex").await {
-        Some(cfg) => cfg,
-        None => {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
             return error(
                 id,
                 -32603,
                 "Image generation requires Codex (Sign in with ChatGPT) credentials. \
                  Run `copilot-api auth --provider codex` first."
+                    .to_string(),
+            );
+        }
+        Err(setup_error) => {
+            tracing::error!(error = %setup_error, "Failed to resolve Codex credentials for MCP");
+            return error(
+                id,
+                -32603,
+                "Codex credential setup failed. Run `copilot-api doctor` and re-authenticate."
                     .to_string(),
             );
         }

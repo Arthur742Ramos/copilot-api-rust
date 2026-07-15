@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::libs::compact::COMPACT_REQUEST;
 use crate::libs::config::{
     get_message_api_web_search_model, get_small_model, is_messages_api_enabled,
-    is_responses_api_web_search_enabled, provider_uses_responses_api, resolve_mapped_model,
+    is_responses_api_web_search_enabled, provider_model_uses_responses_api, resolve_mapped_model,
 };
 use crate::libs::error::AppError;
 use crate::libs::models::{find_endpoint_model, is_context_1m_model};
@@ -114,7 +114,9 @@ fn validate_selected_responses_controls(
             WebSearchRoute::Responses { .. } => {
                 return validate_responses_request_controls(&typed, false);
             }
-            WebSearchRoute::Provider { alias } if provider_uses_responses_api(&alias.provider) => {
+            WebSearchRoute::Provider { alias }
+                if provider_model_uses_responses_api(&alias.provider, &alias.model) =>
+            {
                 return validate_responses_request_controls(&typed, alias.provider == "codex");
             }
             WebSearchRoute::Provider { .. } => return Ok(()),
@@ -123,7 +125,7 @@ fn validate_selected_responses_controls(
     }
 
     if let Some(alias) = parse_provider_model_alias(&model_of(payload)) {
-        if provider_uses_responses_api(&alias.provider) {
+        if provider_model_uses_responses_api(&alias.provider, &alias.model) {
             return validate_responses_request_controls(&typed, alias.provider == "codex");
         }
         return Ok(());
