@@ -57,36 +57,37 @@ impl ResponsesStreamGuard {
             return Err("The upstream Responses stream emitted data after its terminal event.");
         }
 
-        let value: Value = serde_json::from_str(data)
+        let mut value: Value = serde_json::from_str(data)
             .map_err(|_| "The upstream Responses stream returned malformed JSON.")?;
-        let object = value
+        let event_type = value
             .as_object()
-            .ok_or("The upstream Responses stream event must be a JSON object.")?;
-        let event_type = object
+            .ok_or("The upstream Responses stream event must be a JSON object.")?
             .get("type")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .ok_or("The upstream Responses stream event is missing its type.")?;
+            .ok_or("The upstream Responses stream event is missing its type.")?
+            .to_owned();
 
         if let Some(sse_name) = event.event.as_deref().filter(|name| !name.is_empty()) {
-            if sse_name != event_type {
+            if sse_name != event_type.as_str() {
                 return Err("The upstream Responses stream event name does not match its type.");
             }
         }
 
-        let terminal = match event_type {
+        let mut rewrote_terminal_response_id = false;
+        let terminal = match event_type.as_str() {
             "response.created" => {
                 if self.saw_created {
                     return Err("The upstream Responses stream emitted response.created twice.");
                 }
-                let response = object
+                let response = value
                     .get("response")
                     .and_then(Value::as_object)
                     .ok_or("The response.created event is missing its response object.")?;
                 let response_id = response
                     .get("id")
                     .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
+                    .filter(|id| !id.trim().is_empty())
                     .ok_or("The response.created event is missing its response id.")?;
                 self.response_id = Some(response_id.to_owned());
                 self.model = response
@@ -106,17 +107,31 @@ impl ResponsesStreamGuard {
                         "The upstream Responses stream terminated before response.created.",
                     );
                 }
-                let response = object
+                let response = value
                     .get("response")
                     .and_then(Value::as_object)
                     .ok_or("The terminal Responses event is missing its response object.")?;
                 let terminal_id = response
                     .get("id")
                     .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .ok_or("The terminal Responses event is missing its response id.")?;
-                if self.response_id.as_deref() != Some(terminal_id) {
-                    return Err("The terminal Responses event id does not match response.created.");
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or("The terminal Responses event is missing its response id.")?
+                    .to_owned();
+                let canonical_id = self
+                    .response_id
+                    .as_deref()
+                    .expect("response.created established a response id");
+                if terminal_id != canonical_id {
+                    // Copilot may re-encrypt opaque response IDs between created
+                    // and terminal snapshots. Keep the public lifecycle stable;
+                    // event ordering and the single terminal still prove that
+                    // both envelopes belong to this upstream stream.
+                    value
+                        .get_mut("response")
+                        .and_then(Value::as_object_mut)
+                        .expect("terminal response object was validated")
+                        .insert("id".to_string(), Value::String(canonical_id.to_owned()));
+                    rewrote_terminal_response_id = true;
                 }
                 self.terminal = true;
                 Some(if event_type == "response.completed" {
@@ -138,10 +153,18 @@ impl ResponsesStreamGuard {
             }
         };
 
-        let processed = fix_stream_ids(data, Some(event_type), ids);
+        let normalized;
+        let data = if rewrote_terminal_response_id {
+            normalized = serde_json::to_string(&value)
+                .map_err(|_| "The upstream Responses stream event could not be normalized.")?;
+            normalized.as_str()
+        } else {
+            data
+        };
+        let processed = fix_stream_ids(data, Some(&event_type), ids);
         let processed_value = serde_json::from_str(&processed).unwrap_or_else(|_| value.clone());
         Ok(Some(ProcessedResponsesEvent {
-            frame: build_sse_frame(event.id.as_deref(), Some(event_type), &processed),
+            frame: build_sse_frame(event.id.as_deref(), Some(&event_type), &processed),
             value: processed_value,
             terminal,
         }))
@@ -330,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_terminal_response_id_mismatch() {
+    fn canonicalizes_rotated_terminal_response_id() {
         let mut guard = ResponsesStreamGuard::new();
         let mut ids = StreamIdTracker::new();
         guard
@@ -350,6 +373,46 @@ mod tests {
             json!({
                 "type":"response.completed",
                 "response":{"id":"resp_other","status":"completed"}
+            }),
+        );
+        let processed = guard.process(&completed, &mut ids).unwrap().unwrap();
+        assert_eq!(processed.terminal, Some(ResponsesTerminal::Completed));
+        assert_eq!(processed.value["response"]["id"], "resp_created");
+        assert!(processed.frame.contains("\"id\":\"resp_created\""));
+        assert!(!processed.frame.contains("resp_other"));
+    }
+
+    #[test]
+    fn rejects_whitespace_response_ids() {
+        let mut ids = StreamIdTracker::new();
+        let mut guard = ResponsesStreamGuard::new();
+        let created = event(
+            None,
+            json!({
+                "type":"response.created",
+                "response":{"id":"   ","model":"gpt-5"}
+            }),
+        );
+        assert!(guard.process(&created, &mut ids).is_err());
+
+        let mut guard = ResponsesStreamGuard::new();
+        guard
+            .process(
+                &event(
+                    None,
+                    json!({
+                        "type":"response.created",
+                        "response":{"id":"resp_created","model":"gpt-5"}
+                    }),
+                ),
+                &mut ids,
+            )
+            .unwrap();
+        let completed = event(
+            None,
+            json!({
+                "type":"response.completed",
+                "response":{"id":"   ","status":"completed"}
             }),
         );
         assert!(guard.process(&completed, &mut ids).is_err());
