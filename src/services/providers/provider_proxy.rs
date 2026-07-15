@@ -23,24 +23,13 @@ use crate::services::copilot::create_responses::ResponsesPayload;
 /// against a localhost provider; never set this in production.
 const ALLOW_PRIVATE_PROVIDERS_ENV: &str = "COPILOT_API_ALLOW_PRIVATE_PROVIDERS";
 
-/// Dedicated reqwest client for provider forwarding. Unlike the shared
-/// `client()` in http.rs, this one disables redirect-following so an allowed
-/// upstream host cannot 302 the request to an internal address (SSRF bypass).
-/// The rest of the config mirrors `client()` (connect timeout, idle pool,
-/// rustls native roots via Cargo features, proxy-from-env gating).
-static PROVIDER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+fn build_restricted_upstream_client(read_timeout: Option<Duration>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(crate::libs::http::UPSTREAM_CONNECT_TIMEOUT)
-        // read_timeout bounds the gap between successive reads, NOT the total
-        // request duration, so it never caps a healthy long SSE stream that
-        // keeps producing bytes but does rescue a stalled-open upstream
-        // connection. An overall `.timeout(...)` would truncate legitimate long
-        // streams, so it is intentionally absent. Shares the shared client's
-        // COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS knob (default 120; 0 disables).
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(crate::libs::http::UPSTREAM_POOL_MAX_IDLE_PER_HOST)
         .redirect(reqwest::redirect::Policy::none());
-    if let Some(read_timeout) = crate::libs::http::upstream_read_timeout() {
+    if let Some(read_timeout) = read_timeout {
         builder = builder.read_timeout(read_timeout);
     }
     if !proxy_from_env_enabled() {
@@ -54,7 +43,22 @@ static PROVIDER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     builder
         .build()
         .expect("failed to build provider reqwest client")
-});
+}
+
+/// Dedicated reqwest client for provider forwarding. Unlike the shared
+/// `client()` in http.rs, this one disables redirect-following so an allowed
+/// upstream host cannot 302 the request to an internal address (SSRF bypass).
+/// The rest of the config mirrors `client()` (connect timeout, idle pool,
+/// rustls native roots via Cargo features, proxy-from-env gating).
+static PROVIDER_CLIENT: Lazy<reqwest::Client> =
+    Lazy::new(|| build_restricted_upstream_client(crate::libs::http::upstream_read_timeout()));
+
+/// Image generation can legitimately take several minutes before producing a
+/// response. Keep its wider timeout isolated from normal LLM/provider traffic.
+pub(crate) const IMAGES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+static PROVIDER_IMAGES_CLIENT: Lazy<reqwest::Client> =
+    Lazy::new(|| build_restricted_upstream_client(Some(IMAGES_TIMEOUT)));
 
 /// The restricted upstream client: redirects disabled and, for direct
 /// connections, DNS answers checked before the connector receives them.
@@ -62,6 +66,25 @@ static PROVIDER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 /// shared trusted-upstream client.
 pub(crate) fn restricted_upstream_client() -> &'static reqwest::Client {
     &PROVIDER_CLIENT
+}
+
+pub(crate) fn restricted_images_upstream_client() -> &'static reqwest::Client {
+    &PROVIDER_IMAGES_CLIENT
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImagesOperation {
+    Generations,
+    Edits,
+}
+
+impl ImagesOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Generations => "generations",
+            Self::Edits => "edits",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -323,7 +346,9 @@ pub fn build_provider_upstream_headers(
 /// Pass-through proxy response: copy status and headers (minus the stripped
 /// set) and stream the upstream body to the client. Mirrors
 /// `createProviderProxyResponse`.
-pub fn create_provider_proxy_response(upstream: reqwest::Response) -> Response {
+pub(crate) fn provider_proxy_response_parts(
+    upstream: &reqwest::Response,
+) -> (StatusCode, HeaderMap) {
     use axum::http::{HeaderName, HeaderValue, StatusCode};
 
     let status = StatusCode::from_u16(upstream.status().as_u16())
@@ -344,6 +369,11 @@ pub fn create_provider_proxy_response(upstream: reqwest::Response) -> Response {
         }
     }
 
+    (status, headers)
+}
+
+pub fn create_provider_proxy_response(upstream: reqwest::Response) -> Response {
+    let (status, headers) = provider_proxy_response_parts(&upstream);
     let body = Body::from_stream(upstream.bytes_stream());
 
     let mut response = Response::new(body);
@@ -408,6 +438,69 @@ pub async fn forward_provider_responses(
         .send()
         .await
         .map_err(|e| HttpError::internal(format!("Failed to forward provider responses: {e}")))
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_provider_images_url(
+    cfg: &ResolvedProviderConfig,
+    operation: ImagesOperation,
+    query: Option<&str>,
+) -> Result<String, HttpError> {
+    let raw = format!(
+        "{}/v1/images/{}",
+        cfg.base_url.trim_end_matches('/'),
+        operation.as_str()
+    );
+    let mut url = url::Url::parse(&raw)
+        .map_err(|error| HttpError::internal(format!("Invalid provider images URL: {error}")))?;
+    url.set_query(query.filter(|value| !value.is_empty()));
+    Ok(url.to_string())
+}
+
+fn build_provider_images_headers(
+    cfg: &ResolvedProviderConfig,
+    request_headers: &HeaderMap,
+    operation: ImagesOperation,
+) -> reqwest::header::HeaderMap {
+    let mut headers = build_provider_upstream_headers(cfg, request_headers);
+    if let Some(content_type) = request_headers.get("content-type") {
+        if let Ok(value) = reqwest::header::HeaderValue::from_bytes(content_type.as_bytes()) {
+            headers.insert(reqwest::header::CONTENT_TYPE, value);
+        }
+    } else if operation == ImagesOperation::Edits {
+        headers.remove(reqwest::header::CONTENT_TYPE);
+    }
+    headers
+}
+
+/// POST `{base_url}/v1/images/{generations|edits}` while preserving the raw
+/// request body, content type, query string, and upstream response contract.
+pub async fn forward_provider_images(
+    cfg: &ResolvedProviderConfig,
+    body: bytes::Bytes,
+    request_headers: &HeaderMap,
+    operation: ImagesOperation,
+    query: Option<&str>,
+) -> Result<reqwest::Response, HttpError> {
+    let url = resolve_provider_images_url(cfg, operation, query)?;
+    validate_upstream_url(&url)?;
+    restricted_images_upstream_client()
+        .post(url)
+        .headers(build_provider_images_headers(
+            cfg,
+            request_headers,
+            operation,
+        ))
+        .body(body)
+        .timeout(IMAGES_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| {
+            HttpError::internal(format!(
+                "Failed to forward provider image {}: {error}",
+                operation.as_str()
+            ))
+        })
 }
 
 /// POST `{base_url}/v1/responses/compact`, the unary compaction contract used by
@@ -611,6 +704,48 @@ mod tests {
         assert_eq!(headers["thread-id"], "thread-1");
         assert_eq!(headers["x-openai-subagent"], "review");
         assert_eq!(headers["x-codex-installation-id"], "install-1");
+    }
+
+    #[test]
+    fn image_headers_preserve_multipart_and_edits_do_not_invent_content_type() {
+        let provider = cfg("openai-compatible", "authorization", "secret");
+        let mut request = HeaderMap::new();
+        request.insert(
+            "content-type",
+            "multipart/form-data; boundary=image-boundary"
+                .parse()
+                .unwrap(),
+        );
+        let multipart = build_provider_images_headers(&provider, &request, ImagesOperation::Edits);
+        assert_eq!(
+            multipart["content-type"],
+            "multipart/form-data; boundary=image-boundary"
+        );
+
+        let without_content_type =
+            build_provider_images_headers(&provider, &HeaderMap::new(), ImagesOperation::Edits);
+        assert!(without_content_type.get("content-type").is_none());
+
+        let generation = build_provider_images_headers(
+            &provider,
+            &HeaderMap::new(),
+            ImagesOperation::Generations,
+        );
+        assert_eq!(generation["content-type"], "application/json");
+    }
+
+    #[test]
+    fn provider_images_url_preserves_query_parameters() {
+        let provider = cfg("openai-compatible", "authorization", "secret");
+        assert_eq!(
+            resolve_provider_images_url(
+                &provider,
+                ImagesOperation::Generations,
+                Some("output=base64&format=png")
+            )
+            .unwrap(),
+            "https://example.com/v1/images/generations?output=base64&format=png"
+        );
     }
 
     // Validation tests mutate the process-wide opt-out env var, which is global

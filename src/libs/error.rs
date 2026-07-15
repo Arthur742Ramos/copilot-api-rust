@@ -107,14 +107,22 @@ pub fn is_openai_native_path(path: &str) -> bool {
             | "/v1/responses/compact"
             | "/chat/completions"
             | "/v1/chat/completions"
+            | "/images/generations"
+            | "/images/edits"
+            | "/v1/images/generations"
+            | "/v1/images/edits"
             | "/models"
             | "/v1/models"
     ) || path.starts_with("/responses/")
         || path.starts_with("/v1/responses/")
         || path.starts_with("/chat/completions/")
         || path.starts_with("/v1/chat/completions/")
+        || path.starts_with("/images/")
+        || path.starts_with("/v1/images/")
         || path.starts_with("/models/")
         || path.starts_with("/v1/models/")
+        || path.ends_with("/v1/images/generations")
+        || path.ends_with("/v1/images/edits")
         || path.ends_with("/v1/models")
 }
 
@@ -553,6 +561,18 @@ mod tests {
 
     fn status(code: u16) -> StatusCode {
         StatusCode::from_u16(code).unwrap()
+    }
+
+    #[test]
+    fn images_routes_use_openai_error_envelopes() {
+        for path in [
+            "/images/generations",
+            "/v1/images/edits",
+            "/codex/v1/images/generations",
+            "/openrouter/v1/images/edits",
+        ] {
+            assert!(is_openai_native_path(path), "{path}");
+        }
     }
 
     #[tokio::test]

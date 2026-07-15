@@ -13,7 +13,8 @@ third-party LLM providers.
 into GitHub Copilot requests, using your own Copilot subscription. It exposes:
 
 - **OpenAI-compatible** endpoints: `POST /v1/chat/completions`,
-  `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/images/generations`
+  `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/images/generations`,
+  `POST /v1/images/edits`
 - **Anthropic-compatible** endpoints: `POST /v1/messages` and
   `POST /v1/messages/count_tokens`
 - **Local Files API compatibility**: upload once through `/v1/files`, then use
@@ -410,7 +411,9 @@ By default the server binds to `127.0.0.1:<port>` (loopback only). Pass
 | `POST` | `/chat/completions`, `/v1/chat/completions` | OpenAI-compatible chat completions. |
 | `GET`  | `/models`, `/v1/models` | List available models. |
 | `POST` | `/embeddings`, `/v1/embeddings` | OpenAI-compatible embeddings. |
-| `POST` | `/images/generations`, `/v1/images/generations` | OpenAI-compatible image generation via the Codex `image_generation` tool (requires Codex / Sign in with ChatGPT credentials). |
+| `POST` | `/images/generations`, `/v1/images/generations` | OpenAI-compatible image generation proxied to the native Codex Images API (requires Codex / Sign in with ChatGPT credentials). |
+| `POST` | `/images/edits`, `/v1/images/edits` | OpenAI-compatible multipart image edits proxied to the native Codex Images API. |
+| `POST` | `/:provider/v1/images/generations`, `/:provider/v1/images/edits` | Provider-scoped image generation or edits. |
 | `GET`  | `/usage` | Copilot usage data. |
 | `GET`  | `/token` | Returns the live Copilot bearer token (see [Security](#security-warning)). |
 | `*`    | `/token-usage`, `/token-usage/` | Token-usage subsystem routes. |
@@ -491,8 +494,8 @@ Key fields (from `src/libs/config.rs`):
   "dailyTokenBudget": 5000000, // reject new requests with 429 once this many
                                // tokens are recorded in the local day (omit or
                                // <= 0 to disable)
-  "imageChatModel": "gpt-5.5",  // Responses model that drives image generation
-  "imageModel": "gpt-image-2"   // image model the image_generation tool requests
+  "imageChatModel": "gpt-5.5",  // Responses model used by the MCP image tool
+  "imageModel": "gpt-image-2"   // default HTTP/MCP image model
 }
 ```
 
@@ -505,15 +508,17 @@ Notes:
 - `dailyTokenBudget` is a coarse spend guardrail: usage is recorded after each
   response completes, so enforcement gates on cumulative spend so far and can
   overshoot by at most the requests already in flight when the cap is crossed.
-- `POST /v1/images/generations` forwards to the Codex `image_generation` tool
-  using your Codex (Sign in with ChatGPT) credentials, so it requires
-  `copilot-api auth --provider codex`. It returns the OpenAI shape
-  (`{ created, data: [{ b64_json }], usage }`, where `usage` is included when the
-  upstream reports it). `imageChatModel` / `imageModel` let you pin the model
-  slugs, which OpenAI changes over time. Image generations are subject to the
-  same rate-limit / `dailyTokenBudget` admission gates and are recorded in the
-  token-usage subsystem (endpoint `images`). Note this rides an undocumented
-  Codex backend, so it may change without notice.
+- `POST /v1/images/generations` and `/v1/images/edits` proxy the native Codex
+  Images API using your Codex (Sign in with ChatGPT) credentials, so they require
+  `copilot-api auth --provider codex`. Generation requests default `model` to
+  `imageModel` when omitted; edits preserve the incoming multipart content type
+  and bytes. Query parameters, compatible request headers, and the upstream
+  response contract are preserved. Both routes use the same rate-limit /
+  `dailyTokenBudget` admission gates and record upstream image usage when the
+  response is small enough to inspect. The MCP `generate_image` tool still uses
+  `imageChatModel` plus `imageModel` through Responses because it needs to save
+  the returned image locally. These Codex endpoints are undocumented and may
+  change without notice.
 
 ### Exact token counts for Claude models
 

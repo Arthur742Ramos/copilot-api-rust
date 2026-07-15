@@ -134,14 +134,13 @@ pub struct AppConfig {
     /// the cap is crossed (usage is recorded after each response completes).
     #[serde(skip_serializing_if = "Option::is_none", rename = "dailyTokenBudget")]
     pub daily_token_budget: Option<i64>,
-    /// Top-level Responses model used to drive image generation over the Codex
-    /// transport (the actual image model is selected via the `image_generation`
-    /// tool). These model slugs drift on OpenAI's side, so they are configurable.
+    /// Top-level Responses model used by the MCP image-generation tool. This
+    /// model slug drifts on OpenAI's side, so it is configurable.
     /// Defaults to `gpt-5.5`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "imageChatModel")]
     pub image_chat_model: Option<String>,
-    /// The image model the `image_generation` tool requests. Defaults to
-    /// `gpt-image-2`.
+    /// The default image model for the HTTP Images API and MCP image tool.
+    /// Defaults to `gpt-image-2`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "imageModel")]
     pub image_model: Option<String>,
     /// Reject requests with a 429 once the account's cached GitHub Copilot
