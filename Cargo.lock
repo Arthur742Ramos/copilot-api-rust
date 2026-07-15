@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "copilot-api"
-version = "1.12.8"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "arboard",
