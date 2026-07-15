@@ -23,8 +23,10 @@ pub fn create_claude_code_discovery_alias(model_id: &str, context_1m: bool) -> S
 /// proxy already understands. The optional 1M suffix remains attached so normal
 /// context-beta handling still applies when the client sends it verbatim.
 pub fn resolve_claude_code_discovery_alias(model_id: &str) -> Option<String> {
-    let target = model_id.strip_prefix(CLAUDE_CODE_DISCOVERY_ALIAS_PREFIX)?;
-    if target.trim().is_empty() {
+    let target = model_id
+        .strip_prefix(CLAUDE_CODE_DISCOVERY_ALIAS_PREFIX)?
+        .trim();
+    if target.is_empty() {
         return None;
     }
     Some(target.to_string())
@@ -89,6 +91,14 @@ mod tests {
         assert_eq!(alias, "claude-copilot:gpt-5.6-sol[1m]");
         assert_eq!(
             resolve_claude_code_discovery_alias(&alias).as_deref(),
+            Some("gpt-5.6-sol[1m]")
+        );
+    }
+
+    #[test]
+    fn claude_code_discovery_alias_trims_copied_model_id() {
+        assert_eq!(
+            resolve_claude_code_discovery_alias("claude-copilot:  gpt-5.6-sol[1m]  ").as_deref(),
             Some("gpt-5.6-sol[1m]")
         );
     }

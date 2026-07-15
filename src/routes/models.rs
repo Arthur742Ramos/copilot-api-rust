@@ -140,13 +140,11 @@ fn add_anthropic_model_metadata(map: &mut Map<String, Value>, model: &Model) {
         .as_deref()
         .unwrap_or_default();
     let mut effort = Map::new();
-    let mut effort_supported = false;
-    for level in ["low", "medium", "high", "xhigh", "max"] {
+    for level in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
         let supported = efforts.iter().any(|candidate| candidate == level);
-        effort_supported |= supported;
         effort.insert(level.to_string(), capability_support(supported));
     }
-    effort.insert("supported".to_string(), json!(effort_supported));
+    effort.insert("supported".to_string(), json!(!efforts.is_empty()));
     capabilities.insert("effort".to_string(), Value::Object(effort));
 
     let adaptive = model.capabilities.supports.adaptive_thinking == Some(true);
@@ -387,6 +385,8 @@ mod tests {
         m.capabilities.limits.max_context_window_tokens = Some(2_000_000);
         m.capabilities.limits.max_output_tokens = Some(128_000);
         m.capabilities.supports.reasoning_effort = Some(vec![
+            "none".to_string(),
+            "minimal".to_string(),
             "low".to_string(),
             "medium".to_string(),
             "high".to_string(),
@@ -408,6 +408,8 @@ mod tests {
         assert_eq!(obj["max_input_tokens"], 2_000_000);
         assert_eq!(obj["max_tokens"], 128_000);
         assert_eq!(obj["capabilities"]["effort"]["supported"], true);
+        assert_eq!(obj["capabilities"]["effort"]["none"]["supported"], true);
+        assert_eq!(obj["capabilities"]["effort"]["minimal"]["supported"], true);
         assert_eq!(obj["capabilities"]["effort"]["xhigh"]["supported"], true);
         assert_eq!(obj["capabilities"]["effort"]["max"]["supported"], false);
         assert_eq!(obj["capabilities"]["thinking"]["supported"], true);
@@ -446,7 +448,7 @@ mod tests {
         assert_eq!(obj["copilot_model_id"], "gpt-5-mini");
         assert_eq!(
             obj["display_name"],
-            "GPT-5 Mini (Copilot | 2M context | effort low/medium/high/xhigh)"
+            "GPT-5 Mini (Copilot | 2M context | effort none/minimal/low/medium/high/xhigh)"
         );
     }
 
