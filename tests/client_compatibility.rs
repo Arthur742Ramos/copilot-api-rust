@@ -2452,6 +2452,21 @@ fn terminal_contract_stream_fixture(model: &str) -> Option<Response> {
         "gpt-terminal-completed-no-status-no-usage" => {
             vec![created, completed_no_status_no_usage]
         }
+        "gpt-terminal-completed-rotated-id" => vec![
+            created,
+            (
+                "response.completed",
+                json!({
+                    "type":"response.completed",
+                    "sequence_number":1,
+                    "response":{
+                        "id":"resp_terminal_rotated",
+                        "status":"completed",
+                        "fixture_extension":{"keep":true}
+                    }
+                }),
+            ),
+        ],
         "gpt-terminal-completed-matching-status" => vec![
             created,
             (
@@ -9014,6 +9029,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-contract-usage-reasoning-exceeds-output",
         "gpt-terminal-completed-no-status-usage",
         "gpt-terminal-completed-no-status-no-usage",
+        "gpt-terminal-completed-rotated-id",
         "gpt-terminal-completed-matching-status",
         "gpt-terminal-completed-null-status",
         "gpt-terminal-completed-wrong-status-type",
@@ -17765,6 +17781,32 @@ async fn native_responses_forwards_statusless_codex_terminal_unchanged() {
         }),
         "native Responses events were translated into Anthropic events"
     );
+
+    let (status, body) = send(post_json(
+        "/v1/responses",
+        codex_request("gpt-terminal-completed-rotated-id", true),
+        Some(CLIENT_KEY),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = data_events(&body);
+    let created = events
+        .iter()
+        .find(|event| event["type"] == "response.created")
+        .expect("native created event");
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("native completed event");
+    assert_eq!(created["response"]["id"], "resp_terminal_fixture");
+    assert_eq!(completed["response"]["id"], created["response"]["id"]);
+    assert_eq!(
+        completed["response"]["fixture_extension"]["keep"],
+        Value::Bool(true)
+    );
+    assert!(!events
+        .iter()
+        .any(|event| { matches!(event["type"].as_str(), Some("error" | "response.failed")) }));
 
     let (status, body) = send(post_json(
         "/v1/responses",
