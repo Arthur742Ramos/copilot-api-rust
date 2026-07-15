@@ -793,11 +793,6 @@ fn get_or_create_output_text_part<'a>(
         .text_parts_by_key
         .get_mut(&key)
         .expect("text part inserted above");
-    if part.item_id.is_some() && item_id.is_some() && part.item_id != item_id {
-        return Err(invalid_web_search_stream(
-            "a text part changed its output item id",
-        ));
-    }
     if part.item_id.is_none() {
         part.item_id = item_id;
     }
@@ -1252,18 +1247,6 @@ fn build_collected_web_search_output(
                 "text events referenced a non-message output item",
             ));
         }
-        if let (Some(event_id), Some(item_id)) = (
-            part.item_id.as_deref().filter(|id| !id.is_empty()),
-            done.get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty()),
-        ) {
-            if event_id != item_id {
-                return Err(invalid_web_search_stream(
-                    "text events changed their output item id",
-                ));
-            }
-        }
     }
 
     let mut output = Vec::with_capacity(state.output_items_by_index.len());
@@ -1316,21 +1299,18 @@ fn validate_reconciled_response_identity(
     created: &Map<String, Value>,
     terminal: &Map<String, Value>,
 ) -> Result<(), AppError> {
-    let created_id = created
+    let _created_id = created
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| invalid_web_search_stream("response.created had an invalid id"))?;
-    let terminal_id = terminal
+    let _terminal_id = terminal
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| invalid_web_search_stream("the terminal response had an invalid id"))?;
-    if created_id != terminal_id {
-        return Err(invalid_web_search_stream(
-            "the terminal response id conflicted with response.created",
-        ));
-    }
+    // Copilot may re-encrypt opaque response IDs between stream snapshots.
+    // Presence is required; model/object and output lifecycle provide identity.
     for field in ["model", "object"] {
         let created_value = created.get(field).filter(|value| !value.is_null());
         let terminal_value = terminal.get(field).filter(|value| !value.is_null());
@@ -1549,6 +1529,12 @@ fn merge_optional_item_field(
     }
 }
 
+fn merge_opaque_item_id(current: Option<String>, incoming: Option<String>) -> Option<String> {
+    // The latest snapshot is authoritative because Copilot can independently
+    // re-encrypt an output-item ID for every stream event.
+    incoming.or(current)
+}
+
 #[allow(clippy::result_large_err)]
 fn merge_item_status(
     current: Option<String>,
@@ -1653,7 +1639,7 @@ fn merge_web_output_assertion(
                 merged
             };
             Ok(WebOutputAssertion::Message {
-                id: merge_optional_item_field("id", id, incoming_id)?,
+                id: merge_opaque_item_id(id, incoming_id),
                 status: merge_item_status(status, incoming_status, incoming_phase)?,
                 role,
                 content,
@@ -1667,7 +1653,7 @@ fn merge_web_output_assertion(
                 query: incoming_query,
             },
         ) => Ok(WebOutputAssertion::WebSearchCall {
-            id: merge_optional_item_field("id", id, incoming_id)?,
+            id: merge_opaque_item_id(id, incoming_id),
             status: merge_item_status(status, incoming_status, incoming_phase)?,
             query: merge_optional_item_field("query", query, incoming_query)?,
         }),
@@ -2937,6 +2923,89 @@ mod tests {
             state.text_parts_by_key["0:0"].item_id.as_deref(),
             Some("message")
         );
+    }
+
+    #[test]
+    fn collector_accepts_rotating_opaque_response_and_item_ids() {
+        let mut state = WebSearchResponsesStreamCollection::default();
+        for event in [
+            json!({
+                "type":"response.created",
+                "response":{
+                    "id":"response-created",
+                    "object":"response",
+                    "created_at":1,
+                    "model":"gpt-5",
+                    "status":"in_progress"
+                }
+            }),
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{
+                    "type":"message",
+                    "id":"message-added",
+                    "role":"assistant",
+                    "status":"in_progress",
+                    "content":[]
+                }
+            }),
+            json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "content_index":0,
+                "item_id":"message-delta",
+                "delta":"OK"
+            }),
+            json!({
+                "type":"response.output_text.done",
+                "output_index":0,
+                "content_index":0,
+                "item_id":"message-text-done",
+                "text":"OK"
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"message",
+                    "id":"message-done",
+                    "role":"assistant",
+                    "status":"completed",
+                    "content":[{"type":"output_text","text":"OK","annotations":[]}]
+                }
+            }),
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"response-terminal",
+                    "status":"completed",
+                    "output":[{
+                        "type":"message",
+                        "id":"message-terminal",
+                        "role":"assistant",
+                        "status":"completed",
+                        "content":[{"type":"output_text","text":"OK","annotations":[]}]
+                    }],
+                    "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }
+            }),
+        ] {
+            collect_web_search_responses_stream_event(&event, &mut state)
+                .expect("rotating opaque ids remain one ordered lifecycle");
+        }
+
+        let result = build_web_search_responses_stream_result(&state, Some("gpt-5"))
+            .expect("collector builds a complete response");
+        assert_eq!(result.id, "response-created");
+        let ResponseOutputItem::Message(message) = &result.output[0] else {
+            panic!("expected message output");
+        };
+        assert_eq!(message.id.as_deref(), Some("message-terminal"));
+        let ResponseOutputContentBlock::Text(text) = &message.content[0] else {
+            panic!("expected text output");
+        };
+        assert_eq!(text.text, "OK");
     }
 
     #[test]

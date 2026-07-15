@@ -2310,7 +2310,7 @@ fn created_output_contract_stream_fixture(model: &str) -> Option<Response> {
                 }),
             ),
         ],
-        "gpt-contract-created-output-conflict" => vec![
+        "gpt-contract-created-output-rotated-id" => vec![
             (
                 "response.created",
                 json!({
@@ -2734,7 +2734,7 @@ fn created_usage_contract_stream_fixture(model: &str) -> Option<Response> {
         }
         "gpt-contract-completed-empty-id" => terminal_response["id"] = json!(""),
         "gpt-contract-completed-wrong-id" => terminal_response["id"] = json!(42),
-        "gpt-contract-completed-mismatched-id" => {
+        "gpt-contract-completed-rotated-id" => {
             terminal_response["id"] = json!("different-response");
         }
         "gpt-contract-incomplete-empty-id" => {
@@ -2747,7 +2747,7 @@ fn created_usage_contract_stream_fixture(model: &str) -> Option<Response> {
             terminal_response["id"] = json!(42);
             terminal_response["incomplete_details"] = json!({"reason":"max_output_tokens"});
         }
-        "gpt-contract-incomplete-mismatched-id" => {
+        "gpt-contract-incomplete-rotated-id" => {
             terminal_type = "response.incomplete";
             terminal_response["id"] = json!("different-response");
             terminal_response["incomplete_details"] = json!({"reason":"max_output_tokens"});
@@ -5258,7 +5258,7 @@ fn web_search_item_lifecycle_fixture(model: &str) -> Option<Response> {
                 "action":{"type":"search","query":"rust async"}
             }),
         ),
-        "gpt-web-lifecycle-item-id-conflict" => (
+        "gpt-web-lifecycle-item-id-rotation" => (
             json!({
                 "type":"web_search_call",
                 "id":"lifecycle-web-a",
@@ -5823,7 +5823,7 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                 }),
             ),
         ],
-        "gpt-web-item-id-conflict" => vec![
+        "gpt-web-item-id-rotation" => vec![
             (
                 "response.created",
                 json!({
@@ -5858,7 +5858,7 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                 }),
             ),
         ],
-        "gpt-web-message-id-conflict" => vec![
+        "gpt-web-message-id-rotation" => vec![
             (
                 "response.created",
                 json!({
@@ -5929,7 +5929,7 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                 }),
             ),
         ],
-        "gpt-web-terminal-id-conflict" => vec![
+        "gpt-web-terminal-id-rotation" => vec![
             created,
             (
                 "response.completed",
@@ -8912,7 +8912,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-web-end-turn-terminal-only",
         "gpt-web-lifecycle-item-fields-added-only",
         "gpt-web-lifecycle-item-fields-done-only",
-        "gpt-web-lifecycle-item-id-conflict",
+        "gpt-web-lifecycle-item-id-rotation",
         "gpt-web-lifecycle-item-action-conflict",
         "gpt-web-created-lifecycle-equivalent",
         "gpt-web-terminal-output-completed",
@@ -8923,10 +8923,10 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-web-output-null-optional-equivalent",
         "gpt-web-item-id-created-only",
         "gpt-web-item-id-terminal-only",
-        "gpt-web-item-id-conflict",
-        "gpt-web-message-id-conflict",
+        "gpt-web-item-id-rotation",
+        "gpt-web-message-id-rotation",
         "gpt-web-item-status-conflict",
-        "gpt-web-terminal-id-conflict",
+        "gpt-web-terminal-id-rotation",
         "gpt-web-terminal-model-conflict",
         "gpt-web-terminal-object-conflict",
         "gpt-web-terminal-status-conflict",
@@ -8965,7 +8965,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-contract-created-only-output",
         "gpt-contract-created-only-raw-output",
         "gpt-contract-created-output-lifecycle-match",
-        "gpt-contract-created-output-conflict",
+        "gpt-contract-created-output-rotated-id",
         "gpt-contract-created-empty-id",
         "gpt-contract-created-wrong-id",
         "gpt-contract-created-missing-id",
@@ -8976,10 +8976,10 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-contract-created-partial-usage",
         "gpt-contract-completed-empty-id",
         "gpt-contract-completed-wrong-id",
-        "gpt-contract-completed-mismatched-id",
+        "gpt-contract-completed-rotated-id",
         "gpt-contract-incomplete-empty-id",
         "gpt-contract-incomplete-wrong-id",
-        "gpt-contract-incomplete-mismatched-id",
+        "gpt-contract-incomplete-rotated-id",
         "gpt-contract-failed-empty-id",
         "gpt-contract-failed-wrong-id",
         "gpt-contract-failed-mismatched-id",
@@ -11333,7 +11333,7 @@ async fn claude_model_less_created_uses_resolved_model_context() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
-async fn claude_created_output_requires_matching_rendered_lifecycle() {
+async fn claude_created_output_reconciles_lifecycle_with_rotating_ids() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
     configure(&fixture);
@@ -11350,27 +11350,33 @@ async fn claude_created_output_requires_matching_rendered_lifecycle() {
         )
     };
 
-    let (status, body) = send(request("gpt-contract-created-output-lifecycle-match")).await;
-    assert_eq!(status, StatusCode::OK);
-    let events = data_events(&body);
-    let text: String = events
-        .iter()
-        .filter(|event| event["delta"]["type"] == "text_delta")
-        .filter_map(|event| event["delta"]["text"].as_str())
-        .collect();
-    assert_eq!(text, "created lifecycle");
-    assert_eq!(
-        events
+    for model in [
+        "gpt-contract-created-output-lifecycle-match",
+        "gpt-contract-created-output-rotated-id",
+    ] {
+        let (status, body) = send(request(model)).await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        let text: String = events
             .iter()
-            .filter(|event| event["type"] == "message_stop")
-            .count(),
-        1
-    );
+            .filter(|event| event["delta"]["type"] == "text_delta")
+            .filter_map(|event| event["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(text, "created lifecycle", "{model}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1,
+            "{model}"
+        );
+        assert!(!events.iter().any(|event| event["type"] == "error"));
+    }
 
     for model in [
         "gpt-contract-created-only-output",
         "gpt-contract-created-only-raw-output",
-        "gpt-contract-created-output-conflict",
     ] {
         let (status, body) = send(request(model)).await;
         assert_eq!(status, StatusCode::OK, "{model}");
@@ -11394,7 +11400,7 @@ async fn claude_created_output_requires_matching_rendered_lifecycle() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
-async fn claude_created_and_terminal_identity_fields_fail_closed() {
+async fn claude_created_and_terminal_identity_fields_validate_shape_not_ciphertext() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
     configure(&fixture);
@@ -11409,10 +11415,8 @@ async fn claude_created_and_terminal_identity_fields_fail_closed() {
         "gpt-contract-created-wrong-status-type",
         "gpt-contract-completed-empty-id",
         "gpt-contract-completed-wrong-id",
-        "gpt-contract-completed-mismatched-id",
         "gpt-contract-incomplete-empty-id",
         "gpt-contract-incomplete-wrong-id",
-        "gpt-contract-incomplete-mismatched-id",
         "gpt-contract-failed-empty-id",
         "gpt-contract-failed-wrong-id",
         "gpt-contract-failed-mismatched-id",
@@ -11450,6 +11454,39 @@ async fn claude_created_and_terminal_identity_fields_fail_closed() {
                 Some("message_delta" | "message_stop")
             )),
             "{model}: invalid identity/scalar fabricated success"
+        );
+    }
+
+    for (model, expected_stop_reason) in [
+        ("gpt-contract-completed-rotated-id", "end_turn"),
+        ("gpt-contract-incomplete-rotated-id", "max_tokens"),
+    ] {
+        let (status, body) = send(post_json(
+            "/v1/messages",
+            json!({
+                "model":format!("responses-fixture/{model}"),
+                "max_tokens":128,
+                "messages":[{"role":"user","content":"rotated identity contract"}],
+                "stream":true
+            }),
+            Some(CLIENT_KEY),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = data_events(&body);
+        assert!(!events.iter().any(|event| event["type"] == "error"));
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .and_then(|event| event["delta"]["stop_reason"].as_str()),
+            Some(expected_stop_reason),
+            "{model}"
+        );
+        assert_eq!(
+            events.last().and_then(|event| event["type"].as_str()),
+            Some("message_stop"),
+            "{model}"
         );
     }
 
@@ -16861,12 +16898,49 @@ async fn claude_web_search_end_turn_assertions_merge_in_both_directions() {
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
+async fn claude_web_search_accepts_rotating_opaque_ids() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+
+    for model in [
+        "gpt-web-terminal-id-rotation",
+        "gpt-web-item-id-rotation",
+        "gpt-web-message-id-rotation",
+        "gpt-web-lifecycle-item-id-rotation",
+    ] {
+        configure_with_web_search_model(&fixture, Some(&format!("responses-fixture/{model}")));
+        for stream in [false, true] {
+            let (status, body) = send(web_search_messages_request(stream)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{model}/{stream}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            if stream {
+                let events = data_events(&body);
+                assert!(!events.iter().any(|event| event["type"] == "error"));
+                assert_eq!(
+                    events.last().and_then(|event| event["type"].as_str()),
+                    Some("message_stop"),
+                    "{model}"
+                );
+            } else {
+                let response = json_body(&body);
+                assert_eq!(response["type"], "message", "{model}");
+                assert_eq!(response["stop_reason"], "end_turn", "{model}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
 async fn claude_web_search_terminal_conflicts_fail_before_json_or_sse_success() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
 
     for model in [
-        "gpt-web-terminal-id-conflict",
         "gpt-web-terminal-model-conflict",
         "gpt-web-terminal-object-conflict",
         "gpt-web-terminal-status-conflict",
@@ -16890,10 +16964,7 @@ async fn claude_web_search_terminal_conflicts_fail_before_json_or_sse_success() 
         "gpt-web-unrepresentable-search-call",
         "gpt-web-incomplete-search-call",
         "gpt-web-empty-query-entry",
-        "gpt-web-item-id-conflict",
-        "gpt-web-message-id-conflict",
         "gpt-web-item-status-conflict",
-        "gpt-web-lifecycle-item-id-conflict",
         "gpt-web-lifecycle-item-action-conflict",
         "gpt-web-late-text-conflict",
         "gpt-web-delta-after-item-done",

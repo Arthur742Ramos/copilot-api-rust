@@ -140,6 +140,7 @@ pub struct RetainedStateBudget {
 }
 
 impl RetainedStateBudget {
+    #[cfg(test)]
     fn reserve(&mut self, owner: RetainedStateOwner, bytes: usize) -> Result<(), &'static str> {
         if bytes == 0 {
             return Ok(());
@@ -339,7 +340,6 @@ pub struct ResponsesStreamState {
     pub message_start_sent: bool,
     pub message_completed: bool,
     pub translation_failed: bool,
-    pub created_response_id: Option<String>,
     pub created_output_digests: Option<Vec<OutputItemDigest>>,
     pub fallback_model: Option<String>,
     pub next_content_block_index: i64,
@@ -379,7 +379,6 @@ impl ResponsesStreamState {
             message_start_sent: false,
             message_completed: false,
             translation_failed: false,
-            created_response_id: None,
             created_output_digests: None,
             fallback_model: fallback_model.filter(|model| !model.trim().is_empty()),
             next_content_block_index: 0,
@@ -624,14 +623,6 @@ pub(crate) fn validate_event_sequence(
     Ok(false)
 }
 
-fn reserve_retained_state_bytes(
-    state: &mut ResponsesStreamState,
-    owner: RetainedStateOwner,
-    bytes: usize,
-) -> Result<(), &'static str> {
-    state.retained_budget.reserve(owner, bytes)
-}
-
 fn replace_retained_state_bytes(
     state: &mut ResponsesStreamState,
     owner: RetainedStateOwner,
@@ -723,7 +714,15 @@ fn canonical_output_item_digest(
     value: &Value,
     phase: OutputValidationPhase,
 ) -> Result<OutputItemDigest, &'static str> {
-    raw_output_item_digest(&canonical_anthropic_output_item(value, phase)?)
+    let mut canonical = canonical_anthropic_output_item(value, phase)?;
+    if let Some(item) = canonical.as_object_mut() {
+        // Copilot re-encrypts opaque IDs and encrypted reasoning payloads
+        // independently for added, delta, done, and terminal snapshots. Exclude
+        // only those transport envelopes from semantic lifecycle reconciliation.
+        item.remove("id");
+        item.remove("encrypted_content");
+    }
+    raw_output_item_digest(&canonical)
 }
 
 fn output_array_digests(
@@ -1056,7 +1055,6 @@ fn close_all_open_blocks(
     state.tracked_reasoning_parts = 0;
     state.tracked_text_parts = 0;
     state.output_text_by_key.clear();
-    state.created_response_id = None;
     state.created_output_digests = None;
 }
 
@@ -1534,11 +1532,10 @@ fn handle_response_created(
         }
     };
     if let Err(message) =
-        reserve_retained_state_bytes(state, RetainedStateOwner::CreatedResponseId, id.len())
+        replace_retained_state_bytes(state, RetainedStateOwner::CreatedResponseId, id.len())
     {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
-    state.created_response_id = Some(id.to_string());
     state.created_output_digests = created_output_digests;
     message_start(state, id, &model, usage)
 }
@@ -2040,15 +2037,6 @@ fn handle_output_item_done(
                     );
                 }
             }
-            let expected_id = existing.item_id.as_deref().filter(|id| !id.is_empty());
-            if expected_id.is_some() && actual_id.is_some() && expected_id != actual_id {
-                return terminate_responses_stream_with_error(
-                    state,
-                    build_error_event(
-                        "A response.output_item.done event did not match its added item id.",
-                    ),
-                );
-            }
             if existing.done {
                 if existing.done_event_digest == Some(done_event_digest) {
                     // A structurally identical JSON replay is safe to deduplicate.
@@ -2083,13 +2071,29 @@ fn handle_output_item_done(
                 }
             }
         }
-        let late_id_update = if let Some(actual_id) = actual_id {
-            match plan_late_output_item_id(state, &mut budget_transaction, output_index, actual_id)
-            {
-                Ok(update) => update,
-                Err(message) => {
-                    return terminate_responses_stream_with_error(state, build_error_event(message))
+        let needs_late_id_update = state
+            .output_items_by_index
+            .get(&output_index)
+            .and_then(|lifecycle| lifecycle.item_id.as_deref())
+            .is_none_or(str::is_empty);
+        let late_id_update = if needs_late_id_update {
+            if let Some(actual_id) = actual_id {
+                match plan_late_output_item_id(
+                    state,
+                    &mut budget_transaction,
+                    output_index,
+                    actual_id,
+                ) {
+                    Ok(update) => update,
+                    Err(message) => {
+                        return terminate_responses_stream_with_error(
+                            state,
+                            build_error_event(message),
+                        )
+                    }
                 }
+            } else {
+                false
             }
         } else {
             false
@@ -3064,23 +3068,14 @@ fn validate_active_output_item(
     if lifecycle.done || !expected_types.contains(&lifecycle.item_type.as_str()) {
         return Err("An incremental output event targeted a completed or incompatible item.");
     }
-    let expected_id = lifecycle
-        .item_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .map(str::to_string);
+    let item_id_missing = lifecycle.item_id.as_deref().is_none_or(str::is_empty);
     let actual_id = optional_string_field(
         event,
         "item_id",
         "An incremental output event item_id was not a string or null.",
     )?
     .filter(|id| !id.is_empty());
-    if let (Some(expected), Some(actual)) = (expected_id.as_deref(), actual_id) {
-        if expected != actual {
-            return Err("An incremental output event item id did not match its output item.");
-        }
-    }
-    if expected_id.is_none() {
+    if item_id_missing {
         if let Some(actual) = actual_id {
             retain_late_output_item_id(state, output_index, actual)?;
         }
@@ -3128,23 +3123,14 @@ fn validate_reasoning_event(
     if lifecycle.item_type != "reasoning" || lifecycle.done {
         return Err("A reasoning stream event arrived for a non-reasoning or completed item.");
     }
-    let expected_id = lifecycle
-        .item_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .map(str::to_string);
+    let item_id_missing = lifecycle.item_id.as_deref().is_none_or(str::is_empty);
     let actual_id = optional_string_field(
         event,
         "item_id",
         "A reasoning stream event item_id was not a string or null.",
     )?
     .filter(|id| !id.is_empty());
-    if let (Some(expected), Some(actual)) = (expected_id.as_deref(), actual_id) {
-        if expected != actual {
-            return Err("A reasoning stream event item id did not match its output item.");
-        }
-    }
-    if expected_id.is_none() {
+    if item_id_missing {
         if let Some(actual) = actual_id {
             retain_late_output_item_id(state, output_index, actual)?;
         }
@@ -3487,20 +3473,15 @@ fn handle_response_completed(
         );
     };
 
-    let Some(terminal_id) = get_str(response, "id").filter(|id| !id.trim().is_empty()) else {
+    let Some(_terminal_id) = get_str(response, "id").filter(|id| !id.trim().is_empty()) else {
         return terminate_responses_stream_with_error(
             state,
             build_error_event("A terminal Responses event had a missing or empty response id."),
         );
     };
-    if state.created_response_id.as_deref() != Some(terminal_id) {
-        return terminate_responses_stream_with_error(
-            state,
-            build_error_event(
-                "A terminal Responses event id did not match its response.created id.",
-            ),
-        );
-    }
+    // Copilot may re-encrypt the opaque response id between created and
+    // terminal events. Presence is required, but byte equality is not a stable
+    // continuity signal; sequencing and the tracked output lifecycle are.
 
     if let Err(message) = validate_terminal_status(response, terminal_kind) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
@@ -3641,22 +3622,12 @@ fn handle_response_failed(
             build_error_event("A response.failed event contained an invalid response object."),
         );
     };
-    let Some(failed_id) = get_str(response, "id").filter(|id| !id.trim().is_empty()) else {
+    let Some(_failed_id) = get_str(response, "id").filter(|id| !id.trim().is_empty()) else {
         return terminate_responses_stream_with_error(
             state,
             build_error_event("A response.failed event had a missing or empty response id."),
         );
     };
-    if state
-        .created_response_id
-        .as_deref()
-        .is_some_and(|created_id| created_id != failed_id)
-    {
-        return terminate_responses_stream_with_error(
-            state,
-            build_error_event("A response.failed event id did not match its response.created id."),
-        );
-    }
     if let Err(message) = validate_terminal_status(response, ResponsesTerminalKind::Failed) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
     }
@@ -3898,7 +3869,7 @@ mod tests {
         let created = json!({
             "type": "response.created",
             "response": {
-                "id": "resp_1",
+                "id": "resp_created",
                 "model": "gpt-5",
                 "usage": {
                     "input_tokens": 10,
@@ -3912,7 +3883,7 @@ mod tests {
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             AnthropicStreamEventData::MessageStart { message } => {
-                assert_eq!(message.id, "resp_1");
+                assert_eq!(message.id, "resp_created");
                 assert_eq!(message.usage.input_tokens, 8); // 10 - 2 cached
                 assert_eq!(message.usage.cache_read_input_tokens, Some(2));
             }
@@ -3924,7 +3895,7 @@ mod tests {
                 "output_index":0,
                 "item":{
                     "type":"message",
-                    "id":"message-1",
+                    "id":"message-added",
                     "role":"assistant",
                     "content":[]
                 }
@@ -3938,6 +3909,7 @@ mod tests {
             "type": "response.output_text.delta",
             "output_index": 0,
             "content_index": 0,
+            "item_id": "message-delta-1",
             "delta": "Hello"
         });
         let evs = translate_responses_stream_event(&d1, &mut state);
@@ -3953,6 +3925,7 @@ mod tests {
             "type": "response.output_text.delta",
             "output_index": 0,
             "content_index": 0,
+            "item_id": "message-delta-2",
             "delta": " world"
         });
         let evs = translate_responses_stream_event(&d2, &mut state);
@@ -3964,6 +3937,7 @@ mod tests {
             "type": "response.output_text.done",
             "output_index": 0,
             "content_index": 0,
+            "item_id": "message-text-done",
             "text": "Hello world"
         });
         let evs = translate_responses_stream_event(&done, &mut state);
@@ -3974,7 +3948,7 @@ mod tests {
                 "output_index":0,
                 "item":{
                     "type":"message",
-                    "id":"message-1",
+                    "id":"message-done",
                     "role":"assistant",
                     "content":[{"type":"output_text","text":"Hello world"}]
                 }
@@ -3987,11 +3961,11 @@ mod tests {
         let completed = json!({
             "type": "response.completed",
             "response": {
-                "id": "resp_1",
+                "id": "resp_completed",
                 "status": "completed",
                 "output": [{
                     "type":"message",
-                    "id":"message-1",
+                    "id":"message-terminal",
                     "role":"assistant",
                     "content":[{"type":"output_text","text":"Hello world"}]
                 }],
@@ -4415,17 +4389,22 @@ mod tests {
             &json!({
                 "type":"response.output_item.added",
                 "output_index":0,
-                "item":{"type":"reasoning","id":"reasoning-id","summary":[]}
+                "item":{"type":"reasoning","id":"reasoning-added","summary":[]}
             }),
             &mut state,
         )
         .is_empty());
-        for delta in ["  ", "analysis", "  "] {
+        for (item_id, delta) in [
+            ("reasoning-delta-1", "  "),
+            ("reasoning-delta-2", "analysis"),
+            ("reasoning-delta-3", "  "),
+        ] {
             let events = translate_responses_stream_event(
                 &json!({
                     "type":"response.reasoning_summary_text.delta",
                     "output_index":0,
                     "summary_index":0,
+                    "item_id":item_id,
                     "delta":delta
                 }),
                 &mut state,
@@ -4438,7 +4417,7 @@ mod tests {
                 "output_index":0,
                 "item":{
                     "type":"reasoning",
-                    "id":"reasoning-id",
+                    "id":"reasoning-done",
                     "encrypted_content":"encrypted",
                     "summary":[{"type":"summary_text","text":"  analysis  "}]
                 }
@@ -4601,12 +4580,17 @@ mod tests {
     }
 
     #[test]
-    fn identical_done_and_added_replays_are_deduplicated() {
+    fn identical_replays_dedupe_while_opaque_reasoning_fields_rotate() {
         let mut state = started_state();
         let added = json!({
             "type":"response.output_item.added",
             "output_index":0,
-            "item":{"type":"reasoning","id":"dedupe","summary":[]}
+            "item":{
+                "type":"reasoning",
+                "id":"dedupe-added",
+                "encrypted_content":"opaque-added",
+                "summary":[]
+            }
         });
         assert!(translate_responses_stream_event(&added, &mut state).is_empty());
         assert!(translate_responses_stream_event(&added, &mut state).is_empty());
@@ -4616,8 +4600,8 @@ mod tests {
             "output_index":0,
             "item":{
                 "type":"reasoning",
-                "id":"dedupe",
-                "encrypted_content":"opaque",
+                "id":"dedupe-done",
+                "encrypted_content":"opaque-done",
                 "summary":[{"type":"summary_text","text":"once"}]
             }
         });
@@ -4641,12 +4625,12 @@ mod tests {
             &json!({
                 "type":"response.completed",
                 "response":{
-                    "id":"resp_test",
+                    "id":"resp-terminal",
                     "status":"completed",
                     "output":[{
                         "type":"reasoning",
-                        "id":"dedupe",
-                        "encrypted_content":"opaque",
+                        "id":"dedupe-terminal",
+                        "encrypted_content":"opaque-terminal",
                         "summary":[{"type":"summary_text","text":"once"}]
                     }],
                     "usage":null
@@ -4923,7 +4907,7 @@ mod tests {
         let mut state = create_responses_stream_state(None);
         state
             .retained_budget
-            .reserve(RetainedStateOwner::CreatedResponseId, 7)
+            .reserve(RetainedStateOwner::OutputItemMetadata(99), 7)
             .expect("independent retained owner");
         let first = json!({"type":"ping","sequence_number":1,"payload":"first"});
         assert_eq!(validate_event_sequence(&first, &mut state), Ok(false));
