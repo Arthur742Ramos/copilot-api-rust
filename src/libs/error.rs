@@ -118,6 +118,20 @@ pub fn is_openai_native_path(path: &str) -> bool {
         || path.ends_with("/v1/models")
 }
 
+pub fn is_files_path(path: &str) -> bool {
+    matches!(path, "/files" | "/v1/files")
+        || path.starts_with("/files/")
+        || path.starts_with("/v1/files/")
+}
+
+pub fn is_anthropic_files_request(headers: &HeaderMap) -> bool {
+    headers.contains_key("anthropic-version") || headers.contains_key("anthropic-beta")
+}
+
+pub fn is_openai_request(path: &str, headers: &HeaderMap) -> bool {
+    is_openai_native_path(path) || (is_files_path(path) && !is_anthropic_files_request(headers))
+}
+
 /// Render a locally generated failure using the OpenAI error envelope consumed
 /// by Codex and OpenAI SDKs.
 pub fn openai_error_response(

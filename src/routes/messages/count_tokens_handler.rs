@@ -18,6 +18,7 @@ use crate::libs::http::client;
 use crate::libs::models::find_endpoint_model;
 use crate::libs::provider_model::{create_fallback_model, parse_provider_model_alias};
 use crate::libs::tokenizer::get_token_count;
+use crate::routes::files::materialize_anthropic_file_sources;
 use crate::routes::messages::anthropic_types::AnthropicMessagesPayload;
 use crate::routes::messages::non_stream_translation::translate_to_openai;
 use crate::routes::messages::preprocess::normalize_system_messages;
@@ -97,7 +98,12 @@ async fn count_tokens_via_anthropic(payload: &AnthropicMessagesPayload) -> Optio
 
 /// Mirrors `handleCountTokens`.
 #[allow(clippy::result_large_err)]
-pub async fn handle_count_tokens(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
+pub async fn handle_count_tokens(
+    mut body: Value,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    validate_messages_request_shape(&body)?;
+    materialize_anthropic_file_sources(&mut body).await?;
     validate_messages_request_shape(&body)?;
     validate_required_model(&body)?;
     let mut anthropic_payload: AnthropicMessagesPayload = match serde_json::from_value(body) {

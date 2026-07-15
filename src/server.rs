@@ -3,7 +3,7 @@
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -103,6 +103,7 @@ pub fn build_router_with_admission(
             "/v1/messages/count_tokens",
             post(crate::routes::messages::route::post_count_tokens),
         )
+        .merge(crate::routes::files::router())
         .route(
             "/admin/config/model-mappings",
             get(crate::routes::admin_config::get_model_mappings_route)
@@ -261,7 +262,7 @@ fn cors_layer() -> CorsLayer {
         .allow_origin(AllowOrigin::predicate(|origin, _request_parts| {
             is_loopback_origin(origin.as_bytes())
         }))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([
             CONTENT_TYPE,
             AUTHORIZATION,
@@ -306,7 +307,7 @@ fn is_loopback_origin(origin: &[u8]) -> bool {
 /// envelope remains native to the selected public protocol. The panic hook still
 /// records the original diagnostic.
 async fn panic_middleware(req: Request, next: Next) -> Response {
-    let openai_native = crate::libs::error::is_openai_native_path(req.uri().path());
+    let openai_native = crate::libs::error::is_openai_request(req.uri().path(), req.headers());
     match std::panic::AssertUnwindSafe(next.run(req))
         .catch_unwind()
         .await
@@ -326,8 +327,8 @@ async fn panic_middleware(req: Request, next: Next) -> Response {
     }
 }
 
-async fn api_not_found(uri: axum::http::Uri) -> Response {
-    if crate::libs::error::is_openai_native_path(uri.path()) {
+async fn api_not_found(headers: HeaderMap, uri: axum::http::Uri) -> Response {
+    if crate::libs::error::is_openai_request(uri.path(), &headers) {
         crate::libs::error::openai_error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
@@ -343,8 +344,8 @@ async fn api_not_found(uri: axum::http::Uri) -> Response {
     }
 }
 
-async fn api_method_not_allowed(uri: axum::http::Uri) -> Response {
-    if crate::libs::error::is_openai_native_path(uri.path()) {
+async fn api_method_not_allowed(headers: HeaderMap, uri: axum::http::Uri) -> Response {
+    if crate::libs::error::is_openai_request(uri.path(), &headers) {
         crate::libs::error::openai_error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "invalid_request_error",
@@ -365,7 +366,7 @@ async fn api_method_not_allowed(uri: axum::http::Uri) -> Response {
 /// the complete Anthropic `request_too_large` envelope, so clients that parse error
 /// JSON get a consistent shape. Other responses pass through untouched.
 async fn normalize_oversize_response(req: Request, next: Next) -> Response {
-    let openai_native = crate::libs::error::is_openai_native_path(req.uri().path());
+    let openai_native = crate::libs::error::is_openai_request(req.uri().path(), req.headers());
     let response = next.run(req).await;
     if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
         return response;
@@ -608,11 +609,12 @@ async fn general_auth_middleware(req: Request, next: Next) -> Response {
         false,
     ) {
         AuthOutcome::Reject(rejection) => return rejection,
-        AuthOutcome::Allow(Some(label)) => {
+        AuthOutcome::Allow(Some(identity)) => {
             // Record which named key served this request so token usage can be
             // attributed per client. The trace layer installed the task-local
             // context outermost, so this fills its (interior-mutable) cell.
-            crate::libs::request_context::set_request_api_key_label(label);
+            crate::libs::request_context::set_request_api_key_label(identity.attribution);
+            crate::libs::request_context::set_request_api_key_owner_id(identity.owner_id);
         }
         AuthOutcome::Allow(None) => {}
     }
@@ -629,8 +631,9 @@ async fn admin_auth_middleware(req: Request, next: Next) -> Response {
         true,
     ) {
         AuthOutcome::Reject(rejection) => return rejection,
-        AuthOutcome::Allow(Some(label)) => {
-            crate::libs::request_context::set_request_api_key_label(label);
+        AuthOutcome::Allow(Some(identity)) => {
+            crate::libs::request_context::set_request_api_key_label(identity.attribution);
+            crate::libs::request_context::set_request_api_key_owner_id(identity.owner_id);
         }
         AuthOutcome::Allow(None) => {}
     }

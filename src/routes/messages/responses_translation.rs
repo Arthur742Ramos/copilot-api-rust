@@ -17,6 +17,8 @@
 
 use std::collections::HashSet;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde_json::{json, Map, Value};
 
 use crate::libs::config::{get_extra_prompt_for_model, get_reasoning_effort_for_model};
@@ -855,6 +857,7 @@ fn create_file_content(block: &Value) -> Result<ResponseInputFile, AppError> {
 
     let file_data = match source_type {
         "url" => url_source(source, "Document")?,
+        "text" => plain_text_data_url(source)?,
         "file" => {
             return Err(AppError::BadRequest(
                 "Document source of type \"file\" (Files API ids) is not supported".to_string(),
@@ -888,6 +891,33 @@ fn create_file_content(block: &Value) -> Result<ResponseInputFile, AppError> {
         filename: Some(filename),
         extra,
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn plain_text_data_url(source: Option<&Value>) -> Result<String, AppError> {
+    let source = source.and_then(Value::as_object).ok_or_else(|| {
+        AppError::BadRequest("Document text source must be an object".to_string())
+    })?;
+    let media_type = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .filter(|value| *value == "text/plain")
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Document text source requires media_type \"text/plain\"".to_string(),
+            )
+        })?;
+    let data = source
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("Document text source is missing \"data\"".to_string())
+        })?;
+    Ok(format!(
+        "data:{media_type};base64,{}",
+        STANDARD.encode(data)
+    ))
 }
 
 /// A trimmed, non-empty `source.<field>` string, or `None` when absent/blank.

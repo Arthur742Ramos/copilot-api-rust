@@ -723,11 +723,18 @@ fn validate_source(block: &Map<String, Value>, path: &str) -> Result<(), AppErro
         "url" => {
             required_nonempty_string(source, "url", &source_path)?;
         }
+        "text" => {
+            let media_type = required_nonempty_string(source, "media_type", &source_path)?;
+            if media_type != "text/plain" {
+                return Err(invalid(
+                    &format!("{source_path}.media_type"),
+                    "text sources require media_type \"text/plain\"",
+                ));
+            }
+            required_nonempty_string(source, "data", &source_path)?;
+        }
         "file" => {
-            return Err(invalid(
-                &format!("{source_path}.type"),
-                "file sources require the Anthropic Files API, which this proxy does not expose",
-            ))
+            required_nonempty_string(source, "file_id", &source_path)?;
         }
         unsupported => {
             return Err(invalid(

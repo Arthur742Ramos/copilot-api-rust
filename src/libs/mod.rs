@@ -11,6 +11,7 @@ pub mod copilot_rate_limit;
 pub mod credential_store;
 pub mod deviceid;
 pub mod error;
+pub mod file_store;
 pub mod http;
 pub mod logger;
 pub mod metrics;

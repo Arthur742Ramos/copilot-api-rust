@@ -296,13 +296,34 @@ pub struct ResponseInputCompactionTrigger {
 }
 
 /// Mirrors the TS `ResponseInputContent` union.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ResponseInputContent {
     Text(ResponseInputText),
     Image(ResponseInputImage),
     File(ResponseInputFile),
     Other(Value),
+}
+
+impl<'de> Deserialize<'de> for ResponseInputContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text") => serde_json::from_value(value)
+                .map(ResponseInputContent::Text)
+                .map_err(serde::de::Error::custom),
+            Some("input_image") => serde_json::from_value(value)
+                .map(ResponseInputContent::Image)
+                .map_err(serde::de::Error::custom),
+            Some("input_file") => serde_json::from_value(value)
+                .map(ResponseInputContent::File)
+                .map_err(serde::de::Error::custom),
+            _ => Ok(ResponseInputContent::Other(value)),
+        }
+    }
 }
 
 /// Covers both `input_text` and `output_text` block types.
