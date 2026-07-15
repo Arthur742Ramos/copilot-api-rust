@@ -61,10 +61,15 @@ pub static PATHS: Lazy<Paths> = Lazy::new(|| {
 });
 
 pub async fn ensure_paths() -> std::io::Result<()> {
-    tokio::fs::create_dir_all(PATHS.app_dir.join(&PATHS.auth_app)).await?;
-    set_permissions_700(&PATHS.app_dir).await;
+    tokio::fs::create_dir_all(&PATHS.app_dir).await?;
+    set_permissions_700(&PATHS.app_dir).await?;
+    let auth_dir = PATHS.app_dir.join(&PATHS.auth_app);
+    if auth_dir != PATHS.app_dir {
+        tokio::fs::create_dir_all(&auth_dir).await?;
+        set_permissions_700(&auth_dir).await?;
+    }
     tokio::fs::create_dir_all(&PATHS.files_dir).await?;
-    set_permissions_700(&PATHS.files_dir).await;
+    set_permissions_700(&PATHS.files_dir).await?;
     ensure_file(&PATHS.github_token_path).await?;
     ensure_file(&PATHS.config_path).await?;
     ensure_file(&PATHS.provider_credentials_path).await?;
@@ -72,13 +77,101 @@ pub async fn ensure_paths() -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-pub async fn set_permissions_700(path: &std::path::Path) {
+pub(crate) fn set_permissions_700_sync(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("owner-only mode verification failed for {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
-#[cfg(not(unix))]
-pub async fn set_permissions_700(_path: &std::path::Path) {}
+#[cfg(windows)]
+pub(crate) fn set_permissions_700_sync(path: &std::path::Path) -> std::io::Result<()> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$path = $env:COPILOT_API_ACL_PATH
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
+$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+$acl.SetOwner($sid)
+$acl.SetAccessRuleProtection($true, $false)
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+  $sid,
+  [System.Security.AccessControl.FileSystemRights]::FullControl,
+  $inheritance,
+  [System.Security.AccessControl.PropagationFlags]::None,
+  [System.Security.AccessControl.AccessControlType]::Allow
+)
+[void]$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $path -AclObject $acl
+$check = Get-Acl -LiteralPath $path
+$rules = @($check.Access)
+if (-not $check.AreAccessRulesProtected -or $rules.Count -ne 1) {
+  throw 'directory ACL is not protected owner-only'
+}
+$ruleSid = $rules[0].IdentityReference.Translate(
+  [System.Security.Principal.SecurityIdentifier]
+)
+if (($ruleSid.Value -ne $sid.Value) -or ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow)) {
+  throw 'directory ACL owner verification failed'
+}
+if (($rules[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
+  throw 'directory ACL rights verification failed'
+}
+if (($rules[0].InheritanceFlags -band $inheritance) -ne $inheritance) {
+  throw 'directory ACL inheritance verification failed'
+}
+"#;
+
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("COPILOT_API_ACL_PATH", path)
+        .output()?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next()
+            .unwrap_or("unknown ACL error")
+            .chars()
+            .take(200)
+            .collect::<String>();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "failed to enforce owner-only Windows directory ACL for {}: {detail}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn set_permissions_700_sync(path: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "owner-only directory permissions are unsupported for {}",
+            path.display()
+        ),
+    ))
+}
+
+/// Enforce and verify owner-only directory permissions before secrets or local
+/// file content are created beneath the directory.
+pub async fn set_permissions_700(path: &std::path::Path) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || set_permissions_700_sync(&path))
+        .await
+        .map_err(|error| std::io::Error::other(format!("permission worker failed: {error}")))?
+}
 
 async fn ensure_file(path: &std::path::Path) -> std::io::Result<()> {
     if tokio::fs::metadata(path).await.is_err() {
@@ -255,6 +348,26 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn directory_permission_policy_enforces_or_fails_closed() {
+        let path = temporary_file("directory-permission-policy");
+        std::fs::create_dir(&path).unwrap();
+        let result = set_permissions_700_sync(&path);
+        #[cfg(any(unix, windows))]
+        assert!(result.is_ok(), "{result:?}");
+        #[cfg(not(any(unix, windows)))]
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let _ = std::fs::remove_dir(path);
     }
 
     #[test]

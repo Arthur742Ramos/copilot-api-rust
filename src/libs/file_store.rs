@@ -298,12 +298,13 @@ impl FileStore {
             .data_dir
             .join(format!(".{id}.{}.tmp", Uuid::new_v4().simple()));
         let final_path = self.data_path(&id);
-        let file = match tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .await
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
         {
+            options.mode(0o600);
+        }
+        let file = match options.open(&temp_path).await {
             Ok(file) => file,
             Err(error) => {
                 if let Err(cleanup_error) = self.remove_metadata_record(&id).await {
@@ -604,12 +605,12 @@ impl FileStore {
     }
 
     async fn ensure_layout(&self) -> Result<(), FileStoreError> {
-        tokio::fs::create_dir_all(&self.root).await?;
-        tokio::fs::create_dir_all(&self.data_dir).await?;
-        set_permissions_700(&self.root).await;
-        set_permissions_700(&self.data_dir).await;
         self.reconciled
             .get_or_try_init(|| async {
+                tokio::fs::create_dir_all(&self.root).await?;
+                set_permissions_700(&self.root).await?;
+                tokio::fs::create_dir_all(&self.data_dir).await?;
+                set_permissions_700(&self.data_dir).await?;
                 self.reconcile().await?;
                 Ok::<(), FileStoreError>(())
             })
@@ -1039,6 +1040,39 @@ mod tests {
         let root = std::env::temp_dir().join(format!("copilot-api-files-{}", Uuid::new_v4()));
         let store = FileStore::new(root.clone(), limits);
         (root, store)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_directories_and_content_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, store) = test_store(FileStoreLimits::default());
+        let created = store
+            .create(
+                "alice",
+                "private.txt".to_string(),
+                "text/plain".to_string(),
+                None,
+                Bytes::from_static(b"private"),
+            )
+            .await
+            .unwrap();
+        for path in [&root, &root.join("data")] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(store.data_path(&created.id))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]
