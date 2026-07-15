@@ -1209,7 +1209,7 @@ fn update_pending_message_usage(state: &mut AnthropicStreamState, usage: &Anthro
         ..
     }) = state.pending_message_delta.as_mut()
     {
-        *pending_usage = Some(anthropic_delta_usage(usage));
+        *pending_usage = Some(anthropic_delta_usage(usage, true));
     }
 }
 
@@ -1231,7 +1231,7 @@ fn complete_pending_message(
         (Some(usage), AnthropicStreamEventData::MessageDelta { delta, usage: _ }) => {
             AnthropicStreamEventData::MessageDelta {
                 delta,
-                usage: Some(anthropic_delta_usage(usage)),
+                usage: Some(anthropic_delta_usage(usage, true)),
             }
         }
         (_, pending) => pending,
@@ -1254,9 +1254,12 @@ fn complete_pending_message(
     Ok(())
 }
 
-fn anthropic_delta_usage(usage: &AnthropicUsage) -> AnthropicMessageDeltaUsage {
+fn anthropic_delta_usage(
+    usage: &AnthropicUsage,
+    include_input_tokens: bool,
+) -> AnthropicMessageDeltaUsage {
     AnthropicMessageDeltaUsage {
-        input_tokens: Some(usage.input_tokens),
+        input_tokens: include_input_tokens.then_some(usage.input_tokens),
         output_tokens: usage.output_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         cache_read_input_tokens: usage.cache_read_input_tokens,
@@ -1341,6 +1344,7 @@ fn handle_finish(
     }
     schedule_terminal_output(state, events)?;
 
+    let usage_is_known = usage.is_some() || state.chat_usage.is_some();
     let mut effective_usage = usage
         .cloned()
         .or_else(|| state.chat_usage.clone())
@@ -1374,7 +1378,11 @@ fn handle_finish(
                 .map(|s| s.to_string()),
             stop_sequence: None,
         },
-        usage: Some(anthropic_delta_usage(&effective_usage)),
+        // A missing upstream usage object means "unknown", not an authoritative
+        // zero input count. Omitting input_tokens prevents Claude Code from
+        // replacing a previously known workflow count with zero. A later strict
+        // include_usage chunk upgrades this pending delta to the full counters.
+        usage: Some(anthropic_delta_usage(&effective_usage, usage_is_known)),
     });
     state.chat_finish_reason = Some(finish_reason.to_string());
     if usage_present {
@@ -2570,7 +2578,7 @@ mod tests {
                 json!({
                     "type": "message_delta",
                     "delta": { "stop_reason": "end_turn" },
-                    "usage": { "input_tokens": 0, "output_tokens": 0 }
+                    "usage": { "output_tokens": 0 }
                 }),
                 json!({ "type": "message_stop" }),
             ]

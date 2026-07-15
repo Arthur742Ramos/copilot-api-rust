@@ -3515,6 +3515,7 @@ fn handle_response_completed(
             );
         }
     }
+    let usage_is_known = response.get("usage").is_some_and(|usage| !usage.is_null());
     let validated_usage = match validate_raw_responses_usage(response) {
         Ok(usage) => usage,
         Err(message) => {
@@ -3608,7 +3609,7 @@ fn handle_response_completed(
             return terminate_responses_stream_with_error(state, build_error_event(message))
         }
     };
-    let usage = map_responses_usage_delta(validated_usage);
+    let usage = map_responses_usage_delta(validated_usage, usage_is_known);
 
     if let Err(message) = finish_all_function_calls(state, &mut events) {
         return terminate_responses_stream_with_error(state, build_error_event(message));
@@ -3767,9 +3768,13 @@ fn map_responses_stop_reason(
 }
 
 /// Mirrors `mapResponsesUsage`, shaped for the streaming `message_delta`.
-fn map_responses_usage_delta(usage: ValidatedResponsesUsage) -> AnthropicMessageDeltaUsage {
+fn map_responses_usage_delta(
+    usage: ValidatedResponsesUsage,
+    include_input_tokens: bool,
+) -> AnthropicMessageDeltaUsage {
     AnthropicMessageDeltaUsage {
-        input_tokens: Some(usage.input_tokens - usage.cached_input_tokens.unwrap_or(0)),
+        input_tokens: include_input_tokens
+            .then_some(usage.input_tokens - usage.cached_input_tokens.unwrap_or(0)),
         output_tokens: usage.output_tokens,
         cache_creation_input_tokens: None,
         cache_read_input_tokens: usage.cached_input_tokens,

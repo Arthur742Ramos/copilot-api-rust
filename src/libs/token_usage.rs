@@ -5,7 +5,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::libs::request_context::{
-    generate_trace_id, request_api_key_label, request_context_store,
+    generate_trace_id, request_api_key_label, request_context_store, RequestContext,
 };
 use crate::libs::sqlite::with_usage_conn;
 use crate::libs::state;
@@ -133,7 +133,20 @@ pub fn resolve_token_usage_session_id(
     session_id: Option<&str>,
     fallback_session_id: Option<&str>,
 ) -> String {
-    if let Some(affinity) = request_context_store().and_then(|c| c.session_affinity) {
+    let context = request_context_store();
+    resolve_token_usage_session_id_with_context(
+        context.as_ref().and_then(|c| c.session_affinity.as_deref()),
+        session_id,
+        fallback_session_id,
+    )
+}
+
+fn resolve_token_usage_session_id_with_context(
+    request_session_id: Option<&str>,
+    session_id: Option<&str>,
+    fallback_session_id: Option<&str>,
+) -> String {
+    if let Some(affinity) = request_session_id {
         let trimmed = affinity.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -171,6 +184,7 @@ pub struct TokenUsageRecorder {
     pub provider_name: Option<String>,
     pub session_id: Option<String>,
     pub fallback_session_id: Option<String>,
+    request_context: Option<RequestContext>,
 }
 
 impl TokenUsageRecorder {
@@ -178,16 +192,7 @@ impl TokenUsageRecorder {
         if !is_token_usage_storage_enabled() {
             return;
         }
-        let event = match to_persisted_event(
-            self.endpoint,
-            self.source,
-            &self.model,
-            self.provider_name.as_deref(),
-            self.session_id.as_deref(),
-            self.fallback_session_id.as_deref(),
-            None,
-            &usage,
-        ) {
+        let event = match self.to_persisted_event(&usage) {
             Some(event) => event,
             None => return,
         };
@@ -211,6 +216,25 @@ impl TokenUsageRecorder {
                 }
             }
         }
+    }
+
+    fn to_persisted_event(&self, usage: &UsageTokens) -> Option<PersistedTokenUsageEvent> {
+        // Streaming bodies are polled after the request task-local has left
+        // scope. Prefer the context captured when the recorder was created, but
+        // retain the old in-scope behavior for synchronous/direct callers.
+        let current_context = request_context_store();
+        let context = self.request_context.as_ref().or(current_context.as_ref());
+        to_persisted_event_with_context(
+            self.endpoint,
+            self.source,
+            &self.model,
+            self.provider_name.as_deref(),
+            self.session_id.as_deref(),
+            self.fallback_session_id.as_deref(),
+            None,
+            context,
+            usage,
+        )
     }
 }
 
@@ -239,6 +263,7 @@ pub fn create_copilot_token_usage_recorder(
         provider_name: None,
         session_id: None,
         fallback_session_id,
+        request_context: request_context_store(),
     }
 }
 
@@ -255,6 +280,7 @@ pub fn create_provider_token_usage_recorder(
         provider_name: Some(provider_name.into()),
         session_id: None,
         fallback_session_id,
+        request_context: request_context_store(),
     }
 }
 
@@ -266,14 +292,7 @@ pub fn create_request_scoped_provider_token_usage_recorder(
     model: impl Into<String>,
     provider_name: impl Into<String>,
 ) -> TokenUsageRecorder {
-    let session_affinity = request_context_store()
-        .and_then(|context| context.session_affinity)
-        .map(|session| session.trim().to_string())
-        .filter(|session| !session.is_empty())
-        .unwrap_or_default();
-    let mut recorder = create_provider_token_usage_recorder(endpoint, model, provider_name, None);
-    recorder.session_id = Some(session_affinity);
-    recorder
+    create_provider_token_usage_recorder(endpoint, model, provider_name, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -457,16 +476,17 @@ pub fn resolve_total_tokens(input: &UsageTokens) -> i64 {
 
 /// Mirrors `resolveTraceId` in src/lib/token-usage/index.ts: trim the supplied
 /// id, else fall back to the request-context trace id, else generate one.
-fn resolve_token_usage_trace_id(trace_id: Option<&str>) -> String {
+fn resolve_token_usage_trace_id(trace_id: Option<&str>, request_trace_id: Option<&str>) -> String {
     if let Some(t) = trace_id {
         let trimmed = t.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
     }
-    if let Some(ctx) = request_context_store() {
-        if !ctx.trace_id.is_empty() {
-            return ctx.trace_id;
+    if let Some(request_trace_id) = request_trace_id {
+        let trimmed = request_trace_id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
         }
     }
     generate_trace_id()
@@ -494,7 +514,11 @@ fn resolve_user_id(source: TokenUsageSource, provider_name: Option<&str>) -> Str
 /// request context (filled by the auth layer). Trimmed; `None` when absent or
 /// empty. This is the per-key identity a budget lookup will reuse.
 pub(crate) fn resolve_api_key_label() -> Option<String> {
-    request_api_key_label()
+    normalize_api_key_label(request_api_key_label())
+}
+
+fn normalize_api_key_label(label: Option<String>) -> Option<String> {
+    label
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
 }
@@ -509,6 +533,32 @@ pub fn to_persisted_event(
     session_id: Option<&str>,
     fallback_session_id: Option<&str>,
     trace_id: Option<&str>,
+    usage: &UsageTokens,
+) -> Option<PersistedTokenUsageEvent> {
+    let context = request_context_store();
+    to_persisted_event_with_context(
+        endpoint,
+        source,
+        model,
+        provider_name,
+        session_id,
+        fallback_session_id,
+        trace_id,
+        context.as_ref(),
+        usage,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn to_persisted_event_with_context(
+    endpoint: TokenUsageEndpoint,
+    source: TokenUsageSource,
+    model: &str,
+    provider_name: Option<&str>,
+    session_id: Option<&str>,
+    fallback_session_id: Option<&str>,
+    trace_id: Option<&str>,
+    request_context: Option<&RequestContext>,
     usage: &UsageTokens,
 ) -> Option<PersistedTokenUsageEvent> {
     if !has_any_token(usage) {
@@ -538,12 +588,21 @@ pub fn to_persisted_event(
         model,
         output_tokens: normalize_token(usage.output_tokens.map(|v| v as f64)),
         provider_name: provider_name.clone(),
-        session_id: resolve_token_usage_session_id(session_id, fallback_session_id),
+        session_id: resolve_token_usage_session_id_with_context(
+            request_context.and_then(|context| context.session_affinity.as_deref()),
+            session_id,
+            fallback_session_id,
+        ),
         source,
         total_tokens: resolve_total_tokens(usage),
-        trace_id: resolve_token_usage_trace_id(trace_id),
+        trace_id: resolve_token_usage_trace_id(
+            trace_id,
+            request_context.map(|context| context.trace_id.as_str()),
+        ),
         user_id: resolve_user_id(source, provider_name.as_deref()),
-        api_key_label: resolve_api_key_label(),
+        api_key_label: normalize_api_key_label(
+            request_context.and_then(|context| context.api_key_label.get().cloned()),
+        ),
     })
 }
 
@@ -1457,6 +1516,43 @@ mod tests {
         }));
         let event = event.expect("event present");
         assert_eq!(event.api_key_label.as_deref(), Some("team-a"));
+    }
+
+    #[tokio::test]
+    async fn recorder_preserves_request_context_after_stream_leaves_scope() {
+        let context = RequestContext::new(
+            "trace-stream-context".to_string(),
+            0,
+            "claude-code/test".to_string(),
+            Some("claude-workflow-session".to_string()),
+            None,
+        );
+        let mut recorder = run_with_context(context, async {
+            set_request_api_key_label("workflow-client".to_string());
+            create_provider_token_usage_recorder(
+                "provider_messages",
+                "workflow-model",
+                "workflow-provider",
+                None,
+            )
+        })
+        .await;
+
+        // A provider payload may also carry metadata.user_id. The request header
+        // affinity is the stable Claude Code workflow identity and must win.
+        recorder.session_id = Some("payload-session".to_string());
+        assert!(request_context_store().is_none());
+
+        let event = recorder
+            .to_persisted_event(&UsageTokens {
+                input_tokens: Some(12),
+                output_tokens: Some(3),
+                ..Default::default()
+            })
+            .expect("usage produces an event");
+        assert_eq!(event.session_id, "claude-workflow-session");
+        assert_eq!(event.trace_id, "trace-stream-context");
+        assert_eq!(event.api_key_label.as_deref(), Some("workflow-client"));
     }
 
     #[test]
