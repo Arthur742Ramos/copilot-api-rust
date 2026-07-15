@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_copilot-api")
@@ -10,6 +11,31 @@ fn temp_home(label: &str) -> std::path::PathBuf {
         std::process::id(),
         uuid::Uuid::new_v4()
     ))
+}
+
+fn output_with_timeout(command: &mut Command, timeout: Duration) -> Output {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "command did not fail fast\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -134,6 +160,43 @@ fn non_interactive_quick_provider_without_secret_fails_without_waiting() {
     assert!(output.contains("non-interactive"));
     assert!(output.contains("COPILOT_API_PROVIDER_OPENROUTER_API_KEY"));
     let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn every_builtin_oauth_path_fails_fast_without_a_tty() {
+    for provider in [None, Some("copilot"), Some("codex")] {
+        let home = temp_home(provider.unwrap_or("default-oauth"));
+        let mut command = Command::new(binary());
+        command
+            .args(["--api-home", home.to_str().unwrap(), "auth"])
+            .env_remove("COPILOT_API_GITHUB_TOKEN");
+        if let Some(provider) = provider {
+            command.args(["--provider", provider]);
+        }
+        let timeout = if cfg!(windows) {
+            // Windows verifies three protected ACLs through PowerShell before
+            // reaching OAuth dispatch; keep the assertion bounded without
+            // conflating ACL setup time with an OAuth callback wait.
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(2)
+        };
+        let started = Instant::now();
+        let output = output_with_timeout(&mut command, timeout);
+        assert!(!output.status.success(), "{provider:?}");
+        assert!(started.elapsed() < timeout);
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.contains("requires an interactive terminal"),
+            "{output}"
+        );
+        assert!(output.contains("protected credential store"), "{output}");
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
 
 #[test]

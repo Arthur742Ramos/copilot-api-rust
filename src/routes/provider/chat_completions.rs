@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::libs::config::ModelConfig;
+use crate::libs::config::{resolve_effective_provider_config, ModelConfig};
 use crate::libs::error::{http_error_from_response, AppError};
 use crate::libs::provider_capabilities::{supports, ProviderCapability};
 use crate::libs::provider_resolver::resolve_provider_config;
@@ -29,7 +29,7 @@ pub async fn handle_provider_chat_completions(
     provider: String,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let Some(provider_config) = resolve_provider_config(&provider).await else {
+    let Some(provider_config) = resolve_provider_config(&provider).await? else {
         return Ok(crate::libs::error::openai_error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
@@ -37,6 +37,7 @@ pub async fn handle_provider_chat_completions(
             format!("Provider '{provider}' not found or disabled"),
         ));
     };
+    let provider_config = resolve_effective_provider_config(&provider_config, &payload.model);
     if !supports(&provider_config, ProviderCapability::ChatCompletions) {
         return Ok(crate::libs::error::openai_error_response(
             StatusCode::BAD_REQUEST,

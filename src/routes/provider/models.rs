@@ -34,7 +34,7 @@ pub async fn handle_provider_models(
     headers: HeaderMap,
     provider: String,
 ) -> Result<Response, AppError> {
-    let Some(provider_config) = resolve_provider_config(&provider).await else {
+    let Some(provider_config) = resolve_provider_config(&provider).await? else {
         return Ok(openai_error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",

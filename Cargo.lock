@@ -466,6 +466,7 @@ dependencies = [
  "url",
  "uuid",
  "webbrowser",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

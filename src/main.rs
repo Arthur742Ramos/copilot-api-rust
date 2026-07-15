@@ -222,10 +222,7 @@ async fn main() {
         Command::Start(args) => run_server(args).await,
         Command::Auth(args) => run_auth(args).await,
         Command::CheckUsage => run_check_usage().await,
-        Command::Debug { json } => {
-            debug::run_debug(json).await;
-            Ok(())
-        }
+        Command::Debug { json } => debug::run_debug(json).await,
         Command::Doctor { json } => {
             // The doctor command owns its own exit code (non-zero when any check
             // FAILs) so it can gate a CI / preflight step. Exit directly rather
@@ -279,6 +276,8 @@ fn init_tracing(verbose: bool, to_stderr: bool) {
 async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     let max_concurrent_requests = resolve_max_concurrent_requests(options.max_concurrent_requests)?;
     raise_server_nofile_limit();
+    // Enforce credential/config permissions before any config or token is read.
+    ensure_paths().await?;
     crate::libs::http::set_proxy_from_env(options.proxy_env);
     if options.proxy_env {
         tracing::debug!("HTTP proxy configured from environment (per-URL)");
@@ -303,7 +302,6 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
         tracing::info!("Using {} plan GitHub account", options.account_type);
     }
 
-    ensure_paths().await?;
     cache_vscode_version().await;
     cache_mac_machine_id();
     cache_vscode_session_id();
@@ -475,9 +473,6 @@ async fn run_server(options: StartArgs) -> anyhow::Result<()> {
     }
 
     print_ready_banner(&server_url);
-    // Emitted after the ready banner so this Windows-only advisory doesn't lead
-    // the startup output and read as something being wrong on a single-user box.
-    crate::libs::paths::warn_if_file_perms_unrestricted();
 
     // Run the server, but flush the token-usage WAL on the way out whether serve
     // returns Ok (graceful shutdown) or Err — otherwise a serve error would skip
@@ -702,7 +697,6 @@ fn raise_server_nofile_limit() {
 async fn run_auth(options: AuthArgs) -> anyhow::Result<()> {
     state::with_state_mut(|s| s.show_token = options.show_token);
     ensure_paths().await?;
-    crate::libs::paths::warn_if_file_perms_unrestricted();
 
     let setup_options = auth_setup::AuthSetupOptions {
         provider: options.provider,
@@ -716,8 +710,10 @@ async fn run_auth(options: AuthArgs) -> anyhow::Result<()> {
         probe: options.probe,
     };
     let mut prompt = auth_setup::TerminalPrompt::detect();
-    match auth_setup::build_auth_plan(&setup_options, &mut prompt, |name| std::env::var(name).ok())?
-    {
+    let plan =
+        auth_setup::build_auth_plan(&setup_options, &mut prompt, |name| std::env::var(name).ok())?;
+    auth_setup::require_interactive_oauth(&plan, prompt.is_interactive_terminal())?;
+    match plan {
         auth_setup::AuthPlan::Copilot => {
             setup_github_token(true).await?;
             tracing::info!(

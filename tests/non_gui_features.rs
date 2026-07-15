@@ -12,7 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use common::{json_body, send, send_full};
 use copilot_api::libs::config::{
-    set_cached_config_for_test, AppConfig, AuthConfig, ProviderConfig,
+    set_cached_config_for_test, AppConfig, AuthConfig, ModelConfig, ProviderConfig,
 };
 use copilot_api::libs::state;
 use serde_json::{json, Map, Value};
@@ -42,11 +42,22 @@ async fn alpha_fixture(
         "upstream_path": uri.path(),
         "echo": body,
         "authenticated": headers.contains_key("authorization"),
+        "authorization_replaced": headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer inbound-client-token"),
+        "accept": headers.get("accept").and_then(|value| value.to_str().ok()),
+        "openai_beta": headers
+            .get("openai-beta")
+            .and_then(|value| value.to_str().ok()),
+        "content_type": headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
     }))
     .into_response()
 }
 
-async fn chat_fixture(Json(body): Json<Value>) -> Response {
+async fn chat_fixture(headers: HeaderMap, Json(body): Json<Value>) -> Response {
     if body.get("stream") == Some(&Value::Bool(true)) {
         return Response::builder()
             .status(StatusCode::OK)
@@ -70,11 +81,13 @@ async fn chat_fixture(Json(body): Json<Value>) -> Response {
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         "future": body.get("future").cloned(),
+        "saw_authorization": headers.contains_key("authorization"),
+        "saw_x_api_key": headers.contains_key("x-api-key"),
     }))
     .into_response()
 }
 
-async fn responses_fixture(Json(body): Json<Value>) -> Response {
+async fn responses_fixture(headers: HeaderMap, Json(body): Json<Value>) -> Response {
     if body.get("stream") == Some(&Value::Bool(true)) {
         return Response::builder()
             .status(StatusCode::OK)
@@ -96,8 +109,25 @@ async fn responses_fixture(Json(body): Json<Value>) -> Response {
         "output": [],
         "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
         "future": body.get("future").cloned(),
+        "saw_authorization": headers.contains_key("authorization"),
+        "saw_x_api_key": headers.contains_key("x-api-key"),
     }))
     .into_response()
+}
+
+async fn anthropic_fixture(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+    Json(json!({
+        "id":"msg_mixed_fixture",
+        "type":"message",
+        "role":"assistant",
+        "model":body["model"],
+        "content":[{"type":"text","text":"native anthropic"}],
+        "stop_reason":"end_turn",
+        "stop_sequence":null,
+        "usage":{"input_tokens":1,"output_tokens":1},
+        "saw_authorization":headers.contains_key("authorization"),
+        "saw_x_api_key":headers.contains_key("x-api-key"),
+    }))
 }
 
 async fn compact_fixture(Json(_body): Json<Value>) -> Json<Value> {
@@ -114,6 +144,7 @@ async fn start_fixture() -> (String, tokio::task::JoinHandle<()>) {
         .route("/codex/alpha/search", post(alpha_fixture))
         .route("/v1/chat/completions", post(chat_fixture))
         .route("/v1/responses", post(responses_fixture))
+        .route("/v1/messages", post(anthropic_fixture))
         .route("/v1/responses/compact", post(compact_fixture))
         .route(
             "/v1/models",
@@ -160,6 +191,33 @@ fn provider(
 }
 
 fn install_fixture_config(base_url: &str, client_keys: &[&str]) {
+    let mixed_models = BTreeMap::from([
+        (
+            "mixed-chat".to_string(),
+            ModelConfig {
+                provider_type: Some("openai-compatible".to_string()),
+                extra: Map::from_iter([(
+                    "futureModelOption".to_string(),
+                    json!({"preserved":true}),
+                )]),
+                ..Default::default()
+            },
+        ),
+        (
+            "mixed-responses".to_string(),
+            ModelConfig {
+                provider_type: Some("openai-responses".to_string()),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let native_model = BTreeMap::from([(
+        "mixed-anthropic".to_string(),
+        ModelConfig {
+            provider_type: Some("anthropic".to_string()),
+            ..Default::default()
+        },
+    )]);
     let providers = BTreeMap::from([
         (
             "responses-fixture".to_string(),
@@ -172,6 +230,20 @@ fn install_fixture_config(base_url: &str, client_keys: &[&str]) {
         (
             "anthropic-fixture".to_string(),
             provider("anthropic", base_url, None),
+        ),
+        (
+            "mixed-fixture".to_string(),
+            ProviderConfig {
+                models: Some(mixed_models),
+                ..provider("anthropic", base_url, None)
+            },
+        ),
+        (
+            "responses-mixed-fixture".to_string(),
+            ProviderConfig {
+                models: Some(native_model),
+                ..provider("openai-responses", base_url, None)
+            },
         ),
         (
             "codex".to_string(),
@@ -232,12 +304,22 @@ async fn alpha_search_public_provider_aliases_and_errors_are_conformant() {
         "/responses-fixture/alpha/search?q=rust",
         "/responses-fixture/v1/alpha/search?q=rust",
     ] {
-        let (status, body) = send(post_json(
+        let mut request = post_json(
             path,
             json!({"query":"rust","future_option":{"rank":true}}),
             None,
-        ))
-        .await;
+        );
+        request
+            .headers_mut()
+            .insert("accept", "application/vnd.alpha+json".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("openai-beta", "alpha-client-beta".parse().unwrap());
+        request.headers_mut().insert(
+            "authorization",
+            "Bearer inbound-client-token".parse().unwrap(),
+        );
+        let (status, body) = send(request).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -248,6 +330,10 @@ async fn alpha_search_public_provider_aliases_and_errors_are_conformant() {
         assert_eq!(body["query"], "q=rust");
         assert_eq!(body["echo"]["future_option"]["rank"], true);
         assert_eq!(body["authenticated"], true);
+        assert_eq!(body["authorization_replaced"], true);
+        assert_eq!(body["accept"], "application/vnd.alpha+json");
+        assert_eq!(body["openai_beta"], "alpha-client-beta");
+        assert_eq!(body["content_type"], "application/json");
         let expected_upstream = if path.starts_with("/responses-fixture/") {
             "/v1/alpha/search"
         } else {
@@ -255,6 +341,17 @@ async fn alpha_search_public_provider_aliases_and_errors_are_conformant() {
         };
         assert_eq!(body["upstream_path"], expected_upstream, "{path}");
     }
+
+    let (status, body) = send(post_json(
+        "/v1/alpha/search?mode=default",
+        json!({"query":"default headers"}),
+        None,
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json_body(&body);
+    assert_eq!(body["accept"], "application/json");
+    assert!(body["openai_beta"].is_null());
 
     for path in ["/alpha/search", "/responses-fixture/v1/alpha/search"] {
         let (status, body) = send(
@@ -342,6 +439,85 @@ async fn provider_route_breadth_supports_streaming_and_non_streaming_aliases() {
         .await;
         assert_eq!(status, StatusCode::OK, "{path}");
         assert!(json_body(&body)["input_tokens"].as_i64().is_some());
+    }
+
+    let (status, body) = send(post_json(
+        "/mixed-fixture/v1/chat/completions",
+        json!({
+            "model":"mixed-chat",
+            "messages":[{"role":"user","content":"hello"}]
+        }),
+        None,
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json_body(&body);
+    assert_eq!(body["saw_authorization"], true);
+    assert_eq!(body["saw_x_api_key"], false);
+
+    let (status, body) = send(post_json(
+        "/mixed-fixture/v1/responses",
+        json!({"model":"mixed-responses","input":"hello"}),
+        None,
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json_body(&body);
+    assert_eq!(body["saw_authorization"], true);
+    assert_eq!(body["saw_x_api_key"], false);
+
+    for (path, model) in [
+        ("/mixed-fixture/v1/messages", "mixed-chat"),
+        ("/mixed-fixture/v1/messages", "mixed-responses"),
+    ] {
+        let (status, body) = send(post_json(
+            path,
+            json!({
+                "model":model,
+                "max_tokens":16,
+                "messages":[{"role":"user","content":"hello"}]
+            }),
+            None,
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let (status, body) = send(post_json(
+        "/responses-mixed-fixture/v1/messages",
+        json!({
+            "model":"mixed-anthropic",
+            "max_tokens":16,
+            "messages":[{"role":"user","content":"hello"}]
+        }),
+        None,
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json_body(&body);
+    assert_eq!(body["saw_authorization"], false);
+    assert_eq!(body["saw_x_api_key"], true);
+
+    for (path, model) in [
+        ("/mixed-fixture/v1/responses", "mixed-chat"),
+        ("/mixed-fixture/v1/chat/completions", "mixed-responses"),
+    ] {
+        let (status, body) = send(post_json(
+            path,
+            json!({"model":model,"input":"hello","messages":[]}),
+            None,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(
+            json_body(&body)["error"]["code"],
+            "unsupported_provider_capability"
+        );
     }
 
     for path in [

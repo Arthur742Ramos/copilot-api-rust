@@ -196,7 +196,8 @@ fn print_debug_info_json(info: &DebugInfo) {
     }
 }
 
-pub async fn run_debug(json: bool) {
+pub async fn run_debug(json: bool) -> anyhow::Result<()> {
+    crate::libs::paths::ensure_paths().await?;
     let debug_info = get_debug_info().await;
 
     if json {
@@ -204,6 +205,7 @@ pub async fn run_debug(json: bool) {
     } else {
         print_debug_info_plain(&debug_info);
     }
+    Ok(())
 }
 
 #[cfg(test)]

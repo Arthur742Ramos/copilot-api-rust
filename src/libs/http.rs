@@ -168,6 +168,7 @@ pub fn preregister_retry_metrics() {
         "provider" => "codex"
     )
     .increment(0);
+    metrics::counter!("responses_websocket_pool_reopen_total").increment(0);
     for outcome in ["completed", "failed", "incomplete", "error", "unknown"] {
         metrics::counter!(
             "copilot_responses_websocket_terminal_total",

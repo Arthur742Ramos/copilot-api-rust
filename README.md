@@ -398,10 +398,11 @@ The image path uses an undocumented Codex backend and can change without notice.
 ## Configuration
 
 Run `copilot-api auth` in a terminal for guided Copilot, Codex, DeepSeek,
-DashScope, OpenRouter, OpenCode Go, or custom provider setup. In a non-TTY it
-preserves the legacy Copilot default and never prompts. Custom provider
-automation uses `--api-key-env`; the secret is written to the owner-only
-credential store rather than `config.json`:
+DashScope, OpenRouter, OpenCode Go, or custom provider setup. Built-in Copilot
+and Codex OAuth fail immediately without a TTY; preconfigured services reuse
+their protected credentials instead of invoking `auth`. Non-interactive custom
+provider automation uses `--api-key-env`; the secret is written to the
+owner-only credential store rather than `config.json`:
 
 ```sh
 export TEAM_OPENAI_KEY='set-at-runtime'
@@ -441,8 +442,12 @@ customize:
       "enabled": true,
       "baseUrl": "https://provider.example.com",
       "authType": "authorization",
-      "capabilities": ["messages", "count_tokens", "models", "chat_completions", "images"],
-      "models": {}
+      "capabilities": ["messages", "count_tokens", "models", "chat_completions", "responses", "responses_compact", "images", "alpha_search"],
+      "models": {
+        "gpt-responses": {
+          "type": "openai-responses"
+        }
+      }
     }
   },
   "modelMappings": {
@@ -469,8 +474,16 @@ Notes:
 - Provider API keys created by `copilot-api auth` live in the protected
   `provider_credentials.json` store. Existing inline `apiKey` configuration
   remains readable for backward compatibility; new setup does not write it.
+- Credential/config writes are owner-only from file creation onward: verified
+  `0600` on Unix and a protected single-user DACL on Windows. Unsupported
+  platforms or ACL failures fail closed before secrets/config are read or
+  written.
 - `capabilities` is optional. When absent, conservative defaults are derived
   from the provider type; unsupported routes fail before upstream dispatch.
+- A model can override its provider protocol with
+  `models.<model>.type`. Capability checks, endpoint selection, and default auth
+  mode use this effective type; unknown model fields and future type values are
+  preserved, with unsupported type values falling back to the provider type.
 - The provider name `copilot` is reserved.
 - `claudeCodeModelDiscoveryAliases` is disabled by default. Enable it only when
   Claude Code's `/model` picker should include non-Claude Copilot models.
@@ -566,7 +579,7 @@ Admin routes always require the separately generated `auth.adminApiKey`.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--provider <NAME>` | guided in TTY; `copilot` otherwise | Authenticate or configure `copilot`, `codex`, `opencode-go`, `deepseek`, `dashscope`, `openrouter`, or `custom`. |
+| `--provider <NAME>` | guided in TTY; built-in OAuth fails outside TTY | Authenticate or configure `copilot`, `codex`, `opencode-go`, `deepseek`, `dashscope`, `openrouter`, or `custom`. |
 | `--name <NAME>` | none | Name a custom provider. |
 | `--type <TYPE>` | provider default | `anthropic`, `openai-compatible`, or `openai-responses`. |
 | `--base-url <URL>` | provider default | Provider base URL; credentials/query/fragment are rejected. |

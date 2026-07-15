@@ -18,7 +18,10 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::libs::config::{provider_uses_responses_api, ModelConfig, ResolvedProviderConfig};
+use crate::libs::config::{
+    provider_model_uses_responses_api, resolve_effective_provider_config, ModelConfig,
+    ResolvedProviderConfig,
+};
 use crate::libs::error::{anthropic_error_response, http_error_from_response, AppError};
 use crate::libs::provider_capabilities::{supports, ProviderCapability};
 use crate::libs::provider_resolver::resolve_provider_config;
@@ -102,7 +105,7 @@ pub async fn post_provider_messages(
             return AppError::BadRequest(format!("Invalid request payload: {e}")).into_response()
         }
     };
-    if provider_uses_responses_api(&provider) {
+    if provider_model_uses_responses_api(&provider, &payload.model) {
         if let Err(error) = validate_responses_request_controls(&payload, provider == "codex") {
             return error.into_response();
         }
@@ -142,13 +145,14 @@ pub async fn handle_provider_messages_for_provider(
     provider: String,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let Some(provider_config) = resolve_provider_config(&provider).await else {
+    let Some(provider_config) = resolve_provider_config(&provider).await? else {
         return Ok(anthropic_error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
             format!("Provider '{provider}' not found or disabled"),
         ));
     };
+    let provider_config = resolve_effective_provider_config(&provider_config, &payload.model);
     if !supports(&provider_config, ProviderCapability::Messages) {
         return Ok(anthropic_error_response(
             StatusCode::BAD_REQUEST,

@@ -516,36 +516,52 @@ fn print_json(report: &DoctorReport) {
 /// Run the full preflight and return the process exit code (0 when no FAIL, 1
 /// otherwise). All check messages are secret-free.
 pub async fn run_doctor(json: bool) -> i32 {
-    // Load config up front so provider + drift checks see the merged runtime
-    // config. A malformed config.json surfaces as a FAIL rather than aborting.
     let mut checks = Vec::new();
-    if let Err(e) = config::merge_config_with_defaults() {
+    // Permissions are enforced before config/token reads. Failure remains a
+    // reportable doctor check, but the process does not silently inspect a
+    // credential file with unverifiable access controls.
+    let paths_ready = match ensure_paths().await {
+        Ok(()) => true,
+        Err(e) => {
+            checks.push(Check::new(
+                "paths",
+                Status::Fail,
+                format!("Failed to enforce app paths and credential permissions: {e}"),
+            ));
+            false
+        }
+    };
+    // Load config only after the permission boundary is established. A malformed
+    // config.json surfaces as a FAIL rather than aborting.
+    if paths_ready {
+        if let Err(e) = config::merge_config_with_defaults() {
+            checks.push(Check::new(
+                "config.load",
+                Status::Fail,
+                format!("Failed to load config: {e}"),
+            ));
+        }
+    } else {
         checks.push(Check::new(
             "config.load",
             Status::Fail,
-            format!("Failed to load config: {e}"),
+            "Config was not loaded because credential permissions could not be verified.",
         ));
     }
 
-    if let Err(e) = ensure_paths().await {
-        checks.push(Check::new(
-            "paths",
-            Status::Fail,
-            format!("Failed to ensure app paths: {e}"),
-        ));
+    if paths_ready {
+        checks.extend(check_auth().await);
+
+        // Warm the Copilot catalog for the drift check. Failure is non-fatal here —
+        // the Copilot-token check above already reports the underlying auth problem,
+        // and the drift check degrades to the Codex-only catalog.
+        if let Err(e) = crate::libs::utils::cache_models().await {
+            tracing::debug!("doctor: cache_models failed: {e}");
+        }
+
+        checks.extend(check_providers().await);
+        checks.extend(check_model_drift().await);
     }
-
-    checks.extend(check_auth().await);
-
-    // Warm the Copilot catalog for the drift check. Failure is non-fatal here —
-    // the Copilot-token check above already reports the underlying auth problem,
-    // and the drift check degrades to the Codex-only catalog.
-    if let Err(e) = crate::libs::utils::cache_models().await {
-        tracing::debug!("doctor: cache_models failed: {e}");
-    }
-
-    checks.extend(check_providers().await);
-    checks.extend(check_model_drift().await);
 
     let (counts, exit_code) = summarize(&checks);
 

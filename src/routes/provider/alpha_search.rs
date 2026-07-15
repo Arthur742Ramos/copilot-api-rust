@@ -40,13 +40,17 @@ pub async fn post_provider_alpha_search(
         Err(error) => return AppError::Other(error.into()).into_openai_response(),
     };
 
-    let Some(config) = resolve_provider_config(&provider).await else {
-        return openai_error_response(
-            StatusCode::NOT_FOUND,
-            "invalid_request_error",
-            Some("provider_not_found"),
-            format!("Provider '{provider}' not found or disabled"),
-        );
+    let config = match resolve_provider_config(&provider).await {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return openai_error_response(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                Some("provider_not_found"),
+                format!("Provider '{provider}' not found or disabled"),
+            )
+        }
+        Err(error) => return AppError::Other(error).into_openai_response(),
     };
     if !supports(&config, ProviderCapability::AlphaSearch) {
         return openai_error_response(

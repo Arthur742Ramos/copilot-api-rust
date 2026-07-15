@@ -129,14 +129,19 @@ provider/OpenAI secret in this variable unless it is intentionally also your
 gateway client key; configured upstream providers have their own `apiKey`, and
 the gateway replaces inbound authorization before forwarding. Guided
 `copilot-api auth` setup stores that upstream key in the protected provider
-credential store; inline `apiKey` remains a legacy-compatible input.
+credential store; inline `apiKey` remains a legacy-compatible input. The store
+is verified `0600` on Unix or protected by a verified current-user-only Windows
+DACL; inability to establish that boundary fails closed.
 
 The public Responses WebSocket transport is not exposed. Leave
 `supports_websockets` unset/false: Codex talks HTTP/SSE to this gateway. For a
 Codex-backed streaming provider, the gateway may use the reference's upstream
-WebSocket protocol internally. It reuses only terminal-clean sockets, evicts on
-cancellation, bounds silence, and falls back to HTTP only when the handshake
-fails before `response.create` is sent.
+WebSocket protocol internally. Before every request it completes a bounded
+ping/pong preflight, evicts and reopens a failed pooled socket once, and falls
+back to HTTP only for handshake/preflight failures before `response.create`.
+Ambiguous request-frame send errors are not replayed. Idle close/error/stale
+frames are observed in the background, cancellation evicts the socket, and only
+a terminal accepted by the full Responses lifecycle guard permits reuse.
 
 Codex 0.144.1 sends:
 
@@ -886,7 +891,7 @@ Status means deterministic, credential-free evidence exists.
 | Chat Completions | lossless representable JSON/SSE extensions; explicit request 400, malformed-JSON 502, or one terminal SSE error; stable chunk identity, source-ordered scheduling, and a shared aggregate translated-payload budget | not Codex 0.144.1's wire API | public provider/direct captures, split/partial/deferred/multi-tool refusal ordering, exact/overflow reasoning/opaque/mixed UTF-8 budgets, malformed chunks, status/header, usage, and collisions |
 | Responses-to-Messages budgets | transactionally coupled retained/output ownership; exact/+1 UTF-8 text, reasoning/signature, block keys, lifecycle metadata, parallel tool arguments, authoritative growth/shrink, release, and terminal cleanup | native Responses remains protocol-native | `claude_responses_state_budgets_cross_provider_and_direct_boundaries` plus 38 retained/cross-budget unit invariants |
 | Public Responses WebSocket | not applicable | **Not exposed**; client uses HTTP SSE | intentional public-protocol limit |
-| Codex upstream Responses WebSocket | supported through translated Messages | supported internally with pooling and safe fallback | deterministic handshake, reuse, cancellation, heartbeat/silence, missing-terminal tests |
+| Codex upstream Responses WebSocket | supported through translated Messages | supported internally with lifecycle-authorized pooling and pre-request-only fallback | deterministic handshake/preflight, reopen, idle close, malformed terminal, reuse, cancellation, heartbeat/silence, missing-terminal tests |
 
 The detailed Claude-specific matrix remains in
 [`claude-code-api-compatibility.md`](./claude-code-api-compatibility.md).

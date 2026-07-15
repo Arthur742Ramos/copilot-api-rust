@@ -32,13 +32,17 @@ pub async fn post_alpha_search(headers: HeaderMap, uri: Uri, body: Bytes) -> Res
         Err(error) => return AppError::Other(error.into()).into_openai_response(),
     };
 
-    let Some(provider) = resolve_provider_config("codex").await else {
-        return openai_error_response(
-            StatusCode::NOT_FOUND,
-            "invalid_request_error",
-            Some("provider_not_found"),
-            "Provider 'codex' not found or disabled",
-        );
+    let provider = match resolve_provider_config("codex").await {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            return openai_error_response(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                Some("provider_not_found"),
+                "Provider 'codex' not found or disabled",
+            )
+        }
+        Err(error) => return AppError::Other(error).into_openai_response(),
     };
     if !supports(&provider, ProviderCapability::AlphaSearch) {
         return openai_error_response(

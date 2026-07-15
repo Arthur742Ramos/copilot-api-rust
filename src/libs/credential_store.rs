@@ -4,10 +4,15 @@ use std::collections::BTreeMap;
 use crate::libs::oauth::codex::CodexCredentials;
 use crate::libs::paths::{set_permissions_600, PATHS};
 
-// Mirrors src/lib/credential-store.ts. Reads/writes the GitHub token and Codex
-// credential files, with 0600 permissions on write.
+// Reads/writes GitHub, Codex, and provider credentials through the verified
+// owner-only permission policy (0600 on Unix, protected user DACL on Windows).
 
 async fn read_optional_file(path: &std::path::Path) -> Result<Option<String>, anyhow::Error> {
+    match tokio::fs::metadata(path).await {
+        Ok(_) => set_permissions_600(path).await?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
     match tokio::fs::read_to_string(path).await {
         Ok(contents) => Ok(Some(contents)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -16,12 +21,54 @@ async fn read_optional_file(path: &std::path::Path) -> Result<Option<String>, an
 }
 
 async fn write_protected_file(path: &std::path::Path, content: &str) -> Result<(), anyhow::Error> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    let path = path.to_path_buf();
+    let content = content.to_string();
+    tokio::task::spawn_blocking(move || write_protected_file_sync(&path, &content))
+        .await
+        .map_err(|error| anyhow::anyhow!("Credential writer failed: {error}"))?
+}
+
+fn write_protected_file_sync(path: &std::path::Path, content: &str) -> Result<(), anyhow::Error> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Credential path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("credential");
+    let temporary = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| -> Result<(), anyhow::Error> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&temporary)?;
+        drop(file);
+        crate::libs::paths::set_permissions_600_sync(&temporary)?;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&temporary)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        crate::libs::paths::atomic_replace_file(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    tokio::fs::write(path, content).await?;
-    set_permissions_600(path).await;
-    Ok(())
+    result
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -31,6 +78,9 @@ struct ProviderCredentials {
 }
 
 fn read_provider_credentials_sync() -> Result<ProviderCredentials, anyhow::Error> {
+    if PATHS.provider_credentials_path.exists() {
+        crate::libs::paths::set_permissions_600_sync(&PATHS.provider_credentials_path)?;
+    }
     match std::fs::read_to_string(&PATHS.provider_credentials_path) {
         Ok(raw) if raw.trim().is_empty() => Ok(ProviderCredentials::default()),
         Ok(raw) => serde_json::from_str(&raw).map_err(|error| {
@@ -47,46 +97,8 @@ fn read_provider_credentials_sync() -> Result<ProviderCredentials, anyhow::Error
 }
 
 fn write_provider_credentials_sync(credentials: &ProviderCredentials) -> Result<(), anyhow::Error> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    std::fs::create_dir_all(&PATHS.app_dir)?;
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = PATHS.app_dir.join(format!(
-        "provider_credentials.json.tmp.{}.{}",
-        std::process::id(),
-        sequence
-    ));
-    let result = (|| -> Result<(), anyhow::Error> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        let json = serde_json::to_string_pretty(credentials)?;
-        file.write_all(json.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-
-        #[cfg(windows)]
-        if PATHS.provider_credentials_path.exists() {
-            // Windows' std::fs::rename cannot replace an existing file. The
-            // temporary file still prevents a partial/truncated credential set;
-            // the short remove/rename window is the platform fallback.
-            std::fs::remove_file(&PATHS.provider_credentials_path)?;
-        }
-        std::fs::rename(&temporary, &PATHS.provider_credentials_path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    let json = serde_json::to_string_pretty(credentials)?;
+    write_protected_file_sync(&PATHS.provider_credentials_path, &format!("{json}\n"))
 }
 
 /// Read one provider key from the repository credential store. This synchronous

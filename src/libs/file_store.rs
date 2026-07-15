@@ -298,7 +298,7 @@ impl FileStore {
             .data_dir
             .join(format!(".{id}.{}.tmp", Uuid::new_v4().simple()));
         let final_path = self.data_path(&id);
-        let mut file = match tokio::fs::OpenOptions::new()
+        let file = match tokio::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temp_path)
@@ -316,10 +316,39 @@ impl FileStore {
                 return Err(FileStoreError::Io(error));
             }
         };
+        drop(file);
+        if let Err(error) = set_permissions_600(&temp_path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            if let Err(cleanup_error) = self.remove_metadata_record(&id).await {
+                tracing::warn!(
+                    file_id = %id,
+                    error = %cleanup_error,
+                    "Could not roll back reserved file metadata; stale cleanup will retry"
+                );
+            }
+            return Err(FileStoreError::Io(error));
+        }
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp_path)
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                if let Err(cleanup_error) = self.remove_metadata_record(&id).await {
+                    tracing::warn!(
+                        file_id = %id,
+                        error = %cleanup_error,
+                        "Could not roll back reserved file metadata; stale cleanup will retry"
+                    );
+                }
+                return Err(FileStoreError::Io(error));
+            }
+        };
         if let Err(error) = async {
             file.write_all(&bytes).await?;
             file.sync_all().await?;
-            set_permissions_600(&temp_path).await;
             tokio::fs::rename(&temp_path, &final_path).await?;
             sync_directory(&self.data_dir).await
         }

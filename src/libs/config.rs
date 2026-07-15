@@ -26,6 +26,8 @@ pub struct AuthConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelConfig {
+    #[serde(skip_serializing_if = "Option::is_none", rename = "type")]
+    pub provider_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "topP")]
@@ -43,6 +45,10 @@ pub struct ModelConfig {
         rename = "toolContentSupportType"
     )]
     pub tool_content_support_type: Option<Vec<String>>,
+    /// Preserve pricing and future model-level fields from the TypeScript
+    /// configuration contract.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -359,11 +365,14 @@ fn write_config_to_disk(config: &AppConfig) -> std::io::Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&tmp_path)?;
+        let file = opts.open(&tmp_path)?;
+        drop(file);
+        crate::libs::paths::set_permissions_600_sync(&tmp_path)?;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&tmp_path)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp_path, target)
+        crate::libs::paths::atomic_replace_file(&tmp_path, target)
     })();
 
     if write_result.is_err() {
@@ -712,19 +721,31 @@ pub fn set_provider_config(
 }
 
 pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
+    match get_provider_config_checked(name) {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::warn!(provider = name.trim(), %error, "Failed to resolve provider config");
+            None
+        }
+    }
+}
+
+pub fn get_provider_config_checked(name: &str) -> anyhow::Result<Option<ResolvedProviderConfig>> {
     let provider_name = name.trim();
     if provider_name.is_empty() {
-        return None;
+        return Ok(None);
     }
     if is_reserved_provider_name(provider_name) {
         tracing::warn!(
             "Provider {provider_name} is reserved and cannot be configured in config.providers"
         );
-        return None;
+        return Ok(None);
     }
-    let provider = get_raw_provider_config(provider_name)?;
+    let Some(provider) = get_raw_provider_config(provider_name) else {
+        return Ok(None);
+    };
     if provider.enabled == Some(false) {
-        return None;
+        return Ok(None);
     }
     let provider_type = provider
         .provider_type
@@ -737,7 +758,7 @@ pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
         tracing::warn!(
             "Provider {provider_name} is ignored because type '{provider_type}' is not supported"
         );
-        return None;
+        return Ok(None);
     }
     let base_url = normalize_provider_base_url(provider.base_url.as_deref().unwrap_or(""));
     let auth_type =
@@ -749,24 +770,15 @@ pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
         .trim()
         .to_string();
     let api_key = if api_key.is_empty() {
-        std::env::var(provider_api_key_env_name(provider_name))
+        let from_environment = std::env::var(provider_api_key_env_name(provider_name))
             .ok()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                match crate::libs::credential_store::read_provider_api_key_sync(provider_name) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::warn!(
-                            provider = provider_name,
-                            %error,
-                            "Failed to read provider credential store"
-                        );
-                        None
-                    }
-                }
-            })
-            .unwrap_or_default()
+            .filter(|value| !value.is_empty());
+        match from_environment {
+            Some(value) => value,
+            None => crate::libs::credential_store::read_provider_api_key_sync(provider_name)?
+                .unwrap_or_default(),
+        }
     } else {
         api_key
     };
@@ -782,9 +794,9 @@ pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
             "Provider {provider_name} is enabled but missing {}",
             missing.join(" or ")
         );
-        return None;
+        return Ok(None);
     }
-    Some(ResolvedProviderConfig {
+    Ok(Some(ResolvedProviderConfig {
         name: provider_name.to_string(),
         provider_type,
         base_url,
@@ -793,7 +805,7 @@ pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
         models: provider.models,
         capabilities: provider.capabilities,
         adjust_input_tokens: provider.adjust_input_tokens,
-    })
+    }))
 }
 
 /// Whether a provider routes requests through the OpenAI Responses wire
@@ -804,6 +816,52 @@ pub fn provider_uses_responses_api(name: &str) -> bool {
     name == "codex"
         || get_provider_config(name)
             .is_some_and(|config| config.provider_type == "openai-responses")
+}
+
+/// Resolve the wire protocol selected by a provider model. Invalid/future
+/// model-level values remain preserved in `ModelConfig.extra`/`provider_type`
+/// but conservatively fall back to the provider-level type.
+pub fn resolve_effective_provider_type(provider: &ResolvedProviderConfig, model: &str) -> String {
+    provider
+        .models
+        .as_ref()
+        .and_then(|models| models.get(model))
+        .and_then(|model| model.provider_type.as_deref())
+        .filter(|provider_type| {
+            matches!(
+                *provider_type,
+                "anthropic" | "openai-compatible" | "openai-responses"
+            )
+        })
+        .unwrap_or(&provider.provider_type)
+        .to_string()
+}
+
+/// Clone a resolved provider with the model's effective wire type and the auth
+/// default appropriate to that type. An explicit provider auth mode applies only
+/// to the provider-level type; switching wire protocols recomputes the default
+/// so an Anthropic model uses `x-api-key` while OpenAI protocols use bearer auth.
+pub fn resolve_effective_provider_config(
+    provider: &ResolvedProviderConfig,
+    model: &str,
+) -> ResolvedProviderConfig {
+    let provider_type = resolve_effective_provider_type(provider, model);
+    if provider_type == provider.provider_type {
+        return provider.clone();
+    }
+    ResolvedProviderConfig {
+        provider_type: provider_type.clone(),
+        auth_type: resolve_provider_auth_type(&provider.name, None, &provider_type),
+        ..provider.clone()
+    }
+}
+
+pub fn provider_model_uses_responses_api(name: &str, model: &str) -> bool {
+    let name = name.trim();
+    match get_provider_config(name) {
+        Some(provider) => resolve_effective_provider_type(&provider, model) == "openai-responses",
+        None => name == "codex",
+    }
 }
 
 pub fn list_enabled_providers() -> Vec<String> {
@@ -995,5 +1053,54 @@ mod tests {
             assert_eq!(efforts.get(model).map(String::as_str), Some("max"));
         }
         assert_eq!(efforts.get("gpt-5.5").map(String::as_str), Some("xhigh"));
+    }
+
+    #[test]
+    fn model_config_preserves_type_and_unknown_fields() {
+        let raw = r#"{"type":"openai-responses","temperature":0.2,"pricing":{"input":1.5},"future":{"enabled":true}}"#;
+        let model: ModelConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(model.provider_type.as_deref(), Some("openai-responses"));
+        assert_eq!(model.extra["pricing"]["input"], 1.5);
+        assert_eq!(model.extra["future"]["enabled"], true);
+        let round_trip = serde_json::to_value(model).unwrap();
+        assert_eq!(round_trip["type"], "openai-responses");
+        assert_eq!(round_trip["pricing"]["input"], 1.5);
+        assert_eq!(round_trip["future"]["enabled"], true);
+    }
+
+    #[test]
+    fn effective_provider_type_recomputes_auth_and_falls_back_on_unknown_type() {
+        let provider = ResolvedProviderConfig {
+            name: "mixed".to_string(),
+            provider_type: "anthropic".to_string(),
+            base_url: "https://example.com".to_string(),
+            api_key: "key".to_string(),
+            auth_type: "x-api-key".to_string(),
+            models: Some(BTreeMap::from([
+                (
+                    "responses-model".to_string(),
+                    ModelConfig {
+                        provider_type: Some("openai-responses".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "future-model".to_string(),
+                    ModelConfig {
+                        provider_type: Some("future-wire".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            capabilities: None,
+            adjust_input_tokens: None,
+        };
+        let effective = resolve_effective_provider_config(&provider, "responses-model");
+        assert_eq!(effective.provider_type, "openai-responses");
+        assert_eq!(effective.auth_type, "authorization");
+        assert_eq!(
+            resolve_effective_provider_type(&provider, "future-model"),
+            "anthropic"
+        );
     }
 }

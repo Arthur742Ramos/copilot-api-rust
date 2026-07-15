@@ -87,6 +87,7 @@ async fn handle(
     let provider_name = provider.as_deref().unwrap_or("codex").trim().to_string();
     let provider_config = resolve_provider_config(&provider_name)
         .await
+        .map_err(AppError::Other)?
         .ok_or_else(|| provider_not_found(&provider_name))?;
     if !supports(&provider_config, ProviderCapability::Images) {
         return Err(AppError::BadRequest(format!(

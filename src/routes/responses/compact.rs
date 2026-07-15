@@ -6,7 +6,7 @@ use axum::response::Response;
 use serde_json::Value;
 
 use crate::libs::compact::COMPACT_REQUEST;
-use crate::libs::config::resolve_mapped_model;
+use crate::libs::config::{resolve_effective_provider_config, resolve_mapped_model};
 use crate::libs::error::{openai_error_response, AppError, HttpError};
 use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::provider_resolver::resolve_provider_config;
@@ -176,7 +176,7 @@ async fn handle_provider_compact(
     provider: String,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let Some(config) = resolve_provider_config(&provider).await else {
+    let Some(config) = resolve_provider_config(&provider).await? else {
         return Ok(openai_error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
@@ -184,6 +184,7 @@ async fn handle_provider_compact(
             format!("Provider '{provider}' not found or disabled."),
         ));
     };
+    let config = resolve_effective_provider_config(&config, &payload.model);
     if !crate::libs::provider_capabilities::supports(
         &config,
         crate::libs::provider_capabilities::ProviderCapability::ResponsesCompact,

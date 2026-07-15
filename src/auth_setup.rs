@@ -71,6 +71,10 @@ impl TerminalPrompt {
         }
     }
 
+    pub fn is_interactive_terminal(&self) -> bool {
+        self.interactive
+    }
+
     fn read_line(&self, prompt: &str) -> anyhow::Result<String> {
         if !self.interactive {
             anyhow::bail!("Interactive input is unavailable on this terminal");
@@ -81,6 +85,22 @@ impl TerminalPrompt {
         std::io::stdin().lock().read_line(&mut input)?;
         Ok(input.trim().to_string())
     }
+}
+
+pub fn require_interactive_oauth(plan: &AuthPlan, interactive: bool) -> anyhow::Result<()> {
+    if interactive || matches!(plan, AuthPlan::Configure(_)) {
+        return Ok(());
+    }
+    let provider = match plan {
+        AuthPlan::Copilot => "copilot",
+        AuthPlan::Codex => "codex",
+        AuthPlan::Configure(_) => unreachable!(),
+    };
+    anyhow::bail!(
+        "Built-in OAuth provider '{provider}' requires an interactive terminal. \
+         Run `copilot-api auth --provider {provider}` from a TTY. Preconfigured \
+         services should reuse the protected credential store instead of invoking auth."
+    )
 }
 
 impl PromptIo for TerminalPrompt {
@@ -662,5 +682,19 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("fixed type"));
+    }
+
+    #[test]
+    fn built_in_oauth_requires_tty_but_provider_configuration_does_not() {
+        assert!(require_interactive_oauth(&AuthPlan::Copilot, false).is_err());
+        assert!(require_interactive_oauth(&AuthPlan::Codex, false).is_err());
+        assert!(require_interactive_oauth(&AuthPlan::Copilot, true).is_ok());
+        let plan = AuthPlan::Configure(Box::new(ProviderSetupPlan {
+            provider_name: "fixture".to_string(),
+            config: ProviderConfig::default(),
+            api_key: "not-logged".to_string(),
+            probe: false,
+        }));
+        assert!(require_interactive_oauth(&plan, false).is_ok());
     }
 }

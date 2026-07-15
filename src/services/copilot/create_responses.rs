@@ -1092,9 +1092,9 @@ pub async fn create_responses(
         match create_web_socket_responses(&payload, &st, &headers, &options).await {
             Ok(stream) => return Ok(stream),
             Err(error) => {
-                // The pooled engine completes its handshake before returning a
-                // stream, so this failure happened before any response.create
-                // frame was sent. Falling back to HTTP cannot duplicate work.
+                // The pooled engine returns Err only before response.create
+                // (handshake or ping/pong preflight). Ambiguous request-frame
+                // send failures are stream errors and cannot reach this replay.
                 metrics::counter!(
                     "copilot_responses_websocket_fallback_total",
                     "provider" => "copilot"
@@ -1197,7 +1197,7 @@ async fn create_web_socket_responses(
             idle_timeout_ms: None,
             connect_timeout: crate::libs::http::UPSTREAM_CONNECT_TIMEOUT,
             read_timeout: crate::libs::http::upstream_read_timeout(),
-            is_terminal_chunk: is_terminal_ws_chunk,
+            preflight_timeout: std::time::Duration::from_secs(2),
             open_error_message: "Failed to create responses websocket".to_string(),
             stream_error_message: "Responses websocket stream error".to_string(),
             terminal_chunk_missing_message: "Responses websocket ended without a terminal response"
@@ -1227,17 +1227,6 @@ fn ws_chunk_from_data(data: String) -> crate::libs::sse::SseEvent {
         })
         .unwrap_or((None, None));
     crate::libs::sse::SseEvent { id, event, data }
-}
-
-/// Terminal websocket chunk detector: completed / failed / incomplete / error.
-fn is_terminal_ws_chunk(chunk: &crate::libs::sse::SseEvent) -> bool {
-    matches!(
-        chunk.event.as_deref(),
-        Some("response.completed")
-            | Some("response.failed")
-            | Some("response.incomplete")
-            | Some("error")
-    )
 }
 
 /// Mirrors `createHttpResponses`: POST `{copilotBaseUrl}/responses`, log rate

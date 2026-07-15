@@ -48,6 +48,9 @@ redaction, trace, panic, and metrics middleware as its existing counterpart.
 
 An explicit `capabilities` array overrides these conservative defaults.
 Unsupported combinations return `400` without contacting an upstream.
+`models.<model>.type` may select a different effective protocol for one model;
+route capabilities, endpoint dispatch, and default auth mode are resolved from
+that effective type. Unknown model fields are retained.
 
 | Provider type | messages | count | models | chat | responses | compact | images | alpha search |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -57,10 +60,12 @@ Unsupported combinations return `400` without contacting an upstream.
 | built-in `codex` | yes (translated) | yes | local catalog | no | yes | yes | yes | yes |
 
 Provider API keys configured by `copilot-api auth` are stored in
-`provider_credentials.json` with owner-only permissions where the platform
-supports them. `config.json` contains protocol metadata and capability/model
-choices, not the secret. Non-interactive setup reads a named environment
-variable and never prompts.
+`provider_credentials.json`. Unix mode is set and verified as `0600`; Windows
+uses a protected DACL verified to contain only the current user's allow rule.
+Any unsupported platform or ACL failure stops before secret/config access.
+`config.json` contains protocol metadata and capability/model choices, not the
+secret. Non-interactive custom setup reads a named environment variable and
+never prompts; built-in OAuth requires a TTY and fails immediately otherwise.
 
 ## Runnable examples
 
@@ -113,10 +118,18 @@ Client plugin installation and removal are documented in
   explicit private-provider development override is set.
 - Connections cancelled before a terminal event are evicted; queued frames can
   never leak into the next request.
+- Every socket passes a bounded ping/pong preflight before `response.create`.
+  A failed pooled socket is evicted and reopened once before the safe HTTP
+  fallback boundary; ambiguous application-frame send failures are never
+  replayed. An idle watcher evicts remote closes and stale post-terminal frames.
 - Silence has a bounded per-frame deadline. Ping/pong frames keep a live
   connection healthy but are not exposed as model events.
 - Completion, failure, incomplete, and error are terminal exactly once. Missing
-  terminals and malformed/truncated streams remain failures.
+  terminals and malformed/truncated streams remain failures. Only a terminal
+  accepted by the shared Responses lifecycle guard makes a socket reusable.
+- Alpha Search preserves caller-supplied `Accept` and `openai-beta` headers,
+  defaults missing `Accept` to JSON, replaces inbound authorization, and
+  preserves query parameters and unknown JSON fields.
 - Generation, image, and other billable requests are not automatically replayed
   after observable progress.
 

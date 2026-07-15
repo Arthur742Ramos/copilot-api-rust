@@ -1,8 +1,8 @@
 //! Codex `/responses` HTTP and pooled upstream WebSocket transports.
 //!
 //! Ported from services/codex/create-responses.ts. Streaming requests select the
-//! upstream WebSocket when enabled, with handshake-only fallback to HTTP. Unary
-//! and compaction requests remain HTTP.
+//! upstream WebSocket when enabled, with handshake/preflight-only fallback to
+//! HTTP. Unary and compaction requests remain HTTP.
 //!
 //! Conventions match the rest of the crate (see create_chat_completions.rs):
 //! services return `Result<_, HttpError>`; headers are built into a
@@ -270,7 +270,7 @@ async fn forward_codex_responses_websocket_inner(
             idle_timeout_ms: None,
             connect_timeout: crate::libs::http::UPSTREAM_CONNECT_TIMEOUT,
             read_timeout: crate::libs::http::upstream_read_timeout(),
-            is_terminal_chunk: websocket_terminal,
+            preflight_timeout: std::time::Duration::from_secs(2),
             open_error_message: "Failed to create codex responses websocket".to_string(),
             stream_error_message: "Codex responses websocket stream error".to_string(),
             terminal_chunk_missing_message:
@@ -335,9 +335,10 @@ pub async fn forward_codex_responses_selected(
         match forward_codex_responses_websocket(payload.clone(), request_headers, base_url).await {
             Ok(stream) => return Ok(CodexResponsesReturn::Stream(stream)),
             Err(error) => {
-                // `create_pooled_web_socket_stream` returns only after its
-                // handshake and before sending response.create. Replaying over
-                // HTTP is safe at this boundary and nowhere later.
+                // The pooled constructor returns Err only for handshake or
+                // ping/pong preflight failures before response.create. Ambiguous
+                // request-frame send failures are delivered inside an Ok stream,
+                // so replay is safe at this boundary and nowhere later.
                 metrics::counter!(
                     "copilot_responses_websocket_fallback_total",
                     "provider" => "codex"
@@ -965,9 +966,15 @@ mod tests {
             })
             .await
             .unwrap();
-            let request = websocket.next().await.unwrap().unwrap();
-            let Message::Text(request) = request else {
-                panic!("expected response.create text frame")
+            let request = loop {
+                match websocket.next().await.unwrap().unwrap() {
+                    Message::Ping(payload) => websocket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("send preflight pong"),
+                    Message::Text(request) => break request,
+                    other => panic!("unexpected pre-request frame: {other:?}"),
+                }
             };
             let request: Value = serde_json::from_str(&request).unwrap();
             assert_eq!(request["type"], "response.create");
@@ -975,7 +982,13 @@ mod tests {
             assert!(request.get("stream").is_none());
             websocket
                 .send(Message::Text(
-                    r#"{"type":"response.completed","response":{"id":"resp_fixture"}}"#.to_string(),
+                    r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_fixture"}}"#.to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    r#"{"type":"response.completed","sequence_number":1,"response":{"id":"resp_fixture"}}"#.to_string(),
                 ))
                 .await
                 .unwrap();
@@ -992,6 +1005,8 @@ mod tests {
         )
         .await
         .unwrap();
+        let created = stream.next().await.unwrap().unwrap();
+        assert_eq!(created.event.as_deref(), Some("response.created"));
         let terminal = stream.next().await.unwrap().unwrap();
         assert_eq!(terminal.event.as_deref(), Some("response.completed"));
         assert!(stream.next().await.is_none());

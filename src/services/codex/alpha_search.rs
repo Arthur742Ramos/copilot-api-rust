@@ -16,13 +16,13 @@ async fn send_alpha_search(
     token: &str,
 ) -> Result<reqwest::Response, HttpError> {
     let mut headers = build_codex_responses_headers(request_headers, Some(false), token)?;
-    // Alpha Search uses the shared Codex auth/request headers, not the
-    // Responses experimental beta.
-    headers.remove("openai-beta");
-    headers.insert(
-        reqwest::header::ACCEPT,
-        reqwest::header::HeaderValue::from_static("application/json"),
-    );
+    // Alpha Search uses the shared Codex auth/request headers, not the default
+    // Responses experimental beta. Preserve an explicitly supplied beta and the
+    // caller's Accept; the shared builder already defaults a missing Accept to
+    // application/json.
+    if !request_headers.contains_key("openai-beta") {
+        headers.remove("openai-beta");
+    }
     upstream_client
         .post(url)
         .headers(headers)
