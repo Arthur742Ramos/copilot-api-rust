@@ -2155,14 +2155,9 @@ pub(crate) fn validate_output_item_reconciliation(
         return Err("A completed output item had an invalid type.");
     };
 
-    if let (Some(added_id), Some(done_id)) = (
-        raw_optional_string(added, "id"),
-        raw_optional_string(done, "id"),
-    ) {
-        if added_id != done_id {
-            return Err("A completed output item changed its item id.");
-        }
-    }
+    // Copilot independently re-encrypts opaque output-item IDs across added,
+    // incremental, and done events. The stream's output_index is the stable
+    // lifecycle identity; structural fields below still have to reconcile.
     if let (Some(added_metadata), Some(done_metadata)) = (
         added.get("internal_chat_message_metadata_passthrough"),
         done.get("internal_chat_message_metadata_passthrough"),
@@ -2224,24 +2219,9 @@ pub(crate) fn validate_output_item_reconciliation(
                 return Err("A completed message changed its role.");
             }
         }
-        "reasoning" => {
-            if let (Some(added_encrypted), Some(done_encrypted)) = (
-                added.get("encrypted_content"),
-                done.get("encrypted_content"),
-            ) {
-                if !added_encrypted.is_null()
-                    && !done_encrypted.is_null()
-                    && added_encrypted != done_encrypted
-                {
-                    return Err("A completed reasoning item changed its encrypted content.");
-                }
-            }
-        }
-        "compaction" | "compaction_summary" => {
-            if added.get("encrypted_content") != done.get("encrypted_content") {
-                return Err("A completed compaction item changed its encrypted content.");
-            }
-        }
+        // Copilot re-encrypts these opaque payloads independently for each
+        // stream snapshot. Their completed-item values are authoritative.
+        "reasoning" | "compaction" | "compaction_summary" => {}
         _ => {}
     }
     Ok(())
