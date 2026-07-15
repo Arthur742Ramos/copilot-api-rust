@@ -18,6 +18,7 @@ use crate::services::copilot::create_responses::{
     ResponsesBufferedContract, ResponsesPayload, ResponsesRequestOptions,
 };
 
+use crate::routes::files::materialize_responses_file_references;
 use crate::routes::responses::stream_guard::{ResponsesStreamGuard, ResponsesTerminal};
 use crate::routes::responses::stream_id_sync::StreamIdTracker;
 use crate::routes::responses::utils::{
@@ -32,6 +33,8 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
         .map_err(|e| AppError::BadRequest(format!("Invalid request payload: {e}")))?;
 
     validate_responses_payload(&payload)?;
+    compact_input_by_latest_compaction(&mut payload);
+    materialize_responses_file_references(&mut payload).await?;
 
     let requested_model = payload.model.clone();
     payload.model = resolve_mapped_model(&payload.model);
@@ -85,8 +88,6 @@ pub async fn handle_responses(body: Value, headers: HeaderMap) -> Result<Respons
     if !is_responses_api_web_search_enabled() {
         remove_web_search_tool(&mut payload);
     }
-
-    compact_input_by_latest_compaction(&mut payload);
 
     let selected_model = state::with_state(|s| {
         s.models.as_ref().and_then(|m| {

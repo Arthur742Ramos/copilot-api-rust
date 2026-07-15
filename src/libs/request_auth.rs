@@ -26,6 +26,12 @@ pub struct ApiKeyConfig {
     pub daily_token_budget: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedApiKey {
+    pub attribution: String,
+    pub owner_id: String,
+}
+
 impl ApiKeyConfig {
     /// The stable attribution token for this key: its label when set, otherwise a
     /// short, deterministic fingerprint of the key. Never the raw key — safe to
@@ -202,13 +208,13 @@ pub fn extract_request_api_key(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-fn unauthorized_response(path: &str) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(
+fn unauthorized_response(path: &str, headers: &HeaderMap) -> Response {
+    let mut output_headers = HeaderMap::new();
+    output_headers.insert(
         "WWW-Authenticate",
         axum::http::HeaderValue::from_static("Bearer realm=\"copilot-api\""),
     );
-    let mut response = if crate::libs::error::is_openai_native_path(path) {
+    let mut response = if crate::libs::error::is_openai_request(path, headers) {
         crate::libs::error::openai_error_response(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -222,7 +228,7 @@ fn unauthorized_response(path: &str) -> Response {
             "Unauthorized",
         )
     };
-    response.headers_mut().extend(headers);
+    response.headers_mut().extend(output_headers);
     response
 }
 
@@ -280,7 +286,7 @@ impl AuthOptions {
 /// no keys configured).
 pub enum AuthOutcome {
     Reject(Response),
-    Allow(Option<String>),
+    Allow(Option<AuthenticatedApiKey>),
 }
 
 /// Returns `Reject(response)` when the request should be rejected, `Allow(label)`
@@ -314,28 +320,31 @@ pub fn check_auth(
         return if options.allow_when_no_api_keys {
             AuthOutcome::Allow(None)
         } else {
-            AuthOutcome::Reject(unauthorized_response(path))
+            AuthOutcome::Reject(unauthorized_response(path, headers))
         };
     }
 
     let request_api_key = match extract_request_api_key(headers) {
         Some(key) => key,
-        None => return AuthOutcome::Reject(unauthorized_response(path)),
+        None => return AuthOutcome::Reject(unauthorized_response(path, headers)),
     };
 
     // Compare against every configured key without short-circuiting, so neither
     // the per-byte comparison (constant_time_eq) nor the loop reveals which key
     // matched or how far a near-miss got. The matched entry's attribution token
     // is captured for usage accounting.
-    let mut matched: Option<String> = None;
+    let mut matched: Option<AuthenticatedApiKey> = None;
     for entry in &api_keys {
         if constant_time_eq(&entry.key, &request_api_key) {
-            matched = Some(entry.attribution());
+            matched = Some(AuthenticatedApiKey {
+                attribution: entry.attribution(),
+                owner_id: key_fingerprint(&entry.key),
+            });
         }
     }
     match matched {
-        Some(attribution) => AuthOutcome::Allow(Some(attribution)),
-        None => AuthOutcome::Reject(unauthorized_response(path)),
+        Some(identity) => AuthOutcome::Allow(Some(identity)),
+        None => AuthOutcome::Reject(unauthorized_response(path, headers)),
     }
 }
 
@@ -476,7 +485,10 @@ mod tests {
             &bearer("key-one"),
             false,
         ) {
-            AuthOutcome::Allow(Some(label)) => assert_eq!(label, "alice"),
+            AuthOutcome::Allow(Some(identity)) => {
+                assert_eq!(identity.attribution, "alice");
+                assert_eq!(identity.owner_id, key_fingerprint("key-one"));
+            }
             _ => panic!("expected Allow with label"),
         }
     }
@@ -491,8 +503,9 @@ mod tests {
             &bearer("key-two"),
             false,
         ) {
-            AuthOutcome::Allow(Some(label)) => {
-                assert_eq!(label, key_fingerprint("key-two"));
+            AuthOutcome::Allow(Some(identity)) => {
+                assert_eq!(identity.attribution, key_fingerprint("key-two"));
+                assert_eq!(identity.owner_id, key_fingerprint("key-two"));
             }
             _ => panic!("expected Allow with fingerprint"),
         }

@@ -17,6 +17,10 @@ pub struct RequestContext {
     /// auth layer fills this `OnceLock` (shared across clones via the `Arc`) once
     /// the key is matched. Read later by the token-usage recorder.
     pub api_key_label: Arc<OnceLock<String>>,
+    /// Stable fingerprint of the matched raw API key. Unlike the optional
+    /// human-readable label, this is safe to use as an authorization principal
+    /// for owner-scoped local resources.
+    pub api_key_owner_id: Arc<OnceLock<String>>,
     /// Shared, mutable per-request triage summary. Cloning a `RequestContext`
     /// (e.g. `request_context_store()`) shares the SAME `Arc`, so every layer —
     /// the api_flows flow selection, the `StreamTimer`, and the
@@ -68,6 +72,7 @@ impl RequestContext {
             session_affinity,
             parent_session_id,
             api_key_label: Arc::new(OnceLock::new()),
+            api_key_owner_id: Arc::new(OnceLock::new()),
             summary: Arc::new(Mutex::new(RequestSummary::default())),
         }
     }
@@ -176,12 +181,25 @@ pub fn set_request_api_key_label(label: String) {
     });
 }
 
+pub fn set_request_api_key_owner_id(owner_id: String) {
+    let _ = REQUEST_CONTEXT.try_with(|ctx| {
+        let _ = ctx.api_key_owner_id.set(owner_id);
+    });
+}
+
 /// Read the API-key attribution token filled by the auth layer for the current
 /// request, if any. Returns `None` when no context is installed or no key matched
 /// (e.g. unauthenticated requests when no keys are configured).
 pub fn request_api_key_label() -> Option<String> {
     REQUEST_CONTEXT
         .try_with(|ctx| ctx.api_key_label.get().cloned())
+        .ok()
+        .flatten()
+}
+
+pub fn request_api_key_owner_id() -> Option<String> {
+    REQUEST_CONTEXT
+        .try_with(|ctx| ctx.api_key_owner_id.get().cloned())
         .ok()
         .flatten()
 }
@@ -334,6 +352,7 @@ mod summary_tests {
             session_affinity: Some("session-1".to_string()),
             parent_session_id: Some("parent-9".to_string()),
             api_key_label: Arc::new(OnceLock::new()),
+            api_key_owner_id: Arc::new(OnceLock::new()),
             summary: Arc::new(Mutex::new(summary)),
         }
     }

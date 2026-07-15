@@ -41,12 +41,13 @@ Status terms:
 |---|---|---|---|
 | `POST /v1/messages` (streaming and JSON) | Supported | `src/routes/messages/handler.rs`; `src/routes/messages/api_flows.rs`; `tests/router_smoke.rs` | Dispatches to native Messages, Responses, or Chat Completions based on resolved model capabilities. |
 | `POST /v1/messages/count_tokens` | Supported | `src/routes/messages/count_tokens_handler.rs`; tokenizer tests; `tests/provider_routing.rs::provider_model_alias_count_tokens_returns_complete_anthropic_404` | Uses Anthropic's counter when configured; otherwise uses the documented local estimate, including provider/model aliases. |
+| `/v1/files` upload/list/retrieve/content/delete lifecycle | Supported locally | `src/libs/file_store.rs`; `src/routes/files/`; tests `local_files_api_materializes_messages_and_responses_inputs` and `anthropic_upload_list_content_and_delete_round_trip` | Copilot has no Files API, so owner-scoped bytes remain under `COPILOT_API_HOME/files` and file references are expanded to inline base64 before dispatch. |
 | `GET /v1/models` and `GET /v1/models/:id` | Supported | `src/routes/models.rs` tests `shape_model_overlays_client_fields` and `shape_model_advertises_1m_variant` | Returns Anthropic-shaped model records and `[1m]` aliases. |
 | Provider-scoped Messages route | Supported | `src/routes/provider/messages.rs`; `tests/provider_routing.rs::unknown_provider_returns_complete_anthropic_404` | Anthropic, OpenAI-compatible, Responses, and configured model aliases are covered. |
 | Provider-scoped and provider/model-alias count-token routes | **Fixed here** | `src/routes/provider/count_tokens.rs`; tests `unknown_provider_count_tokens_returns_complete_anthropic_404`, `provider_model_alias_count_tokens_returns_complete_anthropic_404`, `direct_and_alias_count_tokens_malformed_json_returns_anthropic_400`, `direct_and_alias_count_tokens_invalid_payloads_return_anthropic_400`, and `direct_and_alias_count_tokens_body_limits_return_anthropic_413` | Direct and alias dispatch now share complete Anthropic envelopes for provider resolution, raw JSON parsing, typed-payload validation, and request-size rejection. |
 | Required `model`, non-empty `messages`, positive integer `max_tokens` | **Fixed here** | `validate_generation_request`; test `generation_validation_requires_messages_and_positive_max_tokens`; router test `generation_requires_positive_max_tokens_before_upstream_dispatch` | Generation now fails as a stable 400 before admission/accounting instead of silently acquiring a transport-specific default. `count_tokens` intentionally does not require `max_tokens`. |
 | String and structured system prompts | Supported | `src/routes/messages/preprocess.rs`; request translation tests | Normalizes multiple system representations while preserving cache-control data. |
-| User/assistant text, image, document/PDF, tool-use, and tool-result blocks | Supported | `src/routes/messages/non_stream_translation.rs` and `responses_translation.rs`; tests including `tool_result_message_comes_before_user_message` and `tool_result_image_moves_to_user_message_when_unsupported` | Base64 and URL media sources are supported. Files API IDs are rejected explicitly because this proxy does not expose Anthropic's `/v1/files` lifecycle. Unsupported provider media capabilities return a client error or use the provider's documented fallback rather than panicking. |
+| User/assistant text, image, document/PDF, tool-use, and tool-result blocks | Supported | `src/routes/messages/non_stream_translation.rs`, `responses_translation.rs`, and `src/routes/files/materialize.rs`; tests including `tool_result_message_comes_before_user_message`, `tool_result_image_moves_to_user_message_when_unsupported`, and `local_files_api_materializes_messages_and_responses_inputs` | Base64, URL, and locally uploaded Files API sources are supported. Unsupported provider media capabilities return a client error or use the provider's documented fallback rather than panicking. |
 | Tool definitions and `auto` / `any` / named `tool` / `none` choice | Supported | `translate_anthropic_tools_to_openai`; test `tool_choice_maps_variants` | Object schemas missing `properties` are normalized for OpenAI-compatible providers. |
 | Prompt caching and `cache_control` | Supported | `src/routes/messages/preprocess.rs`; `api_flows.rs` cache marker tests | Cache markers and tool-result merge behavior match Claude Code request patterns. |
 | Extended/adaptive thinking and reasoning signatures | **Fixed here** | `non_stream_translation.rs`; `responses_translation.rs`; streaming translator tests; `create_messages.rs` beta tests; `claude_code_2_1_209_controls_cross_chat_bridge` | Includes compaction-carrier and reasoning signature round trips. Chat-backed models now accept Claude Code's `display:"omitted"` control, suppress upstream reasoning blocks, map effort, and consume the safe keep-all context-management edit instead of forwarding Anthropic-only controls to an OpenAI-compatible provider. |
@@ -118,10 +119,10 @@ Status terms:
 
 ## Explicitly out of scope
 
-- Anthropic endpoints other than Messages, Messages token counting, and model
-  discovery.
-- Anthropic Files API uploads and `source.type: "file"` references. Use base64
-  or URL media sources with Messages requests.
+- Anthropic endpoints other than Messages, Messages token counting, local Files
+  API compatibility, and model discovery.
+- Anthropic `container_upload` blocks and provider-hosted file IDs. Local Files
+  API IDs are expanded to inline media before dispatch.
 - Live credential/provider availability, quota policy, model quality, or exact
   upstream rollout timing; the regression suite is credential-free.
 - Blind passthrough of unknown beta headers, private/internal response headers,

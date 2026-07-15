@@ -80,10 +80,16 @@ pub async fn post_provider_messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let value = match crate::routes::parse_json_body(&body) {
+    let mut value = match crate::routes::parse_json_body(&body) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    if let Err(error) = validate_messages_request_shape(&value) {
+        return error.into_response();
+    }
+    if let Err(error) = crate::routes::files::materialize_anthropic_file_sources(&mut value).await {
+        return error.into_response();
+    }
     if let Err(error) = validate_messages_request_shape(&value) {
         return error.into_response();
     }

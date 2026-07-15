@@ -10,6 +10,8 @@
 //! `serde_json::json!` / `Value` building, while fixed shapes use the typed
 //! structs from `anthropic_types` / `create_chat_completions`.
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde_json::{json, Map, Value};
 
 use crate::libs::error::{AppError, HttpError};
@@ -1108,13 +1110,26 @@ fn create_chat_document_part(
                 "{path}: document extensions cannot be represented by the Chat text fallback"
             )));
         }
+        if source.get("type").and_then(Value::as_str) == Some("text") {
+            let text = source.get("data").and_then(Value::as_str).ok_or_else(|| {
+                AppError::BadRequest(format!("{source_path}.data must be a string"))
+            })?;
+            return Ok(json!({"type": "text", "text": text}));
+        }
         return Ok(create_document_text_part());
     }
 
+    let default_filename = if source.get("type").and_then(Value::as_str) == Some("text")
+        || source.get("media_type").and_then(Value::as_str) == Some("text/plain")
+    {
+        "document.txt"
+    } else {
+        "document.pdf"
+    };
     let filename = block_source
         .get("title")
         .and_then(Value::as_str)
-        .unwrap_or("document.pdf");
+        .unwrap_or(default_filename);
     let mut file = Map::from_iter([
         (
             "file_data".to_string(),
@@ -1146,6 +1161,7 @@ fn validate_source_field_usage(source: &Map<String, Value>, path: &str) -> Resul
     let unused_fields: &[&str] = match source_type {
         "base64" => &["url", "file_id"],
         "url" => &["media_type", "data", "file_id"],
+        "text" => &["url", "file_id"],
         _ => &[],
     };
     if let Some(field) = unused_fields
@@ -1218,6 +1234,28 @@ fn image_url_from_source(source: Option<&Value>) -> Result<String, AppError> {
         "file" => Err(AppError::BadRequest(
             "Image source of type \"file\" (Files API ids) is not supported".to_string(),
         )),
+        "text" => {
+            let media_type = source
+                .and_then(|s| s.get("media_type"))
+                .and_then(Value::as_str)
+                .filter(|value| *value == "text/plain")
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "Text source requires media_type \"text/plain\"".to_string(),
+                    )
+                })?;
+            let data = source
+                .and_then(|s| s.get("data"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::BadRequest("Text source is missing \"data\"".to_string())
+                })?;
+            Ok(format!(
+                "data:{media_type};base64,{}",
+                STANDARD.encode(data)
+            ))
+        }
         "base64" => {
             let media_type = source
                 .and_then(|s| s.get("media_type"))
@@ -2547,5 +2585,25 @@ mod tests {
         .unwrap();
         let pdf_parts = pdf_out.messages[0].content.as_ref().unwrap();
         assert_eq!(pdf_parts[0]["type"], "file");
+    }
+
+    #[test]
+    fn titleless_plain_text_document_uses_text_filename() {
+        let part = create_chat_document_part(
+            &json!({
+                "type": "document",
+                "source": {
+                    "type": "text",
+                    "media_type": "text/plain",
+                    "data": "hello",
+                },
+            }),
+            true,
+            "messages[0].content[0]",
+        )
+        .unwrap();
+
+        assert_eq!(part["file"]["filename"], "document.txt");
+        assert_eq!(part["file"]["file_data"], "data:text/plain;base64,aGVsbG8=");
     }
 }

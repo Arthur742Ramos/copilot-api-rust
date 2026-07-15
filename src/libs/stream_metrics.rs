@@ -233,6 +233,7 @@ mod tests {
             session_affinity: Some("sess-7".to_string()),
             parent_session_id: None,
             api_key_label: std::sync::Arc::new(std::sync::OnceLock::new()),
+            api_key_owner_id: std::sync::Arc::new(std::sync::OnceLock::new()),
             summary: Arc::new(Mutex::new(RequestSummary::default())),
         }
     }

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 /// Mirrors src/lib/paths.ts. All paths are computed once from env at startup.
 pub struct Paths {
     pub app_dir: PathBuf,
+    pub files_dir: PathBuf,
     pub github_token_path: PathBuf,
     pub codex_credential_path: PathBuf,
     pub config_path: PathBuf,
@@ -42,11 +43,13 @@ pub static PATHS: Lazy<Paths> = Lazy::new(|| {
     let github_token_path = app_dir
         .join(&auth_app)
         .join(format!("{enterprise_prefix}github_token"));
+    let files_dir = app_dir.join("files");
     let codex_credential_path = app_dir.join("codex_credentials.json");
     let config_path = app_dir.join("config.json");
 
     Paths {
         app_dir,
+        files_dir,
         github_token_path,
         codex_credential_path,
         config_path,
@@ -56,10 +59,21 @@ pub static PATHS: Lazy<Paths> = Lazy::new(|| {
 
 pub async fn ensure_paths() -> std::io::Result<()> {
     tokio::fs::create_dir_all(PATHS.app_dir.join(&PATHS.auth_app)).await?;
+    tokio::fs::create_dir_all(&PATHS.files_dir).await?;
+    set_permissions_700(&PATHS.files_dir).await;
     ensure_file(&PATHS.github_token_path).await?;
     ensure_file(&PATHS.config_path).await?;
     Ok(())
 }
+
+#[cfg(unix)]
+pub async fn set_permissions_700(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await;
+}
+
+#[cfg(not(unix))]
+pub async fn set_permissions_700(_path: &std::path::Path) {}
 
 async fn ensure_file(path: &std::path::Path) -> std::io::Result<()> {
     if tokio::fs::metadata(path).await.is_err() {
@@ -95,9 +109,9 @@ pub fn warn_if_file_perms_unrestricted() {
     #[cfg(windows)]
     {
         tracing::warn!(
-            "File permissions are not restricted on this platform (win32): the GitHub token and \
-             admin key in {} are stored without owner-only (0600) access control. Protect this \
-             directory with NTFS ACLs if other users share the machine.",
+            "File permissions are not restricted on this platform (win32): credentials and local \
+             Files API content in {} are stored without owner-only Unix permission bits. Protect \
+             this directory with NTFS ACLs if other users share the machine.",
             PATHS.app_dir.display()
         );
     }

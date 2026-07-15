@@ -16017,7 +16017,110 @@ async fn claude_complex_boolean_schemas_choices_and_sources_preserve_supported_s
 
 #[tokio::test]
 #[serial_test::serial(client_compatibility)]
-async fn claude_unsupported_source_types_fail_before_admission_or_dispatch() {
+async fn local_files_api_materializes_messages_and_responses_inputs() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure(&fixture);
+
+    let boundary = "compatibility-files-boundary";
+    let multipart = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         hello files\r\n\
+         --{boundary}--\r\n"
+    );
+    let upload = Request::builder()
+        .method("POST")
+        .uri("/v1/files")
+        .header("x-api-key", CLIENT_KEY)
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "files-api-2025-04-14")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(multipart))
+        .unwrap();
+    let (status, uploaded) = send(upload).await;
+    assert_eq!(status, StatusCode::OK);
+    let uploaded = json_body(&uploaded);
+    let file_id = uploaded["id"].as_str().expect("local file id");
+    assert!(file_id.starts_with("file_local_"));
+
+    let messages_body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "max_tokens":128,
+        "messages":[{
+            "role":"user",
+            "content":[
+                {"type":"text","text":"Summarize this."},
+                {
+                    "type":"document",
+                    "source":{"type":"file","file_id":file_id}
+                }
+            ]
+        }]
+    });
+    let (status, _) = send(post_json("/v1/messages", messages_body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let translated = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("translated Responses request");
+    let document = &translated.body["input"][0]["content"][1];
+    assert_eq!(document["type"], "input_file");
+    assert_eq!(document["filename"], "notes.txt");
+    assert_eq!(
+        document["file_data"],
+        "data:text/plain;base64,aGVsbG8gZmlsZXM="
+    );
+    assert!(document.get("file_id").is_none());
+
+    let direct_body = json!({
+        "model":"responses-fixture/gpt-fixture",
+        "input":[{
+            "type":"message",
+            "role":"user",
+            "content":[{
+                "type":"input_file",
+                "file_id":file_id
+            }]
+        }]
+    });
+    let (status, _) = send(post_json("/v1/responses", direct_body, Some(CLIENT_KEY))).await;
+    assert_eq!(status, StatusCode::OK);
+    let direct = fixture
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|capture| capture.path == "/v1/responses")
+        .expect("direct Responses request");
+    let input_file = &direct.body["input"][0]["content"][0];
+    assert_eq!(input_file["filename"], "notes.txt");
+    assert_eq!(
+        input_file["file_data"],
+        "data:text/plain;base64,aGVsbG8gZmlsZXM="
+    );
+    assert!(input_file.get("file_id").is_none());
+
+    let delete = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{file_id}"))
+        .header("x-api-key", CLIENT_KEY)
+        .header("anthropic-version", "2023-06-01")
+        .body(Body::empty())
+        .unwrap();
+    let (status, deleted) = send(delete).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&deleted)["type"], "file_deleted");
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_unresolvable_file_and_unknown_sources_fail_before_admission_or_dispatch() {
     std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     let fixture = Fixture::start().await;
     configure(&fixture);
@@ -16046,16 +16149,16 @@ async fn claude_unsupported_source_types_fail_before_admission_or_dispatch() {
             "messages":[{"role":"user","content":[block]}]
         });
         let (status, response) = send(post_json("/v1/messages", body, Some(CLIENT_KEY))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
-        assert_anthropic_invalid_request(&response, label);
         let response_json = json_body(&response);
         let message = response_json["error"]["message"]
             .as_str()
             .expect("invalid source diagnostic");
-        assert!(message.contains("source.type"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+        assert_anthropic_invalid_request(&response, label);
         if label.contains("file source") {
-            assert!(message.contains("Anthropic Files API"));
-            assert!(!message.contains("Responses translation"));
+            assert!(message.contains("Files API"));
+        } else {
+            assert!(message.contains("source.type"));
         }
         assert_eq!(fixture.requests().len(), before, "{label} reached upstream");
     }

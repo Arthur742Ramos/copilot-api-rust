@@ -16,6 +16,8 @@ into GitHub Copilot requests, using your own Copilot subscription. It exposes:
   `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/images/generations`
 - **Anthropic-compatible** endpoints: `POST /v1/messages` and
   `POST /v1/messages/count_tokens`
+- **Local Files API compatibility**: upload once through `/v1/files`, then use
+  the returned `file_id` from Anthropic Messages or OpenAI Responses requests
 - **OpenAI Responses API**: `POST /v1/responses` and Codex compaction at
   `POST /v1/responses/compact`
 - **Provider routing** for Codex and third-party providers via a
@@ -204,6 +206,10 @@ containers (the `start` flags below have matching `COPILOT_API_*` variables):
 | `COPILOT_API_ENTERPRISE_URL` | `--enterprise-url` | Enterprise URL for GitHub. |
 | `COPILOT_API_LOG_FORMAT` | _(env only)_ | Set to `json` for structured JSON logs; defaults to the human-readable format. |
 | `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS` | _(env only)_ | Days of `token_usage_events` to retain before pruning (default `45`; `<= 0` disables pruning). |
+| `COPILOT_API_FILE_MAX_BYTES` | _(env only)_ | Maximum size of one local Files API upload (default `20971520`, 20 MiB; capped below the gateway's 32 MiB request limit). |
+| `COPILOT_API_FILE_MAX_OWNER_BYTES` | _(env only)_ | Maximum stored Files API bytes per API-key identity (default `536870912`, 512 MiB). |
+| `COPILOT_API_FILE_MAX_OWNER_COUNT` | _(env only)_ | Maximum number of stored files per API-key identity (default and hard ceiling `1000`; lower values are accepted). |
+| `COPILOT_API_FILE_RETENTION_DAYS` | _(env only)_ | Days to retain local Files API uploads (default `30`; `0` disables expiry). Expired content is removed lazily during upload/list operations. |
 | `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | _(env only)_ | Max seconds of silence on an upstream HTTP or WebSocket stream before the connection is treated as stalled and dropped (default `120`; `0` disables the read timeout). Raise it if legitimately slow generations are being cut off mid-stream. |
 | `COPILOT_API_SSE_HEARTBEAT_SECS` | _(env only)_ | Idle window (seconds) after which the proxy injects a keep-alive frame into a streaming response so long "thinking" gaps survive intermediaries (nginx/ALB) with sub-120s idle timeouts (default `15`; `0` disables heartbeats). A heartbeat is a no-op ping (Anthropic `event: ping` on `/v1/messages`, an SSE comment on `/responses`) and never affects token-usage or latency metrics. |
 | `COPILOT_API_MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | Optional fail-fast cap on concurrent upstream-facing proxy requests. Unset (default) means unlimited; `64` is recommended for a desktop process with a 256-FD soft limit. When configured, excess requests receive a retryable `503 Service Unavailable` with `Retry-After: 1`. |
@@ -412,6 +418,9 @@ By default the server binds to `127.0.0.1:<port>` (loopback only). Pass
 | `POST` | `/responses/compact`, `/v1/responses/compact` | Unary Responses compaction used by Codex CLI. |
 | `POST` | `/v1/messages` | Anthropic-compatible messages. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. |
+| `GET` / `POST` | `/files`, `/v1/files` | List or upload locally stored files. Anthropic headers select Anthropic metadata; other requests use OpenAI metadata and require `purpose` on upload. |
+| `GET` / `DELETE` | `/files/:id`, `/v1/files/:id` | Retrieve metadata or delete an owner-scoped local file. |
+| `GET` | `/files/:id/content`, `/v1/files/:id/content` | Download local file content. |
 | `GET` / `POST` | `/admin/config/model-mappings` | Read / write the model-mapping table (admin auth). |
 | `GET` | `/admin/config` | Read the effective merged runtime config with all secrets stripped from `config`; presence indicators (which secrets are set, the `apiKeys` count, which providers have a key) are reported under a separate `secrets` object (admin auth). |
 | `GET` / `POST` | `/admin/config/providers` | List / upsert third-party providers; `apiKey` is redacted to `apiKeySet` in responses (admin auth). |
@@ -420,6 +429,22 @@ By default the server binds to `127.0.0.1:<port>` (loopback only). Pass
 | `POST` | `/:provider/v1/messages` | Provider-routed Anthropic messages. |
 | `POST` | `/:provider/v1/messages/count_tokens` | Provider-routed token counting. |
 | `GET`  | `/:provider/v1/models` | Provider-routed model list. |
+
+### Local Files API
+
+Copilot has no upstream Files API, so uploads are kept locally under
+`COPILOT_API_HOME/files` with SQLite metadata and owner-only filesystem
+permissions where the platform supports them. File IDs are scoped to a stable
+fingerprint of the authenticated API key (labels are not authorization
+principals); when API authentication is disabled, all callers share the
+`unauthenticated-local` scope.
+
+Anthropic image/document file references and OpenAI Responses
+`input_image.file_id`/`input_file.file_id` references are expanded to inline
+base64 immediately before dispatch. Only the inline data reaches the selected
+provider. Anthropic image references support JPEG, PNG, GIF, and WebP;
+document references support PDF and plain text. `container_upload` and
+provider-hosted file IDs are not supported.
 
 ## Configuration
 

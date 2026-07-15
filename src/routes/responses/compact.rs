@@ -15,6 +15,7 @@ use crate::libs::token_usage::{
     create_copilot_token_usage_recorder, create_request_scoped_provider_token_usage_recorder,
     normalize_responses_usage, TokenUsageRecorder,
 };
+use crate::routes::files::materialize_responses_file_references;
 use crate::routes::parse_json_body;
 use crate::routes::responses::handler::{
     get_codex_responses_subagent_marker, get_incoming_responses_session_id,
@@ -46,6 +47,7 @@ async fn handle_responses_compact(body: Value, headers: HeaderMap) -> Result<Res
     let mut payload: ResponsesPayload = serde_json::from_value(body)
         .map_err(|error| AppError::BadRequest(format!("Invalid request payload: {error}")))?;
     validate_responses_payload(&payload)?;
+    materialize_responses_file_references(&mut payload).await?;
     if payload.stream == Some(true) {
         return Err(AppError::BadRequest(
             "stream: /responses/compact is a non-streaming endpoint".to_string(),

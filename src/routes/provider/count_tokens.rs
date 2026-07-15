@@ -98,10 +98,16 @@ pub async fn post_provider_count_tokens(
     axum::extract::Path(provider): axum::extract::Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    let value = match crate::routes::parse_json_body(&body) {
+    let mut value = match crate::routes::parse_json_body(&body) {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = validate_messages_request_shape(&value) {
+        return error.into_response();
+    }
+    if let Err(error) = crate::routes::files::materialize_anthropic_file_sources(&mut value).await {
+        return error.into_response();
+    }
     if let Err(error) = validate_messages_request_shape(&value) {
         return error.into_response();
     }

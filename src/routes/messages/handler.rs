@@ -20,6 +20,7 @@ use crate::libs::provider_model::parse_provider_model_alias;
 use crate::libs::state;
 use crate::libs::subagent::parse_subagent_marker_from_first_user;
 use crate::libs::utils::{generate_request_id_from_payload, get_root_session_id, get_uuid};
+use crate::routes::files::materialize_anthropic_file_sources;
 use crate::routes::messages::anthropic_types::AnthropicMessagesPayload;
 use crate::routes::messages::api_flows::{
     handle_with_chat_completions, handle_with_messages_api, handle_with_responses_api, FlowOptions,
@@ -155,6 +156,8 @@ fn validate_selected_responses_controls(
 pub async fn handle_completion(body: Value, headers: HeaderMap) -> Result<Response, AppError> {
     let mut payload = body;
 
+    validate_messages_request_shape(&payload)?;
+    materialize_anthropic_file_sources(&mut payload).await?;
     validate_messages_request_shape(&payload)?;
     validate_generation_request(&payload)?;
     normalize_system_messages(&mut payload);
