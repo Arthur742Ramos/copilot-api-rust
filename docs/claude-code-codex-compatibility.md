@@ -598,8 +598,10 @@ explicit omission or conflicts fail closed.
 The SSE event type—not `response.status`—is the terminal discriminator:
 
 - `response.completed` requires the Codex-required response `id`. Optional
-  status may be absent, `null`, or `completed`; usage is optional and maps to
-  zero when absent/null. `end_turn: false` maps to Anthropic `pause_turn`
+  status may be absent, `null`, or `completed`; usage is optional. When it is
+  absent/null, the terminal Anthropic delta omits the unknown input/cache
+  counters instead of asserting zero and resetting a client's known count.
+  `end_turn: false` maps to Anthropic `pause_turn`
   ([Codex requests follow-up inference](https://github.com/openai/codex/blob/44918ea10c0f99151c6710411b4322c2f5c96bea/codex-rs/core/src/session/turn.rs#L2288-L2303)),
   while true/absent values retain normal `end_turn` or `tool_use` behavior.
 - `response.incomplete` accepts absent/null status and maps
@@ -614,7 +616,7 @@ The SSE event type—not `response.status`—is the terminal discriminator:
 Created and terminal identities are non-empty and stable: completed and
 incomplete ids must exactly match `response.created`; failed ids must match when
 a created event preceded them. A canonical failed-only stream remains valid.
-Usage omission or `null` is accepted. A present usage object must contain all
+Usage omission or `null` is accepted as no usage assertion. A present usage object must contain all
 three required non-negative `i64` counters, `total_tokens` must equal input plus
 output without overflow, and cached/reasoning details must be well typed,
 non-negative, and no larger than their parent counters. Partial, wrong-typed,

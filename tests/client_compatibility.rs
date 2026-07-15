@@ -10967,14 +10967,14 @@ async fn claude_completed_terminals_follow_codex_event_discriminator() {
     for (model, input_tokens, output_tokens, cached_tokens) in [
         (
             "gpt-terminal-completed-no-status-usage",
-            8_i64,
+            Some(8_i64),
             7_i64,
             Some(3_i64),
         ),
-        ("gpt-terminal-completed-no-status-no-usage", 0, 0, None),
-        ("gpt-terminal-completed-matching-status", 0, 0, None),
-        ("gpt-terminal-completed-null-status", 0, 0, None),
-        ("gpt-terminal-completed-repeated-later", 8, 7, Some(3)),
+        ("gpt-terminal-completed-no-status-no-usage", None, 0, None),
+        ("gpt-terminal-completed-matching-status", None, 0, None),
+        ("gpt-terminal-completed-null-status", None, 0, None),
+        ("gpt-terminal-completed-repeated-later", Some(8), 7, Some(3)),
     ] {
         let (status, body) = send(post_json(
             "/v1/messages",
@@ -11023,7 +11023,11 @@ async fn claude_completed_terminals_follow_codex_event_discriminator() {
             .find(|event| event["type"] == "message_delta")
             .expect("completed terminal emits message_delta");
         assert_eq!(delta["delta"]["stop_reason"], "end_turn", "{model}");
-        assert_eq!(delta["usage"]["input_tokens"], input_tokens, "{model}");
+        assert_eq!(
+            delta["usage"].get("input_tokens").and_then(Value::as_i64),
+            input_tokens,
+            "{model}"
+        );
         assert_eq!(delta["usage"]["output_tokens"], output_tokens, "{model}");
         assert_eq!(
             delta["usage"]
@@ -11086,35 +11090,35 @@ async fn claude_incomplete_terminals_preserve_truncation_semantics_without_statu
         (
             "gpt-terminal-incomplete-no-status-usage",
             "max_tokens",
-            8_i64,
+            Some(8_i64),
             7_i64,
             Some(3_i64),
         ),
         (
             "gpt-terminal-incomplete-no-status-no-usage",
             "refusal",
-            0,
+            None,
             0,
             None,
         ),
         (
             "gpt-terminal-incomplete-matching-status",
             "max_tokens",
-            0,
+            None,
             0,
             None,
         ),
         (
             "gpt-terminal-incomplete-null-status",
             "max_tokens",
-            0,
+            None,
             0,
             None,
         ),
         (
             "gpt-terminal-incomplete-repeated-later",
             "max_tokens",
-            8,
+            Some(8),
             7,
             Some(3),
         ),
@@ -11153,7 +11157,11 @@ async fn claude_incomplete_terminals_preserve_truncation_semantics_without_statu
             .find(|event| event["type"] == "message_delta")
             .expect("incomplete terminal emits truncation delta");
         assert_eq!(delta["delta"]["stop_reason"], stop_reason, "{model}");
-        assert_eq!(delta["usage"]["input_tokens"], input_tokens, "{model}");
+        assert_eq!(
+            delta["usage"].get("input_tokens").and_then(Value::as_i64),
+            input_tokens,
+            "{model}"
+        );
         assert_eq!(delta["usage"]["output_tokens"], output_tokens, "{model}");
         assert_eq!(
             delta["usage"]
@@ -11522,14 +11530,14 @@ async fn claude_usage_contract_preserves_valid_details_and_omission() {
     for (model, input_tokens, output_tokens, cached_tokens) in [
         (
             "gpt-contract-usage-valid-details",
-            3_i64,
+            Some(3_i64),
             3_i64,
             Some(2_i64),
         ),
-        ("gpt-contract-usage-null-details", 5, 3, None),
-        ("gpt-contract-usage-null", 0, 0, None),
-        ("gpt-contract-terminal-null-end-turn", 0, 0, None),
-        ("gpt-contract-created-model-less", 0, 0, None),
+        ("gpt-contract-usage-null-details", Some(5), 3, None),
+        ("gpt-contract-usage-null", None, 0, None),
+        ("gpt-contract-terminal-null-end-turn", None, 0, None),
+        ("gpt-contract-created-model-less", None, 0, None),
     ] {
         let (status, body) = send(post_json(
             "/v1/messages",
@@ -11556,7 +11564,11 @@ async fn claude_usage_contract_preserves_valid_details_and_omission() {
             .iter()
             .find(|event| event["type"] == "message_delta")
             .expect("valid usage emits terminal delta");
-        assert_eq!(delta["usage"]["input_tokens"], input_tokens, "{model}");
+        assert_eq!(
+            delta["usage"].get("input_tokens").and_then(Value::as_i64),
+            input_tokens,
+            "{model}"
+        );
         assert_eq!(delta["usage"]["output_tokens"], output_tokens, "{model}");
         assert_eq!(
             delta["usage"]
@@ -14766,7 +14778,7 @@ async fn claude_chat_sse_strict_identity_usage_extras_and_tools_cross_public_bou
         .iter()
         .find(|event| event["type"] == "message_delta")
         .expect("usage-optional terminal");
-    assert_eq!(terminal["usage"]["input_tokens"], 0);
+    assert!(terminal["usage"].get("input_tokens").is_none());
     assert_eq!(terminal["usage"]["output_tokens"], 0);
     assert_eq!(events.last().unwrap()["type"], "message_stop");
 

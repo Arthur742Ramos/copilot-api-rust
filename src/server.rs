@@ -424,8 +424,7 @@ async fn trace_middleware(req: Request, next: Next) -> Response {
     let trace_id = resolve_trace_id(incoming_trace.as_deref());
 
     let user_agent = header_string(&req, "user-agent").unwrap_or_default();
-    let session_affinity = header_string(&req, "x-session-affinity")
-        .or_else(|| header_string(&req, "x-client-request-id"));
+    let session_affinity = resolve_session_affinity(&req);
     let parent_session_id = header_string(&req, "x-parent-session-id");
 
     let context = RequestContext::new(
@@ -619,6 +618,21 @@ fn header_string(req: &Request, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn resolve_session_affinity(req: &Request) -> Option<String> {
+    [
+        "x-session-affinity",
+        "x-claude-code-session-id",
+        "x-session-id",
+        "x-client-request-id",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        header_string(req, name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
 async fn general_auth_middleware(req: Request, next: Next) -> Response {
     let options = AuthOptions::general();
     match check_auth(
@@ -698,6 +712,34 @@ mod tests {
 
     async fn panic_before_next(_req: Request, _next: Next) -> Response {
         panic!("fixture middleware panic")
+    }
+
+    #[test]
+    fn claude_code_session_header_is_a_stable_affinity_source() {
+        let request = Request::builder()
+            .header("x-claude-code-session-id", "claude-session")
+            .header("x-client-request-id", "request-specific")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            resolve_session_affinity(&request).as_deref(),
+            Some("claude-session")
+        );
+    }
+
+    #[test]
+    fn explicit_session_affinity_precedes_client_session_headers() {
+        let request = Request::builder()
+            .header("x-session-affinity", "explicit-session")
+            .header("x-claude-code-session-id", "claude-session")
+            .header("x-session-id", "generic-session")
+            .header("x-client-request-id", "request-specific")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            resolve_session_affinity(&request).as_deref(),
+            Some("explicit-session")
+        );
     }
 
     async fn panic_response(path: &str) -> serde_json::Value {
