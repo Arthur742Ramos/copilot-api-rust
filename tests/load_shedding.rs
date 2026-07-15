@@ -103,7 +103,9 @@ async fn configured_overload_covers_upstream_routes_but_not_control_plane() {
         (Method::POST, "/embeddings"),
         (Method::POST, "/v1/embeddings"),
         (Method::POST, "/images/generations"),
+        (Method::POST, "/images/edits"),
         (Method::POST, "/v1/images/generations"),
+        (Method::POST, "/v1/images/edits"),
         (Method::POST, "/responses"),
         (Method::POST, "/v1/responses"),
         (Method::POST, "/responses/compact"),
@@ -112,6 +114,8 @@ async fn configured_overload_covers_upstream_routes_but_not_control_plane() {
         (Method::POST, "/v1/messages/count_tokens"),
         (Method::POST, "/test-provider/v1/messages"),
         (Method::POST, "/test-provider/v1/messages/count_tokens"),
+        (Method::POST, "/test-provider/v1/images/generations"),
+        (Method::POST, "/test-provider/v1/images/edits"),
         (Method::GET, "/test-provider/v1/models"),
         (Method::HEAD, "/test-provider/v1/models"),
     ];

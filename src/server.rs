@@ -65,11 +65,19 @@ pub fn build_router_with_admission(
         )
         .route(
             "/images/generations",
-            post(crate::routes::images::post_images),
+            post(crate::routes::images::post_images_generations),
+        )
+        .route(
+            "/images/edits",
+            post(crate::routes::images::post_images_edits),
         )
         .route(
             "/v1/images/generations",
-            post(crate::routes::images::post_images),
+            post(crate::routes::images::post_images_generations),
+        )
+        .route(
+            "/v1/images/edits",
+            post(crate::routes::images::post_images_edits),
         )
         .route("/usage", get(crate::routes::usage::get_usage))
         .route("/token", get(crate::routes::token::get_token))
@@ -138,6 +146,14 @@ pub fn build_router_with_admission(
             "/:provider/v1/models",
             get(crate::routes::provider::models::get_provider_models),
         )
+        .route(
+            "/:provider/v1/images/generations",
+            post(crate::routes::provider::images::post_provider_images_generations),
+        )
+        .route(
+            "/:provider/v1/images/edits",
+            post(crate::routes::provider::images::post_provider_images_edits),
+        )
         .fallback(api_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
         // Middleware stack (innermost first; trace ends up outermost).
@@ -204,7 +220,9 @@ fn is_upstream_proxy_route(method: &Method, route: &str) -> bool {
         | "/embeddings"
         | "/v1/embeddings"
         | "/images/generations"
+        | "/images/edits"
         | "/v1/images/generations"
+        | "/v1/images/edits"
         | "/responses"
         | "/v1/responses"
         | "/responses/compact"
@@ -212,7 +230,9 @@ fn is_upstream_proxy_route(method: &Method, route: &str) -> bool {
         | "/v1/messages"
         | "/v1/messages/count_tokens"
         | "/:provider/v1/messages"
-        | "/:provider/v1/messages/count_tokens" => method == Method::POST,
+        | "/:provider/v1/messages/count_tokens"
+        | "/:provider/v1/images/generations"
+        | "/:provider/v1/images/edits" => method == Method::POST,
         "/models" | "/v1/models" | "/models/:id" | "/v1/models/:id" | "/:provider/v1/models" => {
             method == Method::GET || method == Method::HEAD
         }

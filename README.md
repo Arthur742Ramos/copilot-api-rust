@@ -430,6 +430,11 @@ Notes:
 - Unknown configuration keys are preserved when the file is round-tripped.
 - `dailyTokenBudget` rejects new work with `429` after the recorded local-day
   total reaches the configured guardrail. In-flight requests can overshoot it.
+- `POST /v1/images/generations` and `/v1/images/edits` proxy the native Codex
+  Images API using Codex OAuth credentials. Generation requests default an
+  omitted `model` from `imageModel`; edits preserve multipart content types and
+  bytes. The MCP `generate_image` tool still uses `imageChatModel` and
+  `imageModel` through Responses so it can save the returned image locally.
 
 ### Exact Claude token counts
 
@@ -582,7 +587,8 @@ concurrency setting.
 | `POST` | `/responses`, `/v1/responses` | OpenAI Responses. |
 | `POST` | `/responses/compact`, `/v1/responses/compact` | Responses compaction used by Codex CLI. |
 | `POST` | `/embeddings`, `/v1/embeddings` | OpenAI-compatible embeddings. |
-| `POST` | `/images/generations`, `/v1/images/generations` | Codex-backed OpenAI image generation. |
+| `POST` | `/images/generations`, `/v1/images/generations` | Native Codex-backed OpenAI image generation. |
+| `POST` | `/images/edits`, `/v1/images/edits` | Native Codex-backed multipart image edits. |
 | `POST` | `/v1/messages` | Anthropic Messages. |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting. |
 | `GET`, `POST` | `/files`, `/v1/files` | List or upload local files. |
@@ -596,6 +602,8 @@ concurrency setting.
 | `POST` | `/:provider/v1/messages` | Provider-routed Anthropic Messages. |
 | `POST` | `/:provider/v1/messages/count_tokens` | Provider-routed token counting. |
 | `GET` | `/:provider/v1/models` | Provider-routed model discovery. |
+| `POST` | `/:provider/v1/images/generations` | Provider-routed image generation. |
+| `POST` | `/:provider/v1/images/edits` | Provider-routed multipart image edits. |
 
 General API-key auth applies to proxy, token, metrics, usage, and file routes.
 Admin endpoints additionally require `auth.adminApiKey`.
@@ -614,8 +622,8 @@ Admin endpoints additionally require `auth.adminApiKey`.
   Anthropic `container_upload` blocks are not supported.
 - Exact Claude token counts require an Anthropic key. Without one, counts are
   suitable estimates rather than billing authority.
-- Image generation requires `copilot-api auth --provider codex` and uses an
-  undocumented backend that may change.
+- Native image generation and edits require `copilot-api auth --provider codex`
+  and use undocumented Codex endpoints that may change.
 - Compatibility is tested without consuming live quota. Live provider
   availability, model quality, and rollout timing remain upstream concerns.
 
