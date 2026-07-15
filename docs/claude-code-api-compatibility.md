@@ -8,6 +8,8 @@ not a claim that every Anthropic product endpoint is emulated.
 
 - Client target: **Claude Code 2.1.209**, official release
   [`v2.1.209`](https://github.com/anthropics/claude-code/releases/tag/v2.1.209).
+- Gateway model discovery was separately verified against installed **Claude
+  Code 2.1.210** on 2026-07-15.
 - Credential-free client-shaped boundary evidence:
   `tests/client_compatibility.rs::claude_code_2_1_209_contract_crosses_public_axum_boundary`.
 - Combined Claude Code/Codex setup, headers, versions, and transport matrix:
@@ -42,7 +44,7 @@ Status terms:
 | `POST /v1/messages` (streaming and JSON) | Supported | `src/routes/messages/handler.rs`; `src/routes/messages/api_flows.rs`; `tests/router_smoke.rs` | Dispatches to native Messages, Responses, or Chat Completions based on resolved model capabilities. |
 | `POST /v1/messages/count_tokens` | Supported | `src/routes/messages/count_tokens_handler.rs`; tokenizer tests; `tests/provider_routing.rs::provider_model_alias_count_tokens_returns_complete_anthropic_404` | Uses Anthropic's counter when configured; otherwise uses the documented local estimate, including provider/model aliases. |
 | `/v1/files` upload/list/retrieve/content/delete lifecycle | Supported locally | `src/libs/file_store.rs`; `src/routes/files/`; tests `local_files_api_materializes_messages_and_responses_inputs` and `anthropic_upload_list_content_and_delete_round_trip` | Copilot has no Files API, so owner-scoped bytes remain under `COPILOT_API_HOME/files` and file references are expanded to inline base64 before dispatch. |
-| `GET /v1/models` and `GET /v1/models/:id` | Supported | `src/routes/models.rs` tests `shape_model_overlays_client_fields` and `shape_model_advertises_1m_variant` | Returns Anthropic-shaped model records and `[1m]` aliases. |
+| `GET /v1/models` and `GET /v1/models/:id` | Supported | `src/routes/models.rs` model-shape and discovery-alias tests | Returns Anthropic-shaped model records, standard context/effort metadata, response cursors, and `[1m]` aliases. Optional `claude-copilot:` aliases make non-Claude Copilot chat models pass Claude Code's discovery filter. |
 | Provider-scoped Messages route | Supported | `src/routes/provider/messages.rs`; `tests/provider_routing.rs::unknown_provider_returns_complete_anthropic_404` | Anthropic, OpenAI-compatible, Responses, and configured model aliases are covered. |
 | Provider-scoped and provider/model-alias count-token routes | **Fixed here** | `src/routes/provider/count_tokens.rs`; tests `unknown_provider_count_tokens_returns_complete_anthropic_404`, `provider_model_alias_count_tokens_returns_complete_anthropic_404`, `direct_and_alias_count_tokens_malformed_json_returns_anthropic_400`, `direct_and_alias_count_tokens_invalid_payloads_return_anthropic_400`, and `direct_and_alias_count_tokens_body_limits_return_anthropic_413` | Direct and alias dispatch now share complete Anthropic envelopes for provider resolution, raw JSON parsing, typed-payload validation, and request-size rejection. |
 | Required `model`, non-empty `messages`, positive integer `max_tokens` | **Fixed here** | `validate_generation_request`; test `generation_validation_requires_messages_and_positive_max_tokens`; router test `generation_requires_positive_max_tokens_before_upstream_dispatch` | Generation now fails as a stable 400 before admission/accounting instead of silently acquiring a transport-specific default. `count_tokens` intentionally does not require `max_tokens`. |
@@ -55,6 +57,29 @@ Status terms:
 | Web-search server tool bridge | Supported | `src/routes/messages/web_search/`; provider web-search tests | Fulfilled requests preserve Anthropic content and usage shapes. |
 | Model mapping, endpoint normalization, warmup/small-model selection, and `[1m]` beta injection | Supported | `handler.rs`; model/config tests; `create_messages.rs::beta_header_keeps_context_1m_beta`; installed Claude canary | The alias is resolved before transport selection, ordinary no-tool requests retain their selected model, only identified subagent warmups use the small model, and the 1M beta is injected idempotently. |
 | High-fan-out Ultracode workflows | Supported | `tests/load_shedding.rs::ultracode_sized_messages_burst_is_bounded_and_recovers_without_cross_talk`; installed Claude Code Ultracode audit | A 64-request current-client-shaped burst is bounded at the configured limit, preserves per-worker responses, releases permits on completion and cancellation, and accepts a full recovery wave. A live 16-worker Claude Code 2.1.209 Ultracode run also completed after deliberate overload/retry pressure. |
+
+### Gateway model discovery
+
+Claude Code 2.1.210 runs gateway discovery only when all of these conditions
+hold:
+
+- `ANTHROPIC_BASE_URL` points to this proxy.
+- `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is set.
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is not set to `1`.
+
+It requests `GET /v1/models?limit=1000`, reads only `id` and optional
+`display_name`, and ignores IDs that do not begin with `claude` or `anthropic`.
+The proxy's normal catalog remains unchanged by default. Setting
+`claudeCodeModelDiscoveryAliases` to `true` adds reversible
+`claude-copilot:<model-id>` entries for non-Claude Copilot models whose upstream
+catalog record has `model_picker_enabled: true`. The alias label carries the
+actual context window and complete upstream effort list because Claude Code does
+not consume those capability fields during discovery.
+
+The normal model records also expose Anthropic's current Models API fields:
+`max_input_tokens`, `max_tokens`, `capabilities.effort`, and
+`capabilities.thinking`, while preserving the original Copilot capability
+object. The list envelope includes `first_id`, `last_id`, and `has_more`.
 
 ## Response and streaming matrix
 
@@ -116,6 +141,12 @@ Status terms:
    truncate malformed token counts. Optional nulls and fragmented string tool
    arguments remain accepted. Continuing after consumed-field corruption could
    fabricate a successful Anthropic completion or incorrect accounting.
+7. **Gateway discovery cannot communicate arbitrary context windows.** Claude
+   Code 2.1.210 consumes only model IDs and display names from `/v1/models`.
+   Models at or above 1M use a `[1m]` compatibility alias. Values such as 128K,
+   256K, or 400K are shown in the picker label, but Claude Code still applies its
+   built-in context budgeting. The proxy cannot correct that client-side budget
+   through model metadata.
 
 ## Explicitly out of scope
 

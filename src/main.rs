@@ -536,6 +536,7 @@ fn print_ready_banner(server_url: &str) {
          Anthropic / Claude Code:\n\
            ANTHROPIC_BASE_URL={server_url}\n\
            ANTHROPIC_AUTH_TOKEN={anthropic_token}\n\
+           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1\n\
          {auth_line}\n\
          ============================================================"
     );
@@ -744,7 +745,7 @@ fn claude_code_env_vars<'a>(
         ("ANTHROPIC_DEFAULT_SONNET_MODEL", selected_model),
         ("ANTHROPIC_DEFAULT_HAIKU_MODEL", selected_small_model),
         ("DISABLE_NON_ESSENTIAL_MODEL_CALLS", "1"),
-        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1"),
         ("CLAUDE_CODE_ATTRIBUTION_HEADER", "0"),
         ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false"),
         ("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "true"),
@@ -931,6 +932,12 @@ mod cli_tests {
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").copied(),
             Some("claude-haiku-4-5")
         );
+        assert_eq!(
+            env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
+                .copied(),
+            Some("1")
+        );
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"));
         assert!(!env.contains_key("CLAUDE_PLUGIN_ENABLE_QUESTION_RULES"));
     }
 }

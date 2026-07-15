@@ -57,7 +57,8 @@ Claude Code uses the Anthropic base URL **without** `/v1`:
     "ANTHROPIC_MODEL": "claude-sonnet-4-6",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-sonnet-4-6",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5"
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
   }
 }
 ```
@@ -68,12 +69,29 @@ placeholder token works. If keys are configured, `ANTHROPIC_AUTH_TOKEN` must
 match one of them. The gateway accepts the resulting bearer token as well as
 `x-api-key`.
 
+Do not combine discovery with
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; Claude Code suppresses the
+`/v1/models` request when nonessential traffic is disabled. To expose
+non-Claude Copilot chat models in `/model`, also set this proxy option in
+`config.json` and reload the server:
+
+```json
+{
+  "claudeCodeModelDiscoveryAliases": true
+}
+```
+
+Those entries use reversible `claude-copilot:` IDs. Their display names include
+the real Copilot context window and effort levels. Claude Code 2.1.210 reads
+only model IDs and display names during discovery, so 1M aliases can select the
+1M client context tier but arbitrary context sizes remain display-only.
+
 Claude Code exercises:
 
 - `POST /v1/messages?beta=true` with `anthropic-version`, `anthropic-beta`,
   `content-type`, client identity/subagent headers, and streaming or JSON bodies.
 - `POST /v1/messages/count_tokens` for context budgeting.
-- `GET /v1/models` for gateway-backed model discovery in current Claude Code.
+- `GET /v1/models?limit=1000` for opt-in gateway-backed model discovery.
 
 Provider models use the same client setup with a `provider/model` ID, for
 example `anthropic-prod/claude-sonnet-4-6`. The proxy removes the provider

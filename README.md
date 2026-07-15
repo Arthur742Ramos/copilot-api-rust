@@ -151,11 +151,31 @@ For manual setup:
 export ANTHROPIC_BASE_URL="http://127.0.0.1:4141"
 export ANTHROPIC_AUTH_TOKEN="local"
 export ANTHROPIC_MODEL="MODEL_ID"
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
 claude
 ```
 
 Replace `MODEL_ID` with a model from `/v1/models`. If you configure
 `auth.apiKeys`, replace `local` with one of those keys.
+
+Claude Code normally imports only gateway model IDs beginning with `claude` or
+`anthropic`. To add every picker-enabled Copilot chat model to `/model`, enable
+reversible compatibility aliases in `config.json`:
+
+```json
+{
+  "claudeCodeModelDiscoveryAliases": true
+}
+```
+
+Reload or restart `copilot-api`, then restart Claude Code. Non-Claude entries
+appear as `claude-copilot:<model-id>` aliases and resolve back to the real model
+before upstream dispatch. Their picker labels include the Copilot context window
+and supported reasoning efforts. Claude Code only understands its built-in 200K
+and 1M context tiers: aliases for models with at least 1M context use `[1m]`;
+other context sizes are displayed accurately but cannot change Claude Code's
+internal context budget. A model can always be selected directly with
+`/model <model-id>` even when compatibility aliases are disabled.
 
 The detailed [Claude Code compatibility contract](./docs/claude-code-api-compatibility.md)
 documents supported content blocks, tools, thinking, streaming behavior, error
@@ -410,6 +430,7 @@ customize:
     "friendly-model": "team-openai/upstream-model-id"
   },
   "smallModel": "gpt-5-mini",
+  "claudeCodeModelDiscoveryAliases": false,
   "modelReasoningEfforts": {
     "gpt-5.4": "high"
   },
@@ -427,6 +448,8 @@ Notes:
 - Provider types are `anthropic`, `openai-compatible`, and
   `openai-responses`.
 - The provider name `copilot` is reserved.
+- `claudeCodeModelDiscoveryAliases` is disabled by default. Enable it only when
+  Claude Code's `/model` picker should include non-Claude Copilot models.
 - Unknown configuration keys are preserved when the file is round-tripped.
 - `dailyTokenBudget` rejects new work with `429` after the recorded local-day
   total reaches the configured guardrail. In-flight requests can overshoot it.

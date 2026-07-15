@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use super::paths::PATHS;
+use super::provider_model::resolve_claude_code_discovery_alias;
 
 pub type ReasoningEffort = String; // "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
 
@@ -105,6 +106,13 @@ pub struct AppConfig {
     pub model_reasoning_efforts: Option<BTreeMap<String, ReasoningEffort>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "useMessagesApi")]
     pub use_messages_api: Option<bool>,
+    /// Advertise reversible `claude-copilot:` aliases for non-Claude Copilot
+    /// models so Claude Code's opt-in gateway discovery can show them.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "claudeCodeModelDiscoveryAliases"
+    )]
+    pub claude_code_model_discovery_aliases: Option<bool>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         rename = "useResponsesApiWebSocket"
@@ -233,6 +241,7 @@ fn default_config() -> AppConfig {
         model_responses_api_compact_thresholds: Some(thresholds),
         model_reasoning_efforts: Some(efforts),
         use_messages_api: Some(true),
+        claude_code_model_discovery_aliases: Some(false),
         use_responses_api_web_socket: Some(true),
         use_responses_api_web_search: Some(true),
         message_api_web_search_model: Some("gpt-5-mini".to_string()),
@@ -536,14 +545,25 @@ pub fn set_model_mappings(
 }
 
 pub fn resolve_mapped_model(model: &str) -> String {
-    get_config()
+    let config = get_config();
+    let mapped = config
         .model_mappings
         .as_ref()
         .and_then(|m| match m.get(model) {
             Some(Value::String(t)) if !t.trim().is_empty() => Some(t.clone()),
             _ => None,
         })
-        .unwrap_or_else(|| model.to_string())
+        .unwrap_or_else(|| model.to_string());
+
+    // Accept previously discovered aliases even if advertising is later
+    // disabled, so an active or cached Claude Code selection keeps working.
+    resolve_claude_code_discovery_alias(&mapped).unwrap_or(mapped)
+}
+
+pub fn are_claude_code_model_discovery_aliases_enabled() -> bool {
+    get_config()
+        .claude_code_model_discovery_aliases
+        .unwrap_or(false)
 }
 
 pub fn get_small_model() -> String {
@@ -884,6 +904,42 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(get_small_model(), "gpt-5-mini");
+        reset_cached_config_for_test();
+    }
+
+    #[test]
+    fn claude_code_discovery_aliases_are_disabled_by_default() {
+        assert_eq!(
+            default_config().claude_code_model_discovery_aliases,
+            Some(false)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn enabled_claude_code_discovery_alias_resolves_to_copilot_model() {
+        set_cached_config_for_test(AppConfig {
+            claude_code_model_discovery_aliases: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            resolve_mapped_model("claude-copilot:gpt-5.6-sol[1m]"),
+            "gpt-5.6-sol[1m]"
+        );
+        reset_cached_config_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_claude_code_discovery_alias_resolves_when_advertising_is_disabled() {
+        set_cached_config_for_test(AppConfig {
+            claude_code_model_discovery_aliases: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(
+            resolve_mapped_model("claude-copilot:gpt-5.6-sol"),
+            "gpt-5.6-sol"
+        );
         reset_cached_config_for_test();
     }
 
