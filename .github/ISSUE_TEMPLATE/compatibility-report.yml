@@ -1,0 +1,68 @@
+name: Client compatibility report
+description: Report a Claude Code, Codex, OpenCode, SDK, or provider protocol gap.
+title: "[Compatibility]: "
+labels: ["compatibility"]
+body:
+  - type: input
+    id: client
+    attributes:
+      label: Client and exact version
+      placeholder: Claude Code 2.1.210
+    validations:
+      required: true
+  - type: input
+    id: gateway
+    attributes:
+      label: copilot-api version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Wire protocol
+      options:
+        - Anthropic Messages JSON
+        - Anthropic Messages SSE
+        - OpenAI Responses JSON
+        - OpenAI Responses SSE
+        - Upstream Responses WebSocket
+        - OpenAI Chat Completions JSON
+        - OpenAI Chat Completions SSE
+        - MCP stdio
+        - Plugin hook
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: route
+    attributes:
+      label: Redacted route and provider type
+      placeholder: /provider/v1/responses (openai-responses)
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Observed compatibility gap
+      description: Describe the request/event/header shape without proprietary content.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Credential-free reproduction or protocol reference
+      description: Prefer a local fixture and public specification/source link.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted debug/doctor output and trace ID
+      render: json
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Redaction confirmation
+      options:
+        - label: I removed all tokens, account data, prompts, file content, private URLs, and machine-specific paths.
+          required: true

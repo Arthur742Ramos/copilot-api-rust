@@ -23,14 +23,30 @@ pub async fn resolve_provider_config(provider_name: &str) -> Option<ResolvedProv
             }
         }
 
-        if let Err(error) = setup_codex_token().await {
-            if is_missing_codex_credentials_error(&error) {
+        let loaded_codex_auth = state::with_state(|state| {
+            let token_loaded = state
+                .codex_access_token
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let account_loaded = state
+                .codex_account_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let unexpired = state
+                .codex_expires_at
+                .is_some_and(|expires| expires > chrono::Utc::now().timestamp_millis());
+            token_loaded && account_loaded && unexpired
+        });
+        if !loaded_codex_auth {
+            if let Err(error) = setup_codex_token().await {
+                if is_missing_codex_credentials_error(&error) {
+                    return None;
+                }
+                // TS rethrows non-credentials errors. This function returns
+                // Option, so log and fall through to None instead.
+                tracing::error!("Failed to set up Codex token: {error}");
                 return None;
             }
-            // TS rethrows non-credentials errors. This function returns Option,
-            // so we log and fall through to None instead of propagating.
-            tracing::error!("Failed to set up Codex token: {error}");
-            return None;
         }
 
         let provider_config = get_provider_config(normalized_provider_name)?;

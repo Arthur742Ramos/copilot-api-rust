@@ -1,7 +1,13 @@
+use once_cell::sync::Lazy;
 use serde::Serialize;
 
 use crate::libs::config;
 use crate::libs::paths::PATHS;
+
+static CLIENT_VERSION_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"(?i)\bv?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?\b")
+        .expect("static client version regex")
+});
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +35,17 @@ struct PathsInfo {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IntegrationInfo {
+    claude_code: Option<String>,
+    codex_cli: Option<String>,
+    open_code: Option<String>,
+    agent_inject_plugin: &'static str,
+    tool_search_plugin: &'static str,
+    open_code_marker: &'static str,
+}
+
+#[derive(Serialize)]
 struct DebugInfo {
     providers: ProvidersInfo,
     version: String,
@@ -36,6 +53,7 @@ struct DebugInfo {
     paths: PathsInfo,
     #[serde(rename = "tokenExists")]
     token_exists: bool,
+    integrations: IntegrationInfo,
 }
 
 fn get_runtime_info() -> RuntimeInfo {
@@ -54,8 +72,44 @@ async fn check_file_exists(path: &std::path::Path) -> bool {
     }
 }
 
+fn sanitize_version_output(output: &[u8]) -> Option<String> {
+    let first_line = String::from_utf8_lossy(output)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect::<String>();
+    let version = CLIENT_VERSION_RE
+        .find(&first_line)?
+        .as_str()
+        .trim_start_matches(['v', 'V'])
+        .to_string();
+    Some(version)
+}
+
+async fn detect_client_version(command: &str) -> Option<String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new(command)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    sanitize_version_output(&output.stdout).or_else(|| sanitize_version_output(&output.stderr))
+}
+
 async fn get_debug_info() -> DebugInfo {
     let token_exists = check_file_exists(&PATHS.github_token_path).await;
+    let (claude_code, codex_cli, open_code) = tokio::join!(
+        detect_client_version("claude"),
+        detect_client_version("codex"),
+        detect_client_version("opencode")
+    );
 
     DebugInfo {
         providers: ProvidersInfo {
@@ -70,6 +124,14 @@ async fn get_debug_info() -> DebugInfo {
             github_token_path: PATHS.github_token_path.display().to_string(),
         },
         token_exists,
+        integrations: IntegrationInfo {
+            claude_code,
+            codex_cli,
+            open_code,
+            agent_inject_plugin: "1.0.0",
+            tool_search_plugin: "1.0.0",
+            open_code_marker: "1.0.0",
+        },
     }
 }
 
@@ -85,6 +147,8 @@ fn print_debug_info_plain(info: &DebugInfo) {
         "No"
     };
     let token_exists = if info.token_exists { "Yes" } else { "No" };
+    let detected =
+        |value: &Option<String>| value.clone().unwrap_or_else(|| "not detected".to_string());
 
     println!(
         "copilot-api debug
@@ -114,6 +178,15 @@ GitHub token exists: {token_exists}",
         github_token_path = info.paths.github_token_path,
         token_exists = token_exists,
     );
+    println!(
+        "\nIntegrations:\n- Claude Code: {}\n- Codex CLI: {}\n- OpenCode: {}\n- agent-inject plugin: {}\n- tool-search plugin: {}\n- OpenCode marker: {}",
+        detected(&info.integrations.claude_code),
+        detected(&info.integrations.codex_cli),
+        detected(&info.integrations.open_code),
+        info.integrations.agent_inject_plugin,
+        info.integrations.tool_search_plugin,
+        info.integrations.open_code_marker,
+    );
 }
 
 fn print_debug_info_json(info: &DebugInfo) {
@@ -130,5 +203,20 @@ pub async fn run_debug(json: bool) {
         print_debug_info_json(&debug_info);
     } else {
         print_debug_info_plain(&debug_info);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_output_is_single_line_and_bounded() {
+        assert_eq!(
+            sanitize_version_output(b"client 1.2.3\nignored token-like detail"),
+            Some("1.2.3".to_string())
+        );
+        assert!(sanitize_version_output(b"\n").is_none());
+        assert!(sanitize_version_output(b"token=private-value").is_none());
     }
 }

@@ -1095,7 +1095,11 @@ pub async fn create_responses(
                 // The pooled engine completes its handshake before returning a
                 // stream, so this failure happened before any response.create
                 // frame was sent. Falling back to HTTP cannot duplicate work.
-                metrics::counter!("copilot_responses_websocket_fallback_total").increment(1);
+                metrics::counter!(
+                    "copilot_responses_websocket_fallback_total",
+                    "provider" => "copilot"
+                )
+                .increment(1);
                 tracing::warn!(
                     "responses websocket unavailable before request send; falling back to HTTP: {error}"
                 );

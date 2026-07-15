@@ -1,8 +1,8 @@
 // The crate's modules live in the `copilot_api` library (src/lib.rs) so that
 // integration tests can link against them. The binary just drives the CLI.
-use copilot_api::{debug, doctor, libs, mcp, server, services};
+use copilot_api::{auth_setup, debug, doctor, libs, mcp, server, services};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::num::NonZeroUsize;
 
 use crate::libs::config::merge_config_with_defaults;
@@ -57,6 +57,11 @@ enum Command {
     Mcp,
     /// Update copilot-api to the latest released version
     Update(UpdateArgs),
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -136,9 +141,34 @@ struct StartArgs {
 
 #[derive(Args, Debug)]
 struct AuthArgs {
-    /// Provider to log in with (copilot or codex)
-    #[arg(long)]
+    /// Provider to authenticate/configure. Omit in a TTY for guided setup.
+    #[arg(long, value_parser = auth_setup::AUTH_PROVIDERS)]
     provider: Option<String>,
+    /// Name for a custom provider
+    #[arg(long)]
+    name: Option<String>,
+    /// Custom/quick provider protocol type
+    #[arg(long = "type", value_parser = auth_setup::PROVIDER_TYPES)]
+    provider_type: Option<String>,
+    /// Provider API base URL
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Provider authentication header mode
+    #[arg(long, value_parser = auth_setup::AUTH_TYPES)]
+    auth_type: Option<String>,
+    /// Environment variable containing the provider API key (never pass secrets
+    /// directly on the command line)
+    #[arg(long)]
+    api_key_env: Option<String>,
+    /// Supported model name; repeat or use comma-separated values
+    #[arg(long = "model", value_delimiter = ',')]
+    models: Vec<String>,
+    /// Endpoint capability; repeat or use comma-separated values
+    #[arg(long = "capability", value_delimiter = ',')]
+    capabilities: Vec<String>,
+    /// Run a bounded provider health probe after configuration
+    #[arg(long, default_value_t = false)]
+    probe: bool,
     /// Enable verbose logging
     #[arg(short = 'v', long, default_value_t = false)]
     verbose: bool,
@@ -205,6 +235,11 @@ async fn main() {
         }
         Command::Mcp => mcp::run_mcp_server().await,
         Command::Update(args) => run_update(args).await,
+        Command::Completions { shell } => {
+            let mut command = Cli::command();
+            clap_complete::generate(shell, &mut command, "copilot-api", &mut std::io::stdout());
+            Ok(())
+        }
     };
 
     if let Err(e) = result {
@@ -667,22 +702,81 @@ fn raise_server_nofile_limit() {
 async fn run_auth(options: AuthArgs) -> anyhow::Result<()> {
     state::with_state_mut(|s| s.show_token = options.show_token);
     ensure_paths().await?;
+    crate::libs::paths::warn_if_file_perms_unrestricted();
 
-    let provider = options.provider.unwrap_or_else(|| "copilot".to_string());
-    let provider = provider.trim();
-    match provider {
-        "copilot" => {
+    let setup_options = auth_setup::AuthSetupOptions {
+        provider: options.provider,
+        name: options.name,
+        provider_type: options.provider_type,
+        base_url: options.base_url,
+        auth_type: options.auth_type,
+        api_key_env: options.api_key_env,
+        models: options.models,
+        capabilities: options.capabilities,
+        probe: options.probe,
+    };
+    let mut prompt = auth_setup::TerminalPrompt::detect();
+    match auth_setup::build_auth_plan(&setup_options, &mut prompt, |name| std::env::var(name).ok())?
+    {
+        auth_setup::AuthPlan::Copilot => {
             setup_github_token(true).await?;
             tracing::info!(
                 "GitHub token written to {}",
                 PATHS.github_token_path.display()
             );
         }
-        "codex" => {
+        auth_setup::AuthPlan::Codex => {
             run_codex_login().await?;
         }
-        other => {
-            anyhow::bail!("Unknown provider '{other}'. Expected one of: copilot, codex");
+        auth_setup::AuthPlan::Configure(plan) => {
+            // Persist the secret before reloading config so the resolver sees a
+            // complete provider on the first reload. The non-secret config never
+            // contains the API key.
+            crate::libs::credential_store::write_provider_api_key(
+                &plan.provider_name,
+                &plan.api_key,
+            )
+            .await?;
+            crate::libs::config::set_provider_config(&plan.provider_name, plan.config)?;
+            tracing::info!(
+                provider = %plan.provider_name,
+                credential_store = %PATHS.provider_credentials_path.display(),
+                config = %PATHS.config_path.display(),
+                "Provider configured; API key stored separately with restrictive permissions"
+            );
+
+            if plan.probe {
+                let config = crate::libs::config::get_provider_config(&plan.provider_name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Provider '{}' could not be resolved after configuration",
+                            plan.provider_name
+                        )
+                    })?;
+                let (outcome, latency_ms) =
+                    crate::services::providers::provider_proxy::probe_provider_models(&config)
+                        .await;
+                match outcome {
+                    crate::services::providers::provider_proxy::ProbeOutcome::Status(status) => {
+                        tracing::info!(
+                            provider = %plan.provider_name,
+                            status,
+                            latency_ms,
+                            "Provider health probe completed"
+                        );
+                    }
+                    crate::services::providers::provider_proxy::ProbeOutcome::Unreachable(
+                        category,
+                    ) => {
+                        tracing::warn!(
+                            provider = %plan.provider_name,
+                            category,
+                            latency_ms,
+                            "Provider health probe could not obtain a response"
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())

@@ -2,6 +2,7 @@
 //! messages, responses, embeddings, models, token, and usage endpoints).
 
 pub mod admin_config;
+pub mod alpha_search;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod files;

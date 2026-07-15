@@ -59,6 +59,10 @@ pub struct ProviderConfig {
     pub auth_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeMap<String, ModelConfig>>,
+    /// Explicit endpoint capabilities. When absent, conservative defaults are
+    /// derived from `type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "adjustInputTokens")]
     pub adjust_input_tokens: Option<bool>,
     /// Preserve unknown keys so round-tripping config.json does not drop fields.
@@ -74,6 +78,7 @@ pub struct ResolvedProviderConfig {
     pub api_key: String,
     pub auth_type: String, // authorization | oauth2 | x-api-key
     pub models: Option<BTreeMap<String, ModelConfig>>,
+    pub capabilities: Option<Vec<String>>,
     pub adjust_input_tokens: Option<bool>,
 }
 
@@ -659,6 +664,20 @@ fn is_provider_api_key_required(provider_name: &str, auth_type: &str) -> bool {
     !(provider_name == "codex" && auth_type == "oauth2")
 }
 
+fn provider_api_key_env_name(provider_name: &str) -> String {
+    let normalized = provider_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("COPILOT_API_PROVIDER_{normalized}_API_KEY")
+}
+
 pub fn get_raw_provider_config(name: &str) -> Option<ProviderConfig> {
     let provider_name = name.trim();
     if provider_name.is_empty() {
@@ -729,6 +748,28 @@ pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
         .unwrap_or_default()
         .trim()
         .to_string();
+    let api_key = if api_key.is_empty() {
+        std::env::var(provider_api_key_env_name(provider_name))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                match crate::libs::credential_store::read_provider_api_key_sync(provider_name) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            provider = provider_name,
+                            %error,
+                            "Failed to read provider credential store"
+                        );
+                        None
+                    }
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        api_key
+    };
     let mut missing = Vec::new();
     if base_url.is_empty() {
         missing.push("baseUrl");
@@ -750,6 +791,7 @@ pub fn get_provider_config(name: &str) -> Option<ResolvedProviderConfig> {
         api_key,
         auth_type,
         models: provider.models,
+        capabilities: provider.capabilities,
         adjust_input_tokens: provider.adjust_input_tokens,
     })
 }

@@ -141,6 +141,7 @@ fn sync_codex_provider_config(enabled: Option<bool>) {
         auth_type: Some("oauth2".to_string()),
         api_key: existing.api_key,
         models: existing.models,
+        capabilities: existing.capabilities,
         adjust_input_tokens: existing.adjust_input_tokens,
         extra: existing.extra,
     };

@@ -6,21 +6,19 @@ not a claim that every Anthropic product endpoint is emulated.
 
 ## Reference audited
 
-- Client target: **Claude Code 2.1.209**, official release
-  [`v2.1.209`](https://github.com/anthropics/claude-code/releases/tag/v2.1.209).
-- Gateway model discovery was separately verified against installed **Claude
-  Code 2.1.210** on 2026-07-15.
+- Client target: **Claude Code 2.1.210**, installed and verified on 2026-07-15.
 - Credential-free client-shaped boundary evidence:
   `tests/client_compatibility.rs::claude_code_2_1_209_contract_crosses_public_axum_boundary`.
 - Combined Claude Code/Codex setup, headers, versions, and transport matrix:
   [`claude-code-codex-compatibility.md`](./claude-code-codex-compatibility.md).
+- Complete non-GUI endpoint/provider/plugin matrix:
+  [`non-gui-compatibility.md`](./non-gui-compatibility.md).
 - Reference implementation:
   [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api) at
   commit
-  [`65ab96bd806f47c35443aa58b65134d45a345570`](https://github.com/caozhiyuan/copilot-api/tree/65ab96bd806f47c35443aa58b65134d45a345570)
-  (`dev`).
-- Retrieved/audited: **2026-07-14T18:15:16Z**. Releases 2.1.208 and
-  2.1.209 introduced no Messages wire-contract changes.
+  [`287d2d330c299bbdf3ed213a1bc05b1739aecf03`](https://github.com/caozhiyuan/copilot-api/tree/287d2d330c299bbdf3ed213a1bc05b1739aecf03)
+  (`1.14.9`).
+- Retrieved/audited: **2026-07-15**.
 - Compared surfaces: `src/routes/messages/` (handler, token counting,
   preprocessing, request, non-streaming and both streaming translators),
   `src/routes/provider/messages/`, `src/routes/models.ts`, `src/lib/error.ts`, and

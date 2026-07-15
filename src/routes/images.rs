@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::libs::config::get_image_model;
 use crate::libs::error::{AppError, HttpError};
+use crate::libs::provider_capabilities::{supports, ProviderCapability};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{create_provider_token_usage_recorder, normalize_responses_usage};
 use crate::services::codex::images::forward_codex_images;
@@ -87,6 +88,11 @@ async fn handle(
     let provider_config = resolve_provider_config(&provider_name)
         .await
         .ok_or_else(|| provider_not_found(&provider_name))?;
+    if !supports(&provider_config, ProviderCapability::Images) {
+        return Err(AppError::BadRequest(format!(
+            "Provider '{provider_name}' does not support the Images endpoint"
+        )));
+    }
 
     let query = uri.query();
     let (upstream, model) = if provider_config.name == "codex" {

@@ -1,0 +1,82 @@
+name: Bug report
+description: Report a reproducible gateway defect with redacted diagnostics.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste GitHub, Codex, provider, client, or admin credentials. Replace
+        tokens, account IDs, user paths, prompts, file contents, and private URLs.
+  - type: input
+    id: version
+    attributes:
+      label: copilot-api version
+      description: Output of `copilot-api --version`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: Windows 11 x64 / macOS arm64 / Ubuntu x86_64
+    validations:
+      required: true
+  - type: dropdown
+    id: endpoint
+    attributes:
+      label: Endpoint family
+      options:
+        - Anthropic Messages
+        - OpenAI Responses
+        - OpenAI Chat Completions
+        - Alpha Search
+        - Images
+        - Models
+        - Files
+        - CLI/auth/configuration
+        - MCP/plugins
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider type and route
+      description: Use the provider protocol type, not a private alias or URL.
+      placeholder: openai-responses via /example/v1/responses
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include a redacted request or command and whether it streams.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Attach `copilot-api debug --json`, `doctor --json`, trace ID, and bounded logs after redaction.
+      render: json
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed credentials, private prompts/files, account IDs, user paths, and private provider URLs.
+          required: true
+        - label: I reproduced without using the production server on port 4141.
+          required: true

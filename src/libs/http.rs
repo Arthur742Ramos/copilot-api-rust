@@ -146,7 +146,36 @@ pub fn preregister_retry_metrics() {
     }
     // The WebSocket path falls back to HTTP only before an application frame is
     // sent. Keep this transport-resilience series visible at zero too.
-    metrics::counter!("copilot_responses_websocket_fallback_total").increment(0);
+    for provider in ["copilot", "codex"] {
+        metrics::counter!(
+            "copilot_responses_websocket_fallback_total",
+            "provider" => provider
+        )
+        .increment(0);
+    }
+    metrics::counter!(
+        "copilot_responses_websocket_attempt_total",
+        "provider" => "codex"
+    )
+    .increment(0);
+    metrics::counter!(
+        "copilot_responses_websocket_stream_error_total",
+        "provider" => "codex"
+    )
+    .increment(0);
+    metrics::counter!(
+        "copilot_responses_websocket_cancel_total",
+        "provider" => "codex"
+    )
+    .increment(0);
+    for outcome in ["completed", "failed", "incomplete", "error", "unknown"] {
+        metrics::counter!(
+            "copilot_responses_websocket_terminal_total",
+            "provider" => "codex",
+            "outcome" => outcome
+        )
+        .increment(0);
+    }
 }
 
 /// Send a request, retrying ONCE on a genuine connection failure.
@@ -639,7 +668,7 @@ mod tests {
                 );
             }
         }
-        assert!(out.contains("copilot_responses_websocket_fallback_total 0"));
+        assert!(out.contains("copilot_responses_websocket_fallback_total{provider=\"codex\"} 0"));
     }
 
     #[test]

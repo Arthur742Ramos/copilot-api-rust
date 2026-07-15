@@ -10,6 +10,7 @@ use axum::Json;
 use serde_json::json;
 
 use crate::libs::error::{openai_error_response, AppError};
+use crate::libs::provider_capabilities::{supports, ProviderCapability};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::services::codex::get_models::get_codex_models;
 use crate::services::providers::provider_proxy::{
@@ -41,6 +42,14 @@ pub async fn handle_provider_models(
             format!("Provider '{provider}' not found or disabled"),
         ));
     };
+    if !supports(&provider_config, ProviderCapability::Models) {
+        return Ok(openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("unsupported_provider_capability"),
+            format!("Provider '{provider}' does not support model discovery"),
+        ));
+    }
 
     if provider_config.name == "codex" {
         let models = get_codex_models();

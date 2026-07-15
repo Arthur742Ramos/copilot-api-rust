@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a protocol, provider, CLI, or integration capability.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What terminal/client workflow is blocked?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include routes, capability checks, lifecycle, and error semantics where relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Public protocol/client evidence
+      description: Link a specification, public source, or release version; do not paste proprietary code.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: This request does not require a GUI.
+          required: true
+        - label: This request does not depend on committed credentials or live CI credentials.
+          required: true

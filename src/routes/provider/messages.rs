@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::libs::config::{provider_uses_responses_api, ModelConfig, ResolvedProviderConfig};
 use crate::libs::error::{anthropic_error_response, http_error_from_response, AppError};
+use crate::libs::provider_capabilities::{supports, ProviderCapability};
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::token_usage::{
     create_provider_token_usage_recorder, merge_anthropic_usage, normalize_anthropic_usage,
@@ -62,7 +63,9 @@ use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
     DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO,
 };
-use crate::services::codex::create_responses::forward_codex_responses;
+use crate::services::codex::create_responses::{
+    forward_codex_responses_selected, CodexResponsesReturn,
+};
 use crate::services::codex::get_models::get_codex_models;
 use crate::services::copilot::create_chat_completions::ChatCompletionsPayload;
 use crate::services::copilot::create_responses::{ResponsesEventStream, ResponsesResult};
@@ -146,6 +149,13 @@ pub async fn handle_provider_messages_for_provider(
             format!("Provider '{provider}' not found or disabled"),
         ));
     };
+    if !supports(&provider_config, ProviderCapability::Messages) {
+        return Ok(anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("Provider '{provider}' does not support the Messages endpoint"),
+        ));
+    }
     if provider_config.provider_type == "openai-responses" {
         validate_responses_request_controls(&payload, provider == "codex")?;
     }
@@ -280,9 +290,20 @@ async fn handle_openai_responses_provider_messages(
     if is_codex {
         let codex_headers =
             prepare_codex_messages_transport(&mut responses_payload, headers, wants_stream);
-        let upstream_response =
-            forward_codex_responses(responses_payload, &codex_headers, &provider_config.base_url)
-                .await?;
+        let selected = forward_codex_responses_selected(
+            responses_payload,
+            &codex_headers,
+            &provider_config.base_url,
+        )
+        .await?;
+        let upstream_response = match selected {
+            CodexResponsesReturn::Stream(stream) => {
+                return Ok(stream_responses_provider_message_events(
+                    stream, &payload, provider, true,
+                ))
+            }
+            CodexResponsesReturn::Http(response) => response,
+        };
 
         // forward_codex_responses relays non-401 errors verbatim, so guard the
         // status here too (mirrors the generic branch below) to avoid wrapping a
@@ -382,18 +403,24 @@ async fn handle_openai_responses_provider_web_search_messages(
     let recorder = create_provider_messages_usage_recorder(&payload, provider);
 
     let body: ResponsesResult = if is_codex {
-        let upstream_response =
-            forward_codex_responses(responses_payload, headers, &provider_config.base_url).await?;
-        if !upstream_response.status().is_success() {
-            tracing::error!("Failed to create provider web search responses: {provider}");
-            return Err(http_error_from_response(
-                "Failed to create provider web search responses",
-                upstream_response,
-            )
-            .await
-            .into());
-        }
-        let stream = Box::pin(crate::libs::sse::events(upstream_response));
+        let selected =
+            forward_codex_responses_selected(responses_payload, headers, &provider_config.base_url)
+                .await?;
+        let stream: ResponsesEventStream = match selected {
+            CodexResponsesReturn::Stream(stream) => stream,
+            CodexResponsesReturn::Http(upstream_response) => {
+                if !upstream_response.status().is_success() {
+                    tracing::error!("Failed to create provider web search responses: {provider}");
+                    return Err(http_error_from_response(
+                        "Failed to create provider web search responses",
+                        upstream_response,
+                    )
+                    .await
+                    .into());
+                }
+                Box::pin(crate::libs::sse::events(upstream_response))
+            }
+        };
         let mut observed_usage = None;
         let collected = collect_web_search_responses_stream_result_with_usage_observer(
             stream,
@@ -490,13 +517,21 @@ fn stream_responses_provider_messages(
     provider: &str,
     is_codex: bool,
 ) -> Response {
+    let event_stream: ResponsesEventStream = Box::pin(crate::libs::sse::events(upstream));
+    stream_responses_provider_message_events(event_stream, payload, provider, is_codex)
+}
+
+fn stream_responses_provider_message_events(
+    event_stream: ResponsesEventStream,
+    payload: &AnthropicMessagesPayload,
+    provider: &str,
+    is_codex: bool,
+) -> Response {
     let recorder = create_provider_messages_usage_recorder(payload, provider);
     let tool_search_name =
         resolve_bridge_tool_search_name(anthropic_tools_as_slice(payload).as_deref());
     let response_model = payload.model.clone();
     let provider_label = provider.to_string();
-    let event_stream = crate::libs::sse::events(upstream);
-
     let body = Body::from_stream(async_stream::stream! {
         use crate::libs::stream_metrics::{transport, StreamTimer};
         let mut timer = StreamTimer::new("provider_messages", transport::NATIVE)

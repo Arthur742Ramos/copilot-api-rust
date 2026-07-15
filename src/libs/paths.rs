@@ -10,6 +10,7 @@ pub struct Paths {
     pub files_dir: PathBuf,
     pub github_token_path: PathBuf,
     pub codex_credential_path: PathBuf,
+    pub provider_credentials_path: PathBuf,
     pub config_path: PathBuf,
     pub auth_app: String,
 }
@@ -45,6 +46,7 @@ pub static PATHS: Lazy<Paths> = Lazy::new(|| {
         .join(format!("{enterprise_prefix}github_token"));
     let files_dir = app_dir.join("files");
     let codex_credential_path = app_dir.join("codex_credentials.json");
+    let provider_credentials_path = app_dir.join("provider_credentials.json");
     let config_path = app_dir.join("config.json");
 
     Paths {
@@ -52,6 +54,7 @@ pub static PATHS: Lazy<Paths> = Lazy::new(|| {
         files_dir,
         github_token_path,
         codex_credential_path,
+        provider_credentials_path,
         config_path,
         auth_app,
     }
@@ -59,10 +62,12 @@ pub static PATHS: Lazy<Paths> = Lazy::new(|| {
 
 pub async fn ensure_paths() -> std::io::Result<()> {
     tokio::fs::create_dir_all(PATHS.app_dir.join(&PATHS.auth_app)).await?;
+    set_permissions_700(&PATHS.app_dir).await;
     tokio::fs::create_dir_all(&PATHS.files_dir).await?;
     set_permissions_700(&PATHS.files_dir).await;
     ensure_file(&PATHS.github_token_path).await?;
     ensure_file(&PATHS.config_path).await?;
+    ensure_file(&PATHS.provider_credentials_path).await?;
     Ok(())
 }
 

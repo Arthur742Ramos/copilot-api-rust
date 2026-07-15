@@ -812,4 +812,186 @@ mod tests {
         .await
         .expect("idle-close task should evict the completed socket");
     }
+
+    #[tokio::test]
+    async fn clean_terminal_stream_reuses_one_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reuse listener");
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            accepted_server.fetch_add(1, Ordering::SeqCst);
+            let mut websocket = accept_async(tcp).await.unwrap();
+            for request_number in 1..=2 {
+                let request = websocket.next().await.unwrap().unwrap();
+                assert!(matches!(request, Message::Text(_)));
+                websocket
+                    .send(Message::Text(format!(
+                        r#"{{"type":"response.output_text.delta","delta":"{request_number}"}}"#
+                    )))
+                    .await
+                    .unwrap();
+                websocket
+                    .send(Message::Text(
+                        r#"{"type":"response.completed"}"#.to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let pool_key = format!("reuse-test-{}", next_entry_id());
+        let request = || PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: pool_key.clone(),
+            url: format!("ws://{address}"),
+        };
+        let mut options = test_options();
+        options.idle_timeout_ms = Some(1_000);
+
+        for _ in 0..2 {
+            let mut stream = Box::pin(
+                create_pooled_web_socket_stream(request(), options.clone())
+                    .await
+                    .unwrap(),
+            );
+            assert!(!test_terminal(
+                &stream.next().await.unwrap().expect("delta")
+            ));
+            assert!(test_terminal(
+                &stream.next().await.unwrap().expect("terminal")
+            ));
+            assert!(stream.next().await.is_none());
+        }
+
+        server.await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let entry_id = WEBSOCKET_POOL
+            .lock()
+            .unwrap()
+            .get(&pool_key)
+            .map(|entry| entry.id);
+        if let Some(entry_id) = entry_id {
+            remove_pooled_entry(&pool_key, entry_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_is_a_heartbeat_but_silence_is_bounded() {
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind heartbeat listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(tcp).await.unwrap();
+            let _request = websocket.next().await.unwrap().unwrap();
+            websocket.send(Message::Ping(vec![1, 2, 3])).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    r#"{"type":"response.completed"}"#.to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: format!("heartbeat-test-{}", next_entry_id()),
+            url: format!("ws://{address}"),
+        };
+        let mut stream = Box::pin(
+            create_pooled_web_socket_stream(request, test_options())
+                .await
+                .unwrap(),
+        );
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert!(
+            test_terminal(&terminal),
+            "control frames must not become events"
+        );
+        assert!(stream.next().await.is_none());
+        server.await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silence listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(tcp).await.unwrap();
+            let _request = websocket.next().await.unwrap().unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: format!("silence-test-{}", next_entry_id()),
+            url: format!("ws://{address}"),
+        };
+        let mut options = test_options();
+        options.read_timeout = Some(Duration::from_millis(20));
+        let mut stream = Box::pin(
+            create_pooled_web_socket_stream(request, options)
+                .await
+                .unwrap(),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("silence error")
+            .expect_err("silence must fail");
+        assert!(error.to_string().contains("no data within"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_without_terminal_is_an_explicit_failure() {
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(tcp).await.unwrap();
+            let _request = websocket.next().await.unwrap().unwrap();
+            websocket
+                .send(Message::Text(
+                    r#"{"type":"response.output_text.delta","delta":"partial"}"#.to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: format!("truncated-test-{}", next_entry_id()),
+            url: format!("ws://{address}"),
+        };
+        let mut stream = Box::pin(
+            create_pooled_web_socket_stream(request, test_options())
+                .await
+                .unwrap(),
+        );
+        assert!(stream.next().await.unwrap().is_ok());
+        let error = stream
+            .next()
+            .await
+            .expect("terminal-missing error")
+            .expect_err("truncated stream must fail");
+        assert_eq!(error.to_string(), "terminal missing");
+        server.await.unwrap();
+    }
 }

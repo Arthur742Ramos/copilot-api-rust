@@ -20,6 +20,7 @@ pub mod oauth;
 pub mod opencode;
 pub mod paths;
 pub mod premium_interactions;
+pub mod provider_capabilities;
 pub mod provider_model;
 pub mod provider_resolver;
 pub mod rate_limit;

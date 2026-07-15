@@ -10,6 +10,7 @@ use axum::Json;
 use serde_json::json;
 
 use crate::libs::error::{anthropic_error_response, AppError};
+use crate::libs::provider_capabilities::{supports, ProviderCapability};
 use crate::libs::provider_model::create_fallback_model;
 use crate::libs::provider_resolver::resolve_provider_config;
 use crate::libs::tokenizer::get_token_count;
@@ -42,6 +43,13 @@ pub async fn handle_provider_count_tokens_for_provider(
             format!("Provider '{provider}' not found or disabled"),
         ));
     };
+    if !supports(&provider_config, ProviderCapability::CountTokens) {
+        return Ok(anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("Provider '{provider}' does not support token counting"),
+        ));
+    }
 
     // Mirror the TS: only the openai-compatible / openai-responses providers
     // thread the translation options from `modelConfig`; the anthropic

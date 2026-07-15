@@ -4,6 +4,7 @@
 // same modules, so there is a single compiled copy of the process-global state
 // (STATE, CACHED_CONFIG, the SQLite connection, ...).
 
+pub mod auth_setup;
 pub mod libs;
 pub mod routes;
 pub mod server;

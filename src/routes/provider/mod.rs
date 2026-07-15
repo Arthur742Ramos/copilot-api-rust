@@ -1,3 +1,4 @@
+pub mod alpha_search;
 pub mod chat_completions;
 pub mod count_tokens;
 pub mod images;

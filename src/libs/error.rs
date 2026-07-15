@@ -105,6 +105,8 @@ pub fn is_openai_native_path(path: &str) -> bool {
             | "/v1/responses"
             | "/responses/compact"
             | "/v1/responses/compact"
+            | "/alpha/search"
+            | "/v1/alpha/search"
             | "/chat/completions"
             | "/v1/chat/completions"
             | "/images/generations"
@@ -115,15 +117,21 @@ pub fn is_openai_native_path(path: &str) -> bool {
             | "/v1/models"
     ) || path.starts_with("/responses/")
         || path.starts_with("/v1/responses/")
+        || path.starts_with("/alpha/search/")
+        || path.starts_with("/v1/alpha/search/")
         || path.starts_with("/chat/completions/")
         || path.starts_with("/v1/chat/completions/")
         || path.starts_with("/images/")
         || path.starts_with("/v1/images/")
         || path.starts_with("/models/")
         || path.starts_with("/v1/models/")
-        || path.ends_with("/v1/images/generations")
-        || path.ends_with("/v1/images/edits")
-        || path.ends_with("/v1/models")
+        || path.ends_with("/responses")
+        || path.ends_with("/responses/compact")
+        || path.ends_with("/chat/completions")
+        || path.ends_with("/alpha/search")
+        || path.ends_with("/images/generations")
+        || path.ends_with("/images/edits")
+        || path.ends_with("/models")
 }
 
 pub fn is_files_path(path: &str) -> bool {
@@ -564,12 +572,19 @@ mod tests {
     }
 
     #[test]
-    fn images_routes_use_openai_error_envelopes() {
+    fn openai_provider_routes_use_openai_error_envelopes() {
         for path in [
             "/images/generations",
             "/v1/images/edits",
             "/codex/v1/images/generations",
             "/openrouter/v1/images/edits",
+            "/alpha/search",
+            "/v1/alpha/search",
+            "/codex/alpha/search",
+            "/provider/v1/responses",
+            "/provider/responses/compact",
+            "/provider/v1/chat/completions",
+            "/provider/models",
         ] {
             assert!(is_openai_native_path(path), "{path}");
         }
