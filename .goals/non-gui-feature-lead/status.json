@@ -1,7 +1,7 @@
 {
   "goal_id": "non-gui-feature-lead",
   "status": "inspecting",
-  "iteration": 1,
+  "iteration": 2,
   "builder_model": "OpenAI:GPT-5.6-Sol",
   "inspector_model": "OpenAI:GPT-5.6-Luna",
   "initial_sha": "4dde013890d131e887021c6e948509eb575546a0",
@@ -11,6 +11,11 @@
       "iteration": 1,
       "verdict": "FAIL",
       "summary": "Codex WebSocket pooled reuse/fallback is not state-safe; per-model provider types, Alpha header conformance, and non-TTY/credential safeguards remain incomplete."
+    },
+    {
+      "iteration": 2,
+      "verdict": "PASS",
+      "summary": "All five iteration-1 defects independently verified fixed; protocol, onboarding, integrations, docs, middleware, and native gates remain green."
     }
   ]
 }
