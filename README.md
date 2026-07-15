@@ -1,588 +1,673 @@
+<div align="center">
+
 # copilot-api
 
-An OpenAI- and Anthropic-compatible API gateway for GitHub Copilot, Codex, and
-third-party LLM providers.
+**One local gateway for GitHub Copilot, Claude Code, Codex CLI, and OpenAI-compatible clients.**
 
-> **A Rust port of [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api).**
-> This is an independent Rust re-implementation of the upstream TypeScript
-> project. See [`NOTICE.md`](./NOTICE.md) for attribution.
+Expose OpenAI- and Anthropic-compatible APIs from a native Rust service, then
+route each request to GitHub Copilot, Codex, or a provider you configure.
 
-## What it does
+[![CI](https://github.com/Arthur742Ramos/copilot-api-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Arthur742Ramos/copilot-api-rust/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/copilot-api.svg)](https://crates.io/crates/copilot-api)
+[![Latest release](https://img.shields.io/github/v/release/Arthur742Ramos/copilot-api-rust)](https://github.com/Arthur742Ramos/copilot-api-rust/releases/latest)
+[![License: 0BSD](https://img.shields.io/badge/license-0BSD-blue.svg)](./LICENSE)
+[![Rust 1.82+](https://img.shields.io/badge/rust-1.82%2B-orange.svg)](https://www.rust-lang.org/)
 
-`copilot-api` runs a local HTTP server that translates standard LLM API calls
-into GitHub Copilot requests, using your own Copilot subscription. It exposes:
+[Quick start](#quick-start) |
+[Connect a client](#connect-your-client) |
+[Features](#what-you-get) |
+[Configuration](#configuration) |
+[API reference](#api-reference) |
+[Security](#security)
 
-- **OpenAI-compatible** endpoints: `POST /v1/chat/completions`,
-  `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/images/generations`,
-  `POST /v1/images/edits`
-- **Anthropic-compatible** endpoints: `POST /v1/messages` and
-  `POST /v1/messages/count_tokens`
-- **Local Files API compatibility**: upload once through `/v1/files`, then use
-  the returned `file_id` from Anthropic Messages or OpenAI Responses requests
-- **OpenAI Responses API**: `POST /v1/responses` and Codex compaction at
-  `POST /v1/responses/compact`
-- **Provider routing** for Codex and third-party providers via a
-  `provider/model` alias syntax and per-provider `/:provider/v1/...` routes
+</div>
 
-This lets you point existing OpenAI or Anthropic clients (including Claude Code)
-at a local endpoint backed by GitHub Copilot.
+---
 
-See the [Claude Code / Anthropic API compatibility
-matrix](./docs/claude-code-api-compatibility.md) for audited behaviors,
-intentional divergences, and explicit scope limits.
-The combined [Claude Code 2.1.209 and Codex CLI 0.144.1 compatibility
-guide](./docs/claude-code-codex-compatibility.md) includes exact setup,
-headers, transport evidence, failure behavior, and an opt-in local canary.
+`copilot-api` lets existing AI tools talk to a local endpoint while the gateway
+handles authentication, model discovery, protocol translation, streaming, tool
+calls, provider routing, and usage accounting.
 
-## Install / build
+It began as an independent Rust reimplementation of
+[`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api) and now
+evolves independently. See [`NOTICE.md`](./NOTICE.md) for attribution.
 
-This is a Rust project. Build from source with Cargo:
+> [!IMPORTANT]
+> This is unofficial community software. It is not affiliated with or endorsed
+> by GitHub, Microsoft, OpenAI, or Anthropic. Review the
+> [disclaimer](#disclaimer) and use the project responsibly.
 
-```sh
-cargo build --release
+## What you get
+
+| Capability | What it unlocks |
+| --- | --- |
+| **OpenAI compatibility** | Chat Completions, Responses, compaction, models, embeddings, images, and a local Files API. |
+| **Anthropic compatibility** | Messages, token counting, streaming, thinking blocks, tools, prompt caching, images, PDFs, and local file references. |
+| **Coding-agent support** | Audited integration paths for Claude Code and Codex CLI, including their current headers, request shapes, and SSE lifecycles. |
+| **Backend choice** | Use GitHub Copilot, Codex OAuth, Anthropic, OpenAI-compatible APIs, Responses-compatible APIs, or your own provider aliases. |
+| **Local control** | API keys, admin routes, model mappings, token budgets, rate limits, load shedding, and provider-only mode. |
+| **Operational visibility** | Readiness and version endpoints, Prometheus metrics, structured logs, diagnostics, and a built-in usage dashboard. |
+| **Simple distribution** | Install from crates.io, download a release binary, build from source, or run the published container image. |
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    A[Claude Code] --> G[copilot-api<br/>localhost:4141]
+    B[Codex CLI] --> G
+    C[OpenAI / Anthropic SDKs] --> G
+    D[Other compatible clients] --> G
+
+    G --> E[GitHub Copilot]
+    G --> F[Codex OAuth]
+    G --> H[Third-party providers]
+
+    G --> I[Local files]
+    G --> J[Usage + metrics]
 ```
 
-The binary is produced at `target/release/copilot-api` (on Windows,
-`target\release\copilot-api.exe`). Run it directly or copy it onto your `PATH`.
-
-All examples below assume `copilot-api` is on your `PATH`; otherwise invoke it
-via the full path to the built binary.
-
-## Updating
-
-If you are running a release binary, update it in place with the built-in
-self-updater:
-
-```sh
-copilot-api update          # check, then prompt before replacing the binary
-copilot-api update --yes    # update immediately, no prompt (for scripts/CI)
-copilot-api update --check  # report whether a newer release exists; change nothing
-```
-
-`update` queries the latest [GitHub release][releases], compares it against the
-running version, and — if newer — downloads the binary for your platform and
-atomically swaps the running executable. Restart `copilot-api` afterward for the
-new version to take effect. You can confirm the running build at any time with
-`copilot-api --version` or the `/version` endpoint.
-
-> The self-updater fetches prebuilt release assets, so it works only on the
-> platforms the [release workflow][releases] publishes (Linux x86-64, macOS
-> Apple Silicon, Windows x86-64). On other targets, build from source instead.
->
-> **Docker users:** don't use `update` inside a container — pull the new image
-> instead (`docker compose pull` / `docker pull ghcr.io/arthur742ramos/copilot-api-rust:latest`).
-
-> **Maintainer note:** `update` needs published GitHub releases to exist. Each
-> release is built by `.github/workflows/release.yml` when a `v*` tag is pushed,
-> so cut releases by tagging: `git tag v1.12.5 && git push origin v1.12.5`. The
-> same tag push also publishes the crate to [crates.io][cratesio] (so
-> `cargo install copilot-api` gets the new version): the `publish-crate` job
-> verifies the tag matches the `Cargo.toml` version, then publishes — skipping
-> cleanly if that version is already on crates.io, so re-running a release is
-> safe. Bump the `version` in `Cargo.toml` before tagging, or the job fails the
-> version-match check.
-
-[releases]: https://github.com/Arthur742Ramos/copilot-api-rust/releases
-[cratesio]: https://crates.io/crates/copilot-api
+Clients keep using familiar APIs. The gateway resolves the requested model,
+selects the right upstream transport, translates the request and streaming
+response, and preserves the client-facing protocol.
 
 ## Quick start
 
-1. **Start the server:**
+### 1. Install
 
-   ```sh
-   copilot-api start
-   ```
-
-   On first run, if you are not already authenticated, this kicks off the GitHub
-   device-login flow automatically: it prints a code, opens your browser to
-   GitHub's device page (best-effort), and waits for you to authorize. The
-   GitHub token is then stored locally and reused on subsequent runs. By default
-   the server listens on `127.0.0.1:4141` (loopback only).
-
-   On startup it prints a ready banner showing the exact base URLs to point your
-   clients at.
-
-2. **Point a client at it.** OpenAI-style clients use the base URL
-   `http://localhost:4141/v1`.
-
-### Pre-authenticating separately
-
-If you prefer to run the GitHub login as its own step (for example before
-scripting `start`), use the `auth` subcommand:
+With Cargo:
 
 ```sh
-copilot-api auth
+cargo install copilot-api --locked
 ```
 
-This runs the same device-login flow and stores your GitHub token locally,
-without starting the server.
+Or download a prebuilt binary from the
+[latest release](https://github.com/Arthur742Ramos/copilot-api-rust/releases/latest).
+Release assets are published for Linux x86-64, macOS Apple Silicon, and Windows
+x86-64.
 
-### Non-interactive auth
-
-If you already have a GitHub token (e.g. one generated by `copilot-api auth`),
-you can pass it directly and skip the interactive login:
+### 2. Start the gateway
 
 ```sh
-copilot-api start -g <github-token>
+copilot-api start
 ```
 
-### Launching Claude Code against the gateway
+On first run, `copilot-api` starts GitHub's device-login flow, opens the
+authorization page when possible, stores the token in your local app-data
+directory, and loads the models available to your account.
 
-The `--claude-code` (`-c`) flag prompts you to pick a primary and a small model,
-then builds a shell command that sets the right `ANTHROPIC_*` environment
-variables and launches `claude`. The command is copied to your clipboard (and
-printed if clipboard access fails):
+The server listens on `http://127.0.0.1:4141` by default.
+
+### 3. Confirm it is ready
+
+In another terminal:
+
+```sh
+curl -fsS http://127.0.0.1:4141/readyz
+curl -fsS http://127.0.0.1:4141/v1/models
+```
+
+### 4. Send a request
+
+Choose a model ID returned by `/v1/models`, replace `MODEL_ID`, and call the
+OpenAI-compatible endpoint:
+
+```sh
+curl http://127.0.0.1:4141/v1/chat/completions \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "MODEL_ID",
+    "messages": [
+      {"role": "user", "content": "Explain why Rust is useful for API gateways."}
+    ]
+  }'
+```
+
+That is the complete local path: authenticate once, start one process, and point
+your client at it.
+
+## Connect your client
+
+The most common setup difference is whether the client expects `/v1` in its base
+URL:
+
+| Client | Base URL | Client credential |
+| --- | --- | --- |
+| OpenAI SDKs and compatible apps | `http://127.0.0.1:4141/v1` | Any non-empty value by default; a configured `auth.apiKeys` value when auth is enabled. |
+| Claude Code and Anthropic SDKs | `http://127.0.0.1:4141` | Any non-empty `ANTHROPIC_AUTH_TOKEN` by default; a configured key when auth is enabled. |
+| Codex CLI | `http://127.0.0.1:4141/v1` | `COPILOT_API_KEY`, using the same rule as other client credentials. |
+
+### Claude Code
+
+The guided setup asks you to choose primary and small models, then prints and
+copies a ready-to-run Claude Code command:
 
 ```sh
 copilot-api start --claude-code
 ```
 
-> Tip: `--claude-code` only generates a convenience command. All models remain
-> usable without it — you can also set the model IDs directly in your client
-> configuration.
-
-## Pointing clients at it
-
-- **OpenAI clients:** set `base_url` to `http://localhost:4141/v1` (any API key
-  string works unless you have configured `auth.apiKeys` — see
-  [Security](#security-warning)).
-- **Claude Code / Anthropic clients:** set
-  `ANTHROPIC_BASE_URL=http://localhost:4141` and
-  `ANTHROPIC_AUTH_TOKEN` to any non-empty value (e.g. `dummy`).
-- **Codex CLI 0.144.1:** configure a custom model provider with
-  `base_url = "http://localhost:4141/v1"` and `wire_api = "responses"`.
-  See the [audited client guide](./docs/claude-code-codex-compatibility.md#codex-cli-01441-setup)
-  for the complete `config.toml`.
-
-## Running with Docker
-
-A multi-stage [`Dockerfile`](./Dockerfile) builds a slim runtime image. The
-server persists its GitHub token and config under `COPILOT_API_HOME` (set to
-`/data` in the image and exposed as a volume), so mount a volume there to keep
-state across restarts.
-
-The image sets `COPILOT_API_HOST=0.0.0.0` so the server binds all interfaces
-inside the container and Docker's published port (`-p`) is reachable. (The
-binary itself defaults to `127.0.0.1`; see [Security](#security-warning).)
-
-### With Docker Compose (recommended)
-
-A [`docker-compose.yml`](./docker-compose.yml) is provided:
+For manual setup:
 
 ```sh
-# First run: authenticate (device-code flow). State is kept in a named volume.
-docker compose run --rm copilot-api auth
-
-# Start the server (published on http://localhost:4141).
-docker compose up
+export ANTHROPIC_BASE_URL="http://127.0.0.1:4141"
+export ANTHROPIC_AUTH_TOKEN="local"
+export ANTHROPIC_MODEL="MODEL_ID"
+claude
 ```
 
-### With plain `docker run`
+Replace `MODEL_ID` with a model from `/v1/models`. If you configure
+`auth.apiKeys`, replace `local` with one of those keys.
+
+The detailed [Claude Code compatibility contract](./docs/claude-code-api-compatibility.md)
+documents supported content blocks, tools, thinking, streaming behavior, error
+semantics, and explicit limits.
+
+### Codex CLI
+
+Add a custom provider to `~/.codex/config.toml`:
+
+```toml
+model = "gpt-5.4"
+model_provider = "copilot_api"
+
+[model_providers.copilot_api]
+name = "copilot_api"
+base_url = "http://127.0.0.1:4141/v1"
+env_key = "COPILOT_API_KEY"
+wire_api = "responses"
+```
+
+Then launch Codex:
 
 ```sh
-# Build the image
-docker build -t copilot-api .
-
-# First run: authenticate (device-code flow). Keep state in a named volume.
-docker run -it --rm -v copilot-api-data:/data copilot-api auth
-
-# Start the server, publishing the port.
-docker run --rm -p 4141:4141 -v copilot-api-data:/data copilot-api
+export COPILOT_API_KEY="local"
+codex
 ```
 
-The container `HEALTHCHECK` probes `/readyz`, so Docker only reports the
-container healthy once a Copilot token and the model list are loaded.
+The public Responses WebSocket transport is not exposed, so leave
+`supports_websockets` unset or `false`. The
+[combined Claude Code and Codex guide](./docs/claude-code-codex-compatibility.md)
+contains the audited client versions, headers, request shapes, compaction
+behavior, and reproducible test evidence.
 
-Configuration is available via environment variables, which is convenient in
-containers (the `start` flags below have matching `COPILOT_API_*` variables):
+### OpenAI SDKs
 
-| Variable | Equivalent flag | Description |
-| -------- | --------------- | ----------- |
-| `COPILOT_API_PORT` | `--port` | Port to listen on (also used by the healthcheck). |
-| `COPILOT_API_HOST` | `--host` | Interface to bind. The image defaults this to `0.0.0.0`. |
-| `COPILOT_API_ACCOUNT_TYPE` | `--account-type` | Account type: `individual`, `business`, `enterprise`. |
-| `COPILOT_API_GITHUB_TOKEN` | `--github-token` | GitHub token for non-interactive startup. |
-| `COPILOT_API_HOME` | `--api-home` | App data / token directory. |
-| `COPILOT_API_OAUTH_APP` | `--oauth-app` | OAuth app identifier. |
-| `COPILOT_API_ENTERPRISE_URL` | `--enterprise-url` | Enterprise URL for GitHub. |
-| `COPILOT_API_LOG_FORMAT` | _(env only)_ | Set to `json` for structured JSON logs; defaults to the human-readable format. |
-| `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS` | _(env only)_ | Days of `token_usage_events` to retain before pruning (default `45`; `<= 0` disables pruning). |
-| `COPILOT_API_FILE_MAX_BYTES` | _(env only)_ | Maximum size of one local Files API upload (default `20971520`, 20 MiB; capped below the gateway's 32 MiB request limit). |
-| `COPILOT_API_FILE_MAX_OWNER_BYTES` | _(env only)_ | Maximum stored Files API bytes per API-key identity (default `536870912`, 512 MiB). |
-| `COPILOT_API_FILE_MAX_OWNER_COUNT` | _(env only)_ | Maximum number of stored files per API-key identity (default and hard ceiling `1000`; lower values are accepted). |
-| `COPILOT_API_FILE_RETENTION_DAYS` | _(env only)_ | Days to retain local Files API uploads (default `30`; `0` disables expiry). Expired content is removed lazily during upload/list operations. |
-| `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | _(env only)_ | Max seconds of silence on an upstream HTTP or WebSocket stream before the connection is treated as stalled and dropped (default `120`; `0` disables the read timeout). Raise it if legitimately slow generations are being cut off mid-stream. |
-| `COPILOT_API_SSE_HEARTBEAT_SECS` | _(env only)_ | Idle window (seconds) after which the proxy injects a keep-alive frame into a streaming response so long "thinking" gaps survive intermediaries (nginx/ALB) with sub-120s idle timeouts (default `15`; `0` disables heartbeats). A heartbeat is a no-op ping (Anthropic `event: ping` on `/v1/messages`, an SSE comment on `/responses`) and never affects token-usage or latency metrics. |
-| `COPILOT_API_MAX_CONCURRENT_REQUESTS` | `--max-concurrent-requests` | Optional fail-fast cap on concurrent upstream-facing proxy requests. Unset (default) means unlimited; `64` is recommended for a desktop process with a 256-FD soft limit. When configured, excess requests receive a retryable `503 Service Unavailable` with `Retry-After: 1`. |
-| `COPILOT_API_RATE_LIMIT_MAX_WAITERS` | _(env only)_ | In rate-limit wait mode, the maximum number of requests allowed to be queued (sleeping) at once. When the queue is full, new arrivals are rejected with `429 Too Many Requests` rather than enqueued. Unset (default) means unlimited. |
-| `COPILOT_API_RATE_LIMIT_MAX_WAIT_SECS` | _(env only)_ | In rate-limit wait mode, the maximum number of seconds a request is allowed to wait in the queue. Requests whose projected wait would exceed this limit are rejected with `429 Too Many Requests`. Unset (default) means no limit. |
-| `COPILOT_API_UPSTREAM_RETRY_5XX` | _(env only)_ | Set to `true` to retry transient upstream 5xx errors on **non-billable** routes (e.g. model list, version checks). Billable generation routes (`/v1/messages`, `/v1/responses`, `/v1/chat/completions`) always use a no-retry policy regardless of this setting to avoid double-billing. Default `false`. |
-| `COPILOT_API_ALLOW_REMOTE_NO_KEY` | `--allow-remote-no-key` | Allow binding to a non-loopback interface without any API key configured. Without this flag (the default), starting the server on a publicly-reachable address with no authentication is a hard error. |
-| `COPILOT_API_PROVIDER_ONLY` | `--provider-only` | Start the proxy in provider-only mode, routing all traffic through the named provider (e.g. `openai`). In this mode the proxy skips GitHub/Copilot token acquisition, model cache priming, and token-budget checks. `/readyz` returns immediately with `{"status":"ready","mode":"provider_only","provider":"<name>"}`. |
+Any client that supports a custom OpenAI base URL can use the gateway. For
+example, with the Python SDK:
 
-Example:
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:4141/v1",
+    api_key="local",
+)
+
+response = client.chat.completions.create(
+    model="MODEL_ID",
+    messages=[{"role": "user", "content": "Say hello in one sentence."}],
+)
+
+print(response.choices[0].message.content)
+```
+
+Use a model returned by `/v1/models`. The same base URL works for clients using
+the Responses API.
+
+## Install and run
+
+### Prebuilt releases
+
+The [Releases page](https://github.com/Arthur742Ramos/copilot-api-rust/releases)
+contains native binaries for:
+
+- Linux x86-64
+- macOS Apple Silicon
+- Windows x86-64
+
+Place the binary on your `PATH`, then run `copilot-api start`.
+
+### Cargo
+
+Install the published crate:
 
 ```sh
-docker run --rm -p 8080:8080 \
-  -e COPILOT_API_PORT=8080 \
-  -e COPILOT_API_GITHUB_TOKEN=<github-token> \
-  -e COPILOT_API_MAX_CONCURRENT_REQUESTS=64 \
-  -v copilot-api-data:/data copilot-api
+cargo install copilot-api --locked
 ```
 
-### Concurrency and file-descriptor headroom
+Rust 1.82 or newer is required.
 
-Concurrency is unlimited by default. For long-running desktop services, set
-`COPILOT_API_MAX_CONCURRENT_REQUESTS=64` (or
-`--max-concurrent-requests 64`) so a client burst cannot consume every process
-file descriptor. The admission check is fail-fast: it never queues excess
-inbound requests, never terminates an already-admitted stream, and holds each
-slot until the complete response body reaches EOF or is dropped because of an
-upstream error or client disconnect. Liveness, readiness, version, metrics,
-usage, and admin/control routes remain outside the cap.
-The former `COPILOT_API_MAX_IN_FLIGHT` variable is still accepted as a
-deprecated fallback.
-
-The shared HTTP clients also retain at most eight idle connections per upstream
-host. On Unix, server startup makes a best-effort attempt to raise the process
-soft file-descriptor limit to `4096`, never exceeding the inherited hard limit.
-If launchd/systemd supplies a lower hard limit, configure
-`NumberOfFiles`/`LimitNOFILE` in the deployment that owns the service. OS limits
-provide secondary headroom; they do not replace application-level admission.
-This repository does not generate launchd service files.
-
-For a macOS LaunchAgent, add resource limits such as:
-
-```xml
-<key>SoftResourceLimits</key>
-<dict>
-  <key>NumberOfFiles</key>
-  <integer>4096</integer>
-</dict>
-<key>HardResourceLimits</key>
-<dict>
-  <key>NumberOfFiles</key>
-  <integer>8192</integer>
-</dict>
-```
-
-Reload the launchd job after editing its plist; changing `ulimit -n` in an
-interactive shell does not update an already-running service.
-
-Prometheus exports `proxy_upstream_concurrency_limit` (`0` means unlimited),
-`proxy_upstream_requests_active`, and
-`proxy_upstream_overload_rejections_total`.
-
-## Logging
-
-Logging uses the [`tracing`](https://docs.rs/tracing) ecosystem and is
-controlled by environment variables:
-
-- `RUST_LOG` sets the log filter (e.g. `RUST_LOG=debug`,
-  `RUST_LOG=copilot_api=debug,hyper=warn`). When unset, the level defaults to
-  `info` (or `debug` when `--verbose` / `-v` is passed).
-- `COPILOT_API_LOG_FORMAT=json` switches log output from the default
-  human-readable format to structured JSON lines, which is handy for shipping
-  logs to a collector. Any other value keeps the default format.
-
-## CLI reference
-
-Global usage: `copilot-api [GLOBAL OPTIONS] <SUBCOMMAND>`
-
-### Subcommands
-
-| Subcommand     | Description |
-| -------------- | ----------- |
-| `start`        | Start the Copilot API server. |
-| `auth`         | Run authentication flows without starting the server. |
-| `check-usage`  | Show current GitHub Copilot usage / quota information. |
-| `debug`        | Print environment, provider, and path diagnostics. Add `--json` for JSON output. |
-| `doctor`       | Run a one-shot preflight over auth, providers, and config; exits non-zero on any `FAIL`. Add `--json` for JSON output. |
-| `mcp`          | Start the MCP bridge server over stdio (`tool_search` + `generate_image` tools). |
-| `update`       | Update copilot-api in place to the latest GitHub release. |
-
-### Global options
-
-These apply to every subcommand:
-
-| Flag                       | Description |
-| -------------------------- | ----------- |
-| `--api-home <PATH>`        | Path to the API home directory (sets `COPILOT_API_HOME`). |
-| `--oauth-app <NAME>`       | OAuth app identifier (sets `COPILOT_API_OAUTH_APP`). |
-| `--enterprise-url <URL>`   | Enterprise URL for GitHub (sets `COPILOT_API_ENTERPRISE_URL`). |
-
-### `start` flags
-
-| Flag | Alias | Default | Description |
-| ---- | ----- | ------- | ----------- |
-| `--port <PORT>` | `-p` | `4141` | Port to listen on. Env: `COPILOT_API_PORT`. |
-| `--host <HOST>` | `-H` | `127.0.0.1` | Interface to bind. Accepts an IP literal or `localhost`. Use `0.0.0.0` to expose on the LAN / make Docker `-p` work. Env: `COPILOT_API_HOST`. |
-| `--verbose` | `-v` | `false` | Enable verbose (debug) logging. |
-| `--account-type <TYPE>` | `-a` | `individual` | Account type: `individual`, `business`, or `enterprise`. Env: `COPILOT_API_ACCOUNT_TYPE`. |
-| `--manual` | | `false` | Enable manual request approval. |
-| `--rate-limit <SECONDS>` | `-r` | (none) | Minimum seconds between requests. |
-| `--max-concurrent-requests <COUNT>` | | (unlimited) | Fail-fast cap for upstream-facing requests. Slots are held for the complete response-body/stream lifetime. Env: `COPILOT_API_MAX_CONCURRENT_REQUESTS`. |
-| `--wait` | `-w` | `false` | Wait instead of erroring when the rate limit is hit. |
-| `--github-token <TOKEN>` | `-g` | (none) | Provide a GitHub token directly (non-interactive). Env: `COPILOT_API_GITHUB_TOKEN`. |
-| `--claude-code` | `-c` | `false` | Generate a clipboard command to launch Claude Code against the gateway. |
-| `--show-token` | | `false` | Show GitHub and Copilot tokens on fetch and refresh. |
-| `--proxy-env` | | `false` | Initialize the HTTP proxy from environment variables. Responses requests use HTTP instead of WebSocket so they also traverse the proxy. |
-
-### `auth` flags
-
-| Flag | Default | Description |
-| ---- | ------- | ----------- |
-| `--provider <NAME>` | `copilot` | Provider to log in with: `copilot` or `codex`. |
-| `--verbose` / `-v` | `false` | Enable verbose logging. |
-| `--show-token` | `false` | Show the provider access token on auth. |
-
-### `doctor` preflight
-
-`copilot-api doctor` runs a one-shot health check and exits non-zero when any
-check reports `FAIL`, so it can gate a CI step or a deployment script:
+### Build from source
 
 ```sh
-copilot-api doctor          # human-readable summary
-copilot-api doctor --json   # machine-readable report (checks, summary, exitCode)
+git clone https://github.com/Arthur742Ramos/copilot-api-rust.git
+cd copilot-api-rust
+cargo build --release --locked
 ```
 
-Each check reports `OK | WARN | FAIL` with a short, secret-free message (tokens
-and apiKeys are never printed). Checks performed:
+The binary is written to `target/release/copilot-api` (or
+`target\release\copilot-api.exe` on Windows).
 
-- **Auth** — GitHub token present and usable; Copilot token obtained and fresh;
-  Codex credentials present and unexpired (only when a `codex` provider is
-  configured). A missing GitHub token `FAIL`s without starting the interactive
-  device-code login.
-- **Providers** — every enabled third-party provider is actively probed
-  (`GET {baseUrl}/v1/models`). `200`/`404` is `OK`; `401`/`403` is `FAIL` (bad
-  apiKey); an SSRF-blocked base URL or a connect/timeout failure is `FAIL`.
-- **Config model-id drift** — `smallModel`, `messageApiWebSearchModel`,
-  `imageChatModel`, and the model-keyed maps (`modelMappings` targets,
-  `modelReasoningEfforts`, `extraPrompts`) are cross-checked against the model
-  catalog they belong to. A dangling id silently no-ops at runtime, so it is
-  reported as a `WARN` (it never fails the preflight).
+### Docker
 
-The exit code is `0` when no check `FAIL`s (WARNs are advisory) and `1`
-otherwise.
-
-## MCP bridge (image generation in Claude Code)
-
-The `mcp` subcommand runs a stdio MCP server exposing a `generate_image` tool, so
-Claude Code (or any MCP host) can generate images natively — you ask in plain
-language and the model calls the tool.
-
-It uses the same Codex (Sign in with ChatGPT) backend as
-`POST /v1/images/generations`, so it requires `copilot-api auth --provider codex`
-first.
-
-Register it with Claude Code once:
+The published image persists tokens and configuration under `/data`. This
+local-only example binds the host port to loopback:
 
 ```sh
-claude mcp add copilot-images -- copilot-api mcp
+docker pull ghcr.io/arthur742ramos/copilot-api-rust:latest
+docker volume create copilot-api-data
+
+# Authenticate once.
+docker run -it --rm \
+  -v copilot-api-data:/data \
+  ghcr.io/arthur742ramos/copilot-api-rust:latest auth
+
+# Start the gateway.
+docker run --rm \
+  -p 127.0.0.1:4141:4141 \
+  -e COPILOT_API_ALLOW_REMOTE_NO_KEY=true \
+  -v copilot-api-data:/data \
+  ghcr.io/arthur742ramos/copilot-api-rust:latest
 ```
 
-Then in a session, just ask: *"generate an image of a red fox in a snowy
-forest"*. The tool returns two things:
+The explicit `COPILOT_API_ALLOW_REMOTE_NO_KEY=true` is needed because the process
+binds `0.0.0.0` inside the container. Publishing the port only on
+`127.0.0.1` keeps this example local to the host. For any network-accessible
+deployment, configure `auth.apiKeys` instead of using that override.
 
-- a **saved file** under `<app-data>/images/` (always reliable — you get a PNG on
-  disk regardless of how the host renders it), and
-- the **inline image** as MCP image content, which the host converts into a
-  vision block so the model can see the result and you can iterate ("make it
-  wider", "now at night").
+A [`Dockerfile`](./Dockerfile) and [`docker-compose.yml`](./docker-compose.yml)
+are included for source builds and customized deployments. The container
+healthcheck probes `/readyz`.
 
-> Note: whether the host forwards the full inline image to the model (vs.
-> truncating it on its MCP output-token cap) is host-dependent; the saved file
-> path is the reliable signal that generation succeeded. As with the HTTP image
-> route, this rides an undocumented Codex backend and may change without notice.
+### Update an installed binary
 
-## Endpoints
+```sh
+copilot-api update          # check and ask before replacing the binary
+copilot-api update --yes    # update without prompting
+copilot-api update --check  # check only
+```
 
-By default the server binds to `127.0.0.1:<port>` (loopback only). Pass
-`-H/--host 0.0.0.0` to expose it on all interfaces (LAN). Routes (from
-`src/server.rs`):
+The updater verifies the latest GitHub release and atomically replaces the
+current executable on supported release platforms. Restart the process
+afterward. Container users should pull a newer image instead.
 
-| Method | Path | Description |
-| ------ | ---- | ----------- |
-| `GET`  | `/` | Liveness check (`Server running`). |
-| `GET`  | `/readyz` | Readiness probe; `200` only once a Copilot token and the model list are loaded, `503` otherwise. |
-| `GET`  | `/version` | Build metadata: crate version, git SHA, and build timestamp. |
-| `GET`  | `/metrics` | Prometheus metrics (text exposition). Subject to the normal API-key check: open only when `auth.apiKeys` is empty, otherwise a key is required. |
-| `GET`  | `/usage-viewer`, `/usage-viewer/` | Self-contained usage dashboard (renders the `/token-usage` data). |
-| `POST` | `/chat/completions`, `/v1/chat/completions` | OpenAI-compatible chat completions. |
-| `GET`  | `/models`, `/v1/models` | List available models. |
-| `POST` | `/embeddings`, `/v1/embeddings` | OpenAI-compatible embeddings. |
-| `POST` | `/images/generations`, `/v1/images/generations` | OpenAI-compatible image generation proxied to the native Codex Images API (requires Codex / Sign in with ChatGPT credentials). |
-| `POST` | `/images/edits`, `/v1/images/edits` | OpenAI-compatible multipart image edits proxied to the native Codex Images API. |
-| `POST` | `/:provider/v1/images/generations`, `/:provider/v1/images/edits` | Provider-scoped image generation or edits. |
-| `GET`  | `/usage` | Copilot usage data. |
-| `GET`  | `/token` | Returns the live Copilot bearer token (see [Security](#security-warning)). |
-| `*`    | `/token-usage`, `/token-usage/` | Token-usage subsystem routes. |
-| `POST` | `/responses`, `/v1/responses` | OpenAI Responses API. |
-| `POST` | `/responses/compact`, `/v1/responses/compact` | Unary Responses compaction used by Codex CLI. |
-| `POST` | `/v1/messages` | Anthropic-compatible messages. |
-| `POST` | `/v1/messages/count_tokens` | Anthropic token counting. |
-| `GET` / `POST` | `/files`, `/v1/files` | List or upload locally stored files. Anthropic headers select Anthropic metadata; other requests use OpenAI metadata and require `purpose` on upload. |
-| `GET` / `DELETE` | `/files/:id`, `/v1/files/:id` | Retrieve metadata or delete an owner-scoped local file. |
-| `GET` | `/files/:id/content`, `/v1/files/:id/content` | Download local file content. |
-| `GET` / `POST` | `/admin/config/model-mappings` | Read / write the model-mapping table (admin auth). |
-| `GET` | `/admin/config` | Read the effective merged runtime config with all secrets stripped from `config`; presence indicators (which secrets are set, the `apiKeys` count, which providers have a key) are reported under a separate `secrets` object (admin auth). |
-| `GET` / `POST` | `/admin/config/providers` | List / upsert third-party providers; `apiKey` is redacted to `apiKeySet` in responses (admin auth). |
-| `GET` | `/admin/providers/health` | Actively probe every enabled third-party provider (`GET {baseUrl}/v1/models`, concurrent, 4s per-probe timeout) so a bad `apiKey` / wrong `baseUrl` / unreachable host surfaces immediately; reports per provider `reachable`, the raw HTTP `status` (distinguishes 401 vs 404 vs connect error), and `latencyMs`. Builtin copilot/codex are reported by token freshness instead of an HTTP probe. No secrets are returned (admin auth). |
-| `POST` | `/admin/config/reload` | Re-read `config.json` from disk without restarting; returns a secret-redacted summary (admin auth). |
-| `POST` | `/:provider/v1/messages` | Provider-routed Anthropic messages. |
-| `POST` | `/:provider/v1/messages/count_tokens` | Provider-routed token counting. |
-| `GET`  | `/:provider/v1/models` | Provider-routed model list. |
+## Highlights
 
-### Local Files API
+### Protocol translation that goes beyond text
 
-Copilot has no upstream Files API, so uploads are kept locally under
-`COPILOT_API_HOME/files` with SQLite metadata and owner-only filesystem
-permissions where the platform supports them. File IDs are scoped to a stable
-fingerprint of the authenticated API key (labels are not authorization
-principals); when API authentication is disabled, all callers share the
-`unauthenticated-local` scope.
+The gateway handles:
 
-Anthropic image/document file references and OpenAI Responses
-`input_image.file_id`/`input_file.file_id` references are expanded to inline
-base64 immediately before dispatch. Only the inline data reaches the selected
-provider. Anthropic image references support JPEG, PNG, GIF, and WebP;
-document references support PDF and plain text. `container_upload` and
-provider-hosted file IDs are not supported.
+- JSON and SSE streaming responses
+- tool definitions, tool choice, parallel calls, and fragmented arguments
+- Anthropic thinking blocks and OpenAI reasoning items
+- prompt caching and `cache_control`
+- text, image, PDF, and tool-result content
+- OpenAI Responses continuation items and remote compaction
+- safe, SDK-recognizable error envelopes
+- unknown JSON fields where the destination protocol can represent them
+
+The compatibility guides document where translation is exact, where it is a
+deliberate safety improvement, and where a feature is out of scope.
+
+### Route models to the backend you want
+
+Configure Anthropic, OpenAI-compatible, or Responses-compatible providers, then
+address a model as `provider/model`:
+
+```text
+team-openai/gpt-5
+research-anthropic/claude-sonnet-4-6
+```
+
+The provider prefix selects credentials and transport; only the model suffix is
+sent upstream. You can also remap model IDs globally with `modelMappings`, or
+start without GitHub authentication in provider-only mode:
+
+```sh
+copilot-api start --provider-only team-openai
+```
+
+### Keep files local
+
+Copilot does not expose a Files API, so this project provides an owner-scoped
+local implementation backed by SQLite metadata and local storage. Upload once,
+then reference the returned `file_id` from Anthropic Messages or OpenAI
+Responses. Supported references are expanded to inline data immediately before
+dispatch; only the inline content reaches the selected provider.
+
+### Operate it like a service
+
+| Surface | Purpose |
+| --- | --- |
+| `/readyz` | Readiness probe for orchestration and startup checks. |
+| `/version` | Crate version, git SHA, and build timestamp. |
+| `/metrics` | Prometheus metrics for requests, upstreams, retries, quotas, and concurrency. |
+| `/usage-viewer` | Self-contained browser dashboard for local token usage. |
+| `copilot-api doctor` | Secret-free auth, config, and provider preflight with a non-zero failure exit code. |
+| `copilot-api debug` | Environment, provider, and path diagnostics; supports JSON output. |
+
+Structured JSON logs are available with `COPILOT_API_LOG_FORMAT=json`; use
+`RUST_LOG` for filtering.
+
+## MCP bridge
+
+The `mcp` subcommand runs a stdio MCP server with:
+
+- `search` for loading deferred tools through the gateway's tool-search bridge
+- `generate_image` for Codex-backed image generation, returning both inline
+  image content and a saved local file
+
+Register it with Claude Code:
+
+```sh
+claude mcp add copilot-api -- copilot-api mcp
+```
+
+Image generation requires Codex credentials:
+
+```sh
+copilot-api auth --provider codex
+```
+
+The image path uses an undocumented Codex backend and can change without notice.
 
 ## Configuration
 
-On first run a `config.json` is created in the app data directory. By default
-this is:
+On first run, the gateway creates `config.json` in its platform-specific app-data
+directory. Run `copilot-api debug` to print the exact paths in use, or override
+the directory with:
 
+```sh
+copilot-api --api-home /path/to/data start
+# or
+export COPILOT_API_HOME="/path/to/data"
 ```
-<home>/.local/share/copilot-api/config.json
-```
 
-(`<home>` is your OS home directory.) Override the directory with
-`--api-home <PATH>` or the `COPILOT_API_HOME` environment variable. The GitHub
-token and Codex credentials live in the same directory
-(`github_token`, `codex_credentials.json`).
+The GitHub token, Codex credentials, local files, and usage database live under
+the same app-data directory.
 
-### Schema
+### Core schema
 
-Key fields (from `src/libs/config.rs`):
+The generated file contains more model defaults; these are the fields most users
+customize:
 
 ```jsonc
 {
   "auth": {
-    "apiKeys": [],          // client API keys accepted by the server (see Security)
-    "adminApiKey": "..."    // auto-generated key required for /admin/* routes
+    "apiKeys": ["replace-with-a-random-client-key"],
+    "adminApiKey": "generated-automatically"
   },
-  "providers": {            // map of name -> provider config (the "copilot" name is reserved)
-    "<name>": {
-      "type": "anthropic",  // anthropic | openai-compatible | openai-responses
+  "providers": {
+    "team-openai": {
+      "type": "openai-compatible",
       "enabled": true,
-      "baseUrl": "https://...",
-      "apiKey": "...",
-      "authType": "x-api-key", // authorization | x-api-key | oauth2 (oauth2 only for builtin codex)
-      "models": { "<model-id>": { /* per-model overrides */ } },
-      "adjustInputTokens": false
+      "baseUrl": "https://provider.example.com",
+      "apiKey": "provider-secret",
+      "authType": "authorization",
+      "models": {}
     }
   },
-  "modelMappings": {        // map source model id -> target model id
-    "<source>": "<target>"
+  "modelMappings": {
+    "friendly-model": "team-openai/upstream-model-id"
   },
   "smallModel": "gpt-5-mini",
-  "extraPrompts": { "<model>": "..." },
-  "modelReasoningEfforts": { "<model>": "high" },
-  "anthropicApiKey": "...",
-  "dailyTokenBudget": 5000000, // reject new requests with 429 once this many
-                               // tokens are recorded in the local day (omit or
-                               // <= 0 to disable)
-  "imageChatModel": "gpt-5.5",  // Responses model used by the MCP image tool
-  "imageModel": "gpt-image-2"   // default HTTP/MCP image model
+  "modelReasoningEfforts": {
+    "gpt-5.4": "high"
+  },
+  "extraPrompts": {},
+  "anthropicApiKey": "optional-token-counting-only",
+  "dailyTokenBudget": 5000000,
+  "imageChatModel": "gpt-5.5",
+  "imageModel": "gpt-image-2"
 }
 ```
 
 Notes:
 
-- A provider is only used if it is enabled and has a valid `baseUrl` (and an
-  `apiKey`, unless it is the builtin `codex` provider using `oauth2`).
-- `adminApiKey` is generated automatically on startup if not set; it is required
-  to call the `/admin/*` routes.
-- `dailyTokenBudget` is a coarse spend guardrail: usage is recorded after each
-  response completes, so enforcement gates on cumulative spend so far and can
-  overshoot by at most the requests already in flight when the cap is crossed.
+- `adminApiKey` is generated automatically and always protects `/admin/*`.
+- Provider types are `anthropic`, `openai-compatible`, and
+  `openai-responses`.
+- The provider name `copilot` is reserved.
+- Unknown configuration keys are preserved when the file is round-tripped.
+- `dailyTokenBudget` rejects new work with `429` after the recorded local-day
+  total reaches the configured guardrail. In-flight requests can overshoot it.
 - `POST /v1/images/generations` and `/v1/images/edits` proxy the native Codex
-  Images API using your Codex (Sign in with ChatGPT) credentials, so they require
-  `copilot-api auth --provider codex`. Generation requests default `model` to
-  `imageModel` when omitted; edits preserve the incoming multipart content type
-  and bytes. Query parameters, compatible request headers, and the upstream
-  response contract are preserved. Both routes use the same rate-limit /
-  `dailyTokenBudget` admission gates and record upstream image usage when the
-  response is small enough to inspect. The MCP `generate_image` tool still uses
-  `imageChatModel` plus `imageModel` through Responses because it needs to save
-  the returned image locally. These Codex endpoints are undocumented and may
-  change without notice.
+  Images API using Codex OAuth credentials. Generation requests default an
+  omitted `model` from `imageModel`; edits preserve multipart content types and
+  bytes. The MCP `generate_image` tool still uses `imageChatModel` and
+  `imageModel` through Responses so it can save the returned image locally.
 
-### Exact token counts for Claude models
+### Exact Claude token counts
 
-Set the top-level `anthropicApiKey` field (or the `ANTHROPIC_API_KEY`
-environment variable) to your Anthropic API key to get **exact** token counts
-for Claude models on `POST /v1/messages/count_tokens`. With it set, the gateway
-forwards count requests to Anthropic's free `count_tokens` endpoint, so Claude
-Code's context-window bar and auto-compact thresholds are accurate.
+Set `anthropicApiKey` or `ANTHROPIC_API_KEY` to use Anthropic's free
+`count_tokens` endpoint for exact Claude counts:
 
-Without it, counts are **estimated** with a tokenizer approximation, which is
-slightly off. The key is used **only** for the `count_tokens` endpoint and is
-never used for generation — generation always goes through GitHub Copilot.
+```sh
+export ANTHROPIC_API_KEY="..."
+```
 
-### `provider/model` alias routing
+The key is used only by `POST /v1/messages/count_tokens`; model generation still
+uses the selected Copilot or configured-provider route. Without it, Claude token
+counts use a local approximation.
 
-Any model ID containing a `/` is parsed as `provider/model`. For example,
-requesting the model `myprovider/claude-3.5-sonnet` routes the request to the
-provider named `myprovider` (from `providers` in `config.json`) using the model
-`claude-3.5-sonnet`. The part before the first `/` is the provider name; the
-rest is the model ID passed to that provider. The name `copilot` is reserved.
+## Security
 
-## Security warning
+> [!WARNING]
+> Local client authentication is disabled by default. Keep the default loopback
+> bind unless you configure API keys.
 
-> **By default, the server is UNAUTHENTICATED.**
+The safe default is `127.0.0.1:4141`, which is reachable only from the same
+machine. If `auth.apiKeys` is empty, local requests may use any credential value
+and `GET /token` can return the live Copilot bearer token.
 
-The generated `config.json` ships with `auth.apiKeys` set to an empty list.
-When `auth.apiKeys` is empty, the general auth layer allows **every** request
-through with no API key. That means anyone who can reach the listening port can:
+The server **refuses to bind a non-loopback address without API keys** unless you
+explicitly pass `--allow-remote-no-key`. For LAN, container, or hosted use:
 
-- use your GitHub Copilot subscription through the gateway, and
-- read your **live GitHub Copilot bearer token** via `GET /token`.
+1. Set one or more strong random values in `auth.apiKeys`.
+2. Send a matching value with `Authorization: Bearer <key>` or `x-api-key`.
+3. Restrict the port with a firewall or private network.
+4. Add TLS at a trusted reverse proxy when traffic leaves the host.
+5. Never expose `/token` to untrusted clients.
 
-By default the server binds to loopback (`127.0.0.1`), so it is only reachable
-from the same machine. If you pass `-H 0.0.0.0` (or another non-loopback host —
-as the Docker image does), it becomes reachable from other machines on your
-network; in that case configure `auth.apiKeys` and/or a firewall. The server
-logs a warning whenever it binds to a non-loopback interface.
+Admin routes always require the separately generated `auth.adminApiKey`.
 
-If you are on a shared or untrusted machine/network:
+## API reference
 
-- Set `auth.apiKeys` to one or more non-empty strings in `config.json`. Clients
-  must then send a matching key via the `x-api-key` header or an
-  `Authorization: Bearer <key>` header.
-- Restrict access to the port (firewall, or only expose it on `localhost`).
+<details>
+<summary><strong>CLI commands and flags</strong></summary>
 
-The `/admin/*` routes are separately protected by `auth.adminApiKey`, which is
-always required regardless of `auth.apiKeys`.
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `start` | Start the API gateway. |
+| `auth` | Authenticate without starting the server. |
+| `check-usage` | Show current GitHub Copilot usage and quota information. |
+| `debug` | Print secret-free environment, provider, and path diagnostics. |
+| `doctor` | Run auth, config, and provider preflight checks. |
+| `mcp` | Start the MCP bridge over stdio. |
+| `update` | Update a release binary in place. |
+
+### Global flags
+
+| Flag | Description |
+| --- | --- |
+| `--api-home <PATH>` | Override the app-data directory. |
+| `--oauth-app <NAME>` | Override the GitHub OAuth app identifier. |
+| `--enterprise-url <URL>` | Set the GitHub Enterprise URL. |
+
+### `start` flags
+
+| Flag | Alias | Default | Description |
+| --- | --- | --- | --- |
+| `--port <PORT>` | `-p` | `4141` | Listen port. Env: `COPILOT_API_PORT`. |
+| `--host <HOST>` | `-H` | `127.0.0.1` | Listen IP or `localhost`. Env: `COPILOT_API_HOST`. |
+| `--verbose` | `-v` | `false` | Enable debug logging. |
+| `--account-type <TYPE>` | `-a` | `individual` | `individual`, `business`, or `enterprise`. |
+| `--manual` | | `false` | Require manual request approval. |
+| `--rate-limit <SECONDS>` | `-r` | none | Minimum interval between requests. |
+| `--max-concurrent-requests <COUNT>` | | unlimited | Fail-fast cap for upstream-facing requests. |
+| `--wait` | `-w` | `false` | Wait instead of immediately failing at the rate limit. |
+| `--github-token <TOKEN>` | `-g` | none | Supply a GitHub token non-interactively. |
+| `--claude-code` | `-c` | `false` | Generate a Claude Code launch command. |
+| `--show-token` | | `false` | Print fetched and refreshed provider tokens. |
+| `--proxy-env` | | `false` | Initialize outbound HTTP proxy settings from environment variables. |
+| `--allow-remote-no-key` | | `false` | Explicitly allow non-loopback binding with no client API keys. |
+| `--provider-only <NAME>` | | none | Skip Copilot auth and route all traffic to one configured provider. |
+
+### `auth` flags
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--provider <NAME>` | `copilot` | Authenticate `copilot` or `codex`. |
+| `--verbose` / `-v` | `false` | Enable debug logging. |
+| `--show-token` | `false` | Print the provider access token. |
+
+### `update` flags
+
+| Flag | Description |
+| --- | --- |
+| `--check` | Check for a newer release without changing the binary. |
+| `--yes` / `-y` | Update without a confirmation prompt. |
+
+</details>
+
+<details>
+<summary><strong>Environment variables</strong></summary>
+
+| Variable | Purpose |
+| --- | --- |
+| `COPILOT_API_HOME` | App-data, token, config, file, and usage storage directory. |
+| `COPILOT_API_PORT` | Listen port. |
+| `COPILOT_API_HOST` | Listen interface. |
+| `COPILOT_API_ACCOUNT_TYPE` | `individual`, `business`, or `enterprise`. |
+| `COPILOT_API_GITHUB_TOKEN` | GitHub token for non-interactive startup. |
+| `COPILOT_API_OAUTH_APP` | GitHub OAuth app identifier. |
+| `COPILOT_API_ENTERPRISE_URL` | GitHub Enterprise URL. |
+| `COPILOT_API_MANUAL` | Enable manual request approval. |
+| `COPILOT_API_RATE_LIMIT` | Minimum seconds between requests. |
+| `COPILOT_API_WAIT` | Wait when the rate limit is reached. |
+| `COPILOT_API_MAX_CONCURRENT_REQUESTS` | Fail-fast cap on upstream-facing requests; `64` is a practical desktop starting point. |
+| `COPILOT_API_RATE_LIMIT_MAX_WAITERS` | Maximum queued rate-limit waiters. |
+| `COPILOT_API_RATE_LIMIT_MAX_WAIT_SECS` | Maximum projected wait before returning `429`. |
+| `COPILOT_API_ALLOW_REMOTE_NO_KEY` | Allow non-loopback binding with no API keys. |
+| `COPILOT_API_PROVIDER_ONLY` | Route all traffic through one configured provider. |
+| `COPILOT_API_LOG_FORMAT` | Set `json` for structured logs. |
+| `RUST_LOG` | Logging filter, such as `copilot_api=debug,hyper=warn`. |
+| `ANTHROPIC_API_KEY` | Optional exact Claude token counting only. |
+| `COPILOT_API_TOKEN_USAGE_RETENTION_DAYS` | Usage-event retention; default `45`, non-positive disables pruning. |
+| `COPILOT_API_FILE_MAX_BYTES` | Maximum single local file upload; default 20 MiB. |
+| `COPILOT_API_FILE_MAX_OWNER_BYTES` | Maximum stored bytes per API-key identity; default 512 MiB. |
+| `COPILOT_API_FILE_MAX_OWNER_COUNT` | Maximum files per API-key identity; default and hard ceiling `1000`. |
+| `COPILOT_API_FILE_RETENTION_DAYS` | Local-file retention; default `30`, `0` disables expiry. |
+| `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | Upstream stream silence timeout; default `120`, `0` disables it. |
+| `COPILOT_API_SSE_HEARTBEAT_SECS` | Idle interval for SSE keepalives; default `15`, `0` disables them. |
+| `COPILOT_API_UPSTREAM_RETRY_5XX` | Retry transient 5xx responses on non-billable routes; generation routes are never retried. |
+
+The deprecated `COPILOT_API_MAX_IN_FLIGHT` variable remains a fallback for the
+concurrency setting.
+
+</details>
+
+<details>
+<summary><strong>HTTP endpoints</strong></summary>
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/` | Liveness response. |
+| `GET` | `/readyz` | Readiness probe. |
+| `GET` | `/version` | Build version, git SHA, and timestamp. |
+| `GET` | `/metrics` | Prometheus metrics. |
+| `GET` | `/usage-viewer` | Built-in usage dashboard. |
+| `GET` | `/usage` | Current Copilot usage data. |
+| `GET` | `/token` | Live Copilot bearer token; protect this route. |
+| `GET` | `/token-usage/*` | Usage summary, daily, events, sessions, and client views. |
+| `GET` | `/models`, `/v1/models` | List available models. |
+| `GET` | `/models/:id`, `/v1/models/:id` | Retrieve one model. |
+| `POST` | `/chat/completions`, `/v1/chat/completions` | OpenAI Chat Completions. |
+| `POST` | `/responses`, `/v1/responses` | OpenAI Responses. |
+| `POST` | `/responses/compact`, `/v1/responses/compact` | Responses compaction used by Codex CLI. |
+| `POST` | `/embeddings`, `/v1/embeddings` | OpenAI-compatible embeddings. |
+| `POST` | `/images/generations`, `/v1/images/generations` | Native Codex-backed OpenAI image generation. |
+| `POST` | `/images/edits`, `/v1/images/edits` | Native Codex-backed multipart image edits. |
+| `POST` | `/v1/messages` | Anthropic Messages. |
+| `POST` | `/v1/messages/count_tokens` | Anthropic token counting. |
+| `GET`, `POST` | `/files`, `/v1/files` | List or upload local files. |
+| `GET`, `DELETE` | `/files/:id`, `/v1/files/:id` | Retrieve metadata or delete a local file. |
+| `GET` | `/files/:id/content`, `/v1/files/:id/content` | Download local file content. |
+| `GET`, `POST` | `/admin/config/model-mappings` | Read or update model mappings. |
+| `GET` | `/admin/config` | Read secret-redacted effective configuration. |
+| `GET`, `POST` | `/admin/config/providers` | List or upsert providers. |
+| `GET` | `/admin/providers/health` | Probe enabled providers. |
+| `POST` | `/admin/config/reload` | Reload `config.json` without restarting. |
+| `POST` | `/:provider/v1/messages` | Provider-routed Anthropic Messages. |
+| `POST` | `/:provider/v1/messages/count_tokens` | Provider-routed token counting. |
+| `GET` | `/:provider/v1/models` | Provider-routed model discovery. |
+| `POST` | `/:provider/v1/images/generations` | Provider-routed image generation. |
+| `POST` | `/:provider/v1/images/edits` | Provider-routed multipart image edits. |
+
+General API-key auth applies to proxy, token, metrics, usage, and file routes.
+Admin endpoints additionally require `auth.adminApiKey`.
+
+</details>
+
+## Compatibility and limits
+
+- Available Copilot models depend on your account, plan, region, and GitHub's
+  current rollout.
+- Anthropic compatibility targets Messages, token counting, models, and local
+  file references; this is not an emulator for every Anthropic product API.
+- The public OpenAI Responses WebSocket transport is not exposed. HTTP/SSE is
+  the supported Codex CLI path.
+- Local Files API IDs are expanded before dispatch; provider-hosted file IDs and
+  Anthropic `container_upload` blocks are not supported.
+- Exact Claude token counts require an Anthropic key. Without one, counts are
+  suitable estimates rather than billing authority.
+- Native image generation and edits require `copilot-api auth --provider codex`
+  and use undocumented Codex endpoints that may change.
+- Compatibility is tested without consuming live quota. Live provider
+  availability, model quality, and rollout timing remain upstream concerns.
+
+See:
+
+- [Claude Code / Anthropic API compatibility](./docs/claude-code-api-compatibility.md)
+- [Claude Code and Codex CLI compatibility](./docs/claude-code-codex-compatibility.md)
+
+## Contributing
+
+Contributions that improve correctness, compatibility, performance, safety, or
+documentation are welcome. Start with [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+
+The local quality gates are:
+
+```sh
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo build
+cargo test
+```
+
+If the project saves you setup time, a
+[GitHub star](https://github.com/Arthur742Ramos/copilot-api-rust) helps other
+developers discover it.
 
 ## Acknowledgements
 
 This project is a Rust port of
-[`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api)
-(npm: `@jeffreycao/copilot-api`). All credit for the original design and
-behavior belongs to its authors and contributors. See [`NOTICE.md`](./NOTICE.md)
-for full attribution.
+[`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api), published
+on npm as `@jeffreycao/copilot-api`. Thanks to its authors and contributors for
+the original design and foundation. Full attribution is preserved in
+[`NOTICE.md`](./NOTICE.md).
 
 ## Disclaimer
 
-This is unofficial community software. It is **not affiliated with or endorsed
-by GitHub, Microsoft, OpenAI, or Anthropic.** Using it to access GitHub Copilot
-through non-official clients may violate GitHub Copilot's Terms of Service and
-could put your account at risk. Use it responsibly and at your own risk — see
-[`NOTICE.md`](./NOTICE.md) for the GitHub Copilot security notice.
+This project is not affiliated with or endorsed by GitHub, Microsoft, OpenAI, or
+Anthropic. Using GitHub Copilot through unofficial clients may conflict with
+GitHub's terms or trigger abuse detection for excessive automated use. You are
+responsible for reviewing applicable terms, protecting your credentials, and
+using the software responsibly and at your own risk.
 
 ## License
 
-[MIT](./LICENSE) © 2026 Arthur Freitas Ramos
+[Zero-Clause BSD (0BSD)](./LICENSE). Original work in this repository does not
+require attribution. Applicable upstream notices are preserved in
+[`NOTICE.md`](./NOTICE.md).

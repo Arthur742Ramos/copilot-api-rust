@@ -17,6 +17,7 @@ yanked = "warn"
 version = 2
 # Permissive licenses present across the dependency tree.
 allow = [
+    "0BSD",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
