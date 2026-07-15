@@ -724,6 +724,12 @@ fn validate_source(block: &Map<String, Value>, path: &str) -> Result<(), AppErro
             required_nonempty_string(source, "url", &source_path)?;
         }
         "text" => {
+            if block.get("type").and_then(Value::as_str) != Some("document") {
+                return Err(invalid(
+                    &format!("{source_path}.type"),
+                    "text sources are only supported for document blocks",
+                ));
+            }
             let media_type = required_nonempty_string(source, "media_type", &source_path)?;
             if media_type != "text/plain" {
                 return Err(invalid(
@@ -1310,4 +1316,34 @@ pub fn validate_messages_request_shape(payload: &Value) -> Result<(), AppError> 
         validate_cache_control(cache_control, "cache_control")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn image_blocks_reject_plain_text_sources() {
+        let payload = json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "text",
+                        "media_type": "text/plain",
+                        "data": "not an image"
+                    }
+                }]
+            }]
+        });
+
+        let error = validate_messages_request_shape(&payload).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("text sources are only supported for document blocks"));
+    }
 }

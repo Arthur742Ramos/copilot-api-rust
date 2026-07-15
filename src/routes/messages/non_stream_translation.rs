@@ -1119,10 +1119,17 @@ fn create_chat_document_part(
         return Ok(create_document_text_part());
     }
 
+    let default_filename = if source.get("type").and_then(Value::as_str) == Some("text")
+        || source.get("media_type").and_then(Value::as_str) == Some("text/plain")
+    {
+        "document.txt"
+    } else {
+        "document.pdf"
+    };
     let filename = block_source
         .get("title")
         .and_then(Value::as_str)
-        .unwrap_or("document.pdf");
+        .unwrap_or(default_filename);
     let mut file = Map::from_iter([
         (
             "file_data".to_string(),
@@ -2578,5 +2585,25 @@ mod tests {
         .unwrap();
         let pdf_parts = pdf_out.messages[0].content.as_ref().unwrap();
         assert_eq!(pdf_parts[0]["type"], "file");
+    }
+
+    #[test]
+    fn titleless_plain_text_document_uses_text_filename() {
+        let part = create_chat_document_part(
+            &json!({
+                "type": "document",
+                "source": {
+                    "type": "text",
+                    "media_type": "text/plain",
+                    "data": "hello",
+                },
+            }),
+            true,
+            "messages[0].content[0]",
+        )
+        .unwrap();
+
+        assert_eq!(part["file"]["filename"], "document.txt");
+        assert_eq!(part["file"]["file_data"], "data:text/plain;base64,aGVsbG8=");
     }
 }
