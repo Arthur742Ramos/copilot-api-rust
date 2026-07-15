@@ -5531,6 +5531,138 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
             ));
             events
         }
+        "gpt-web-reasoning-output" => {
+            let reasoning_item = json!({
+                "type":"reasoning",
+                "id":"web-reasoning",
+                "summary":[{"type":"summary_text","text":"Search planning"}],
+                "encrypted_content":"opaque",
+                "status":"completed"
+            });
+            let batched_web_search_item = json!({
+                "type":"web_search_call",
+                "id":"web-search-item",
+                "status":"completed",
+                "action":{
+                    "type":"search",
+                    "queries":["rust async","tokio runtime"]
+                }
+            });
+            let open_page_item = json!({
+                "type":"web_search_call",
+                "id":"web-open-page",
+                "status":"completed",
+                "action":{
+                    "type":"open_page",
+                    "url":"https://example.test/source"
+                }
+            });
+            let find_in_page_item = json!({
+                "type":"web_search_call",
+                "id":"web-find-in-page",
+                "status":"completed",
+                "action":{
+                    "type":"find_in_page",
+                    "url":"https://example.test/source",
+                    "pattern":"async"
+                }
+            });
+            vec![
+                created,
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":1,
+                        "output_index":0,
+                        "item":reasoning_item.clone()
+                    }),
+                ),
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":2,
+                        "output_index":1,
+                        "item":{
+                            "type":"web_search_call",
+                            "id":"web-search-item",
+                            "status":"searching",
+                            "action":{"type":"search"}
+                        }
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":3,
+                        "output_index":1,
+                        "item":batched_web_search_item.clone()
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":4,
+                        "output_index":2,
+                        "item":open_page_item.clone()
+                    }),
+                ),
+                (
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "sequence_number":5,
+                        "output_index":3,
+                        "item":{
+                            "type":"web_search_call",
+                            "id":"web-find-in-page",
+                            "status":"searching",
+                            "action":{"type":"find_in_page"}
+                        }
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":6,
+                        "output_index":3,
+                        "item":find_in_page_item.clone()
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "sequence_number":7,
+                        "output_index":4,
+                        "item":message_item.clone()
+                    }),
+                ),
+                (
+                    "response.completed",
+                    json!({
+                        "type":"response.completed",
+                        "sequence_number":8,
+                        "response":{
+                            "id":"resp_web_partial",
+                            "status":"completed",
+                            "output":[
+                                reasoning_item,
+                                batched_web_search_item,
+                                open_page_item,
+                                find_in_page_item,
+                                message_item
+                            ],
+                            "usage":usage
+                        }
+                    }),
+                ),
+            ]
+        }
         "gpt-web-terminal-output-completed" => vec![
             created,
             (
@@ -6185,9 +6317,12 @@ fn web_search_partial_terminal_fixture(model: &str) -> Option<Response> {
                         "usage":usage,
                         "output":[{
                             "type":"web_search_call",
-                            "id":"web-multiple",
+                            "id":"web-future-navigation",
                             "status":"completed",
-                            "action":{"type":"search","queries":["one","two"]}
+                            "action":{
+                                "type":"future_navigation",
+                                "url":"https://example.test/source"
+                            }
                         }]
                     }
                 }),
@@ -8930,6 +9065,7 @@ fn configure_with_web_search_model(fixture: &Fixture, web_search_model: Option<&
         "gpt-web-lifecycle-item-id-rotation",
         "gpt-web-lifecycle-item-action-conflict",
         "gpt-web-created-lifecycle-equivalent",
+        "gpt-web-reasoning-output",
         "gpt-web-terminal-output-completed",
         "gpt-web-created-only-completed",
         "gpt-web-terminal-only-completed",
@@ -16578,6 +16714,84 @@ async fn claude_web_search_partial_terminals_preserve_output_in_json_and_sse() {
         assert_eq!(events[7]["delta"]["text"], "Grounded answer.", "{model}");
         assert_eq!(events[9]["delta"]["stop_reason"], "end_turn", "{model}");
         assert_eq!(events[9]["usage"]["output_tokens"], 4, "{model}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(client_compatibility)]
+async fn claude_web_search_ignores_reasoning_and_preserves_batched_queries() {
+    std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
+    let fixture = Fixture::start().await;
+    configure_with_web_search_model(&fixture, Some("responses-fixture/gpt-web-reasoning-output"));
+
+    for stream in [false, true] {
+        let (status, body) = send(web_search_messages_request(stream)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{stream}: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        if stream {
+            let events = data_events(&body);
+            assert!(!events.iter().any(|event| event["type"] == "error"));
+            let queries = events
+                .iter()
+                .filter(|event| event["delta"]["type"] == "input_json_delta")
+                .map(|event| {
+                    serde_json::from_str::<Value>(
+                        event["delta"]["partial_json"]
+                            .as_str()
+                            .expect("server-tool input JSON"),
+                    )
+                    .expect("valid server-tool input")["query"]
+                        .as_str()
+                        .expect("query string")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(queries, ["rust async", "tokio runtime"]);
+            let result_sizes = events
+                .iter()
+                .filter(|event| event["content_block"]["type"] == "web_search_tool_result")
+                .map(|event| {
+                    event["content_block"]["content"]
+                        .as_array()
+                        .expect("web-search result content")
+                        .len()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(result_sizes, [0, 1]);
+            assert_eq!(
+                events
+                    .iter()
+                    .find(|event| event["type"] == "message_start")
+                    .and_then(|event| {
+                        event["message"]["usage"]["server_tool_use"]["web_search_requests"].as_i64()
+                    }),
+                Some(2)
+            );
+            assert_eq!(
+                events.last().and_then(|event| event["type"].as_str()),
+                Some("message_stop")
+            );
+        } else {
+            let response = json_body(&body);
+            assert_eq!(response["content"].as_array().map(Vec::len), Some(5));
+            assert_eq!(response["content"][0]["input"]["query"], "rust async");
+            assert_eq!(response["content"][1]["content"], json!([]));
+            assert_eq!(response["content"][2]["input"]["query"], "tokio runtime");
+            assert_eq!(
+                response["content"][3]["content"][0]["url"],
+                "https://example.test/source"
+            );
+            assert_eq!(response["content"][4]["text"], "Grounded answer.");
+            assert_eq!(
+                response["usage"]["server_tool_use"]["web_search_requests"],
+                2
+            );
+        }
     }
 }
 
