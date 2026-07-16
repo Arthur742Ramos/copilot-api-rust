@@ -688,6 +688,19 @@ pub async fn create_pooled_web_socket_stream(
                 }
             };
             match next {
+                Some(Ok(Message::Close(_))) => {
+                    // A close frame is terminal transport state, not a heartbeat.
+                    // Surface the missing application terminal immediately instead
+                    // of relying on the platform-specific follow-up socket result.
+                    let _ = await_optional_timeout(read_timeout, websocket.flush()).await;
+                    if pooled {
+                        remove_pooled_entry(&pool_key, id);
+                    }
+                    yield Err(std::io::Error::other(
+                        options.terminal_chunk_missing_message.clone(),
+                    ));
+                    return;
+                }
                 Some(Ok(message)) => {
                     let Some(data) = normalize_message(message) else {
                         // Control frame (ping/pong) -> keep reading.
@@ -1433,6 +1446,12 @@ mod tests {
                 .await
                 .unwrap();
             websocket.close(None).await.unwrap();
+            let acknowledgement = tokio::time::timeout(Duration::from_secs(1), websocket.next())
+                .await
+                .expect("close acknowledgement timed out")
+                .expect("client closed before acknowledging")
+                .expect("close acknowledgement failed");
+            assert!(matches!(acknowledgement, Message::Close(_)));
         });
         let request = PooledWebSocketRequest {
             headers: Vec::new(),
