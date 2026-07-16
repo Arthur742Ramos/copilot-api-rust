@@ -110,16 +110,23 @@ $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
   [System.Security.AccessControl.AccessControlType]::Allow
 )
 [void]$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $path -AclObject $acl
-$check = Get-Acl -LiteralPath $path
-$rules = @($check.Access)
+[System.IO.Directory]::SetAccessControl($path, $acl)
+$check = [System.IO.Directory]::GetAccessControl($path)
+$rules = @($check.GetAccessRules(
+  $true,
+  $false,
+  [System.Security.Principal.SecurityIdentifier]
+))
 if (-not $check.AreAccessRulesProtected -or $rules.Count -ne 1) {
   throw 'directory ACL is not protected owner-only'
 }
-$ruleSid = $rules[0].IdentityReference.Translate(
+$ownerSid = $check.GetOwner(
   [System.Security.Principal.SecurityIdentifier]
 )
-if (($ruleSid.Value -ne $sid.Value) -or ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow)) {
+if ($ownerSid.Value -ne $sid.Value) {
+  throw 'directory ACL owner verification failed'
+}
+if (($rules[0].IdentityReference.Value -ne $sid.Value) -or ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow)) {
   throw 'directory ACL owner verification failed'
 }
 if (($rules[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
@@ -216,16 +223,23 @@ $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
   [System.Security.AccessControl.AccessControlType]::Allow
 )
 [void]$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $path -AclObject $acl
-$check = Get-Acl -LiteralPath $path
-$rules = @($check.Access)
+[System.IO.File]::SetAccessControl($path, $acl)
+$check = [System.IO.File]::GetAccessControl($path)
+$rules = @($check.GetAccessRules(
+  $true,
+  $false,
+  [System.Security.Principal.SecurityIdentifier]
+))
 if (-not $check.AreAccessRulesProtected -or $rules.Count -ne 1) {
   throw 'credential ACL is not protected owner-only'
 }
-$ruleSid = $rules[0].IdentityReference.Translate(
+$ownerSid = $check.GetOwner(
   [System.Security.Principal.SecurityIdentifier]
 )
-if (($ruleSid.Value -ne $sid.Value) -or ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow)) {
+if ($ownerSid.Value -ne $sid.Value) {
+  throw 'credential ACL owner verification failed'
+}
+if (($rules[0].IdentityReference.Value -ne $sid.Value) -or ($rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow)) {
   throw 'credential ACL owner verification failed'
 }
 if (($rules[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
