@@ -218,6 +218,13 @@ pub fn extract_web_search_result(result: &ResponsesResult) -> WebSearchExtract {
             continue;
         }
         if item_type == Some("web_search_call") {
+            let action_type = item_val
+                .get("action")
+                .and_then(|action| action.get("type"))
+                .and_then(Value::as_str);
+            if action_type.is_some_and(|action_type| action_type != "search") {
+                continue;
+            }
             collect_query(&item_val, &mut queries);
             if tool_use_id.is_none() {
                 tool_use_id = item_val

@@ -243,20 +243,28 @@ impl ReconstructedWebSearchResponse {
 
 /// `buildWebSearchResultBlock`: one `web_search_tool_result` block whose content
 /// is the deduped `web_search_result` items.
-fn build_web_search_result_block(tool_use_id: &str, extract: &WebSearchExtract) -> Value {
-    let items: Vec<Value> = extract
-        .sources
-        .iter()
-        .map(|source| {
-            json!({
-                "type": "web_search_result",
-                "url": source.url,
-                "title": source.title,
-                "page_age": source.page_age.clone().map(Value::String).unwrap_or(Value::Null),
-                "encrypted_content": "",
+fn build_web_search_result_block(
+    tool_use_id: &str,
+    extract: &WebSearchExtract,
+    include_sources: bool,
+) -> Value {
+    let items: Vec<Value> = if include_sources {
+        extract
+            .sources
+            .iter()
+            .map(|source| {
+                json!({
+                    "type": "web_search_result",
+                    "url": source.url,
+                    "title": source.title,
+                    "page_age": source.page_age.clone().map(Value::String).unwrap_or(Value::Null),
+                    "encrypted_content": "",
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
     json!({
         "type": "web_search_tool_result",
         "tool_use_id": tool_use_id,
@@ -265,22 +273,43 @@ fn build_web_search_result_block(tool_use_id: &str, extract: &WebSearchExtract) 
 }
 
 /// `buildResponseContent`: one `server_tool_use` + `web_search_tool_result` pair
-/// (when there are sources or a query), then the grounded answer `text` block.
+/// per query (when there are sources or queries), then the grounded answer.
 fn build_response_content(request_id: &str, extract: &WebSearchExtract) -> Vec<Value> {
     let mut blocks: Vec<Value> = Vec::new();
-    let query = extract.queries.first().cloned().unwrap_or_default();
-    if !extract.sources.is_empty() || !query.is_empty() {
-        let tool_use_id = extract
-            .tool_use_id
-            .clone()
-            .unwrap_or_else(|| format!("srvtoolu_{}", get_uuid(request_id)));
-        blocks.push(json!({
-            "type": "server_tool_use",
-            "id": tool_use_id,
-            "name": "web_search",
-            "input": { "query": query },
-        }));
-        blocks.push(build_web_search_result_block(&tool_use_id, extract));
+    if !extract.sources.is_empty() || !extract.queries.is_empty() || extract.tool_use_id.is_some() {
+        let queries = if extract.queries.is_empty() {
+            vec![String::new()]
+        } else {
+            extract.queries.clone()
+        };
+        let query_count = queries.len();
+        for (index, query) in queries.into_iter().enumerate() {
+            let tool_use_id = if query_count == 1 {
+                extract
+                    .tool_use_id
+                    .clone()
+                    .unwrap_or_else(|| format!("srvtoolu_{}", get_uuid(request_id)))
+            } else {
+                format!(
+                    "srvtoolu_{}",
+                    get_uuid(&format!("{request_id}:web-search:{index}"))
+                )
+            };
+            blocks.push(json!({
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "web_search",
+                "input": { "query": query },
+            }));
+            // Responses reports citations for the batched call as a whole. Keep
+            // them once on the final synthetic result rather than duplicating
+            // every source for each query.
+            blocks.push(build_web_search_result_block(
+                &tool_use_id,
+                extract,
+                index + 1 == query_count,
+            ));
+        }
     }
     blocks.push(json!({ "type": "text", "text": extract.answer_text }));
     blocks
@@ -360,16 +389,50 @@ pub fn reconstruct_web_search_response(
 }
 
 #[allow(clippy::result_large_err)]
-fn representable_web_search_query(raw: &Value) -> Result<String, AppError> {
-    let action = raw
-        .get("action")
-        .and_then(Value::as_object)
-        .filter(|action| action.get("type").and_then(Value::as_str) == Some("search"))
-        .ok_or_else(|| {
-            invalid_web_search_stream(
-                "the web-search call action cannot be represented by Anthropic web_search",
-            )
-        })?;
+fn optional_web_search_action_string(
+    action: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, AppError> {
+    match action.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        _ => Err(invalid_web_search_stream(format_args!(
+            "the web-search {field} field was empty or invalid"
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_web_search_action(raw: &Value) -> Result<Option<WebSearchActionAssertion>, AppError> {
+    let Some(action) = raw.get("action").filter(|action| !action.is_null()) else {
+        return Ok(None);
+    };
+    let action = action.as_object().ok_or_else(|| {
+        invalid_web_search_stream("the web-search call action was not an object or null")
+    })?;
+    let action_type = action
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_web_search_stream("the web-search call action type was invalid"))?;
+    match action_type {
+        "search" => Ok(Some(WebSearchActionAssertion::Search(
+            parse_web_search_queries(action)?,
+        ))),
+        "open_page" => Ok(Some(WebSearchActionAssertion::OpenPage {
+            url: optional_web_search_action_string(action, "url")?,
+        })),
+        "find_in_page" => Ok(Some(WebSearchActionAssertion::FindInPage {
+            url: optional_web_search_action_string(action, "url")?,
+            pattern: optional_web_search_action_string(action, "pattern")?,
+        })),
+        _ => Err(invalid_web_search_stream(
+            "the web-search call action cannot be represented by Anthropic web_search",
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_web_search_queries(action: &Map<String, Value>) -> Result<Vec<String>, AppError> {
     let fallback_query = || {
         action
             .get("query")
@@ -394,12 +457,26 @@ fn representable_web_search_query(raw: &Value) -> Result<String, AppError> {
             ))
         }
     };
-    if queries.len() != 1 {
+    Ok(queries.into_iter().map(str::to_string).collect())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_completed_web_search_action(action: &WebSearchActionAssertion) -> Result<(), AppError> {
+    if matches!(
+        action,
+        WebSearchActionAssertion::FindInPage {
+            url: None,
+            pattern: _,
+        } | WebSearchActionAssertion::FindInPage {
+            url: _,
+            pattern: None,
+        }
+    ) {
         return Err(invalid_web_search_stream(
-            "the web-search call did not contain exactly one representable query",
+            "the completed find-in-page action omitted its URL or pattern",
         ));
     }
-    Ok(queries[0].to_string())
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -434,7 +511,6 @@ pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(),
     }
     validate_typed_output_items_and_usage(result)?;
 
-    let mut web_search_calls = 0_usize;
     for item in &result.output {
         let raw = match item {
             ResponseOutputItem::Message(message) => {
@@ -453,6 +529,7 @@ pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(),
                 }
                 continue;
             }
+            ResponseOutputItem::Reasoning(_) => continue,
             ResponseOutputItem::Other(raw) => raw,
             _ => return Err(invalid_web_search_stream(
                 "the web-search response contained an output item unsupported by reconstruction",
@@ -461,12 +538,6 @@ pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(),
         if raw.get("type").and_then(Value::as_str) != Some("web_search_call") {
             return Err(invalid_web_search_stream(
                 "the web-search response contained an unsupported raw output variant",
-            ));
-        }
-        web_search_calls += 1;
-        if web_search_calls > 1 {
-            return Err(invalid_web_search_stream(
-                "multiple web-search calls cannot be represented losslessly",
             ));
         }
         optional_nonnull_string_field(raw, "id").map_err(invalid_web_search_stream)?;
@@ -478,7 +549,10 @@ pub(crate) fn validate_web_search_result(result: &ResponsesResult) -> Result<(),
                 "the completed web-search call had a non-completed status",
             ));
         }
-        representable_web_search_query(raw)?;
+        let action = parse_web_search_action(raw)?.ok_or_else(|| {
+            invalid_web_search_stream("the completed web-search call omitted its action")
+        })?;
+        validate_completed_web_search_action(&action)?;
     }
     Ok(())
 }
@@ -1403,7 +1477,19 @@ enum WebOutputAssertion {
     WebSearchCall {
         id: Option<String>,
         status: Option<String>,
-        query: Option<String>,
+        action: Option<WebSearchActionAssertion>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebSearchActionAssertion {
+    Search(Vec<String>),
+    OpenPage {
+        url: Option<String>,
+    },
+    FindInPage {
+        url: Option<String>,
+        pattern: Option<String>,
     },
 }
 
@@ -1448,7 +1534,7 @@ const WEB_SEARCH_OUTPUT_FIELD_AUTHORITY: &[(&str, ItemFieldAuthority)] = &[
 fn parse_web_output_assertion(
     value: &Value,
     phase: OutputValidationPhase,
-) -> Result<WebOutputAssertion, AppError> {
+) -> Result<Option<WebOutputAssertion>, AppError> {
     match parse_and_validate_output_item(value, phase).map_err(invalid_web_search_stream)? {
         ResponseOutputItem::Message(message) => {
             let _authority = MESSAGE_OUTPUT_FIELD_AUTHORITY;
@@ -1485,12 +1571,12 @@ fn parse_web_output_assertion(
                     annotations,
                 });
             }
-            Ok(WebOutputAssertion::Message {
+            Ok(Some(WebOutputAssertion::Message {
                 id: message.id,
                 status: message.status,
                 role: message.role,
                 content,
-            })
+            }))
         }
         ResponseOutputItem::Other(raw)
             if raw.get("type").and_then(Value::as_str) == Some("web_search_call") =>
@@ -1502,12 +1588,16 @@ fn parse_web_output_assertion(
             let status = optional_nonnull_string_field(&raw, "status")
                 .map_err(invalid_web_search_stream)?
                 .map(str::to_string);
-            let query = match raw.get("action") {
-                None | Some(Value::Null) => None,
-                _ => Some(representable_web_search_query(&raw)?),
-            };
-            Ok(WebOutputAssertion::WebSearchCall { id, status, query })
+            let action = parse_web_search_action(&raw)?;
+            Ok(Some(WebOutputAssertion::WebSearchCall {
+                id,
+                status,
+                action,
+            }))
         }
+        // Reasoning is source-valid but has no representation in the synthetic
+        // Anthropic web-search response.
+        ResponseOutputItem::Reasoning(_) => Ok(None),
         _ => Err(invalid_web_search_stream(
             "web-search output contained an unsupported item",
         )),
@@ -1515,14 +1605,67 @@ fn parse_web_output_assertion(
 }
 
 #[allow(clippy::result_large_err)]
-fn merge_optional_item_field(
+fn merge_optional_web_search_action(
+    current: Option<WebSearchActionAssertion>,
+    incoming: Option<WebSearchActionAssertion>,
+) -> Result<Option<WebSearchActionAssertion>, AppError> {
+    match (current, incoming) {
+        (Some(current), Some(incoming)) => merge_web_search_action(current, incoming).map(Some),
+        (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn merge_web_search_action(
+    current: WebSearchActionAssertion,
+    incoming: WebSearchActionAssertion,
+) -> Result<WebSearchActionAssertion, AppError> {
+    match (current, incoming) {
+        (WebSearchActionAssertion::Search(current), WebSearchActionAssertion::Search(incoming))
+            if current == incoming =>
+        {
+            Ok(WebSearchActionAssertion::Search(current))
+        }
+        (WebSearchActionAssertion::Search(current), WebSearchActionAssertion::Search(incoming))
+            if incoming.starts_with(&current) =>
+        {
+            Ok(WebSearchActionAssertion::Search(incoming))
+        }
+        (WebSearchActionAssertion::Search(current), WebSearchActionAssertion::Search(incoming))
+            if current.starts_with(&incoming) =>
+        {
+            Ok(WebSearchActionAssertion::Search(current))
+        }
+        (
+            WebSearchActionAssertion::OpenPage { url },
+            WebSearchActionAssertion::OpenPage { url: incoming_url },
+        ) => Ok(WebSearchActionAssertion::OpenPage {
+            url: merge_optional_action_field("URL", url, incoming_url)?,
+        }),
+        (
+            WebSearchActionAssertion::FindInPage { url, pattern },
+            WebSearchActionAssertion::FindInPage {
+                url: incoming_url,
+                pattern: incoming_pattern,
+            },
+        ) => Ok(WebSearchActionAssertion::FindInPage {
+            url: merge_optional_action_field("URL", url, incoming_url)?,
+            pattern: merge_optional_action_field("pattern", pattern, incoming_pattern)?,
+        }),
+        _ => Err(invalid_web_search_stream("output item action conflicted")),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn merge_optional_action_field(
     field: &str,
     current: Option<String>,
     incoming: Option<String>,
 ) -> Result<Option<String>, AppError> {
     match (current, incoming) {
         (Some(current), Some(incoming)) if current != incoming => Err(invalid_web_search_stream(
-            format_args!("output item {field} conflicted"),
+            format_args!("web-search action {field} conflicted"),
         )),
         (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
         (None, None) => Ok(None),
@@ -1558,6 +1701,35 @@ fn merge_item_status(
         }
         _ => Err(invalid_web_search_stream(
             "output item status assertions conflicted",
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn merge_web_search_item_status(
+    current: Option<String>,
+    incoming: Option<String>,
+    incoming_phase: OutputValidationPhase,
+) -> Result<Option<String>, AppError> {
+    match (current, incoming) {
+        (None, incoming) => Ok(incoming),
+        (Some(current), None)
+            if matches!(current.as_str(), "in_progress" | "searching")
+                && incoming_phase == OutputValidationPhase::Done =>
+        {
+            Ok(None)
+        }
+        (Some(current), None) => Ok(Some(current)),
+        (Some(current), Some(incoming)) if current == incoming => Ok(Some(current)),
+        (Some(current), Some(incoming))
+            if (current == "in_progress" && incoming == "searching")
+                || (matches!(current.as_str(), "in_progress" | "searching")
+                    && matches!(incoming.as_str(), "completed" | "failed")) =>
+        {
+            Ok(Some(incoming))
+        }
+        _ => Err(invalid_web_search_stream(
+            "web-search output item status assertions conflicted",
         )),
     }
 }
@@ -1646,16 +1818,16 @@ fn merge_web_output_assertion(
             })
         }
         (
-            WebOutputAssertion::WebSearchCall { id, status, query },
+            WebOutputAssertion::WebSearchCall { id, status, action },
             WebOutputAssertion::WebSearchCall {
                 id: incoming_id,
                 status: incoming_status,
-                query: incoming_query,
+                action: incoming_action,
             },
         ) => Ok(WebOutputAssertion::WebSearchCall {
             id: merge_opaque_item_id(id, incoming_id),
-            status: merge_item_status(status, incoming_status, incoming_phase)?,
-            query: merge_optional_item_field("query", query, incoming_query)?,
+            status: merge_web_search_item_status(status, incoming_status, incoming_phase)?,
+            action: merge_optional_web_search_action(action, incoming_action)?,
         }),
         _ => Err(invalid_web_search_stream(
             "web-search output item type conflicted",
@@ -1699,7 +1871,7 @@ fn web_output_assertion_value(assertion: WebOutputAssertion) -> Value {
             );
             Value::Object(value)
         }
-        WebOutputAssertion::WebSearchCall { id, status, query } => {
+        WebOutputAssertion::WebSearchCall { id, status, action } => {
             let mut value = Map::new();
             value.insert(
                 "type".to_string(),
@@ -1711,8 +1883,39 @@ fn web_output_assertion_value(assertion: WebOutputAssertion) -> Value {
             if let Some(status) = status {
                 value.insert("status".to_string(), Value::String(status));
             }
-            if let Some(query) = query {
-                value.insert("action".to_string(), json!({"type":"search","query":query}));
+            if let Some(action) = action {
+                let action = match action {
+                    WebSearchActionAssertion::Search(queries) if queries.len() == 1 => {
+                        json!({"type":"search","query":queries[0]})
+                    }
+                    WebSearchActionAssertion::Search(queries) => {
+                        json!({"type":"search","queries":queries})
+                    }
+                    WebSearchActionAssertion::OpenPage { url } => {
+                        let mut action = Map::from_iter([(
+                            "type".to_string(),
+                            Value::String("open_page".to_string()),
+                        )]);
+                        if let Some(url) = url {
+                            action.insert("url".to_string(), Value::String(url));
+                        }
+                        Value::Object(action)
+                    }
+                    WebSearchActionAssertion::FindInPage { url, pattern } => {
+                        let mut action = Map::from_iter([(
+                            "type".to_string(),
+                            Value::String("find_in_page".to_string()),
+                        )]);
+                        if let Some(url) = url {
+                            action.insert("url".to_string(), Value::String(url));
+                        }
+                        if let Some(pattern) = pattern {
+                            action.insert("pattern".to_string(), Value::String(pattern));
+                        }
+                        Value::Object(action)
+                    }
+                };
+                value.insert("action".to_string(), action);
             }
             Value::Object(value)
         }
@@ -1729,13 +1932,16 @@ fn merge_web_output_snapshot(
     let Some(incoming) = incoming else {
         return Ok(());
     };
+    let incoming = incoming
+        .iter()
+        .map(|item| parse_web_output_assertion(item, phase))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     if incoming.is_empty() && !empty_is_assertion {
         return Ok(());
     }
-    let incoming: Vec<WebOutputAssertion> = incoming
-        .iter()
-        .map(|item| parse_web_output_assertion(item, phase))
-        .collect::<Result<_, _>>()?;
     let Some(existing) = current.as_mut() else {
         *current = Some(incoming);
         return Ok(());
@@ -2751,6 +2957,65 @@ mod tests {
         assert_eq!(response.usage["input_tokens"], 12);
         assert_eq!(response.usage["output_tokens"], 8);
         assert_eq!(response.usage["server_tool_use"]["web_search_requests"], 1);
+    }
+
+    #[test]
+    fn validation_accepts_reasoning_ignored_by_web_search_reconstruction() {
+        let result = result_from(json!({
+            "id": "resp_reasoning",
+            "object": "response",
+            "created_at": 1,
+            "model": "gpt-5-mini",
+            "status": "completed",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 8,
+                "output_tokens_details": {"reasoning_tokens": 2},
+                "total_tokens": 20
+            },
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_1",
+                    "summary": [{"type": "summary_text", "text": "Search planning"}],
+                    "encrypted_content": "opaque",
+                    "status": "completed"
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "search_1",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "queries": ["rust async", "tokio runtime"]
+                    }
+                },
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Answer.",
+                        "annotations": []
+                    }]
+                }
+            ]
+        }));
+
+        validate_web_search_result(&result).expect("reasoning is valid non-visible output");
+        let extract = extract_web_search_result(&result);
+        assert_eq!(extract.answer_text, "Answer.");
+        assert_eq!(extract.queries, ["rust async", "tokio runtime"]);
+
+        let payload = web_search_payload(json!([{ "type": "web_search_20250305" }]));
+        let (_, response) = reconstruct_web_search_response(&payload, &result, "req-reasoning");
+        assert_eq!(response.content.len(), 5);
+        assert_eq!(response.content[0]["input"]["query"], "rust async");
+        assert_eq!(response.content[2]["input"]["query"], "tokio runtime");
+        assert_eq!(response.content[4]["text"], "Answer.");
+        assert_eq!(response.usage["server_tool_use"]["web_search_requests"], 2);
     }
 
     #[test]
