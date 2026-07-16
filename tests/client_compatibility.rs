@@ -16736,16 +16736,25 @@ async fn claude_web_search_ignores_reasoning_and_preserves_batched_queries() {
         if stream {
             let events = data_events(&body);
             assert!(!events.iter().any(|event| event["type"] == "error"));
-            let queries = events
+            let mut streamed_inputs = BTreeMap::<i64, String>::new();
+            for event in events
                 .iter()
                 .filter(|event| event["delta"]["type"] == "input_json_delta")
-                .map(|event| {
-                    serde_json::from_str::<Value>(
+            {
+                streamed_inputs
+                    .entry(event["index"].as_i64().expect("content block index"))
+                    .or_default()
+                    .push_str(
                         event["delta"]["partial_json"]
                             .as_str()
-                            .expect("server-tool input JSON"),
-                    )
-                    .expect("valid server-tool input")["query"]
+                            .expect("server-tool input JSON chunk"),
+                    );
+            }
+            let queries = streamed_inputs
+                .into_values()
+                .map(|input| {
+                    serde_json::from_str::<Value>(&input).expect("complete server-tool input")
+                        ["query"]
                         .as_str()
                         .expect("query string")
                         .to_string()
