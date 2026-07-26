@@ -630,7 +630,7 @@ Admin routes always require the separately generated `auth.adminApiKey`.
 | `COPILOT_API_FILE_MAX_OWNER_BYTES` | Maximum stored bytes per API-key identity; default 512 MiB. |
 | `COPILOT_API_FILE_MAX_OWNER_COUNT` | Maximum files per API-key identity; default and hard ceiling `1000`. |
 | `COPILOT_API_FILE_RETENTION_DAYS` | Local-file retention; default `30`, `0` disables expiry. |
-| `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | Upstream stream silence timeout; default `120`, `0` disables it. |
+| `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | Upstream stream silence timeout; default `600`, `0` disables it. |
 | `COPILOT_API_SSE_HEARTBEAT_SECS` | Idle interval for SSE keepalives; default `15`, `0` disables them. |
 | `COPILOT_API_UPSTREAM_RETRY_5XX` | Retry transient 5xx responses on non-billable routes; generation routes are never retried. |
 
