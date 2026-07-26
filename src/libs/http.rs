@@ -26,7 +26,7 @@ pub fn proxy_from_env_enabled() -> bool {
 /// Default upstream read-timeout (seconds): the maximum gap between successive
 /// reads before a stalled-open connection is killed. Bounds a wedged upstream
 /// without capping a healthy long stream.
-pub const DEFAULT_UPSTREAM_READ_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_UPSTREAM_READ_TIMEOUT_SECS: u64 = 10 * 60;
 
 /// Connection-establishment deadline shared by HTTP and WebSocket transports.
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,7 +41,7 @@ pub const UPSTREAM_POOL_MAX_IDLE_PER_HOST: usize = 8;
 /// `read_timeout` bounds the gap between successive reads, NOT the total request
 /// duration, so it never caps a healthy long SSE stream that keeps producing
 /// bytes — but a very long model "thinking" gap that exceeds it is killed as if
-/// the connection had wedged. Operators seeing spurious ~120s stall failures on
+/// the connection had wedged. Operators seeing spurious ~10-minute stall failures on
 /// legitimately slow generations can raise this; a value of `0` disables the
 /// read timeout entirely (a wedged connection then relies on the pool idle
 /// timeout instead). Read once when each client is first built. Shared by both
@@ -67,7 +67,7 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         // instead of hanging forever. An overall `.timeout(...)` would wrongly
         // cap long legitimate streams, so we deliberately do not use one here.
         // The window is configurable via COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS
-        // (default 120; 0 disables it).
+        // (default 600; 0 disables it).
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(UPSTREAM_POOL_MAX_IDLE_PER_HOST);
     if let Some(read_timeout) = upstream_read_timeout() {
@@ -565,6 +565,11 @@ pub async fn read_text_capped(response: reqwest::Response) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_read_timeout_allows_extended_reasoning_gaps() {
+        assert_eq!(DEFAULT_UPSTREAM_READ_TIMEOUT_SECS, 10 * 60);
+    }
 
     #[test]
     fn append_capped_truncates_at_cap() {

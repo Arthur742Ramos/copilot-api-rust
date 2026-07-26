@@ -237,7 +237,9 @@ fn default_config() -> AppConfig {
     for model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
         efforts.insert(model.to_string(), "max".to_string());
     }
-    efforts.insert("claude-opus-4.8".to_string(), "max".to_string());
+    for model in ["claude-opus-4.8", "claude-opus-5"] {
+        efforts.insert(model.to_string(), "max".to_string());
+    }
 
     AppConfig {
         auth: Some(AuthConfig {
@@ -1044,12 +1046,17 @@ mod tests {
     }
 
     #[test]
-    fn max_capable_codex_models_default_to_max_reasoning() {
+    fn max_capable_models_default_to_max_reasoning() {
         let efforts = default_config()
             .model_reasoning_efforts
             .expect("default reasoning efforts");
 
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "claude-opus-5",
+        ] {
             assert_eq!(efforts.get(model).map(String::as_str), Some("max"));
         }
         assert_eq!(efforts.get("gpt-5.5").map(String::as_str), Some("xhigh"));
