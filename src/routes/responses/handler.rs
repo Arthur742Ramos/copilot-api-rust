@@ -249,24 +249,34 @@ fn stream_responses_sse(
         let mut usage: UsageTokens = UsageTokens::default();
         futures_util::pin_mut!(event_stream);
 
-        use futures_util::StreamExt;
-        let heartbeat = crate::libs::sse::sse_heartbeat_interval();
+        let mut pacer = crate::libs::sse::StallPacer::new();
         loop {
-            let item = match heartbeat {
-                Some(interval) => match tokio::time::timeout(interval, event_stream.next()).await {
-                    Ok(next) => next,
-                    // Idle-but-alive upstream (its read_timeout still bounds a
-                    // truly wedged connection): emit a comment keep-alive so
-                    // sub-120s intermediaries don't drop the stream. A comment is
-                    // not content, so it must not touch the timer/TTFT accounting.
-                    Err(_) => {
-                        yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(
-                            crate::libs::sse::SSE_COMMENT_PING,
-                        ));
-                        continue;
+            let item = match pacer.next(&mut event_stream).await {
+                crate::libs::sse::StreamStep::Item(item) => item,
+                // Idle-but-alive upstream: emit a comment keep-alive so
+                // sub-120s intermediaries don't drop the stream. A comment is
+                // not content, so it must not touch the timer/TTFT accounting.
+                crate::libs::sse::StreamStep::Heartbeat => {
+                    yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(
+                        crate::libs::sse::SSE_COMMENT_PING,
+                    ));
+                    continue;
+                }
+                // Wedged: silent for the whole dead-air budget. Fail the stream
+                // ourselves so the client gets a terminal error instead of an
+                // unexplained truncation.
+                crate::libs::sse::StreamStep::Stalled => {
+                    tracing::warn!("Responses upstream stream stalled");
+                    timer.mark_error();
+                    if let Some(frame) = guard.fail(
+                        "upstream_stalled",
+                        "The upstream Responses stream stopped sending data.",
+                    ) {
+                        yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(frame));
                     }
-                },
-                None => event_stream.next().await,
+                    recorder.record(usage);
+                    return;
+                }
             };
             let Some(item) = item else { break };
             let ev = match item {

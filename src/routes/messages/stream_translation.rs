@@ -998,6 +998,35 @@ pub fn transport_stream_error_events(
     terminal_stream_error_events(state, translate_error_to_anthropic_error_event(cause))
 }
 
+/// Terminal `error` event for a proxy-detected upstream stall.
+///
+/// A stall is a connection that stayed open and never errored but produced
+/// nothing for the whole dead-air budget (see
+/// [`crate::libs::sse::sse_stall_timeout`]). That is the same class of transient
+/// failure as a mid-flight transport break, so it gets the same retryable
+/// `overloaded_error` type rather than `api_error`: without it the client just
+/// sees the stream stop, and reports a truncated response instead of retrying.
+pub fn stalled_stream_error_event() -> AnthropicStreamEventData {
+    AnthropicStreamEventData::Error {
+        error: super::anthropic_types::AnthropicErrorBody {
+            kind: "overloaded_error".to_string(),
+            message: STALLED_STREAM_ERROR_MESSAGE.to_string(),
+        },
+    }
+}
+
+/// Client-visible message for a proxy-detected stall. Shared with the flows that
+/// build the event through their own terminators.
+pub const STALLED_STREAM_ERROR_MESSAGE: &str =
+    "The upstream model stream stopped sending data. This is usually transient — retry the request.";
+
+/// Terminate a translated stream after the proxy detects an upstream stall.
+pub fn stalled_stream_error_events(
+    state: &mut AnthropicStreamState,
+) -> Vec<AnthropicStreamEventData> {
+    terminal_stream_error_events(state, stalled_stream_error_event())
+}
+
 fn terminal_stream_error_events(
     state: &mut AnthropicStreamState,
     error: AnthropicStreamEventData,
@@ -2608,6 +2637,49 @@ mod tests {
         let ev = translate_error_to_anthropic_error_event(Some(&cause));
         let value = serde_json::to_value(&ev).unwrap();
         assert_eq!(value["error"]["type"], "overloaded_error");
+    }
+
+    /// A proxy-detected stall is the same class of transient failure as a
+    /// mid-flight transport break, so it must carry the retryable
+    /// `overloaded_error` type. If it were `api_error` the client would treat
+    /// the wedged upstream as a permanent fault instead of retrying.
+    #[test]
+    fn stalled_stream_error_is_retryable_overloaded_error() {
+        let value = serde_json::to_value(stalled_stream_error_event()).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "overloaded_error");
+        assert_eq!(value["error"]["message"], STALLED_STREAM_ERROR_MESSAGE);
+    }
+
+    /// The stall terminator must close an open content block first (otherwise the
+    /// client is left with a dangling block) and must never emit twice.
+    #[test]
+    fn stalled_stream_closes_open_block_and_errors_once() {
+        let mut state = AnthropicStreamState::default();
+        let chunk = json!({
+            "id": "x", "model": "m",
+            "choices": [{ "index": 0, "delta": { "content": "partial" }, "finish_reason": null }]
+        });
+        let _ = translate_chunk_to_anthropic_events(&chunk, &mut state);
+
+        let events = stalled_stream_error_events(&mut state);
+        let kinds: Vec<String> = events
+            .iter()
+            .map(|e| {
+                serde_json::to_value(e).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            kinds.contains(&"content_block_stop".to_string()),
+            "open block must be closed before the terminal error: {kinds:?}"
+        );
+        assert_eq!(kinds.last().unwrap(), "error");
+
+        // Terminal event is latched: a second call adds nothing.
+        assert!(stalled_stream_error_events(&mut state).is_empty());
     }
 
     #[test]

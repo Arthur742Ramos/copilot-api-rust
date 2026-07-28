@@ -632,6 +632,7 @@ Admin routes always require the separately generated `auth.adminApiKey`.
 | `COPILOT_API_FILE_RETENTION_DAYS` | Local-file retention; default `30`, `0` disables expiry. |
 | `COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS` | Upstream stream silence timeout; default `600`, `0` disables it. |
 | `COPILOT_API_SSE_HEARTBEAT_SECS` | Idle interval for SSE keepalives; default `15`, `0` disables them. |
+| `COPILOT_API_SSE_STALL_TIMEOUT_SECS` | Dead-air budget before a silent-but-open stream is ended with a retryable `overloaded_error`; default `120`, `0` disables it. |
 | `COPILOT_API_UPSTREAM_RETRY_5XX` | Retry transient 5xx responses on non-billable routes; generation routes are never retried. |
 
 The deprecated `COPILOT_API_MAX_IN_FLIGHT` variable remains a fallback for the
