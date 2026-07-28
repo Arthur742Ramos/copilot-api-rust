@@ -40,6 +40,131 @@ pub fn sse_heartbeat_interval() -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
+/// Default dead-air budget (seconds) before a silent-but-open upstream stream is
+/// declared wedged.
+///
+/// This is deliberately far below the upstream read-timeout
+/// (`COPILOT_API_UPSTREAM_READ_TIMEOUT_SECS`, default 600s). That read-timeout
+/// bounds a wedged socket, but every real client gives up long before it: an
+/// abandoned stream observed in production ran 306s before the *client* hung up,
+/// so the proxy's own guard never fired and the failure surfaced as a bare
+/// truncation ("response stalled mid-stream") instead of a terminal error frame
+/// the client could act on.
+///
+/// 120s is ~8 heartbeat intervals and several times the longest healthy stream
+/// seen in practice, while staying under observed client deadlines (~180-300s),
+/// so the proxy wins the race and can end the stream with a retryable
+/// `overloaded_error` that SDKs retry transparently.
+pub const DEFAULT_SSE_STALL_TIMEOUT_SECS: u64 = 120;
+
+/// Dead-air budget before a stream is declared stalled, overridable via
+/// `COPILOT_API_SSE_STALL_TIMEOUT_SECS`. A value of `0` disables stall detection
+/// entirely (returns `None`), leaving a wedged connection to the upstream
+/// read-timeout as before. Re-read per stream so an operator override takes
+/// effect without a restart.
+///
+/// This measures *consecutive silence*, not total stream duration, so a healthy
+/// long stream that keeps producing frames is never affected.
+pub fn sse_stall_timeout() -> Option<Duration> {
+    let secs = std::env::var("COPILOT_API_SSE_STALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SSE_STALL_TIMEOUT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+// The stall budget only helps if the proxy loses the race to no realistic
+// client: it must fire well before observed client abort deadlines (~180-300s)
+// and before the upstream read-timeout, while staying several heartbeats above a
+// normal inter-frame gap. Enforced at compile time so tuning one constant
+// without the others cannot silently reintroduce the wedged-stream failure.
+const _: () = assert!(DEFAULT_SSE_STALL_TIMEOUT_SECS > DEFAULT_SSE_HEARTBEAT_SECS * 4);
+const _: () = assert!(DEFAULT_SSE_STALL_TIMEOUT_SECS < 180);
+const _: () =
+    assert!(DEFAULT_SSE_STALL_TIMEOUT_SECS < crate::libs::http::DEFAULT_UPSTREAM_READ_TIMEOUT_SECS);
+
+/// One step of a paced stream read. Returned by [`StallPacer::next`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum StreamStep<T> {
+    /// The upstream produced an item, or ended the stream (`None`).
+    Item(Option<T>),
+    /// The upstream has been silent for one heartbeat interval but is still
+    /// within its dead-air budget: emit a keep-alive frame and keep waiting.
+    Heartbeat,
+    /// The upstream has produced nothing for the whole dead-air budget. Treat
+    /// the connection as wedged and terminate the stream with a terminal error.
+    Stalled,
+}
+
+/// Paces reads from an upstream SSE stream: injects keep-alive heartbeats while
+/// the upstream is idle-but-alive, and gives up once the silence exceeds the
+/// stall budget.
+///
+/// Folding both windows into one place keeps every streaming flow
+/// (messages/chat-completions/responses, translated and native) on identical
+/// keep-alive and stall semantics.
+pub struct StallPacer {
+    heartbeat: Option<Duration>,
+    stall_after: Option<Duration>,
+    /// Silence accumulated since the last item; reset whenever one arrives.
+    idle: Duration,
+}
+
+impl Default for StallPacer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StallPacer {
+    /// Build a pacer from the current environment configuration.
+    pub fn new() -> Self {
+        Self::with_windows(sse_heartbeat_interval(), sse_stall_timeout())
+    }
+
+    /// Build a pacer with explicit windows. Exposed for tests, which must not
+    /// depend on process-wide environment state.
+    pub fn with_windows(heartbeat: Option<Duration>, stall_after: Option<Duration>) -> Self {
+        Self {
+            heartbeat,
+            stall_after,
+            idle: Duration::ZERO,
+        }
+    }
+
+    /// Await the next item, bounded by the heartbeat and stall windows.
+    pub async fn next<S>(&mut self, stream: &mut S) -> StreamStep<S::Item>
+    where
+        S: Stream + Unpin,
+    {
+        // No heartbeat configured: a single wait, bounded by the stall budget so
+        // a wedged upstream is still caught.
+        let Some(interval) = self.heartbeat else {
+            return match self.stall_after {
+                Some(budget) => match tokio::time::timeout(budget, stream.next()).await {
+                    Ok(item) => StreamStep::Item(item),
+                    Err(_) => StreamStep::Stalled,
+                },
+                None => StreamStep::Item(stream.next().await),
+            };
+        };
+
+        match tokio::time::timeout(interval, stream.next()).await {
+            Ok(item) => {
+                self.idle = Duration::ZERO;
+                StreamStep::Item(item)
+            }
+            Err(_) => {
+                self.idle = self.idle.saturating_add(interval);
+                match self.stall_after {
+                    Some(budget) if self.idle >= budget => StreamStep::Stalled,
+                    _ => StreamStep::Heartbeat,
+                }
+            }
+        }
+    }
+}
+
 /// A single parsed SSE record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SseEvent {
@@ -288,6 +413,116 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
         assert_eq!(parsed["type"], "ping");
         assert_eq!(DEFAULT_SSE_HEARTBEAT_SECS, 15);
+    }
+
+    /// The stall budget only helps if the proxy loses the race to no realistic
+    /// client: it must fire well before observed client abort deadlines
+    /// (~180-300s) and well before the upstream read-timeout (600s), while
+    /// staying several heartbeats above a normal inter-frame gap.
+    #[test]
+    fn stall_budget_sits_between_the_heartbeat_and_the_upstream_read_timeout() {
+        assert_eq!(DEFAULT_SSE_STALL_TIMEOUT_SECS, 120);
+    }
+
+    /// A silent-but-open upstream must produce heartbeats until the dead-air
+    /// budget is spent, then exactly one `Stalled` — this is the wedged-stream
+    /// case that previously surfaced to the client as a bare truncation.
+    #[tokio::test(start_paused = true)]
+    async fn pacer_heartbeats_then_stalls_on_a_silent_upstream() {
+        let mut silent = stream::pending::<u8>();
+        let mut pacer =
+            StallPacer::with_windows(Some(Duration::from_secs(15)), Some(Duration::from_secs(60)));
+
+        for beat in 1..=3 {
+            assert_eq!(
+                pacer.next(&mut silent).await,
+                StreamStep::Heartbeat,
+                "heartbeat {beat} should still be within the budget"
+            );
+        }
+        assert_eq!(pacer.next(&mut silent).await, StreamStep::Stalled);
+    }
+
+    /// A stream that keeps producing must never stall, however long it runs:
+    /// the budget measures consecutive silence, not total duration.
+    #[tokio::test(start_paused = true)]
+    async fn pacer_idle_accounting_resets_on_every_item() {
+        let mut pacer =
+            StallPacer::with_windows(Some(Duration::from_secs(15)), Some(Duration::from_secs(60)));
+
+        // Three heartbeats of silence, then a frame, repeated: without the reset
+        // the accumulated silence would trip the 60s budget on the second pass.
+        for _ in 0..4 {
+            let mut silent = stream::pending::<u8>();
+            for _ in 0..3 {
+                assert_eq!(pacer.next(&mut silent).await, StreamStep::Heartbeat);
+            }
+            let mut one = stream::iter([7u8]);
+            assert_eq!(pacer.next(&mut one).await, StreamStep::Item(Some(7)));
+        }
+
+        // Budget is intact, so a fresh silence still gets its full allowance.
+        let mut silent = stream::pending::<u8>();
+        for _ in 0..3 {
+            assert_eq!(pacer.next(&mut silent).await, StreamStep::Heartbeat);
+        }
+        assert_eq!(pacer.next(&mut silent).await, StreamStep::Stalled);
+    }
+
+    /// End-of-stream is reported as `Item(None)`, not as a stall, so the normal
+    /// terminal-event handling still runs.
+    #[tokio::test(start_paused = true)]
+    async fn pacer_reports_stream_end_as_item_none() {
+        let mut ended = stream::empty::<u8>();
+        let mut pacer =
+            StallPacer::with_windows(Some(Duration::from_secs(15)), Some(Duration::from_secs(60)));
+        assert_eq!(pacer.next(&mut ended).await, StreamStep::Item(None));
+    }
+
+    /// `COPILOT_API_SSE_STALL_TIMEOUT_SECS=0` restores the previous behavior:
+    /// heartbeat forever, and let the upstream read-timeout bound the socket.
+    #[tokio::test(start_paused = true)]
+    async fn pacer_never_stalls_when_the_budget_is_disabled() {
+        let mut silent = stream::pending::<u8>();
+        let mut pacer = StallPacer::with_windows(Some(Duration::from_secs(15)), None);
+        for _ in 0..50 {
+            assert_eq!(pacer.next(&mut silent).await, StreamStep::Heartbeat);
+        }
+    }
+
+    /// With heartbeats disabled the budget still bounds a wedged upstream — it
+    /// just does so in one wait instead of several.
+    #[tokio::test(start_paused = true)]
+    async fn pacer_stalls_without_heartbeats() {
+        let mut silent = stream::pending::<u8>();
+        let mut pacer = StallPacer::with_windows(None, Some(Duration::from_secs(60)));
+        assert_eq!(pacer.next(&mut silent).await, StreamStep::Stalled);
+
+        let mut one = stream::iter([1u8]);
+        let mut pacer = StallPacer::with_windows(None, Some(Duration::from_secs(60)));
+        assert_eq!(pacer.next(&mut one).await, StreamStep::Item(Some(1)));
+    }
+
+    #[test]
+    fn stall_timeout_env_override_is_honored_including_disable() {
+        // Parsed the same way as the heartbeat window: a bad value falls back to
+        // the default, and `0` disables detection.
+        assert_eq!(parse_stall_secs(None), Some(DEFAULT_SSE_STALL_TIMEOUT_SECS));
+        assert_eq!(
+            parse_stall_secs(Some("nonsense")),
+            Some(DEFAULT_SSE_STALL_TIMEOUT_SECS)
+        );
+        assert_eq!(parse_stall_secs(Some(" 45 ")), Some(45));
+        assert_eq!(parse_stall_secs(Some("0")), None);
+    }
+
+    /// Mirrors the parsing in [`sse_stall_timeout`] without touching process-wide
+    /// environment state (which would race other tests).
+    fn parse_stall_secs(raw: Option<&str>) -> Option<u64> {
+        let secs = raw
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SSE_STALL_TIMEOUT_SECS);
+        (secs > 0).then_some(secs)
     }
 
     /// Drive the pure decoder over a sequence of byte chunks, including the

@@ -23,7 +23,6 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
-use futures_util::StreamExt;
 
 use serde_json::{json, Value};
 
@@ -53,8 +52,8 @@ use crate::routes::messages::responses_translation::{
 };
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, malformed_stream_error_events,
-    translate_chunk_to_anthropic_events, translate_error_to_anthropic_error_event,
-    transport_stream_error_events,
+    stalled_stream_error_event, stalled_stream_error_events, translate_chunk_to_anthropic_events,
+    translate_error_to_anthropic_error_event, transport_stream_error_events,
 };
 use crate::routes::responses::utils::{
     apply_responses_api_context_management, compact_input_by_latest_compaction,
@@ -260,26 +259,36 @@ fn stream_chat_completions_response(
         };
         let mut usage = UsageTokens::default();
 
-        let heartbeat = crate::libs::sse::sse_heartbeat_interval();
+        let mut pacer = crate::libs::sse::StallPacer::new();
         let sse = crate::libs::sse::events(upstream);
         futures_util::pin_mut!(sse);
         loop {
-            let item = match heartbeat {
-                Some(interval) => match tokio::time::timeout(interval, sse.next()).await {
-                    Ok(next) => next,
-                    // Upstream silent but still alive (its own read_timeout
-                    // still bounds a truly wedged connection): emit a ping
-                    // so sub-120s intermediaries keep the stream open. A
-                    // ping is not content, so it must not touch the
-                    // timer/TTFT accounting below.
-                    Err(_) => {
-                        yield Ok(Bytes::from_static(
-                            crate::libs::sse::ANTHROPIC_PING_FRAME,
-                        ));
-                        continue;
+            let item = match pacer.next(&mut sse).await {
+                crate::libs::sse::StreamStep::Item(item) => item,
+                // Upstream silent but still within its dead-air budget: emit a
+                // ping so sub-120s intermediaries keep the stream open. A ping
+                // is not content, so it must not touch the timer/TTFT
+                // accounting below.
+                crate::libs::sse::StreamStep::Heartbeat => {
+                    yield Ok(Bytes::from_static(
+                        crate::libs::sse::ANTHROPIC_PING_FRAME,
+                    ));
+                    continue;
+                }
+                // Silent for the whole budget: the connection is wedged. End it
+                // ourselves with a retryable terminal error rather than letting
+                // the client time out on a truncated stream.
+                crate::libs::sse::StreamStep::Stalled => {
+                    tracing::warn!("chat-completions stream stalled; sending terminal error event");
+                    timer.mark_error();
+                    for event in stalled_stream_error_events(&mut state) {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok(frame);
+                        }
                     }
-                },
-                None => sse.next().await,
+                    recorder.record(usage);
+                    return;
+                }
             };
             let Some(item) = item else { break };
             let raw_event = match item {
@@ -476,25 +485,37 @@ pub async fn handle_with_responses_api(
                 );
                 let mut usage = UsageTokens::default();
 
-                let heartbeat = crate::libs::sse::sse_heartbeat_interval();
+                let mut pacer = crate::libs::sse::StallPacer::new();
                 let sse = upstream;
                 futures_util::pin_mut!(sse);
                 loop {
-                    let item = match heartbeat {
-                        Some(interval) => match tokio::time::timeout(interval, sse.next()).await {
-                            Ok(next) => next,
-                            // Idle-but-alive upstream: keep downstream warm with a
-                            // ping. Not content — leaves timer/TTFT untouched.
-                            Err(_) => {
-                                if !state.translation_failed {
-                                    yield Ok(Bytes::from_static(
-                                        crate::libs::sse::ANTHROPIC_PING_FRAME,
-                                    ));
-                                }
-                                continue;
+                    let item = match pacer.next(&mut sse).await {
+                        crate::libs::sse::StreamStep::Item(item) => item,
+                        // Idle-but-alive upstream: keep downstream warm with a
+                        // ping. Not content — leaves timer/TTFT untouched.
+                        crate::libs::sse::StreamStep::Heartbeat => {
+                            if !state.translation_failed {
+                                yield Ok(Bytes::from_static(
+                                    crate::libs::sse::ANTHROPIC_PING_FRAME,
+                                ));
                             }
-                        },
-                        None => sse.next().await,
+                            continue;
+                        }
+                        // Wedged: nothing at all for the whole dead-air budget.
+                        crate::libs::sse::StreamStep::Stalled => {
+                            tracing::warn!("responses stream stalled; sending terminal error event");
+                            timer.mark_error();
+                            for event in terminate_responses_stream_with_error(
+                                &mut state,
+                                stalled_stream_error_event(),
+                            ) {
+                                if let Some(frame) = emit_event(&event) {
+                                    yield Ok(frame);
+                                }
+                            }
+                            recorder.record(usage);
+                            return;
+                        }
                     };
                     let Some(item) = item else { break };
                     let chunk = match item {
@@ -673,23 +694,33 @@ pub async fn handle_with_messages_api(
                 // synthetic success.
                 let mut terminal_event_seen = false;
 
-                let heartbeat = crate::libs::sse::sse_heartbeat_interval();
+                let mut pacer = crate::libs::sse::StallPacer::new();
                 let sse = crate::libs::sse::events(upstream);
                 futures_util::pin_mut!(sse);
                 loop {
-                    let item = match heartbeat {
-                        Some(interval) => match tokio::time::timeout(interval, sse.next()).await {
-                            Ok(next) => next,
-                            // Idle-but-alive upstream: keep downstream warm with a
-                            // ping. Not content — leaves timer/TTFT untouched.
-                            Err(_) => {
-                                yield Ok(Bytes::from_static(
-                                    crate::libs::sse::ANTHROPIC_PING_FRAME,
-                                ));
-                                continue;
+                    let item = match pacer.next(&mut sse).await {
+                        crate::libs::sse::StreamStep::Item(item) => item,
+                        // Idle-but-alive upstream: keep downstream warm with a
+                        // ping. Not content — leaves timer/TTFT untouched.
+                        crate::libs::sse::StreamStep::Heartbeat => {
+                            yield Ok(Bytes::from_static(
+                                crate::libs::sse::ANTHROPIC_PING_FRAME,
+                            ));
+                            continue;
+                        }
+                        // Wedged: the upstream held the connection open without
+                        // sending anything for the whole dead-air budget. Emit a
+                        // retryable terminal error instead of stalling silently
+                        // until the client gives up on a truncated stream.
+                        crate::libs::sse::StreamStep::Stalled => {
+                            tracing::warn!("messages stream stalled; sending terminal error event");
+                            timer.mark_error();
+                            if let Some(frame) = emit_event(&stalled_stream_error_event()) {
+                                yield Ok(frame);
                             }
-                        },
-                        None => sse.next().await,
+                            recorder.record(usage);
+                            return;
+                        }
                     };
                     let Some(item) = item else { break };
                     let event = match item {
