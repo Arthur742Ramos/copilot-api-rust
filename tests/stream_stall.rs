@@ -14,6 +14,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Once};
 
 use axum::body::Body;
@@ -23,6 +24,9 @@ use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
 use common::{send, set_config};
+use copilot_api::libs::config::{
+    set_cached_config_for_test, AppConfig, AuthConfig, ProviderConfig,
+};
 use copilot_api::services::copilot::get_models::{Model, ModelsResponse};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -30,6 +34,16 @@ use tokio::sync::oneshot;
 const CLIENT_KEY: &str = "stall-fixture-client-key";
 const STALLING_MODEL: &str = "claude-stall-fixture";
 const HEALTHY_MODEL: &str = "claude-healthy-fixture";
+const COMMENT_MODEL: &str = "claude-comment-fixture";
+const RESPONSES_CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stall_fixture\",\"model\":\"fixture-model\"}}\n\n";
+const RESPONSES_COMPLETED: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stall_fixture\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+const MESSAGE_FINISH: &str = concat!(
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
 
 /// Heartbeat and stall windows for this suite. Scaled down from the 15s/120s
 /// production defaults so the test runs in about a second while exercising the
@@ -47,6 +61,7 @@ fn init_env() {
         std::env::set_var("COPILOT_API_HOME", dir);
         std::env::set_var("COPILOT_API_SSE_HEARTBEAT_SECS", HEARTBEAT_SECS.to_string());
         std::env::set_var("COPILOT_API_SSE_STALL_TIMEOUT_SECS", STALL_SECS.to_string());
+        std::env::set_var("COPILOT_API_ALLOW_PRIVATE_PROVIDERS", "1");
     });
 }
 
@@ -82,20 +97,20 @@ fn stalling_body(model: &str) -> Body {
 /// Control upstream: a complete, well-formed stream that terminates properly.
 fn healthy_body(model: &str) -> Body {
     let mut text = message_start_frame(model);
-    text.push_str(
-        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-    );
-    text.push_str(
-        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
-    );
-    text.push_str(
-        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-    );
-    text.push_str(
-        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n",
-    );
-    text.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    text.push_str(MESSAGE_FINISH);
     Body::from(text)
+}
+
+fn comment_body(model: &str) -> Body {
+    let opening = message_start_frame(model);
+    Body::from_stream(async_stream::stream! {
+        yield Ok::<Bytes, std::io::Error>(Bytes::from(opening));
+        for _ in 0..8 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            yield Ok(Bytes::from_static(b": upstream is still working\n\n"));
+        }
+        yield Ok(Bytes::from_static(MESSAGE_FINISH.as_bytes()));
+    })
 }
 
 async fn upstream_messages(axum::Json(body): axum::Json<Value>) -> Response {
@@ -106,6 +121,8 @@ async fn upstream_messages(axum::Json(body): axum::Json<Value>) -> Response {
         .to_string();
     let stream_body = if model == HEALTHY_MODEL {
         healthy_body(&model)
+    } else if model == COMMENT_MODEL {
+        comment_body(&model)
     } else {
         stalling_body(&model)
     };
@@ -117,6 +134,73 @@ async fn upstream_messages(axum::Json(body): axum::Json<Value>) -> Response {
         .expect("build upstream SSE response")
 }
 
+async fn upstream_responses(axum::Json(body): axum::Json<Value>) -> Response {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stream_body = match model {
+        "fixture-silent" => Body::from_stream(
+            futures_util::stream::pending::<Result<Bytes, std::io::Error>>(),
+        ),
+        "fixture-partial" => Body::from_stream(async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(RESPONSES_CREATED.as_bytes()));
+            std::future::pending::<()>().await;
+        }),
+        "fixture-comments" => Body::from_stream(async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(RESPONSES_CREATED.as_bytes()));
+            for _ in 0..8 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                yield Ok(Bytes::from_static(b": upstream is still working\n\n"));
+            }
+            yield Ok(Bytes::from_static(RESPONSES_COMPLETED.as_bytes()));
+        }),
+        "fixture-leading-error" => Body::from(
+            "event: error\ndata: {\"type\":\"error\",\"message\":\"fixture rejected\",\"status_code\":429}\n\n",
+        ),
+        _ => Body::from(format!("{RESPONSES_CREATED}{RESPONSES_COMPLETED}")),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(stream_body)
+        .expect("build Responses fixture")
+}
+
+async fn upstream_chat(axum::Json(body): axum::Json<Value>) -> Response {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("chat-stall");
+    let done = model == "chat-done";
+    let opening = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chat_fixture",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "hi"},
+                "finish_reason": Value::Null
+            }]
+        })
+    );
+    let stream_body = Body::from_stream(async_stream::stream! {
+        yield Ok::<Bytes, std::io::Error>(Bytes::from(opening));
+        if done {
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        }
+        std::future::pending::<()>().await;
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(stream_body)
+        .expect("build Chat Completions fixture")
+}
+
 struct Upstream {
     base_url: String,
     shutdown: Option<oneshot::Sender<()>>,
@@ -125,7 +209,10 @@ struct Upstream {
 impl Upstream {
     async fn start() -> Self {
         init_env();
-        let app = Router::new().route("/v1/messages", post(upstream_messages));
+        let app = Router::new()
+            .route("/v1/messages", post(upstream_messages))
+            .route("/v1/responses", post(upstream_responses))
+            .route("/v1/chat/completions", post(upstream_chat));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stall fixture");
@@ -158,7 +245,7 @@ fn configure(upstream: &Upstream) {
 
     let models = ModelsResponse {
         object: "list".to_string(),
-        data: [STALLING_MODEL, HEALTHY_MODEL]
+        data: [STALLING_MODEL, HEALTHY_MODEL, COMMENT_MODEL]
             .into_iter()
             .map(|id| Model {
                 id: id.to_string(),
@@ -178,6 +265,37 @@ fn configure(upstream: &Upstream) {
     });
 }
 
+fn configure_provider(upstream: &Upstream) {
+    let providers = [
+        ("fixture-anthropic", "anthropic"),
+        ("fixture-chat", "openai-compatible"),
+        ("fixture-responses", "openai-responses"),
+    ]
+    .into_iter()
+    .map(|(name, provider_type)| {
+        (
+            name.to_string(),
+            ProviderConfig {
+                provider_type: Some(provider_type.to_string()),
+                enabled: Some(true),
+                base_url: Some(upstream.base_url.clone()),
+                api_key: Some("fixture-provider-key".to_string()),
+                ..Default::default()
+            },
+        )
+    })
+    .collect::<BTreeMap<_, _>>();
+    set_cached_config_for_test(AppConfig {
+        auth: Some(AuthConfig {
+            api_keys: Some(vec![json!(CLIENT_KEY)]),
+            ..Default::default()
+        }),
+        providers: Some(providers),
+        ..Default::default()
+    });
+    copilot_api::libs::state::with_state_mut(|state| state.provider_only = None);
+}
+
 fn stream_request(model: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -194,6 +312,41 @@ fn stream_request(model: &str) -> Request<Body> {
             .to_string(),
         ))
         .expect("build client request")
+}
+
+fn provider_messages_request(provider: &str, model: &str) -> Request<Body> {
+    let mut request = stream_request(model);
+    *request.uri_mut() = format!("/{provider}/v1/messages").parse().unwrap();
+    request
+}
+
+fn provider_responses_request(model: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/fixture-responses/v1/responses")
+        .header("content-type", "application/json")
+        .header("x-api-key", CLIENT_KEY)
+        .body(Body::from(
+            json!({"model": model, "input": "hello", "stream": true}).to_string(),
+        ))
+        .unwrap()
+}
+
+fn provider_chat_request(model: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/fixture-chat/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-api-key", CLIENT_KEY)
+        .body(Body::from(
+            json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap()
 }
 
 fn sse_events(body: &[u8]) -> Vec<Value> {
@@ -316,4 +469,139 @@ async fn healthy_stream_is_not_affected_by_the_stall_budget() {
         !kinds.iter().any(|kind| kind == "error"),
         "the stall guard must not inject an error into a healthy stream: {kinds:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(stream_stall)]
+async fn upstream_sse_comments_keep_a_long_native_stream_alive() {
+    let upstream = Upstream::start().await;
+    configure(&upstream);
+
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        send(stream_request(COMMENT_MODEL)),
+    )
+    .await
+    .expect("stream with upstream comments must complete");
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&body);
+    assert_eq!(events.last().unwrap()["type"], "message_stop");
+    assert!(!events.iter().any(|event| event["type"] == "error"));
+    assert!(
+        events.iter().any(|event| event["type"] == "ping"),
+        "upstream comments must keep the downstream connection warm too"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(stream_stall)]
+async fn provider_responses_stalls_before_and_after_first_event() {
+    let upstream = Upstream::start().await;
+    configure_provider(&upstream);
+
+    for (model, expected_terminal) in [
+        ("fixture-silent", "error"),
+        ("fixture-partial", "response.failed"),
+    ] {
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            send(provider_responses_request(model)),
+        )
+        .await
+        .expect("provider must finish a stalled stream without client cancellation");
+        assert_eq!(status, StatusCode::OK, "{model}");
+        let events = sse_events(&body);
+        let terminal = events.last().expect("terminal error event");
+        assert_eq!(terminal["type"], expected_terminal, "{model}: {events:?}");
+        let code = if expected_terminal == "error" {
+            &terminal["code"]
+        } else {
+            &terminal["response"]["error"]["code"]
+        };
+        assert_eq!(code, "upstream_stalled", "{model}: {terminal}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(stream_stall)]
+async fn provider_response_keepalives_and_fast_leading_errors_remain_compatible() {
+    let upstream = Upstream::start().await;
+    configure_provider(&upstream);
+
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        send(provider_responses_request("fixture-comments")),
+    )
+    .await
+    .expect("provider comments must prevent a false stall");
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&body);
+    assert_eq!(events.last().unwrap()["type"], "response.completed");
+    assert!(
+        String::from_utf8_lossy(&body).contains(":\n\n"),
+        "downstream must receive comment keepalives while upstream sends only comments"
+    );
+    assert!(!events
+        .iter()
+        .any(|event| { matches!(event["type"].as_str(), Some("error" | "response.failed")) }));
+
+    let (status, body) = send(provider_responses_request("fixture-leading-error")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["message"], "fixture rejected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(stream_stall)]
+async fn provider_message_transports_end_stalls_with_anthropic_errors() {
+    let upstream = Upstream::start().await;
+    configure_provider(&upstream);
+
+    for (provider, model) in [
+        ("fixture-anthropic", STALLING_MODEL),
+        ("fixture-chat", "chat-stall"),
+        ("fixture-responses", "fixture-partial"),
+    ] {
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            send(provider_messages_request(provider, model)),
+        )
+        .await
+        .expect("provider Messages must not hang on a wedged upstream");
+        assert_eq!(status, StatusCode::OK, "{provider}");
+        let events = sse_events(&body);
+        assert!(
+            events.iter().any(|event| {
+                event["type"] == "error" && event["error"]["type"] == "overloaded_error"
+            }),
+            "{provider}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(stream_stall)]
+async fn provider_chat_ends_stalls_but_stops_after_done() {
+    let upstream = Upstream::start().await;
+    configure_provider(&upstream);
+
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        send(provider_chat_request("chat-stall")),
+    )
+    .await
+    .expect("provider Chat Completions must not hang on a wedged upstream");
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&body);
+    assert_eq!(events.last().unwrap()["error"]["code"], "upstream_stalled");
+
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        send(provider_chat_request("chat-done")),
+    )
+    .await
+    .expect("[DONE] must end the stream even if the upstream leaves the socket open");
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("data: [DONE]"));
+    assert!(!String::from_utf8_lossy(&body).contains("upstream_stalled"));
 }

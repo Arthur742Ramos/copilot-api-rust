@@ -8,6 +8,8 @@
 //! for a leading `error` event (surfaced as a JSON error) and Codex events are
 //! re-serialized/normalized as they pass through.
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -226,7 +228,8 @@ async fn stream_provider_responses(
     recorder: TokenUsageRecorder,
     normalize_codex: bool,
 ) -> Result<Response, AppError> {
-    let event_stream: ResponsesEventStream = Box::pin(crate::libs::sse::events(upstream));
+    let event_stream: ResponsesEventStream =
+        Box::pin(crate::libs::sse::events_with_activity(upstream));
     stream_provider_response_events(event_stream, provider, recorder, normalize_codex).await
 }
 
@@ -236,29 +239,53 @@ async fn stream_provider_response_events(
     recorder: TokenUsageRecorder,
     normalize_codex: bool,
 ) -> Result<Response, AppError> {
-    // Peek the first non-empty chunk to surface a leading `error` event as a
-    // JSON error instead of an SSE stream.
-    let first = match event_stream.next().await {
-        Some(Ok(ev)) => Some(ev),
-        Some(Err(err)) => {
-            return Err(AppError::Other(anyhow::anyhow!(
-                "Provider responses stream error: {err}"
-            )))
+    let mut pacer = crate::libs::sse::StallPacer::new();
+    // Preserve an immediate leading error as a JSON HTTP response, but do not
+    // withhold the response headers indefinitely while a slow provider thinks.
+    // Once this window passes, stream the eventual first frame (or terminal
+    // stall error) as SSE so the client can receive keepalives.
+    let prefetch_window = crate::libs::sse::sse_heartbeat_interval()
+        .unwrap_or(Duration::from_secs(
+            crate::libs::sse::DEFAULT_SSE_HEARTBEAT_SECS,
+        ))
+        .min(Duration::from_secs(
+            crate::libs::sse::DEFAULT_SSE_HEARTBEAT_SECS,
+        ));
+    let first = tokio::time::timeout(prefetch_window, async {
+        loop {
+            match pacer.next_sse(&mut event_stream).await {
+                crate::libs::sse::StreamStep::Item(Some(Ok(ev))) if ev.data.is_empty() => continue,
+                crate::libs::sse::StreamStep::Item(Some(Ok(ev))) => return Ok(Some(ev)),
+                crate::libs::sse::StreamStep::Item(Some(Err(err))) => {
+                    return Err(AppError::Other(anyhow::anyhow!(
+                        "Provider responses stream error: {err}"
+                    )))
+                }
+                crate::libs::sse::StreamStep::Item(None) => return Ok(None),
+                crate::libs::sse::StreamStep::Heartbeat => continue,
+                crate::libs::sse::StreamStep::Stalled => {
+                    return Err(crate::libs::error::HttpError::upstream_stalled().into());
+                }
+            }
         }
-        None => None,
+    })
+    .await;
+    let first_chunk = match first {
+        Ok(Ok(Some(chunk))) => Some(chunk),
+        Ok(Ok(None)) => {
+            return Err(crate::libs::error::HttpError::new(
+                format!("Empty stream from {provider} responses"),
+                StatusCode::BAD_GATEWAY,
+                HeaderMap::new(),
+                String::new(),
+            )
+            .into())
+        }
+        Ok(Err(error)) => return Err(error),
+        Err(_) => None,
     };
 
-    let Some(first_chunk) = first else {
-        return Err(crate::libs::error::HttpError::new(
-            format!("Empty stream from {provider} responses"),
-            StatusCode::BAD_GATEWAY,
-            HeaderMap::new(),
-            String::new(),
-        )
-        .into());
-    };
-
-    if !first_chunk.data.is_empty() && first_chunk.data != "[DONE]" {
+    if let Some(first_chunk) = first_chunk.as_ref().filter(|chunk| chunk.data != "[DONE]") {
         if let Ok(parsed) = serde_json::from_str::<Value>(&first_chunk.data) {
             if parsed.get("type").and_then(Value::as_str) == Some("error") {
                 let status_code = parsed
@@ -287,13 +314,35 @@ async fn stream_provider_response_events(
         let mut usage = UsageTokens::default();
         let mut guard = ResponsesStreamGuard::new();
         let mut ids = StreamIdTracker::new();
+        let mut pacer = pacer;
 
-        let combined = futures_util::stream::once(async move {
-            Ok::<_, std::io::Error>(first_chunk)
-        })
+        let combined = futures_util::stream::iter(
+            first_chunk.into_iter().map(Ok::<_, std::io::Error>)
+        )
         .chain(event_stream);
         futures_util::pin_mut!(combined);
-        while let Some(item) = combined.next().await {
+        loop {
+            let item = match pacer.next_sse(&mut combined).await {
+                crate::libs::sse::StreamStep::Item(Some(item)) => item,
+                crate::libs::sse::StreamStep::Item(None) => break,
+                crate::libs::sse::StreamStep::Heartbeat => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        crate::libs::sse::SSE_COMMENT_PING,
+                    ));
+                    continue;
+                }
+                crate::libs::sse::StreamStep::Stalled => {
+                    tracing::warn!(provider = %provider_label, "Provider Responses stream stalled");
+                    if let Some(frame) = guard.fail(
+                        "upstream_stalled",
+                        "The upstream Responses stream stopped sending data.",
+                    ) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {

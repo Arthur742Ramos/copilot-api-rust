@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 
-use futures_util::StreamExt;
 use serde_json::{Map, Value};
 
 use crate::libs::error::AppError;
@@ -39,7 +38,16 @@ where
     let mut created_fields = Map::<String, Value>::new();
     let mut usage_observed = false;
 
-    while let Some(next) = upstream.next().await {
+    let mut pacer = crate::libs::sse::StallPacer::new();
+    loop {
+        let next = match pacer.next_sse(&mut upstream).await {
+            crate::libs::sse::StreamStep::Item(Some(next)) => next,
+            crate::libs::sse::StreamStep::Item(None) => break,
+            crate::libs::sse::StreamStep::Heartbeat => continue,
+            crate::libs::sse::StreamStep::Stalled => {
+                return Err(crate::libs::error::HttpError::upstream_stalled().into());
+            }
+        };
         let event =
             next.map_err(|error| collector_error(error_message_prefix, &error.to_string()))?;
 
@@ -395,6 +403,24 @@ mod tests {
 
     use super::*;
     use crate::libs::sse::SseEvent;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_unary_collection_returns_a_retryable_error() {
+        let upstream: ResponsesEventStream = Box::pin(stream::pending());
+        let error = collect_responses_stream_result_with_usage_observer(
+            upstream,
+            "test Responses stream",
+            Some("gpt-test"),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        let AppError::Http(error) = error else {
+            panic!("a stalled collector must produce an HTTP error");
+        };
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.headers[axum::http::header::RETRY_AFTER], "1");
+    }
 
     fn event(kind: &str, value: Value) -> Result<SseEvent, std::io::Error> {
         Ok(SseEvent {

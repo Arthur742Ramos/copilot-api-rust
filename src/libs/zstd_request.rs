@@ -42,19 +42,20 @@ pub async fn zstd_decompression_middleware(req: Request, next: Next) -> Response
         return next.run(req).await;
     }
 
+    let openai_native = crate::libs::error::is_openai_request(req.uri().path(), req.headers());
     let (mut parts, body) = req.into_parts();
 
     let compressed = match to_bytes(body, MAX_COMPRESSED_BYTES).await {
         Ok(bytes) => bytes,
         // `to_bytes` errors when the body exceeds the cap (or on a read error).
-        Err(_) => return payload_too_large(),
+        Err(_) => return payload_too_large(openai_native),
     };
 
     let decompressed = match tokio::task::spawn_blocking(move || decompress_zstd(&compressed)).await
     {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(DecompressError::TooLarge)) => return payload_too_large(),
-        _ => return invalid_body(),
+        Ok(Err(DecompressError::TooLarge)) => return payload_too_large(openai_native),
+        _ => return invalid_body(openai_native),
     };
 
     parts.headers.remove(CONTENT_ENCODING);
@@ -87,20 +88,38 @@ fn decompress_zstd(input: &[u8]) -> Result<Vec<u8>, DecompressError> {
     Ok(output)
 }
 
-fn invalid_body() -> Response {
-    crate::libs::error::anthropic_error_response(
-        StatusCode::BAD_REQUEST,
-        "invalid_request_error",
-        "Failed to decompress zstd request body.",
-    )
+fn invalid_body(openai_native: bool) -> Response {
+    if openai_native {
+        crate::libs::error::openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("invalid_request_error"),
+            "Failed to decompress zstd request body.",
+        )
+    } else {
+        crate::libs::error::anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Failed to decompress zstd request body.",
+        )
+    }
 }
 
-fn payload_too_large() -> Response {
-    crate::libs::error::anthropic_error_response(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "request_too_large",
-        "Request body is too large.",
-    )
+fn payload_too_large(openai_native: bool) -> Response {
+    if openai_native {
+        crate::libs::error::openai_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            Some("request_too_large"),
+            "Request body is too large.",
+        )
+    } else {
+        crate::libs::error::anthropic_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "Request body is too large.",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -149,18 +168,41 @@ mod tests {
     #[tokio::test]
     async fn zstd_failures_use_complete_anthropic_envelopes() {
         assert_complete_error(
-            invalid_body(),
+            invalid_body(false),
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "Failed to decompress zstd request body.",
         )
         .await;
         assert_complete_error(
-            payload_too_large(),
+            payload_too_large(false),
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
             "Request body is too large.",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn zstd_failures_use_openai_envelopes_on_openai_routes() {
+        for (response, status, code) in [
+            (
+                invalid_body(true),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                payload_too_large(true),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+            ),
+        ] {
+            assert_eq!(response.status(), status);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body.get("type").is_none());
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(body["error"]["code"], code);
+        }
     }
 }

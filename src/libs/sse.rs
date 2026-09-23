@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use tokio::time::Instant;
 
 /// Default interval between proxy-injected SSE heartbeat frames (seconds).
 ///
@@ -106,8 +107,8 @@ pub enum StreamStep<T> {
 pub struct StallPacer {
     heartbeat: Option<Duration>,
     stall_after: Option<Duration>,
-    /// Silence accumulated since the last item; reset whenever one arrives.
-    idle: Duration,
+    last_activity: Instant,
+    last_output: Instant,
 }
 
 impl Default for StallPacer {
@@ -125,10 +126,12 @@ impl StallPacer {
     /// Build a pacer with explicit windows. Exposed for tests, which must not
     /// depend on process-wide environment state.
     pub fn with_windows(heartbeat: Option<Duration>, stall_after: Option<Duration>) -> Self {
+        let now = Instant::now();
         Self {
             heartbeat,
             stall_after,
-            idle: Duration::ZERO,
+            last_activity: now,
+            last_output: now,
         }
     }
 
@@ -137,30 +140,77 @@ impl StallPacer {
     where
         S: Stream + Unpin,
     {
-        // No heartbeat configured: a single wait, bounded by the stall budget so
-        // a wedged upstream is still caught.
-        let Some(interval) = self.heartbeat else {
-            return match self.stall_after {
-                Some(budget) => match tokio::time::timeout(budget, stream.next()).await {
-                    Ok(item) => StreamStep::Item(item),
-                    Err(_) => StreamStep::Stalled,
-                },
-                None => StreamStep::Item(stream.next().await),
-            };
+        self.next_with_marker(stream, |_| false).await
+    }
+
+    /// Await a decoded SSE event, treating empty activity markers as upstream
+    /// liveness without passing them to the caller. Downstream heartbeats still
+    /// run on their own schedule even when the upstream sends only comments.
+    pub async fn next_sse<S>(
+        &mut self,
+        stream: &mut S,
+    ) -> StreamStep<Result<SseEvent, std::io::Error>>
+    where
+        S: Stream<Item = Result<SseEvent, std::io::Error>> + Unpin,
+    {
+        loop {
+            let step = self
+                .next_with_marker(
+                    stream,
+                    |item| matches!(item, Ok(event) if event.is_activity_marker()),
+                )
+                .await;
+            if matches!(&step, StreamStep::Item(Some(Ok(event))) if event.is_activity_marker()) {
+                continue;
+            }
+            return step;
+        }
+    }
+
+    async fn next_with_marker<S>(
+        &mut self,
+        stream: &mut S,
+        is_marker: impl Fn(&S::Item) -> bool,
+    ) -> StreamStep<S::Item>
+    where
+        S: Stream + Unpin,
+    {
+        let deadline = self
+            .stall_after
+            .and_then(|budget| self.last_activity.checked_add(budget));
+        let stall = async {
+            if let Some(deadline) = deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let heartbeat_deadline = self
+            .heartbeat
+            .and_then(|interval| self.last_output.checked_add(interval));
+        let heartbeat = async {
+            if let Some(deadline) = heartbeat_deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
         };
 
-        match tokio::time::timeout(interval, stream.next()).await {
-            Ok(item) => {
-                self.idle = Duration::ZERO;
+        tokio::select! {
+            biased;
+            item = stream.next() => {
+                let now = Instant::now();
+                self.last_activity = now;
+                if item.as_ref().is_some_and(|item| !is_marker(item)) {
+                    self.last_output = now;
+                }
                 StreamStep::Item(item)
             }
-            Err(_) => {
-                self.idle = self.idle.saturating_add(interval);
-                match self.stall_after {
-                    Some(budget) if self.idle >= budget => StreamStep::Stalled,
-                    _ => StreamStep::Heartbeat,
-                }
-            }
+            _ = stall => StreamStep::Stalled,
+            _ = heartbeat => {
+                self.last_output = Instant::now();
+                StreamStep::Heartbeat
+            },
         }
     }
 }
@@ -171,6 +221,12 @@ pub struct SseEvent {
     pub id: Option<String>,
     pub event: Option<String>,
     pub data: String,
+}
+
+impl SseEvent {
+    fn is_activity_marker(&self) -> bool {
+        self.id.is_none() && self.event.is_none() && self.data.is_empty()
+    }
 }
 
 /// Maximum bytes the decoder will buffer between record terminators. A
@@ -196,9 +252,9 @@ pub const MAX_SSE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub struct Decoder {
     /// Rolling buffer of not-yet-dispatched raw bytes.
     buf: Vec<u8>,
-    /// Set once the buffer exceeds [`MAX_SSE_RECORD_BYTES`] without a record
-    /// terminator. [`events`] checks this and terminates the stream with an
-    /// error, since [`push`] cannot itself return one.
+    /// Set once a record exceeds [`MAX_SSE_RECORD_BYTES`], whether or not its
+    /// terminator arrived in the same chunk. [`events`] checks this and
+    /// terminates the stream with an error, since [`push`] cannot return one.
     overflowed: bool,
 }
 
@@ -237,6 +293,10 @@ impl Decoder {
         // loop (rather than per-record) keeps this O(n) instead of O(n^2).
         let mut consumed = 0usize;
         while let Some((record_end, boundary_len)) = next_boundary(&self.buf[consumed..]) {
+            if record_end > MAX_SSE_RECORD_BYTES {
+                self.overflowed = true;
+                break;
+            }
             let record_start = consumed;
             let record_bytes = &self.buf[record_start..record_start + record_end];
             // The full record is buffered, so lossy decode is safe here (any
@@ -252,7 +312,7 @@ impl Decoder {
             self.buf.drain(..consumed);
         }
 
-        if self.buf.len() > MAX_SSE_RECORD_BYTES {
+        if self.overflowed || self.buf.len() > MAX_SSE_RECORD_BYTES {
             self.overflowed = true;
             // Release the oversized allocation promptly; `events()` surfaces the
             // overflow via the latch, so the retained bytes serve no purpose.
@@ -369,20 +429,39 @@ fn parse_record(record: &str) -> Option<SseEvent> {
 /// Mirrors the TS `events(response)` helper. Byte-stream errors are mapped to
 /// `std::io::Error` via `std::io::Error::other`, matching the chat handler.
 pub fn events(resp: reqwest::Response) -> impl Stream<Item = Result<SseEvent, std::io::Error>> {
+    events_impl(resp, false)
+}
+
+/// Like [`events`], but emits an empty-data marker when upstream bytes arrive
+/// without a complete data record (including SSE comments and partial frames).
+/// Paced consumers ignore the marker after it resets their silence deadline.
+pub fn events_with_activity(
+    resp: reqwest::Response,
+) -> impl Stream<Item = Result<SseEvent, std::io::Error>> {
+    events_impl(resp, true)
+}
+
+fn events_impl(
+    resp: reqwest::Response,
+    report_activity: bool,
+) -> impl Stream<Item = Result<SseEvent, std::io::Error>> {
     let mut byte_stream = resp.bytes_stream();
     async_stream::try_stream! {
         let mut decoder = Decoder::new();
         while let Some(chunk) = byte_stream.next().await {
             let bytes: Bytes = chunk.map_err(std::io::Error::other)?;
-            for ev in decoder.push(&bytes) {
+            let decoded = decoder.push(&bytes);
+            let empty = decoded.is_empty();
+            for ev in decoded {
                 yield ev;
             }
-            // Bound memory: an upstream that never terminates a record would
-            // otherwise grow the buffer without limit. Terminate the stream.
             if decoder.overflowed() {
                 Err(std::io::Error::other(
-                    "SSE record exceeded the maximum buffered size",
+                    "SSE record exceeded the maximum size",
                 ))?;
+            }
+            if report_activity && empty && !bytes.is_empty() {
+                yield SseEvent::default();
             }
         }
         if let Some(ev) = decoder.finish() {
@@ -501,6 +580,38 @@ mod tests {
         let mut one = stream::iter([1u8]);
         let mut pacer = StallPacer::with_windows(None, Some(Duration::from_secs(60)));
         assert_eq!(pacer.next(&mut one).await, StreamStep::Item(Some(1)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_deadline_is_not_extended_by_a_longer_heartbeat() {
+        let start = Instant::now();
+        let mut silent = stream::pending::<u8>();
+        let mut pacer =
+            StallPacer::with_windows(Some(Duration::from_secs(60)), Some(Duration::from_secs(5)));
+        assert_eq!(pacer.next(&mut silent).await, StreamStep::Stalled);
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_activity_keeps_stall_at_bay_without_suppressing_client_heartbeats() {
+        let source = async_stream::stream! {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                yield Ok::<SseEvent, std::io::Error>(SseEvent::default());
+            }
+            std::future::pending::<()>().await;
+        };
+        futures_util::pin_mut!(source);
+        let start = Instant::now();
+        let mut pacer =
+            StallPacer::with_windows(Some(Duration::from_secs(15)), Some(Duration::from_secs(60)));
+        for heartbeat in 1..=5 {
+            assert!(matches!(
+                pacer.next_sse(&mut source).await,
+                StreamStep::Heartbeat
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(heartbeat * 15));
+        }
     }
 
     #[test]
@@ -732,6 +843,19 @@ mod tests {
     }
 
     #[test]
+    fn complete_oversized_record_is_rejected_before_parsing() {
+        let mut chunk = Vec::with_capacity(MAX_SSE_RECORD_BYTES + 9);
+        chunk.extend_from_slice(b"data: ");
+        chunk.resize(MAX_SSE_RECORD_BYTES + 7, b'x');
+        chunk.extend_from_slice(b"\n\n");
+
+        let mut decoder = Decoder::new();
+        assert!(decoder.push(&chunk).is_empty());
+        assert!(decoder.overflowed());
+        assert!(decoder.finish().is_none());
+    }
+
+    #[test]
     fn no_overflow_for_normal_terminated_records() {
         let mut decoder = Decoder::new();
         for _ in 0..10_000 {
@@ -739,6 +863,46 @@ mod tests {
         }
         assert!(!decoder.overflowed());
         assert!(decoder.buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upstream_comment_bytes_report_activity_without_dispatching_a_data_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind SSE activity fixture");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: upstream heartbeat\n\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket.write_all(b"data: real\n\n").await.unwrap();
+        });
+
+        let upstream = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let stream = events_with_activity(upstream);
+        futures_util::pin_mut!(stream);
+        let activity = stream.next().await.unwrap().unwrap();
+        assert!(activity.data.is_empty());
+        assert!(activity.event.is_none());
+        assert_eq!(stream.next().await.unwrap().unwrap().data, "real");
+        assert!(stream.next().await.is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]

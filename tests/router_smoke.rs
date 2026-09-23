@@ -167,3 +167,27 @@ async fn oversize_body_returns_json_shaped_413() {
     assert_eq!(json["error"]["type"], "request_too_large");
     assert_eq!(json["error"]["message"], "Request body is too large.");
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn malformed_zstd_uses_each_routes_native_error_envelope() {
+    set_config(&[], None);
+    for (path, anthropic) in [
+        ("/v1/messages", true),
+        ("/v1/responses", false),
+        ("/v1/chat/completions", false),
+        ("/v1/files", false),
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("content-encoding", "zstd")
+            .body(Body::from("invalid zstd data"))
+            .unwrap();
+        let (status, bytes) = send(request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.get("type").is_some(), anthropic, "{path}");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{path}");
+    }
+}

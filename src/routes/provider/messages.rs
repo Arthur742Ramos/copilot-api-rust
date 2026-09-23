@@ -15,7 +15,6 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::libs::config::{
@@ -53,8 +52,8 @@ use crate::routes::messages::responses_translation::{
 };
 use crate::routes::messages::stream_translation::{
     flush_pending_anthropic_stream_events, malformed_stream_error_events,
-    translate_chunk_to_anthropic_events, translate_error_to_anthropic_error_event,
-    transport_stream_error_events,
+    stalled_stream_error_event, stalled_stream_error_events, translate_chunk_to_anthropic_events,
+    translate_error_to_anthropic_error_event, transport_stream_error_events,
 };
 use crate::routes::messages::web_search::fulfill::{
     build_synthetic_stream_events, collect_web_search_responses_stream_result_with_usage_observer,
@@ -332,7 +331,8 @@ async fn handle_openai_responses_provider_messages(
         }
 
         let recorder = create_provider_messages_usage_recorder(&payload, provider);
-        let stream: ResponsesEventStream = Box::pin(crate::libs::sse::events(upstream_response));
+        let stream: ResponsesEventStream =
+            Box::pin(crate::libs::sse::events_with_activity(upstream_response));
         let mut observed_usage = None;
         let collected = collect_responses_stream_result_with_usage_observer(
             stream,
@@ -422,7 +422,7 @@ async fn handle_openai_responses_provider_web_search_messages(
                     .await
                     .into());
                 }
-                Box::pin(crate::libs::sse::events(upstream_response))
+                Box::pin(crate::libs::sse::events_with_activity(upstream_response))
             }
         };
         let mut observed_usage = None;
@@ -455,7 +455,7 @@ async fn handle_openai_responses_provider_web_search_messages(
 
         let content_type = response_content_type(&upstream_response);
         if content_type.contains("text/event-stream") {
-            let stream = Box::pin(crate::libs::sse::events(upstream_response));
+            let stream = Box::pin(crate::libs::sse::events_with_activity(upstream_response));
             let mut observed_usage = None;
             let collected = collect_web_search_responses_stream_result_with_usage_observer(
                 stream,
@@ -521,7 +521,8 @@ fn stream_responses_provider_messages(
     provider: &str,
     is_codex: bool,
 ) -> Response {
-    let event_stream: ResponsesEventStream = Box::pin(crate::libs::sse::events(upstream));
+    let event_stream: ResponsesEventStream =
+        Box::pin(crate::libs::sse::events_with_activity(upstream));
     stream_responses_provider_message_events(event_stream, payload, provider, is_codex)
 }
 
@@ -547,7 +548,33 @@ fn stream_responses_provider_message_events(
         );
         futures_util::pin_mut!(event_stream);
 
-        while let Some(item) = event_stream.next().await {
+        let mut pacer = crate::libs::sse::StallPacer::new();
+        loop {
+            let item = match pacer.next_sse(&mut event_stream).await {
+                crate::libs::sse::StreamStep::Item(Some(item)) => item,
+                crate::libs::sse::StreamStep::Item(None) => break,
+                crate::libs::sse::StreamStep::Heartbeat => {
+                    if !state.translation_failed {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            crate::libs::sse::ANTHROPIC_PING_FRAME,
+                        ));
+                    }
+                    continue;
+                }
+                crate::libs::sse::StreamStep::Stalled => {
+                    timer.mark_error();
+                    for event in terminate_responses_stream_with_error(
+                        &mut state,
+                        stalled_stream_error_event(),
+                    ) {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {
@@ -1147,7 +1174,7 @@ fn stream_provider_messages(
 ) -> Response {
     let recorder = create_provider_messages_usage_recorder(payload, provider);
     let adjust = provider_config.adjust_input_tokens.unwrap_or(false);
-    let event_stream = crate::libs::sse::events(upstream);
+    let event_stream = crate::libs::sse::events_with_activity(upstream);
 
     let body = Body::from_stream(async_stream::stream! {
         use crate::libs::stream_metrics::{transport, StreamTimer};
@@ -1157,7 +1184,26 @@ fn stream_provider_messages(
         let mut terminal_event_seen = false;
         futures_util::pin_mut!(event_stream);
 
-        while let Some(item) = event_stream.next().await {
+        let mut pacer = crate::libs::sse::StallPacer::new();
+        loop {
+            let item = match pacer.next_sse(&mut event_stream).await {
+                crate::libs::sse::StreamStep::Item(Some(item)) => item,
+                crate::libs::sse::StreamStep::Item(None) => break,
+                crate::libs::sse::StreamStep::Heartbeat => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        crate::libs::sse::ANTHROPIC_PING_FRAME,
+                    ));
+                    continue;
+                }
+                crate::libs::sse::StreamStep::Stalled => {
+                    timer.mark_error();
+                    if let Some(frame) = emit_event(&stalled_stream_error_event()) {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {
@@ -1286,7 +1332,7 @@ fn stream_openai_compatible_provider_messages(
 ) -> Response {
     let recorder = create_provider_messages_usage_recorder(payload, provider);
     let suppress_thinking = chat_suppresses_thinking(payload);
-    let event_stream = crate::libs::sse::events(upstream);
+    let event_stream = crate::libs::sse::events_with_activity(upstream);
 
     let body = Body::from_stream(async_stream::stream! {
         use crate::libs::stream_metrics::{transport, StreamTimer};
@@ -1299,7 +1345,28 @@ fn stream_openai_compatible_provider_messages(
         };
         futures_util::pin_mut!(event_stream);
 
-        while let Some(item) = event_stream.next().await {
+        let mut pacer = crate::libs::sse::StallPacer::new();
+        loop {
+            let item = match pacer.next_sse(&mut event_stream).await {
+                crate::libs::sse::StreamStep::Item(Some(item)) => item,
+                crate::libs::sse::StreamStep::Item(None) => break,
+                crate::libs::sse::StreamStep::Heartbeat => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        crate::libs::sse::ANTHROPIC_PING_FRAME,
+                    ));
+                    continue;
+                }
+                crate::libs::sse::StreamStep::Stalled => {
+                    timer.mark_error();
+                    for event in stalled_stream_error_events(&mut state) {
+                        if let Some(frame) = emit_event(&event) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                        }
+                    }
+                    recorder.record(usage);
+                    return;
+                }
+            };
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {

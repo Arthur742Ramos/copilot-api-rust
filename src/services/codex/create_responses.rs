@@ -208,8 +208,8 @@ async fn forward_codex_responses_websocket_inner(
     allow_unpinned_custom_url: bool,
 ) -> Result<ResponsesEventStream, HttpError> {
     use crate::services::responses_websocket::{
-        create_pooled_web_socket_stream, create_web_socket_url, PooledWebSocketRequest,
-        PooledWebSocketStreamOptions,
+        create_pooled_web_socket_stream_with_activity, create_web_socket_url,
+        PooledWebSocketRequest, PooledWebSocketStreamOptions,
     };
 
     if !websocket_allowed_for_base_url(base_url, allow_unpinned_custom_url) {
@@ -258,7 +258,7 @@ async fn forward_codex_responses_websocket_inner(
         object.remove("stream");
     }
 
-    let source = create_pooled_web_socket_stream(
+    let source = create_pooled_web_socket_stream_with_activity(
         PooledWebSocketRequest {
             headers,
             payload: websocket_payload,

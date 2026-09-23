@@ -842,7 +842,8 @@ pub enum ResponsesTransport {
 }
 
 /// A boxed stream of decoded SSE events, produced by either the HTTP transport
-/// (parsing the upstream response body) or the pooled websocket transport.
+/// or the pooled websocket transport. Empty-data markers report upstream
+/// activity without a complete event; consumers skip them after stall pacing.
 pub type ResponsesEventStream = std::pin::Pin<
     Box<dyn futures_util::Stream<Item = Result<crate::libs::sse::SseEvent, std::io::Error>> + Send>,
 >;
@@ -1128,8 +1129,8 @@ async fn create_web_socket_responses(
     options: &ResponsesRequestOptions<'_>,
 ) -> Result<CreateResponsesReturn, HttpError> {
     use crate::services::responses_websocket::{
-        create_pooled_web_socket_stream, create_web_socket_url, PooledWebSocketRequest,
-        PooledWebSocketStreamOptions,
+        create_pooled_web_socket_stream_with_activity, create_web_socket_url,
+        PooledWebSocketRequest, PooledWebSocketStreamOptions,
     };
 
     // Headers: the websocket handshake reuses the prepared HTTP headers minus
@@ -1190,7 +1191,7 @@ async fn create_web_socket_responses(
         url,
     };
 
-    let stream = create_pooled_web_socket_stream(
+    let stream = create_pooled_web_socket_stream_with_activity(
         request,
         PooledWebSocketStreamOptions {
             create_chunk: ws_chunk_from_data,
@@ -1295,7 +1296,7 @@ async fn create_http_responses(
             return Err(http_error_from_response("Failed to create responses", response).await);
         }
         Ok(CreateResponsesReturn::Stream(Box::pin(
-            crate::libs::sse::events(response),
+            crate::libs::sse::events_with_activity(response),
         )))
     } else {
         match read_buffered_responses_response(
