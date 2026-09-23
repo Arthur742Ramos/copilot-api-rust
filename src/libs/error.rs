@@ -60,6 +60,23 @@ impl HttpError {
             String::new(),
         )
     }
+
+    /// Retryable failure when an upstream streaming connection stops producing
+    /// data before its terminal event.
+    pub fn upstream_stalled() -> Self {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        let message = "The upstream stream stopped sending data. Retry shortly.";
+        HttpError::new(
+            message,
+            StatusCode::SERVICE_UNAVAILABLE,
+            headers,
+            json!({"error": {"type": "overloaded_error", "message": message}}).to_string(),
+        )
+    }
 }
 
 impl std::fmt::Display for HttpError {

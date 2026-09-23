@@ -260,10 +260,10 @@ fn stream_chat_completions_response(
         let mut usage = UsageTokens::default();
 
         let mut pacer = crate::libs::sse::StallPacer::new();
-        let sse = crate::libs::sse::events(upstream);
+        let sse = crate::libs::sse::events_with_activity(upstream);
         futures_util::pin_mut!(sse);
         loop {
-            let item = match pacer.next(&mut sse).await {
+            let item = match pacer.next_sse(&mut sse).await {
                 crate::libs::sse::StreamStep::Item(item) => item,
                 // Upstream silent but still within its dead-air budget: emit a
                 // ping so sub-120s intermediaries keep the stream open. A ping
@@ -489,7 +489,7 @@ pub async fn handle_with_responses_api(
                 let sse = upstream;
                 futures_util::pin_mut!(sse);
                 loop {
-                    let item = match pacer.next(&mut sse).await {
+                    let item = match pacer.next_sse(&mut sse).await {
                         crate::libs::sse::StreamStep::Item(item) => item,
                         // Idle-but-alive upstream: keep downstream warm with a
                         // ping. Not content — leaves timer/TTFT untouched.
@@ -695,10 +695,10 @@ pub async fn handle_with_messages_api(
                 let mut terminal_event_seen = false;
 
                 let mut pacer = crate::libs::sse::StallPacer::new();
-                let sse = crate::libs::sse::events(upstream);
+                let sse = crate::libs::sse::events_with_activity(upstream);
                 futures_util::pin_mut!(sse);
                 loop {
-                    let item = match pacer.next(&mut sse).await {
+                    let item = match pacer.next_sse(&mut sse).await {
                         crate::libs::sse::StreamStep::Item(item) => item,
                         // Idle-but-alive upstream: keep downstream warm with a
                         // ping. Not content — leaves timer/TTFT untouched.

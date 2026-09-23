@@ -585,6 +585,24 @@ pub async fn create_pooled_web_socket_stream(
     request: PooledWebSocketRequest,
     options: PooledWebSocketStreamOptions,
 ) -> Result<impl Stream<Item = Result<SseChunk, std::io::Error>>, std::io::Error> {
+    create_pooled_web_socket_stream_inner(request, options, false).await
+}
+
+/// Emit empty-data activity markers for ping/pong frames so a downstream
+/// [`crate::libs::sse::StallPacer`] does not mistake a live socket for silence.
+/// The application response filters these markers before writing SSE frames.
+pub async fn create_pooled_web_socket_stream_with_activity(
+    request: PooledWebSocketRequest,
+    options: PooledWebSocketStreamOptions,
+) -> Result<impl Stream<Item = Result<SseChunk, std::io::Error>>, std::io::Error> {
+    create_pooled_web_socket_stream_inner(request, options, true).await
+}
+
+async fn create_pooled_web_socket_stream_inner(
+    request: PooledWebSocketRequest,
+    options: PooledWebSocketStreamOptions,
+    emit_activity_markers: bool,
+) -> Result<impl Stream<Item = Result<SseChunk, std::io::Error>>, std::io::Error> {
     let payload = serde_json::to_string(&request.payload).map_err(|error| {
         std::io::Error::other(format!("{}: {error}", options.stream_error_message))
     })?;
@@ -703,7 +721,9 @@ pub async fn create_pooled_web_socket_stream(
                 }
                 Some(Ok(message)) => {
                     let Some(data) = normalize_message(message) else {
-                        // Control frame (ping/pong) -> keep reading.
+                        if emit_activity_markers {
+                            yield Ok(SseChunk::default());
+                        }
                         continue;
                     };
                     let chunk = (options.create_chunk)(data);
@@ -1355,6 +1375,45 @@ mod tests {
         assert!(valid.next().await.is_none());
         server.await.unwrap();
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn control_frames_emit_activity_markers_when_pacing_is_enabled() {
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind paced heartbeat listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(tcp).await.unwrap();
+            let _request = receive_request(&mut websocket).await;
+            send_created(&mut websocket, "resp-paced-heartbeat").await;
+            websocket.send(Message::Ping(vec![1, 2, 3])).await.unwrap();
+            send_completed(&mut websocket, "resp-paced-heartbeat").await;
+        });
+        let request = PooledWebSocketRequest {
+            headers: Vec::new(),
+            payload: serde_json::json!({"type":"response.create"}),
+            pool_key: format!("paced-heartbeat-test-{}", next_entry_id()),
+            url: format!("ws://{address}"),
+        };
+        let mut stream = Box::pin(
+            create_pooled_web_socket_stream_with_activity(request, test_options())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().event.as_deref(),
+            Some("response.created")
+        );
+        let activity = stream.next().await.unwrap().unwrap();
+        assert!(activity.event.is_none());
+        assert!(activity.data.is_empty());
+        assert!(test_terminal(&stream.next().await.unwrap().unwrap()));
+        assert!(stream.next().await.is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]

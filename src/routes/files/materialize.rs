@@ -39,9 +39,12 @@ async fn materialize_anthropic_file_sources_with_store(
     store: &FileStore,
     owner: &str,
 ) -> Result<(), AppError> {
-    let base_bytes = serialized_size(payload)?;
     let mut ids = BTreeMap::new();
     collect_anthropic_local_ids(payload, &mut ids);
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let base_bytes = serialized_size(payload)?;
     let files = load_files(store, owner, ids, base_bytes).await?;
     rewrite_anthropic_file_sources(payload, &files)?;
     ensure_serialized_limit(payload)
@@ -52,7 +55,6 @@ async fn materialize_responses_file_references_with_store(
     store: &FileStore,
     owner: &str,
 ) -> Result<(), AppError> {
-    let base_bytes = serialized_size(payload)?;
     let mut ids = BTreeMap::new();
     for_each_response_block(payload, |block| match block {
         ResponseInputContent::Image(image) => {
@@ -67,6 +69,10 @@ async fn materialize_responses_file_references_with_store(
         }
         _ => {}
     });
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let base_bytes = serialized_size(payload)?;
     let files = load_files(store, owner, ids, base_bytes).await?;
     for_each_response_block_mut(payload, |block| match block {
         ResponseInputContent::Image(image) => {
@@ -440,6 +446,38 @@ mod tests {
             },
         );
         (root, store)
+    }
+
+    #[tokio::test]
+    async fn requests_without_local_file_ids_are_unchanged() {
+        let (root, store) = test_store();
+        let mut anthropic = json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+        });
+        let original = anthropic.clone();
+        materialize_anthropic_file_sources_with_store(&mut anthropic, &store, "alice")
+            .await
+            .unwrap();
+        assert_eq!(anthropic, original);
+
+        let mut responses: ResponsesPayload = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }]
+        }))
+        .unwrap();
+        let original = serde_json::to_value(&responses).unwrap();
+        materialize_responses_file_references_with_store(&mut responses, &store, "alice")
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(responses).unwrap(), original);
+        assert!(
+            !root.exists(),
+            "no-file requests must not initialize storage"
+        );
     }
 
     #[tokio::test]

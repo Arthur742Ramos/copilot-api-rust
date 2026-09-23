@@ -251,7 +251,7 @@ fn stream_responses_sse(
 
         let mut pacer = crate::libs::sse::StallPacer::new();
         loop {
-            let item = match pacer.next(&mut event_stream).await {
+            let item = match pacer.next_sse(&mut event_stream).await {
                 crate::libs::sse::StreamStep::Item(item) => item,
                 // Idle-but-alive upstream: emit a comment keep-alive so
                 // sub-120s intermediaries don't drop the stream. A comment is

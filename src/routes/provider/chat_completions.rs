@@ -10,7 +10,6 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::libs::config::{resolve_effective_provider_config, ModelConfig};
@@ -227,13 +226,31 @@ fn stream_provider_chat_completions(
     upstream: reqwest::Response,
     recorder: TokenUsageRecorder,
 ) -> Response {
-    let event_stream = crate::libs::sse::events(upstream);
+    let event_stream = crate::libs::sse::events_with_activity(upstream);
 
     let body = Body::from_stream(async_stream::stream! {
         let mut usage = UsageTokens::default();
         futures_util::pin_mut!(event_stream);
 
-        while let Some(item) = event_stream.next().await {
+        let mut pacer = crate::libs::sse::StallPacer::new();
+        loop {
+            let item = match pacer.next_sse(&mut event_stream).await {
+                crate::libs::sse::StreamStep::Item(Some(item)) => item,
+                crate::libs::sse::StreamStep::Item(None) => break,
+                crate::libs::sse::StreamStep::Heartbeat => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        crate::libs::sse::SSE_COMMENT_PING,
+                    ));
+                    continue;
+                }
+                crate::libs::sse::StreamStep::Stalled => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        b"event: error\ndata: {\"error\":{\"type\":\"server_error\",\"code\":\"upstream_stalled\",\"message\":\"The upstream Chat Completions stream stopped sending data. Retry shortly.\"}}\n\n",
+                    ));
+                    recorder.record(usage);
+                    return;
+                }
+            };
             let chunk = match item {
                 Ok(ev) => ev,
                 Err(err) => {
@@ -252,11 +269,19 @@ fn stream_provider_chat_completions(
                 }
             }
 
+            if chunk.data.is_empty() {
+                continue;
+            }
+            let finished = chunk.data == "[DONE]";
             let frame = match chunk.event.as_deref() {
                 Some(name) => format!("event: {name}\ndata: {}\n\n", chunk.data),
                 None => format!("data: {}\n\n", chunk.data),
             };
             yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            if finished {
+                recorder.record(usage);
+                return;
+            }
         }
 
         recorder.record(usage);

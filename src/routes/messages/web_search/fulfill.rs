@@ -28,7 +28,6 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
-use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 
 use crate::libs::config::{get_message_api_web_search_model, is_responses_api_web_search_enabled};
@@ -2259,7 +2258,16 @@ where
     let stream = upstream;
     futures_util::pin_mut!(stream);
 
-    while let Some(item) = stream.next().await {
+    let mut pacer = crate::libs::sse::StallPacer::new();
+    loop {
+        let item = match pacer.next_sse(&mut stream).await {
+            crate::libs::sse::StreamStep::Item(Some(item)) => item,
+            crate::libs::sse::StreamStep::Item(None) => break,
+            crate::libs::sse::StreamStep::Heartbeat => continue,
+            crate::libs::sse::StreamStep::Stalled => {
+                return Err(crate::libs::error::HttpError::upstream_stalled().into());
+            }
+        };
         let event = item
             .map_err(|e| AppError::Other(anyhow::anyhow!("Web search stream read error: {e}")))?;
 
@@ -2753,6 +2761,25 @@ fn synthetic_stream_response(response: &ReconstructedWebSearchResponse) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_web_search_collection_returns_a_retryable_error() {
+        let upstream: crate::services::copilot::create_responses::ResponsesEventStream =
+            Box::pin(futures_util::stream::pending());
+        let error = collect_web_search_responses_stream_result_with_usage_observer(
+            upstream,
+            "test web search",
+            Some("gpt-test"),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        let AppError::Http(error) = error else {
+            panic!("a stalled web search collector must produce an HTTP error");
+        };
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.headers[axum::http::header::RETRY_AFTER], "1");
+    }
 
     fn payload_from(value: Value) -> AnthropicMessagesPayload {
         serde_json::from_value(value).expect("parse payload")
