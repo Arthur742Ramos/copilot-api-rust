@@ -11766,8 +11766,13 @@ async fn claude_malformed_usage_never_coerces_to_success() {
         "gpt-contract-usage-cached-exceeds-input",
         "gpt-contract-usage-reasoning-exceeds-output",
     ];
-    for model in models {
-        let (status, body) = send(post_json(
+    let trace_prefix = format!("malformed-usage-{}", uuid::Uuid::new_v4());
+    let mut trace_ids = Vec::with_capacity(models.len());
+
+    for (index, model) in models.into_iter().enumerate() {
+        let trace_id = format!("{trace_prefix}-{index}");
+        trace_ids.push(trace_id.clone());
+        let mut request = post_json(
             "/v1/messages",
             json!({
                 "model":format!("responses-fixture/{model}"),
@@ -11776,8 +11781,11 @@ async fn claude_malformed_usage_never_coerces_to_success() {
                 "stream":true
             }),
             Some(CLIENT_KEY),
-        ))
-        .await;
+        );
+        request
+            .headers_mut()
+            .insert("x-trace-id", trace_id.parse().expect("valid test trace ID"));
+        let (status, body) = send(request).await;
         assert_eq!(status, StatusCode::OK, "{model}");
         let events = data_events(&body);
         assert_eq!(
@@ -11802,13 +11810,22 @@ async fn claude_malformed_usage_never_coerces_to_success() {
         );
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let usage_events =
-        copilot_api::libs::token_usage::get_token_usage_events_page(1, 500, "day").items;
-    assert!(
-        !usage_events
+    let usage_count = copilot_api::libs::sqlite::with_usage_conn(|conn| {
+        trace_ids
             .iter()
-            .any(|event| models.contains(&event.model.as_str())),
-        "malformed usage must not create cost rows: {usage_events:#?}"
+            .map(|trace_id| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM token_usage_events WHERE trace_id = ?1",
+                    [trace_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count trace-scoped usage events")
+            })
+            .sum::<i64>()
+    });
+    assert_eq!(
+        usage_count, 0,
+        "malformed usage must not create cost rows: {usage_count}"
     );
 }
 
