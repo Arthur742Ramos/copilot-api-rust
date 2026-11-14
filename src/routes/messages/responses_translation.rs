@@ -34,6 +34,7 @@ use crate::routes::messages::anthropic_types::{
     AnthropicInputMessage, AnthropicMessagesPayload, AnthropicResponse, AnthropicTool,
     AnthropicUsage,
 };
+use crate::routes::messages::non_stream_translation::output_format_json_schema;
 use crate::routes::messages::request_validation::{
     collect_open_object_extensions, merge_open_object_extensions,
     validate_translated_context_management, ANTHROPIC_TOOL_KNOWN_FIELDS,
@@ -69,6 +70,7 @@ const RESPONSES_REQUEST_CANONICAL_FIELDS: &[&str] = &[
     "context_management",
     "include",
     "service_tier",
+    "text",
     // Not a Responses field, but accepting this extension would silently
     // bypass the explicit `stop_sequences` unsupported-control policy.
     "stop",
@@ -350,16 +352,27 @@ pub fn translate_anthropic_messages_to_responses_payload(
         merge_open_object_extensions(&thinking.extra, &[], &mut reasoning, "thinking")?;
     }
     if let Some(output_config) = &payload.output_config {
-        merge_open_object_extensions(&output_config.extra, &[], &mut reasoning, "output_config")?;
+        merge_open_object_extensions(
+            &output_config.extra,
+            &["format"],
+            &mut reasoning,
+            "output_config",
+        )?;
     }
 
     validate_translated_context_management(payload.extra.get("context_management"), "Responses")?;
-    let extra = collect_open_object_extensions(
+    let mut extra = collect_open_object_extensions(
         &payload.extra,
         &["context_management"],
         RESPONSES_REQUEST_CANONICAL_FIELDS,
         "request",
     )?;
+    if let Some(schema) = output_format_json_schema(payload)? {
+        extra.insert(
+            "text".to_string(),
+            json!({"format": {"type": "json_schema", "name": "output", "schema": schema}}),
+        );
+    }
     let mut responses_payload = ResponsesPayload {
         model: payload.model.clone(),
         instructions: translate_system_prompt(payload.system.as_ref(), &payload.model)?,
@@ -2703,6 +2716,27 @@ mod tests {
 
         assert_eq!(reasoning["effort"], "none");
         assert!(reasoning.get("summary").is_none());
+    }
+
+    #[test]
+    fn output_format_maps_to_text_format_not_reasoning() {
+        let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}});
+        let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "max_tokens": 64,
+            "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let translated = translate_anthropic_messages_to_responses_payload(&payload, None).unwrap();
+        let value = serde_json::to_value(translated).unwrap();
+
+        assert_eq!(
+            value["text"],
+            json!({"format": {"type": "json_schema", "name": "output", "schema": schema}})
+        );
+        assert!(value["reasoning"].get("format").is_none());
     }
 
     #[test]

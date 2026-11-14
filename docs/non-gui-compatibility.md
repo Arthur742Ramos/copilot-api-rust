@@ -32,6 +32,10 @@ aliases accept either `/{provider}/v1/...` or `/{provider}/...`.
 |---|---|---|---|
 | Anthropic Messages | `POST /v1/messages` | `POST /:provider[/v1]/messages` | `provider_routing`, `client_compatibility` |
 | Token counting | `POST /v1/messages/count_tokens` | `POST /:provider[/v1]/messages/count_tokens` | `provider_routing` |
+| Gemini model listing | `GET /v1beta/models` | — | `gemini_compatibility` |
+| Gemini generation | `POST /v1beta/models/:model:generateContent` | — | `gemini_compatibility` |
+| Gemini streaming | `POST /v1beta/models/:model:streamGenerateContent` | — | `gemini_compatibility` |
+| Gemini token counting | `POST /v1beta/models/:model:countTokens` | — | `gemini_compatibility` |
 | Chat Completions | `POST /[v1/]chat/completions` | `POST /:provider[/v1]/chat/completions` | `non_gui_features` JSON/SSE |
 | Responses | `POST /[v1/]responses` | `POST /:provider[/v1]/responses` | `non_gui_features` JSON/SSE |
 | Responses compaction | `POST /[v1/]responses/compact` | `POST /:provider[/v1]/responses/compact` | compact contract tests |

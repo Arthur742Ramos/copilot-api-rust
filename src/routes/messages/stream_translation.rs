@@ -213,7 +213,11 @@ fn validate_chunk_identity(
         .filter(|value| !value.trim().is_empty())
         .ok_or(())?
         .to_string();
-    if chunk.get("object").and_then(Value::as_str) != Some("chat.completion.chunk") {
+    // Copilot omits `object` for some backends (e.g. Gemini models).
+    if chunk
+        .get("object")
+        .is_some_and(|object| object.as_str() != Some("chat.completion.chunk"))
+    {
         return Err(());
     }
     let created = chunk.get("created").and_then(nonnegative_i64).ok_or(())?;
@@ -239,6 +243,8 @@ fn validate_chunk_identity(
             "model",
             "choices",
             "usage",
+            // Copilot billing metadata that, like `usage`, changes per chunk.
+            "copilot_usage",
             "error",
             "service_tier",
         ],
@@ -248,10 +254,9 @@ fn validate_chunk_identity(
     .map_err(|_| ())?;
 
     if let Some(expected) = state.chat_id.as_deref() {
-        if id != expected
-            || state.chat_model.as_deref() != Some(model.as_str())
-            || state.chat_created != Some(created)
-        {
+        // `created` is not compared: Copilot's Gemini backend stamps each
+        // chunk with its own emission time, so the first value is kept.
+        if id != expected || state.chat_model.as_deref() != Some(model.as_str()) {
             return Err(());
         }
         validate_optional_assertion(&state.chat_service_tier, &service_tier)?;
@@ -609,7 +614,10 @@ fn parse_chunk_usage(
     }
     let parsed = map_openai_chat_completion_usage(usage, service_tier).map_err(|_| ())?;
     if let Some(existing) = &state.chat_usage_source {
-        if existing != usage {
+        // Copilot's Gemini backend reports all-zero usage on every content
+        // chunk before the real totals; only a placeholder may be replaced.
+        let placeholder = existing.get("total_tokens").and_then(Value::as_i64) == Some(0);
+        if existing != usage && !placeholder {
             return Err(());
         }
     }
@@ -3600,6 +3608,58 @@ mod tests {
         assert!(state.pending_message_delta.is_none());
         assert!(state.message_stop_emitted);
         assert!(state.terminal_event_emitted);
+    }
+
+    #[test]
+    fn copilot_gemini_stream_shape_translates_to_complete_message() {
+        let chunk = |delta: Value, finish: Value, usage: (i64, i64), billed: i64| {
+            json!({
+                "id": "gemini-1",
+                "created": 1 + billed,
+                "model": "gemini-3.8-flash",
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+                "usage": {
+                    "prompt_tokens": usage.0,
+                    "completion_tokens": usage.1,
+                    "total_tokens": usage.0 + usage.1,
+                },
+                "copilot_usage": { "total_nano_aiu": billed },
+            })
+        };
+        let chunks = [
+            chunk(json!({ "content": "Hi" }), Value::Null, (0, 0), 0),
+            chunk(
+                json!({ "reasoning_opaque": "sig" }),
+                json!("stop"),
+                (2, 9),
+                65,
+            ),
+        ];
+
+        let mut state = AnthropicStreamState::default();
+        let mut events = Vec::new();
+        for chunk in &chunks {
+            events.extend(to_values(&translate_chunk_to_anthropic_events(
+                chunk, &mut state,
+            )));
+        }
+        events.extend(to_values(&flush_pending_anthropic_stream_events(
+            &mut state,
+        )));
+
+        assert!(
+            events.iter().all(|event| event["type"] != "error"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events.iter().rev().nth(1),
+            Some(&json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "input_tokens": 2, "output_tokens": 9 }
+            }))
+        );
+        assert_eq!(events.last(), Some(&json!({ "type": "message_stop" })));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 # copilot-api
 
-**One local gateway for GitHub Copilot, Claude Code, Codex CLI, and OpenAI-compatible clients.**
+**One local gateway for GitHub Copilot, Claude Code, Gemini CLI, Codex CLI, and OpenAI-compatible clients.**
 
 Expose OpenAI- and Anthropic-compatible APIs from a native Rust service, then
 route each request to GitHub Copilot, Codex, or a provider you configure.
@@ -26,7 +26,8 @@ route each request to GitHub Copilot, Codex, or a provider you configure.
 
 `copilot-api` lets existing AI tools talk to a local endpoint while the gateway
 handles authentication, model discovery, protocol translation, streaming, tool
-calls, provider routing, and usage accounting.
+calls, provider routing, and usage accounting through OpenAI-, Anthropic-, and
+Gemini-compatible APIs.
 
 It began as an independent Rust reimplementation of
 [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api) and now
@@ -43,7 +44,8 @@ evolves independently. See [`NOTICE.md`](./NOTICE.md) for attribution.
 | --- | --- |
 | **OpenAI compatibility** | Chat Completions, Responses, compaction, models, embeddings, images, and a local Files API. |
 | **Anthropic compatibility** | Messages, token counting, streaming, thinking blocks, tools, prompt caching, images, PDFs, and local file references. |
-| **Coding-agent support** | Audited integration paths for Claude Code and Codex CLI, including their current headers, request shapes, and SSE lifecycles. |
+| **Gemini compatibility** | Gemini Developer API routes for Gemini CLI, including content generation, streaming, tool calls, and local token counting. |
+| **Coding-agent support** | Integration paths for Claude Code, Gemini CLI, and Codex CLI. |
 | **Backend choice** | Use GitHub Copilot, Codex OAuth, Anthropic, OpenAI-compatible APIs, Responses-compatible APIs, or your own provider aliases. |
 | **Local control** | API keys, admin routes, model mappings, token budgets, rate limits, load shedding, and provider-only mode. |
 | **Operational visibility** | Readiness and version endpoints, Prometheus metrics, structured logs, diagnostics, and a built-in usage dashboard. |
@@ -55,11 +57,12 @@ evolves independently. See [`NOTICE.md`](./NOTICE.md) for attribution.
 flowchart LR
     A[Claude Code] --> G[copilot-api<br/>localhost:4141]
     B[Codex CLI] --> G
-    C[OpenAI / Anthropic SDKs] --> G
-    D[Other compatible clients] --> G
+    C[Gemini CLI] --> G
+    D[OpenAI / Anthropic SDKs] --> G
+    E[Other compatible clients] --> G
 
-    G --> E[GitHub Copilot]
-    G --> F[Codex OAuth]
+    G --> F[GitHub Copilot]
+    G --> K[Codex OAuth]
     G --> H[Third-party providers]
 
     G --> I[Local files]
@@ -134,6 +137,7 @@ URL:
 | --- | --- | --- |
 | OpenAI SDKs and compatible apps | `http://127.0.0.1:4141/v1` | Any non-empty value by default; a configured `auth.apiKeys` value when auth is enabled. |
 | Claude Code and Anthropic SDKs | `http://127.0.0.1:4141` | Any non-empty `ANTHROPIC_AUTH_TOKEN` by default; a configured key when auth is enabled. |
+| Gemini CLI | `http://127.0.0.1:4141` | `GEMINI_API_KEY`, using the same rule as other client credentials. |
 | Codex CLI | `http://127.0.0.1:4141/v1` | `COPILOT_API_KEY`, using the same rule as other client credentials. |
 
 ### Claude Code
@@ -208,6 +212,43 @@ The public Responses WebSocket transport is not exposed, so leave
 [combined Claude Code and Codex guide](./docs/claude-code-codex-compatibility.md)
 contains the audited client versions, headers, request shapes, compaction
 behavior, and reproducible test evidence.
+
+### Gemini CLI
+
+Gemini CLI can use the Gemini Developer API-compatible routes. Set its API base
+URL and key, then choose a model ID exposed by `/v1beta/models`:
+
+```sh
+export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4141"
+export GEMINI_API_KEY="local"
+export GEMINI_MODEL="COPILOT_MODEL_ID"
+gemini
+```
+
+If `auth.apiKeys` is configured, use one of those keys instead of `local`.
+Gemini CLI only uses `GEMINI_API_KEY` when its auth type is the API key, so set
+`"security": {"auth": {"selectedType": "gemini-api-key"}}` in
+`~/.gemini/settings.json` if it previously signed in with Google. For headless
+runs in an untrusted folder, also set `GEMINI_CLI_TRUST_WORKSPACE=true`.
+
+Requests are translated onto the same Messages pipeline as Claude Code, so
+Claude, GPT, and Gemini Copilot models all work, each over its native upstream
+API. Gemini CLI also makes background calls (routing, summaries) with its own
+model names such as `gemini-3-flash-preview`, `gemini-2.5-flash`, and
+`gemini-2.5-flash-lite`; map those in copilot-api's `config.json`
+`modelMappings` to an available Copilot model ID, then restart or reload
+copilot-api. The gateway does not assume that a Gemini model name is
+equivalent to a Copilot model.
+
+The adapter supports text and inline images, function declarations and
+responses, thinking settings, JSON schema output, and SSE generation.
+`topK` is ignored, and `topP` is dropped for models that only support the
+Responses API, which reject it. `countTokens` is an estimate rather than
+Google's tokenizer result. Gemini `fileData`, `cachedContent`, built-in Google
+tools such as `googleSearch`, non-empty `safetySettings`, and streaming
+requests with multiple candidates are rejected instead of silently ignored.
+See the [Gemini API routes](./docs/non-gui-compatibility.md#public-endpoints)
+for the endpoint list.
 
 ### OpenAI SDKs
 
@@ -655,6 +696,10 @@ concurrency setting.
 | `GET` | `/token-usage/*` | Usage summary, daily, events, sessions, and client views. |
 | `GET` | `/models`, `/v1/models` | List available models. |
 | `GET` | `/models/:id`, `/v1/models/:id` | Retrieve one model. |
+| `GET` | `/v1beta/models` | List models in Gemini Developer API format. |
+| `POST` | `/v1beta/models/:model:generateContent` | Gemini content generation. |
+| `POST` | `/v1beta/models/:model:streamGenerateContent` | Gemini streaming content generation (`alt=sse`). |
+| `POST` | `/v1beta/models/:model:countTokens` | Local Gemini-format token estimate. |
 | `POST` | `/chat/completions`, `/v1/chat/completions` | OpenAI Chat Completions. |
 | `POST` | `/responses`, `/v1/responses` | OpenAI Responses. |
 | `POST` | `/responses/compact`, `/v1/responses/compact` | Responses compaction used by Codex CLI. |
@@ -693,6 +738,9 @@ Admin endpoints additionally require `auth.adminApiKey`.
   current rollout.
 - Anthropic compatibility targets Messages, token counting, models, and local
   file references; this is not an emulator for every Anthropic product API.
+- Gemini CLI compatibility implements a subset of the Gemini Developer API.
+  Generation requests run through the Messages pipeline, model IDs are
+  resolved through `modelMappings`, and token counts are estimates.
 - The public OpenAI Responses WebSocket transport is not exposed. Clients use
   HTTP/SSE; Codex-backed streams may use the pooled upstream WebSocket with
   pre-send-only fallback and strict terminal accounting.

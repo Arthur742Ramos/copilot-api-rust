@@ -53,7 +53,8 @@ pub fn build_router_with_admission(
         .route("/models/:id", get(crate::routes::models::get_model_route))
         .route(
             "/v1/models/:id",
-            get(crate::routes::models::get_model_route),
+            get(crate::routes::models::get_model_route)
+                .post(crate::routes::gemini::post_model_operation),
         )
         .route(
             "/embeddings",
@@ -118,6 +119,11 @@ pub fn build_router_with_admission(
         .route(
             "/v1/messages/count_tokens",
             post(crate::routes::messages::route::post_count_tokens),
+        )
+        .route("/v1beta/models", get(crate::routes::gemini::get_models))
+        .route(
+            "/v1beta/models/*operation",
+            post(crate::routes::gemini::post_model_operation),
         )
         .merge(crate::routes::files::router())
         .route(
@@ -291,6 +297,8 @@ fn is_upstream_proxy_route(method: &Method, route: &str) -> bool {
         | "/v1/alpha/search"
         | "/v1/messages"
         | "/v1/messages/count_tokens"
+        | "/v1beta/models/*operation"
+        | "/v1/models/*operation"
         | "/:provider/v1/messages"
         | "/:provider/messages"
         | "/:provider/v1/messages/count_tokens"
@@ -309,10 +317,13 @@ fn is_upstream_proxy_route(method: &Method, route: &str) -> bool {
         | "/:provider/alpha/search" => method == Method::POST,
         "/models"
         | "/v1/models"
+        | "/v1beta/models"
         | "/models/:id"
-        | "/v1/models/:id"
         | "/:provider/v1/models"
         | "/:provider/models" => method == Method::GET || method == Method::HEAD,
+        "/v1/models/:id" => {
+            method == Method::GET || method == Method::HEAD || method == Method::POST
+        }
         _ => false,
     }
 }
@@ -404,12 +415,17 @@ fn is_loopback_origin(origin: &[u8]) -> bool {
 /// envelope remains native to the selected public protocol. The panic hook still
 /// records the original diagnostic.
 async fn panic_middleware(req: Request, next: Next) -> Response {
+    let gemini_native = crate::libs::error::is_gemini_request(req.uri().path());
     let openai_native = crate::libs::error::is_openai_request(req.uri().path(), req.headers());
     match std::panic::AssertUnwindSafe(next.run(req))
         .catch_unwind()
         .await
     {
         Ok(response) => response,
+        Err(_) if gemini_native => crate::libs::error::gemini_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error.",
+        ),
         Err(_) if openai_native => crate::libs::error::openai_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
@@ -425,7 +441,12 @@ async fn panic_middleware(req: Request, next: Next) -> Response {
 }
 
 async fn api_not_found(headers: HeaderMap, uri: axum::http::Uri) -> Response {
-    if crate::libs::error::is_openai_request(uri.path(), &headers) {
+    if crate::libs::error::is_gemini_request(uri.path()) {
+        crate::libs::error::gemini_error_response(
+            StatusCode::NOT_FOUND,
+            format!("No route for {}.", uri.path()),
+        )
+    } else if crate::libs::error::is_openai_request(uri.path(), &headers) {
         crate::libs::error::openai_error_response(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
@@ -442,7 +463,12 @@ async fn api_not_found(headers: HeaderMap, uri: axum::http::Uri) -> Response {
 }
 
 async fn api_method_not_allowed(headers: HeaderMap, uri: axum::http::Uri) -> Response {
-    if crate::libs::error::is_openai_request(uri.path(), &headers) {
+    if crate::libs::error::is_gemini_request(uri.path()) {
+        crate::libs::error::gemini_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            format!("Method is not allowed for {}.", uri.path()),
+        )
+    } else if crate::libs::error::is_openai_request(uri.path(), &headers) {
         crate::libs::error::openai_error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "invalid_request_error",
@@ -463,6 +489,7 @@ async fn api_method_not_allowed(headers: HeaderMap, uri: axum::http::Uri) -> Res
 /// the complete Anthropic `request_too_large` envelope, so clients that parse error
 /// JSON get a consistent shape. Other responses pass through untouched.
 async fn normalize_oversize_response(req: Request, next: Next) -> Response {
+    let gemini_native = crate::libs::error::is_gemini_request(req.uri().path());
     let openai_native = crate::libs::error::is_openai_request(req.uri().path(), req.headers());
     let response = next.run(req).await;
     if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
@@ -476,7 +503,12 @@ async fn normalize_oversize_response(req: Request, next: Next) -> Response {
     if is_json {
         return response;
     }
-    if openai_native {
+    if gemini_native {
+        crate::libs::error::gemini_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body is too large.",
+        )
+    } else if openai_native {
         crate::libs::error::openai_error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request_error",
