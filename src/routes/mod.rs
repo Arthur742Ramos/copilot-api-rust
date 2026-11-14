@@ -6,6 +6,7 @@ pub mod alpha_search;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod files;
+pub mod gemini;
 pub mod images;
 pub mod messages;
 pub mod models;

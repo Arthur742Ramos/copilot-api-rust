@@ -87,6 +87,7 @@ const CHAT_REQUEST_CANONICAL_FIELDS: &[&str] = &[
     "parallel_tool_calls",
     "stream_options",
     "cache_control",
+    "response_format",
 ];
 const CHAT_MESSAGE_CANONICAL_FIELDS: &[&str] = &[
     "role",
@@ -259,6 +260,15 @@ pub fn translate_to_openai_with_options(
     if let Some(service_tier) = &payload.service_tier {
         extra.insert("service_tier".to_string(), json!(service_tier));
     }
+    if let Some(schema) = output_format_json_schema(payload)? {
+        extra.insert(
+            "response_format".to_string(),
+            json!({
+                "type": "json_schema",
+                "json_schema": {"name": "output", "schema": schema}
+            }),
+        );
+    }
     let request_extensions = collect_open_object_extensions(
         &payload.extra,
         &["context_management"],
@@ -312,13 +322,41 @@ fn validate_chat_config_extensions(payload: &AnthropicMessagesPayload) -> Result
         )?;
     }
     if let Some(output_config) = &payload.output_config {
+        let mut extensions = output_config.extra.clone();
+        extensions.remove("format");
         reject_unrepresentable_extensions(
-            &output_config.extra,
+            &extensions,
             "output_config",
-            "the scalar Chat reasoning_effort field",
+            "the Chat reasoning_effort and response_format fields",
         )?;
     }
     Ok(())
+}
+
+/// Returns the JSON schema from an Anthropic `output_config.format`, which
+/// translated flows map to their own structured-output controls.
+#[allow(clippy::result_large_err)]
+pub(crate) fn output_format_json_schema(
+    payload: &AnthropicMessagesPayload,
+) -> Result<Option<Value>, AppError> {
+    let Some(format) = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.extra.get("format"))
+    else {
+        return Ok(None);
+    };
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return Err(AppError::BadRequest(
+            "output_config.format.type must be \"json_schema\"".to_string(),
+        ));
+    }
+    match format.get("schema") {
+        Some(schema) if schema.is_object() => Ok(Some(schema.clone())),
+        _ => Err(AppError::BadRequest(
+            "output_config.format.schema must be an object".to_string(),
+        )),
+    }
 }
 
 pub(crate) fn chat_suppresses_thinking(payload: &AnthropicMessagesPayload) -> bool {
@@ -1437,7 +1475,9 @@ pub(crate) fn translate_to_anthropic_with_options(
 
     let id = required_nonempty_chat_string(object, "id", "response.id")?;
     let model = required_nonempty_chat_string(object, "model", "response.model")?;
+    // Copilot omits `object` for some backends (e.g. Gemini models).
     match object.get("object") {
+        None => {}
         Some(Value::String(value)) if value == "chat.completion" => {}
         _ => return Err(malformed_chat_response("response.object was invalid")),
     }
@@ -2132,6 +2172,24 @@ mod tests {
         let translated = translate_to_openai(&payload).expect("translate chat request");
         let value = serde_json::to_value(translated).expect("serialize chat request");
         assert_eq!(value["stop"], json!(["z-stop", "a-stop", "z-stop"]));
+    }
+
+    #[test]
+    fn chat_completions_maps_output_format_to_response_format() {
+        let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}});
+        let payload: AnthropicMessagesPayload = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "output_config": {"format": {"type": "json_schema", "schema": schema}},
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let translated = translate_to_openai(&payload).expect("translate chat request");
+        let value = serde_json::to_value(translated).expect("serialize chat request");
+        assert_eq!(
+            value["response_format"],
+            json!({"type": "json_schema", "json_schema": {"name": "output", "schema": schema}})
+        );
     }
 
     #[test]

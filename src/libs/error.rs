@@ -165,6 +165,36 @@ pub fn is_openai_request(path: &str, headers: &HeaderMap) -> bool {
     is_openai_native_path(path) || (is_files_path(path) && !is_anthropic_files_request(headers))
 }
 
+pub fn is_gemini_request(path: &str) -> bool {
+    path == "/v1beta/models"
+        || path.starts_with("/v1beta/models/")
+        || (path.starts_with("/v1/models/") && path.contains(':'))
+}
+
+pub fn gemini_error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    let google_status = match status {
+        StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
+        StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
+        StatusCode::FORBIDDEN => "PERMISSION_DENIED",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => "UNAVAILABLE",
+        StatusCode::INTERNAL_SERVER_ERROR => "INTERNAL",
+        _ => "UNKNOWN",
+    };
+    (
+        status,
+        Json(json!({
+            "error": {
+                "code": status.as_u16(),
+                "message": message.into(),
+                "status": google_status,
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// Render a locally generated failure using the OpenAI error envelope consumed
 /// by Codex and OpenAI SDKs.
 pub fn openai_error_response(

@@ -182,13 +182,14 @@ pub fn get_api_key_daily_budget(attribution: &str) -> Option<i64> {
         .filter(|&b| b > 0)
 }
 
-/// Mirrors `extractRequestApiKey`: prefer `x-api-key`, else a Bearer token from
-/// `authorization`.
+/// Accepts the common API-key headers, then falls back to a Bearer token.
 pub fn extract_request_api_key(headers: &HeaderMap) -> Option<String> {
-    if let Some(x_api_key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        let trimmed = x_api_key.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+    for header in ["x-api-key", "x-goog-api-key"] {
+        if let Some(api_key) = headers.get(header).and_then(|v| v.to_str().ok()) {
+            let trimmed = api_key.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
         }
     }
 
@@ -214,7 +215,9 @@ fn unauthorized_response(path: &str, headers: &HeaderMap) -> Response {
         "WWW-Authenticate",
         axum::http::HeaderValue::from_static("Bearer realm=\"copilot-api\""),
     );
-    let mut response = if crate::libs::error::is_openai_request(path, headers) {
+    let mut response = if crate::libs::error::is_gemini_request(path) {
+        crate::libs::error::gemini_error_response(StatusCode::UNAUTHORIZED, "Invalid API key")
+    } else if crate::libs::error::is_openai_request(path, headers) {
         crate::libs::error::openai_error_response(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
